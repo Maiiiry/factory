@@ -36,7 +36,7 @@ test("packed Factory installs offline and runs its CLI and bundled scanner", () 
     const versionProbe = `npm --version && test "$(npm --version)" = "${npmVersion}"`;
     writeFileSync(
       join(checkout, "README.md"),
-      `# Local package smoke target\n\n${versionProbe}\n\nnpm test\n\n${versionProbe} && npm test\n\nnpm --version"=false" run test\n`,
+      `# Local package smoke target\n\n${versionProbe}\n\nnpm ci --ignore-scripts\n\nnpm test\n\n${versionProbe} && npm test\n\nnpm --version"=false" run test\n`,
     );
     writeFileSync(
       join(checkout, "package.json"),
@@ -161,7 +161,7 @@ import { join } from "node:path";
 import { planningSources, hydrateWorkerInputSources, validateGraphSources } from ${JSON.stringify(pathToFileURL(join(installedRoot, "dist", "compiler.js")).href)};
 import { deliveredPlanningSources, materializePlanningSources, planningSourceDirectory, assertPlanningSourceDelivery } from ${JSON.stringify(pathToFileURL(join(installedRoot, "dist", "compiler", "source-delivery.js")).href)};
 import { validatePlanning } from ${JSON.stringify(pathToFileURL(join(installedRoot, "dist", "config.js")).href)};
-import { assertPinnedNpmScripts, validateWorkItem } from ${JSON.stringify(pathToFileURL(join(installedRoot, "dist", "validation.js")).href)};
+import { assertPinnedNpmScripts, packageBootstrap, packageScriptCommands, validateWorkItem } from ${JSON.stringify(pathToFileURL(join(installedRoot, "dist", "validation.js")).href)};
 const checkout = ${JSON.stringify(checkout)};
 const probe = ${JSON.stringify(versionProbe)};
 const git = (...args) => execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
@@ -200,6 +200,7 @@ changed.scripts.test = "node --check missing.mjs";
 writeFileSync(packagePath, JSON.stringify(changed) + "\\n");
 const commit = (message) => { git("add", "package.json", ".npmrc"); git("-c", "user.name=Factory Integration", "-c", "user.email=factory-integration@example.com", "commit", "-m", message); return git("rev-parse", "HEAD"); };
 const changedScript = commit("Change pinned acceptance script");
+assert.throws(() => assertPinnedNpmScripts(checkout, baseSha, changedScript, ["npm ci --ignore-scripts"], { sourceDeclared: ["npm ci --ignore-scripts"] }), /unchanged tracked package.json/);
 assert.throws(() => assertPinnedNpmScripts(checkout, baseSha, changedScript, ["npm test"]), /script test differs from the accepted base/);
 writeFileSync(packagePath, originalPackage);
 writeFileSync(join(checkout, ".npmrc"), "fund=true\\n");
@@ -207,6 +208,40 @@ const changedConfig = commit("Change pinned package configuration");
 assert.throws(() => assertPinnedNpmScripts(checkout, baseSha, changedConfig, [probe], { sourceDeclared: [probe] }), /\\.npmrc differs from the accepted base/);
 writeFileSync(join(checkout, ".npmrc"), "fund=false\\n");
 commit("Restore pinned package configuration");
+
+// Compile and guard the real source-declared npm preparation without executing
+// this newly admitted install before security approval. The earlier commands
+// still ran in their real fresh checkout and produced exact-tree receipts.
+const bootstrap = "npm ci --ignore-scripts";
+const authority = { sourceDeclared: [bootstrap] };
+assert.equal(packageBootstrap(bootstrap), "npm");
+assert.deepEqual(packageScriptCommands([bootstrap, "npm test"]), ["npm test"]);
+assert.throws(() => assertPinnedNpmScripts(checkout, baseSha, baseSha, [bootstrap], authority), /unchanged tracked package-lock.json/);
+writeFileSync(join(checkout, "package-lock.json"), JSON.stringify({ name: "package-smoke-target", lockfileVersion: 3, requires: true, packages: { "": { name: "package-smoke-target" } } }) + "\\n");
+git("add", "package-lock.json");
+const bootstrapBase = commit("Establish tracked root npm lockfile");
+assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, [bootstrap, "npm test"], authority);
+assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, [bootstrap]), /exact source-declared command authority/);
+assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, ["npm test", bootstrap], authority), /bootstrap must run first/);
+const bootstrapSources = planningSources(body, bootstrapBase, checkout);
+graph.baseSha = bootstrapBase;
+item.validation = [{ command: bootstrap, provenance: "source-declared", source: "README.md" }, { command: "npm test", provenance: "base-observed", source: "package.json" }];
+hydrateWorkerInputSources(graph, bootstrapSources);
+validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase);
+item.validation[0].provenance = "base-observed";
+assert.throws(() => validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase), /no exact source-declared command authority/);
+item.validation[0].provenance = "source-declared";
+item.validation[0].command = bootstrap + " --offline";
+assert.throws(() => validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase), /no exact source-declared command authority/);
+writeFileSync(join(checkout, "package-lock.json"), readFileSync(join(checkout, "package-lock.json"), "utf8") + " ");
+git("add", "package-lock.json");
+const changedLock = commit("Change pinned npm lockfile bytes");
+assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, changedLock, [bootstrap], authority), /unchanged tracked package-lock.json/);
+writeFileSync(join(checkout, "package-lock.json"), git("show", bootstrapBase + ":package-lock.json") + "\\n");
+writeFileSync(join(checkout, "npm-shrinkwrap.json"), "{}\\n");
+git("add", "package-lock.json", "npm-shrinkwrap.json");
+const shrinkwrap = commit("Introduce npm lock override");
+assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, shrinkwrap, [bootstrap], authority), /does not authorize npm-shrinkwrap.json/);
 `,
       ],
       { encoding: "utf8", env: environment },

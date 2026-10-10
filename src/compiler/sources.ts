@@ -13,6 +13,7 @@ import type { PlanCandidate } from "./candidate.js";
 import { normalizedCommand } from "../qa.js";
 import {
   PINNED_PNPM_BOOTSTRAP,
+  packageBootstrap,
   packageScriptInvocation,
   packageManagerVersionProbe,
   assertPinnedNpmScripts,
@@ -421,7 +422,7 @@ function authorizedCommand(
 ): boolean {
   if (!check.command.trim() || !check.source) return false;
   const packageCommand = /\b(?:npm|pnpm)\b/.test(check.command);
-  const bootstrap = check.command.trim() === PINNED_PNPM_BOOTSTRAP;
+  const bootstrap = packageBootstrap(check.command) !== undefined;
   const versionProbe = packageManagerVersionProbe(check.command);
   const invocation =
     packageCommand && !bootstrap
