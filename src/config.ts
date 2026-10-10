@@ -15,6 +15,10 @@ import {
   validateLfsRouting,
 } from "./origin-binding.js";
 import { type AutonomyConfig, resolveAutonomy } from "./repair-policy.js";
+import {
+  assertReviewArtifactSelectors,
+  type ReviewArtifactSelector,
+} from "./review-artifacts.js";
 import { refuseUnknownFields } from "./unknown-fields.js";
 
 export type CodexReasoningEffort =
@@ -223,6 +227,8 @@ export function hostSchedulingDefaults(host: HostFacts): {
 }
 
 export interface FactoryConfig {
+  /** Explicit generated PNG evidence selection; omission retains no artifacts. */
+  reviewArtifacts?: ReviewArtifactSelector[];
   /** Explicit disclosure opt-in; omission publishes no operational summary. */
   githubManagement?: {
     decisions?: { enabled: true; actorIds: number[] };
@@ -612,9 +618,11 @@ export function validateConfig(value: unknown): FactoryConfig {
       "policy",
       "queue",
       "githubManagement",
+      "reviewArtifacts",
     ],
     "configuration",
   );
+  assertReviewArtifactSelectors(value.reviewArtifacts);
   validateTarget(value.repository, value.checkout);
   if (value.githubManagement !== undefined) {
     assertObject(value.githubManagement, "githubManagement");

@@ -39,6 +39,12 @@ import {
   subprocessAsync,
   withWorktreeRegistry,
 } from "./process.js";
+import {
+  assertReviewArtifactSelectors,
+  assertReviewArtifacts,
+  captureReviewArtifacts,
+  type ReviewArtifactSelector,
+} from "./review-artifacts.js";
 import { stepDeadlineAt } from "./step.js";
 import {
   type SelectedLfsValidation,
@@ -327,6 +333,7 @@ export async function validateTree(
   acceptedBaseSha?: string,
   retainFailedValidation = true,
   preparation: ValidationPreparation = { commands: [] },
+  reviewArtifacts: readonly ReviewArtifactSelector[] = [],
 ): Promise<ValidationEvidence> {
   const worktree = join(root, "worktree");
   try {
@@ -352,6 +359,7 @@ export async function validateTree(
       acceptedBaseSha,
       retainFailedValidation,
       preparation,
+      reviewArtifacts,
     );
   } finally {
     if (!hasUnresolvedSubprocesses()) await removeWorktree(checkout, worktree);
@@ -373,7 +381,13 @@ export async function validateCheckout(
   acceptedBaseSha?: string,
   retainFailedValidation = true,
   preparation: ValidationPreparation = { commands: [] },
+  reviewArtifacts: readonly ReviewArtifactSelector[] = [],
 ): Promise<ValidationEvidence> {
+  assertReviewArtifactSelectors(reviewArtifacts);
+  if (reviewArtifacts.length && !contentStore)
+    throw new Error(
+      "Review artifact capture requires the existing content store",
+    );
   const emptyCredentials = join(root, "empty-gh-config");
   try {
     mkdirSync(root, { recursive: true });
@@ -543,6 +557,21 @@ export async function validateCheckout(
         retainFailedValidation && !preparing ? partial : undefined,
       );
     }
+    if (!preparing && contentStore && reviewArtifacts.length) {
+      const captured = await captureReviewArtifacts({
+        worktree,
+        treeSha,
+        commandIndex: index,
+        command: check,
+        stdout,
+        selectors: reviewArtifacts,
+        contentStore,
+      });
+      if (captured.length) {
+        if (!evidence.reviewArtifacts) evidence.reviewArtifacts = [];
+        evidence.reviewArtifacts.push(...captured);
+      }
+    }
     (preparing ? evidence.preparation! : evidence.commands).push({
       index,
       command: check,
@@ -579,6 +608,7 @@ export async function validateCheckout(
       retainFailedValidation ? partial : undefined,
     );
   }
+  assertReviewArtifacts(evidence.reviewArtifacts, treeSha, evidence.commands);
   evidence.worktreeObservation = {
     treeSha,
     initialStatus: "clean",
@@ -1072,6 +1102,7 @@ export async function validateWorkItem(
   workspacePackageAdditions: readonly string[] = [],
   packageManagerUpdate?: string,
   retainFailedValidation = true,
+  reviewArtifacts: readonly ReviewArtifactSelector[] = [],
 ): Promise<ValidationEvidence> {
   assertPinnedNpmScripts(
     checkout,
@@ -1099,6 +1130,8 @@ export async function validateWorkItem(
     contentStore,
     acceptedBaseSha,
     retainFailedValidation,
+    { commands: [] },
+    reviewArtifacts,
   );
 }
 export {

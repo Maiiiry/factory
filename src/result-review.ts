@@ -1,9 +1,15 @@
 import type {
   AgentSessionContinuation,
+  ContentStore,
   ModelInvocationContext,
   PlanningModel,
   ResultReviewEvidenceSource,
 } from "./contracts.js";
+import {
+  loadReviewArtifacts,
+  reviewArtifactEvidence,
+  materializeReviewImages,
+} from "./review-image-evidence.js";
 import { installedControllerCapabilities } from "./controller-capabilities.js";
 import { attachFault, StepFault, transient } from "./fault.js";
 import { pinnedGit } from "./process.js";
@@ -46,6 +52,7 @@ export async function reviewAcceptance(args: {
   baseSha: string;
   commit: string;
   evidence: ValidationEvidence;
+  contentStore?: ContentStore;
   criteria: string[];
   sources: { path: string; content: string }[];
   evidenceSources?: ResultReviewEvidenceSource[];
@@ -72,6 +79,11 @@ export async function reviewAcceptance(args: {
       evidence.treeSha,
       "Preparation",
     );
+  const retainedArtifacts = await loadReviewArtifacts(
+    checkout,
+    evidence,
+    args.contentStore,
+  );
   const selectedLfsEvidence = selectedLfsReviewEvidence(checkout, evidence);
   assertValidationWorktreeObservation(
     evidence.worktreeObservation,
@@ -115,6 +127,7 @@ export async function reviewAcceptance(args: {
     ...byteComparisons.sources,
     ...selectedLfsEvidence.sources,
     ...worktreeEvidence,
+    ...reviewArtifactEvidence(retainedArtifacts),
     ...(evidence.preparation?.length
       ? [
           {
@@ -233,6 +246,10 @@ export async function reviewAcceptance(args: {
           ...request,
           tree: tree!.directory,
           reviewFiles: tree!.reviewFiles,
+          reviewImages: materializeReviewImages(
+            tree!.directory,
+            retainedArtifacts,
+          ),
         })
       : { packetId: packet.id, findings: [] };
   } finally {

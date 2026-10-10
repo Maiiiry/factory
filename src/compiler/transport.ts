@@ -1,4 +1,21 @@
 import { createHash } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { attachFault } from "../fault.js";
+import {
+  assertReviewImageBytes,
+  MAX_REVIEW_IMAGE_BYTES,
+  MAX_REVIEW_IMAGES,
+  MAX_REVIEW_TOTAL_IMAGE_BYTES,
+} from "../review-artifacts.js";
 import type {
   AgentSessionCapabilities,
   AgentSessionContinuation,
@@ -8,6 +25,7 @@ import type {
   ModelInvocationPhase,
   ModelInvocationUsage,
   PlanningRequest,
+  ReviewImageInput,
 } from "../contracts.js";
 import type { Fault } from "../fault.js";
 import type { PromptSection } from "../prompt-bytes.js";
@@ -64,6 +82,8 @@ export interface PlanningTransport {
   /** Pinned adapter identity recorded with opt-in captures. */
   readonly adapter: string;
   readonly sessionCapabilities?: AgentSessionCapabilities;
+  /** Native image observations; absence is unsupported, never silent omission. */
+  readonly reviewImageInput?: "png-local-file-v1";
   reconcileSession?(
     session: AgentSessionRef,
   ): Promise<AgentSessionReconciliation>;
@@ -97,6 +117,7 @@ export interface PlanningTransport {
     invocation: ModelInvocationContext;
     turn: PlanningTurn;
     tree?: string;
+    reviewImages?: ReviewImageInput[];
     session?: AgentSessionContinuation;
     /** Optional caller deadline; the transport still proves owned process settlement. */
     signal?: AbortSignal;
@@ -125,6 +146,7 @@ export interface StructuredCall {
   candidateDigest?: string;
   /** A directory holding the exact tree under review, readable read-only. */
   tree?: string;
+  reviewImages?: ReviewImageInput[];
   session?: AgentSessionContinuation;
 }
 
@@ -136,8 +158,138 @@ export const CODEX_PLANNING_ADAPTER = "@openai/codex@0.160.0/exec-session-v2";
 export function structuredRequestDigest(
   prompt: string,
   schema: unknown,
+  images?: readonly ReviewImageInput[],
 ): string {
   return createHash("sha256")
-    .update(JSON.stringify([prompt, schema]))
+    .update(
+      JSON.stringify(
+        images?.length
+          ? [prompt, schema, reviewImageIdentities(images)]
+          : [prompt, schema],
+      ),
+    )
     .digest("hex");
+}
+
+/** Stable identities authenticate the actual ordered image input, not its temporary location. */
+export function reviewImageIdentities(images: readonly ReviewImageInput[]) {
+  return images.map(({ mediaType, bytes, digest, evidencePath }) => ({
+    mediaType,
+    bytes,
+    digest,
+    evidencePath,
+  }));
+}
+
+export function unsupportedReviewImages(adapter: string): Error {
+  const detail = `${adapter} does not support direct PNG review input on this route`;
+  return attachFault(new Error(detail), {
+    kind: "config",
+    detail,
+    fix: "Use a reviewer adapter with native PNG input support; preserve the pending result and its existing allowances.",
+  });
+}
+
+/** Verify complete bounded raw bytes before admission and again at native dispatch. */
+export function assertReviewImages(
+  images: readonly ReviewImageInput[] | undefined,
+  tree: string | undefined,
+): void {
+  if (!images?.length) return;
+  try {
+    verifyReviewImages(images, tree);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw attachFault(error, {
+      kind: "config",
+      detail,
+      fix: "Restore the exact controller-materialized PNG evidence within the recorded bounds before another admitted review.",
+    });
+  }
+}
+
+function verifyReviewImages(
+  images: readonly ReviewImageInput[],
+  tree: string | undefined,
+): void {
+  const invalid = (detail: string): never => {
+    throw attachFault(new Error(detail), {
+      kind: "config",
+      detail,
+      fix: "Restore the exact controller-materialized PNG evidence within the recorded bounds before another admitted review.",
+    });
+  };
+  if (!tree || !isAbsolute(tree) || images.length > MAX_REVIEW_IMAGES)
+    invalid(
+      "Image review needs a private evidence root and at most eight PNG inputs",
+    );
+  const root = resolve(tree!);
+  if (realpathSync(root) !== root)
+    invalid("Image review root must not be a symlink");
+  let total = 0;
+  const seen = new Set<string>();
+  for (const image of images) {
+    if (
+      image.mediaType !== "image/png" ||
+      !Number.isSafeInteger(image.bytes) ||
+      image.bytes < 8 ||
+      image.bytes > MAX_REVIEW_IMAGE_BYTES ||
+      !/^[a-f0-9]{64}$/.test(image.digest) ||
+      !isAbsolute(image.path)
+    )
+      invalid(
+        "Image review descriptor has an invalid PNG identity or byte bound",
+      );
+    total += image.bytes;
+    if (total > MAX_REVIEW_TOTAL_IMAGE_BYTES || seen.has(image.evidencePath))
+      invalid(
+        "Image review exceeds its aggregate bound or repeats an evidence identity",
+      );
+    seen.add(image.evidencePath);
+    const local = relative(root, image.path);
+    if (
+      !local ||
+      local === ".." ||
+      local.startsWith(`..${sep}`) ||
+      isAbsolute(local) ||
+      local.split(sep).join("/") !== image.evidencePath ||
+      realpathSync(image.path) !== image.path
+    )
+      invalid(
+        "Image review file must match its identity within the private evidence root",
+      );
+    const info = lstatSync(image.path);
+    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o222) !== 0)
+      invalid(
+        "Image review input must be a regular read-only materialized file",
+      );
+    const fd = openSync(image.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const actual = fstatSync(fd);
+      if (
+        !actual.isFile() ||
+        actual.size !== image.bytes ||
+        (actual.mode & 0o222) !== 0
+      )
+        invalid("Image review byte count differs from the admitted identity");
+      const bytes = Buffer.alloc(image.bytes);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const read = readSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (!read)
+          invalid("Image review file ended before its complete admitted bytes");
+        offset += read;
+      }
+      if (fstatSync(fd).size !== image.bytes)
+        invalid("Image review file size changed during admission");
+      assertReviewImageBytes(bytes);
+      if (
+        bytes.length !== image.bytes ||
+        createHash("sha256").update(bytes).digest("hex") !== image.digest
+      )
+        invalid("Image review raw PNG bytes differ from the admitted identity");
+    } finally {
+      closeSync(fd);
+    }
+  }
 }

@@ -1,3 +1,5 @@
+import type { ReviewImageInput } from "./contracts.js";
+import { unsupportedReviewImages } from "./compiler/transport.js";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -577,11 +579,13 @@ class ClaudePlanningTransport implements PlanningTransport {
     invocation: ModelInvocationContext;
     turn: PlanningTurn;
     tree?: string;
+    reviewImages?: ReviewImageInput[];
     session?: AgentSessionContinuation & { currentGraphDigest?: string };
     sourcePacket?: string;
     signal?: AbortSignal;
     deadlineAt?: string;
   }): Promise<void> {
+    if (args.reviewImages?.length) throw unsupportedReviewImages(this.adapter);
     const { invocation, turn: state } = args;
     const selection = this.selection(args.role);
     const { model, reasoningEffort } = selection;

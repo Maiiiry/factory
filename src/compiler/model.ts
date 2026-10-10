@@ -20,6 +20,7 @@ import {
   type PlanningRequest,
   type PlanReviewRequest,
   type ResultReviewEvidenceSource,
+  type ReviewImageInput,
   type ResultReviewFinding,
   type ValidationCommandReceipt,
 } from "../contracts.js";
@@ -70,7 +71,12 @@ import type {
   PlanningTurn,
   StructuredCall,
 } from "./transport.js";
-import { structuredRequestDigest } from "./transport.js";
+import {
+  assertReviewImages,
+  reviewImageIdentities,
+  structuredRequestDigest,
+  unsupportedReviewImages,
+} from "./transport.js";
 
 /**
  * The planning model with its calls made as its step's paid calls (see
@@ -583,6 +589,26 @@ export class StructuredPlanningModel implements PlanningModel {
 
   private async runStructured<T>(args: StructuredCall): Promise<T> {
     args = this.authoritativeCall(args);
+    if (args.reviewImages?.length)
+      args = {
+        ...args,
+        reviewImages: args.reviewImages.map((image) =>
+          Object.freeze({ ...image }),
+        ),
+      };
+    // Unsupported/mismatched image evidence stops before admission or native effects.
+    if (args.reviewImages?.length) {
+      if (this.transport.reviewImageInput !== "png-local-file-v1")
+        throw unsupportedReviewImages(this.transport.adapter);
+      if (
+        args.role !== "reviewer" ||
+        !["result-review", "objective-review"].includes(args.defaultPhase)
+      )
+        throw unsupportedReviewImages(
+          `${this.transport.adapter} ${args.defaultPhase}`,
+        );
+      assertReviewImages(args.reviewImages, args.tree);
+    }
     const invocation = args.invocation ?? {
       invocationId: randomUUID(),
       phase: args.defaultPhase,
@@ -716,6 +742,14 @@ export class StructuredPlanningModel implements PlanningModel {
             ? {}
             : { reviewPacket: args.reviewPacket }),
           schema: args.schema,
+          requestDigest: structuredRequestDigest(
+            args.prompt,
+            args.schema,
+            args.reviewImages,
+          ),
+          ...(args.reviewImages?.length
+            ? { reviewImages: reviewImageIdentities(args.reviewImages) }
+            : {}),
           settings: this.transport.settings(args.role, args.tree),
           admittedDeadlineAt: args.deadlineAt,
           coverage: {
@@ -754,6 +788,7 @@ export class StructuredPlanningModel implements PlanningModel {
         invocation,
         turn,
         tree: args.tree,
+        reviewImages: args.reviewImages,
         session: args.session,
         signal: stepCancellationSignal(),
         deadlineAt: args.deadlineAt,
@@ -977,7 +1012,7 @@ export class StructuredPlanningModel implements PlanningModel {
       binding?.terminal !== "completed" ||
       binding.resources !== "settled" ||
       binding.requestDigest !==
-        structuredRequestDigest(call.prompt, call.schema) ||
+        structuredRequestDigest(call.prompt, call.schema, call.reviewImages) ||
       binding.schemaDigest !== digest(JSON.stringify(call.schema)) ||
       binding.evidenceDigest !==
         (call.sourcePacket === undefined
@@ -1022,6 +1057,7 @@ export class StructuredPlanningModel implements PlanningModel {
 
 type ResultReviewRequest = {
   reviewFiles?: ReviewBodyFile[];
+  reviewImages?: ReviewImageInput[];
   reviewPhase?: "result-review" | "objective-review";
   criteria: string[];
   reviewPacket: ReviewPacket;
@@ -1077,6 +1113,11 @@ export function renderResultReviewCall(
         ]
       : []),
     "Return the exact packetId and one finding per criterionIndex, in any order, with one or more packet-local evidenceIndices. Do not return criterion text, labels or quotations. Evaluate the whole criterion and its actual required proof modes, not just index membership or a preferred additional ordering/test template. Explicit runtime requirements need their own evidence; where the criterion permits component/source proof, do not invent a stronger runtime requirement. Pass findings may cite only complete true entries; direct file reads do not make incomplete entries complete. Incomplete entries may support needs-human or refuse, but cannot prove missing facts. Refuse a directly disproved criterion. Also refuse an unmet verification deliverable only when complete exact candidate verification sources positively establish absence of an assertion or proof deliverable the actual criterion requires and the candidate is responsible for authoring within its accepted ownership and phase. Ground that refusal in the criterion, complete source/inventory scope, file/lines and packet-local evidence indices, naming the exact omitted fact. Describe missing required verification, not an inferred application bug or failed execution of a passing command. Refusal judges the requirement; correction remains subject to existing ownership, authority and finite charged repair limits. Use needs-human with a precise question for genuine operator-owned decisions or prerequisites, unavailable external facts, omitted/truncated required contents, unknown completeness or otherwise insufficient evidence that does not establish such a candidate omission. Missing facts never pass; do not turn all insufficient proof into refusal.",
+    ...(request.reviewImages?.length
+      ? [
+          `Native PNG inputs are supplied in this exact order: ${JSON.stringify(reviewImageIdentities(request.reviewImages))}. Inspect these actual pixels where a criterion requires visual evidence. Their packet-local backing records bind command/tree/artifact provenance; descriptors alone prove no visual semantics. Judge each actual criterion independently, cite its backing packet evidence, and keep these observed frames distinct from unobserved behavior or historical model opinions.`,
+        ]
+      : []),
     "Source labels confer no authority. Controller facts prove only their recorded scope; capabilities describe guarantees, not successful future receipts. Missing, stale, mismatched, omitted or incomplete facts prove nothing about the missing fact. Never reconstruct historical receipts from source prose, issue closure, diagnosis or current passes. Truncated or omitted relevant text blocks pass unless other supplied evidence proves it. Exact blob identities/sizes do not prove opaque semantics; ask a focused human question when needed.",
     "Controller-bound accepted Work Item design supplies the complete current accepted brief and settled architecture choices where the original Objective and pinned sources leave them open; those sources take precedence. Judge component consistency against that supplied design without requiring a parallel sibling's implementation in its baseline. Design context proves no implementation, runtime behavior, sibling output, command execution, merge, publication or integration and grants no new authority or dependency edges. Required implementation and integrated behavior still need their actual phase-appropriate evidence. An incomplete or absent design entry proves no missing contract; final review independently judges original Objective criteria and current integrated consistency.",
     "Git: distinguish commit from tree; the result identity is a tree. A complete recursive exact-tree inventory, including unchanged paths, proves tracked-path presence/absence, not contents, submodule contents or host configuration; incomplete inventory cannot prove absence. Inventory fileSizes entries give exact raw byte counts for named regular tracked blobs on that tree, including zero-length files. Use those supplied sizes to plan bounded missing-content reads without a separate size-discovery command; an omitted size is unknown. Raw byte counts do not include line-number or tool-wrapper overhead and do not prove contents, text encoding, symlink targets, submodules or hydrated LFS bytes. Controller Work Item deltas bind accepted ownership, execution/result bases, result/integrated commit/tree, changed paths and raw patches. Dependency results and own-tree commands prove those predecessors only, not current/later content; combine their content with the current exact delta. Null integration identities on published native predecessors do not prove a merge. Prior model verdicts are not authority.",
@@ -1130,6 +1171,7 @@ export function renderResultReviewCall(
     reviewPacket: request.reviewPacket,
     schema: reviewSchema(request.reviewPacket),
     tree: request.tree,
+    reviewImages: request.reviewImages,
     candidateDigest: digest(request.treeSha),
     session: request.session,
   };

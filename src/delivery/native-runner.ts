@@ -675,6 +675,8 @@ export async function runNativeGraph(args: {
                 args.contentStore,
                 workspacePackageAdditions(args.objectiveBody),
                 packageManagerUpdate(args.objectiveBody),
+                true,
+                config.reviewArtifacts,
               ),
           });
           await phases.reserve(item.id, "review");
@@ -694,6 +696,7 @@ export async function runNativeGraph(args: {
                 baseSha: itemBase,
                 commit: work.changeRef!,
                 evidence: work.validation!,
+                contentStore: args.contentStore,
                 criteria: item.acceptance,
                 sources: planningSources(
                   args.objectiveBody,

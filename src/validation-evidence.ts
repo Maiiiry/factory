@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { ValidationCommandReceipt } from "./contracts.js";
+import type { ReviewArtifactEvidence } from "./review-artifacts.js";
 import type { HydrationReceipt } from "./media.js";
 import type {
   ReviewEvidenceReference,
@@ -29,6 +30,8 @@ export interface AcceptanceDecision {
 export interface ValidationEvidence {
   treeSha: string;
   commands: ValidationCommandReceipt[];
+  /** Complete command-selected raw artifacts retained before checkout cleanup. */
+  reviewArtifacts?: ReviewArtifactEvidence[];
   /** Source-authorized setup in this same fresh tree; never criterion evidence. */
   preparation?: ValidationCommandReceipt[];
   selectedLfs?: SelectedLfsValidation[];
