@@ -301,6 +301,7 @@ function dependencyInputsChanged(
   return changed.some(
     (path) =>
       path === "pnpm-lock.yaml" ||
+      path === "package-lock.json" ||
       path === "pnpm-workspace.yaml" ||
       path === "package.json" ||
       path.endsWith("/package.json"),
@@ -533,7 +534,7 @@ export async function validateCheckout(
       // environment's: it repeats and charges no repair (#839). A changed
       // manifest or lockfile may be what broke it: the candidate's fault.
       if (
-        check.trim() === PINNED_PNPM_BOOTSTRAP &&
+        packageBootstrap(check) !== undefined &&
         !dependencyInputsChanged(worktree, acceptedBaseSha, commit)
       )
         throw new StepFault(transient(detail, false));
@@ -677,6 +678,14 @@ async function unregisterStaleWorktrees(
  * Pin the selected entrypoint and execution config to the accepted base. */
 export const PINNED_PNPM_BOOTSTRAP =
   "pnpm install --frozen-lockfile --ignore-scripts";
+export const PINNED_NPM_BOOTSTRAP = "npm ci --ignore-scripts";
+
+/** Exact script-disabled root installs; this classification grants no authority. */
+export function packageBootstrap(command: string): "npm" | "pnpm" | undefined {
+  if (command.trim() === PINNED_NPM_BOOTSTRAP) return "npm";
+  if (command.trim() === PINNED_PNPM_BOOTSTRAP) return "pnpm";
+  return undefined;
+}
 
 export interface PackageScriptAuthority {
   /** Exact stable same-manager pin declared by the pinned Objective. */
@@ -698,7 +707,7 @@ export function packageScriptCommands(commands: readonly string[]): string[] {
   return commands.filter(
     (check) =>
       /\b(?:npm|pnpm)\b/.test(check) &&
-      check.trim() !== PINNED_PNPM_BOOTSTRAP &&
+      !packageBootstrap(check) &&
       !packageManagerVersionProbe(check),
   );
 }
@@ -748,7 +757,7 @@ export function assertPinnedNpmScripts(
     authority.workspacePackageAdditions,
     authority.predecessorSha,
   );
-  const file = (revision: string, path: string): string | undefined => {
+  const fileBytes = (revision: string, path: string): Buffer | undefined => {
     try {
       const entry = pinnedGit(checkout, "ls-tree", revision, "--", path);
       if (!entry) return undefined;
@@ -756,9 +765,7 @@ export function assertPinnedNpmScripts(
         throw new Error(
           `Package script validation blocked: ${path} is not a regular file`,
         );
-      return pinnedGitRaw(checkout, "show", `${revision}:${path}`).toString(
-        "utf8",
-      );
+      return pinnedGitRaw(checkout, "show", `${revision}:${path}`);
     } catch (error) {
       if (
         authority.packageManagerUpdate !== undefined ||
@@ -768,6 +775,8 @@ export function assertPinnedNpmScripts(
       return undefined;
     }
   };
+  const file = (revision: string, path: string): string | undefined =>
+    fileBytes(revision, path)?.toString("utf8");
   const original = packageMetadata(checkout, acceptedBaseSha);
   const predecessor =
     authority.predecessorSha && authority.predecessorSha !== acceptedBaseSha
@@ -820,11 +829,15 @@ export function assertPinnedNpmScripts(
         throw new Error(
           `Package script validation blocked: ${path} differs from the accepted base; Package manager update grants no configuration or hook changes`,
         );
-  const bootstrap = selected.some(
-    (check) => check.trim() === PINNED_PNPM_BOOTSTRAP,
+  const pnpmBootstrap = selected.some(
+    (check) => packageBootstrap(check) === "pnpm",
   );
+  const npmBootstrap = selected.some(
+    (check) => packageBootstrap(check) === "npm",
+  );
+  const bootstrap = pnpmBootstrap || npmBootstrap;
   if (
-    (bootstrap || authority.packageManagerUpdate !== undefined) &&
+    (pnpmBootstrap || authority.packageManagerUpdate !== undefined) &&
     [file(commit, ".npmrc"), file(commit, "pnpm-workspace.yaml")].some(
       (content) => /pnpmfile/i.test(content ?? ""),
     )
@@ -834,9 +847,61 @@ export function assertPinnedNpmScripts(
     );
   if (!selected.length) return;
   const declared = new Set(authority.sourceDeclared ?? []);
+  if (npmBootstrap) {
+    if (!declared.has(PINNED_NPM_BOOTSTRAP))
+      throw new Error(
+        "Package script validation blocked: npm bootstrap needs exact source-declared command authority",
+      );
+    if (pnpmBootstrap || selected.some((command) => /\bpnpm\b/.test(command)))
+      throw new Error(
+        "Package script validation blocked: npm bootstrap cannot mix package managers",
+      );
+    if (
+      !original ||
+      original.workspaces !== undefined ||
+      (original.packageManager !== undefined &&
+        !String(original.packageManager).startsWith("npm@")) ||
+      authority.packageManagerUpdate !== undefined
+    )
+      throw new Error(
+        "Package script validation blocked: npm bootstrap requires an existing root npm package without workspaces or a manager update",
+      );
+    for (const path of ["package.json", "package-lock.json"]) {
+      const before = fileBytes(acceptedBaseSha, path);
+      const after = fileBytes(commit, path);
+      if (!before?.length || !after || !before.equals(after))
+        throw new Error(
+          `Package script validation blocked: npm bootstrap needs unchanged tracked ${path} from the accepted base`,
+        );
+    }
+    let lock: unknown;
+    try {
+      lock = JSON.parse(file(acceptedBaseSha, "package-lock.json")!);
+    } catch {
+      throw new Error(
+        "Package script validation blocked: npm bootstrap needs a valid package-lock.json",
+      );
+    }
+    if (
+      !lock ||
+      typeof lock !== "object" ||
+      Array.isArray(lock) ||
+      ![1, 2, 3].includes(
+        (lock as Record<string, unknown>).lockfileVersion as number,
+      )
+    )
+      throw new Error(
+        "Package script validation blocked: npm bootstrap needs a supported package-lock.json",
+      );
+    for (const revision of [acceptedBaseSha, commit])
+      if (file(revision, "npm-shrinkwrap.json") !== undefined)
+        throw new Error(
+          "Package script validation blocked: npm bootstrap does not authorize npm-shrinkwrap.json",
+        );
+  }
   if (
     bootstrap &&
-    commands.findIndex((check) => check.trim() === PINNED_PNPM_BOOTSTRAP) >
+    commands.findIndex((check) => packageBootstrap(check) !== undefined) >
       commands.findIndex(
         (check) =>
           managerToken.test(check) && !packageManagerVersionProbe(check),
@@ -936,7 +1001,7 @@ export function assertPinnedNpmScripts(
     throw new Error(
       "Package script validation blocked: pnpm package.yaml manifests are not supported",
     );
-  if (bootstrap) {
+  if (pnpmBootstrap) {
     if (
       (!file(acceptedBaseSha, "pnpm-lock.yaml") &&
         !declared.has(PINNED_PNPM_BOOTSTRAP)) ||

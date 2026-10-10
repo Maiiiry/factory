@@ -248,6 +248,10 @@ Keep Objectives small and executable:
 - Inject missing services or values rather than requiring prerequisites that do not exist.
 - Keep stable repository facts in the target’s contributor docs instead of repeating them in every Objective.
 
+Declare executable validation commands as complete standalone source lines; lines inside a multi-line fenced block are supported. Root package scripts use `npm test`, `pnpm test`, `pnpm check`, or `npm/pnpm run NAME`. Selected script bodies and their pre/post hooks stay pinned; nested package-manager invocations need separate authority.
+
+Dependency preparation supports exact source-declared `pnpm install --frozen-lockfile --ignore-scripts` and `npm ci --ignore-scripts`, ordered before package-script commands. npm preparation requires regular tracked `package.json` and valid `package-lock.json` already present at the accepted base, with both byte-identical in the result; planning cannot authorize creating them for this install. The package must be a root npm package without workspaces, a shrinkwrap override, mixed package managers or a Package manager update. Existing `.npmrc`, `config` and `pnpm` configuration remains fixed, and lifecycle scripts are disabled by the exact install command. Extra options, shell wrappers and other install subcommands are unsupported. This source authority does not grant additional network, filesystem, provider or resource permissions. Each fresh execution or validation checkout still needs its own authorized setup and readiness proof; ignored installations are not transferred.
+
 A version refresh of an existing exact stable npm or pnpm `packageManager` pin needs an optional **Package manager update** section. Use exactly one backticked pin in one bullet, under a level-two or level-three heading:
 
 ```markdown

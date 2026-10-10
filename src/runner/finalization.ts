@@ -193,29 +193,22 @@ export async function finalizeObjective(args: {
     )
       ? []
       : declaredPreparation;
+    // Guard the same complete sequence validation will execute. Separate
+    // guards would miss cross-phase ordering and package-manager mixing.
     assertPinnedNpmScripts(
       config.checkout,
       state.baseSha,
       candidateCommitSha,
-      preparationCommands,
+      [...preparationCommands, ...finalCommands],
       {
-        sourceDeclared: graph.items.flatMap((item) =>
-          item.validation
-            .filter((check) => check.provenance === "source-declared")
-            .map((check) => check.command),
-        ),
-        workspacePackageAdditions: workspacePackageAdditions(issue.body),
-        packageManagerUpdate: packageManagerUpdate(issue.body),
-      },
-    );
-    assertPinnedNpmScripts(
-      config.checkout,
-      state.baseSha,
-      candidateCommitSha,
-      state.objectiveCommands ?? finalObjectiveCommands(issue.body),
-      {
-        sourceDeclared:
-          state.objectiveCommands ?? finalObjectiveCommands(issue.body),
+        sourceDeclared: [
+          ...graph.items.flatMap((item) =>
+            item.validation
+              .filter((check) => check.provenance === "source-declared")
+              .map((check) => check.command),
+          ),
+          ...finalCommands,
+        ],
         workspacePackageAdditions: workspacePackageAdditions(issue.body),
         packageManagerUpdate: packageManagerUpdate(issue.body),
         requirePackageManagerUpdate: true,
