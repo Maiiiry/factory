@@ -113,6 +113,40 @@ Use real tool installation directories on `PATH`, rather than version-manager sh
 
 Claude and Copilot keep the login-bearing home in the SDK process, but the model has no shell and its file tools stay inside the worktree. Claude personal instructions, skills, plugins, subagents and memory are disabled; explicitly selected settings and administrator-managed components remain trusted. Copilot shell, web, GitHub, MCP, plugins and configuration discovery are disabled. Harness processes run as your OS user; these controls do not isolate hostile code.
 
+### Images from validation
+
+Reviewers receive no generated images by default. If acceptance needs visual evidence, add explicit `reviewArtifacts` selectors to the private installation configuration before starting the Objective. This example selects the output of `npm test`:
+
+```json
+{
+  "reviewArtifacts": [
+    {
+      "command": "npm test",
+      "receipt": {
+        "stdoutPathField": "receipt",
+        "stdoutSha256Field": "sha256",
+        "maxBytes": 65536
+      },
+      "image": {
+        "file": "desktop.png",
+        "sha256Field": "screenshotSha256",
+        "maxBytes": 2097152
+      },
+      "candidate": {
+        "file": "index.html",
+        "sha256Field": "htmlSha256"
+      }
+    }
+  ]
+}
+```
+
+The validator must print a JSON object whose direct `receipt` field identifies its receipt file and whose `sha256` field hashes that file's raw bytes. The receipt must directly name the PNG digest in `screenshotSha256` and the observed tracked candidate digest in `htmlSha256`. `desktop.png` is resolved beside the receipt. Paths must stay inside the owned validation checkout and resolve to regular files without symlinks. The selector does not authorize a command; the command still needs ordinary pinned-source authority.
+
+Only the exact matching passed, non-preparation command supplies review images. Factory verifies the candidate against its result tree and retains the complete receipt and PNG before checkout cleanup. Missing, oversized or mismatched evidence cannot become visual proof. The existing review provider receives those pixels directly with their evidence identities; no image-reading tool, browser or network permission is added. An adapter without image-input support refuses before dispatch.
+
+Work Item review uses its candidate's observations. Final Objective review obtains fresh observations from validation of the exact integrated tree. A passing execution receipt or earlier image does not establish the current scene's visual quality. Changing selectors changes the configuration binding; use a fresh corrected Objective rather than resuming an existing one with changed configuration.
+
 ### Execution profiles and adapters
 
 To let planning select a harness per item, replace `execution.harness` with `execution.profiles` and an eligible `execution.defaultProfile`:

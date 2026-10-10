@@ -24,6 +24,12 @@ import {
   codexJsonBoundaries,
 } from "../dist/codex-boundary-telemetry.js";
 import { codexStderrCapture } from "../dist/codex-exec.js";
+import { runCodexAppServer } from "../dist/codex-app-server.js";
+import {
+  assertReviewImages,
+  structuredRequestDigest,
+} from "../dist/compiler/transport.js";
+import { faultOf } from "../dist/fault.js";
 import {
   CodexPlanningModel,
   renderCompilationCall,
@@ -43,6 +49,12 @@ import {
   CODEX_PLANNING_CONFIG,
   createCodexHome,
 } from "../dist/codex-planning-isolation.js";
+import {
+  loadReviewArtifacts,
+  reviewArtifactEvidence,
+  materializeReviewImages,
+} from "../dist/review-image-evidence.js";
+import { assertReviewArtifactSelectors } from "../dist/review-artifacts.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { NativeStackDelivery } from "../dist/delivery/native-stack.js";
 import { RegularDelivery } from "../dist/delivery/regular.js";
@@ -1439,6 +1451,27 @@ test("settled validation reuses its exact Git result once and retains the failed
       join(checkout, "contract.md"),
       "# Context\n\nRésumé 🧭.\n\n# Documentation\n\nDocument the readiness marker.\n\n# Other\n\nRetain other requirements.\n",
     );
+    const imageBytes = readFileSync(
+      new URL(
+        "./fixtures/disposable-target/assets/source.png",
+        import.meta.url,
+      ),
+    );
+    writeFileSync(join(checkout, ".gitignore"), ".runtime/\n");
+    writeFileSync(
+      join(checkout, "capture.cjs"),
+      `
+const fs = require("node:fs"), crypto = require("node:crypto");
+const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
+const output = ".runtime/" + crypto.randomUUID();
+fs.mkdirSync(output, {recursive:true});
+const image = Buffer.from(${JSON.stringify(imageBytes.toString("base64"))}, "base64");
+fs.writeFileSync(output + "/scene.png", image);
+const receipt = Buffer.from(JSON.stringify({candidateSha256: process.argv[2] === "prerequisite" ? "0".repeat(64) : hash(fs.readFileSync("README.md")), imageSha256: hash(image)}));
+fs.writeFileSync(output + "/receipt.json", receipt);
+console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.json" : output + "/receipt.json", sha256: process.argv[2] === "mismatch" ? "0".repeat(64) : hash(receipt)}));
+`,
+    );
     git("add", ".");
     git(
       "-c",
@@ -1744,6 +1777,226 @@ test("settled validation reuses its exact Git result once and retains the failed
     assert.equal(evidence.treeSha, treeSha);
     assert.equal(evidence.commands[0].exitCode, 0);
     assert.equal(evidence.commands[0].executionControl, undefined);
+    // The native input contract verifies actual immutable bytes before effects.
+    const imageInputRoot = join(root, "image-input");
+    mkdirSync(join(imageInputRoot, "artifacts"), { recursive: true });
+    const imageInputPath = join(imageInputRoot, "artifacts", "0.png");
+    writeFileSync(imageInputPath, imageBytes, { mode: 0o400 });
+    const nativeImage = {
+      path: imageInputPath,
+      mediaType: "image/png",
+      bytes: imageBytes.length,
+      digest: createHash("sha256").update(imageBytes).digest("hex"),
+      evidencePath: "artifacts/0.png",
+    };
+    assertReviewImages([nativeImage], imageInputRoot);
+    const textRequest = createHash("sha256")
+      .update(JSON.stringify(["review", { type: "object" }]))
+      .digest("hex");
+    assert.equal(
+      structuredRequestDigest("review", { type: "object" }),
+      textRequest,
+    );
+    assert.equal(
+      structuredRequestDigest("review", { type: "object" }, []),
+      textRequest,
+    );
+    const imageRequest = structuredRequestDigest("review", { type: "object" }, [
+      nativeImage,
+    ]);
+    assert.notEqual(imageRequest, textRequest);
+    assert.notEqual(
+      imageRequest,
+      structuredRequestDigest("review", { type: "object" }, [
+        { ...nativeImage, digest: "0".repeat(64) },
+      ]),
+    );
+    assert.equal(
+      imageRequest,
+      structuredRequestDigest("review", { type: "object" }, [
+        { ...nativeImage, path: join(root, "other", "artifacts", "0.png") },
+      ]),
+    );
+    assert.throws(
+      () =>
+        assertReviewImages(
+          [{ ...nativeImage, digest: "0".repeat(64) }],
+          imageInputRoot,
+        ),
+      /raw PNG bytes/,
+    );
+    await assert.rejects(
+      () =>
+        runCodexAppServer({
+          env: {},
+          options: { workingDirectory: imageInputRoot },
+          prompt: "review",
+          schema: { type: "object" },
+          reviewImages: [nativeImage],
+          signal: new AbortController().signal,
+          event: () => assert.fail("Unsupported image input must not dispatch"),
+        }),
+      (error) =>
+        faultOf(error).kind === "config" &&
+        /does not support direct PNG/.test(error.message),
+    );
+    // Real exact-tree commands emit ignored PNG/receipt bytes; the producer
+    // preserves selected output before the disposable worktree is removed.
+    const imageCommand = `${process.execPath} capture.cjs`;
+    const imageStore = new LocalContentStore(join(root, "image-objects"));
+    const selector = {
+      command: imageCommand,
+      receipt: {
+        stdoutPathField: "receipt",
+        stdoutSha256Field: "sha256",
+        maxBytes: 4096,
+      },
+      image: { file: "scene.png", sha256Field: "imageSha256", maxBytes: 65536 },
+      candidate: { file: "README.md", sha256Field: "candidateSha256" },
+    };
+    assertReviewArtifactSelectors([selector]);
+    const artifactRoot = join(root, "image-validation");
+    const imageEvidence = await validateTree(
+      checkout,
+      artifactRoot,
+      commit,
+      treeSha,
+      [imageCommand],
+      undefined,
+      undefined,
+      [],
+      imageStore,
+      commit,
+      true,
+      { commands: [`${imageCommand} prerequisite`] },
+      [selector, { ...selector, command: `${imageCommand} prerequisite` }],
+    );
+    assert.equal(existsSync(join(artifactRoot, "worktree")), false);
+    assert.equal(imageEvidence.preparation.length, 1);
+    assert.equal(imageEvidence.reviewArtifacts.length, 1);
+    const artifact = imageEvidence.reviewArtifacts[0];
+    assert.equal(artifact.commandIndex, 0);
+    assert.equal(artifact.command, imageCommand);
+    assert.equal(artifact.treeSha, treeSha);
+    assert.equal(artifact.complete, true);
+    assert.equal(
+      artifact.candidate.sha256,
+      createHash("sha256")
+        .update(readFileSync(join(checkout, "README.md")))
+        .digest("hex"),
+    );
+    await imageStore.materialize(
+      artifact.image.ref,
+      join(root, "retained-scene.png"),
+    );
+    assert.deepEqual(
+      readFileSync(join(root, "retained-scene.png")),
+      imageBytes,
+    );
+    await imageStore.materialize(
+      artifact.receipt.ref,
+      join(root, "retained-receipt.json"),
+    );
+    assert.equal(
+      JSON.parse(readFileSync(join(root, "retained-receipt.json"), "utf8"))
+        .imageSha256,
+      artifact.image.ref.digest,
+    );
+    const loadedImages = await loadReviewArtifacts(
+      checkout,
+      imageEvidence,
+      imageStore,
+    );
+    const imageDescriptors = reviewArtifactEvidence(loadedImages);
+    assert.equal(imageDescriptors[0].path, "artifacts/0.png");
+    const descriptorIdentity = JSON.parse(imageDescriptors[0].content);
+    assert.equal(descriptorIdentity.command, imageCommand);
+    assert.equal(descriptorIdentity.treeSha, treeSha);
+    assert.deepEqual(descriptorIdentity.candidate, artifact.candidate);
+    assert.deepEqual(descriptorIdentity.image.ref, artifact.image.ref);
+    const normalReviewRoot = join(root, "normal-image-review");
+    mkdirSync(normalReviewRoot);
+    const normalInputs = materializeReviewImages(
+      normalReviewRoot,
+      loadedImages,
+    );
+    assertReviewImages(normalInputs, normalReviewRoot);
+    assert.deepEqual(readFileSync(normalInputs[0].path), imageBytes);
+    const mismatchedCandidate = structuredClone(imageEvidence);
+    mismatchedCandidate.reviewArtifacts[0].candidate.sha256 = "0".repeat(64);
+    await assert.rejects(
+      () => loadReviewArtifacts(checkout, mismatchedCandidate, imageStore),
+      /candidate bytes differ/,
+    );
+    const retainedImageState = structuredClone(state);
+    retainedImageState.graph.items.find(
+      (item) => item.id === "local",
+    ).validation = [{ command: imageCommand, provenance: "source-declared" }];
+    retainedImageState.planGraphDigest = graphDigest(retainedImageState.graph);
+    retainedImageState.work.local = {
+      status: "running",
+      step: "validate",
+      attempt: "actual-image-validation",
+      baseSha: commit,
+      executionBaseSha: commit,
+      graphRevisionDigest: retainedImageState.planGraphDigest,
+      changeRef: commit,
+      treeSha,
+    };
+    retainedImageState.work.local.validation = await validateTree(
+      checkout,
+      artifactRoot,
+      commit,
+      treeSha,
+      [imageCommand],
+      undefined,
+      undefined,
+      [],
+      imageStore,
+      commit,
+      true,
+      { commands: [] },
+      [selector],
+    );
+    assert.deepEqual(
+      parseFactoryState(retainedImageState, state.repository, state.objective)
+        .work.local.validation.reviewArtifacts,
+      retainedImageState.work.local.validation.reviewArtifacts,
+    );
+    const invalidImageState = structuredClone(retainedImageState);
+    invalidImageState.work.local.validation.reviewArtifacts[0].commandIndex = 1;
+    assert.throws(
+      () =>
+        parseFactoryState(invalidImageState, state.repository, state.objective),
+      /passing exact command/,
+    );
+    for (const [option, expected] of [
+      ["escape", /contained and relative/],
+      ["mismatch", /receipt digest/],
+    ]) {
+      const badCommand = `${imageCommand} ${option}`;
+      await assert.rejects(
+        () =>
+          validateTree(
+            checkout,
+            artifactRoot,
+            commit,
+            treeSha,
+            [badCommand],
+            undefined,
+            undefined,
+            [],
+            imageStore,
+            commit,
+            true,
+            { commands: [] },
+            [{ ...selector, command: badCommand }],
+          ),
+        expected,
+      );
+      assert.equal(existsSync(join(artifactRoot, "worktree")), false);
+    }
+
     const deadlineAt = new Date(Date.now() + 10_000).toISOString();
     const boundedState = {
       ...structuredClone(state),

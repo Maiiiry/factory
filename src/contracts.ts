@@ -461,6 +461,17 @@ export interface ValidationCommandReceipt {
   stoppedLeftovers?: number;
 }
 
+/** Exact controller-materialized observation supplied as native image input. */
+export interface ReviewImageInput {
+  /** Absolute regular PNG in this invocation's private read-only evidence root. */
+  path: string;
+  mediaType: "image/png";
+  bytes: number;
+  digest: string;
+  /** Stable packet-local identity; never an ephemeral absolute path. */
+  evidencePath: string;
+}
+
 export interface ResultReviewEvidenceSource {
   /** Retained citations preserve source/controller provenance when forwarded. */
   origin?: "source" | "controller";
@@ -617,6 +628,7 @@ export interface PlanningModel {
     previousInvalid?: string;
     /** Current authenticated pinned-source files; absent for inline review. */
     reviewFiles?: import("./review-evidence.js").ReviewBodyFile[];
+    reviewImages?: ReviewImageInput[];
     /** Exported exact candidate and approved source files; no Git metadata. */
     tree?: string;
     session?: AgentSessionContinuation;

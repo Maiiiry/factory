@@ -14,6 +14,8 @@ import {
   type SubprocessInputChannel,
 } from "./process.js";
 
+import type { ReviewImageInput } from "./contracts.js";
+import { unsupportedReviewImages } from "./compiler/transport.js";
 import { assertProviderTurnDeadline } from "./provider-turn.js";
 
 /** Codex-private protocol facts; callers keep native identities in adapter data. */
@@ -53,6 +55,7 @@ export interface CodexAppServerOptions {
 export interface CodexAppServerTurnOptions extends CodexAppServerOptions {
   prompt: string;
   schema: unknown;
+  reviewImages?: ReviewImageInput[];
   threadId?: string;
   /** Operational checkpoint; rejection must precede further dispatch. */
   checkpoint?: (ref: CodexAppServerCheckpoint) => void;
@@ -467,6 +470,8 @@ function verifySettings(
 export async function runCodexAppServer(
   args: CodexAppServerTurnOptions,
 ): Promise<void> {
+  if (args.reviewImages?.length)
+    throw unsupportedReviewImages("Codex app-server");
   assertProviderTurnDeadline(args.deadlineAt);
   args.signal.throwIfAborted();
   const settings = requestedSettings(args.options);

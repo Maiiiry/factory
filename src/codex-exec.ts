@@ -12,6 +12,8 @@ import {
   codexJsonBoundaries,
 } from "./codex-boundary-telemetry.js";
 
+import type { ReviewImageInput } from "./contracts.js";
+import { assertReviewImages } from "./compiler/transport.js";
 import { assertProviderTurnDeadline } from "./provider-turn.js";
 
 export interface CodexStderrDiagnostic {
@@ -74,6 +76,7 @@ export async function runCodexExec(args: {
   options: ThreadOptions;
   prompt: string;
   schema: unknown;
+  reviewImages?: ReviewImageInput[];
   threadId?: string;
   signal: AbortSignal;
   deadlineAt?: string;
@@ -82,6 +85,7 @@ export async function runCodexExec(args: {
   redactionValues?: string[];
   boundary?: (observation: ModelBoundaryObservation) => void;
 }): Promise<void> {
+  assertReviewImages(args.reviewImages, args.options.workingDirectory);
   const started = performance.now();
   const observe = (
     source: ModelBoundaryObservation["source"],
@@ -129,6 +133,9 @@ export async function runCodexExec(args: {
     );
   command.push("--config", 'approval_policy="never"');
   if (args.threadId) command.push("resume", args.threadId);
+  // Same native input contract as SDK 0.160 local_image, including resumed turns.
+  for (const image of args.reviewImages ?? [])
+    command.push("--image", image.path);
   const stop = new AbortController();
   const signal = AbortSignal.any([args.signal, stop.signal]);
   const decoder = new StringDecoder("utf8");

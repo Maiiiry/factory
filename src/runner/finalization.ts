@@ -289,6 +289,7 @@ export async function finalizeObjective(args: {
                 entry.final,
               ),
           },
+          config.reviewArtifacts,
         );
         const selectedAssets = graph.items.flatMap((item) => {
           const work = state.work[item.id];
@@ -355,6 +356,7 @@ export async function finalizeObjective(args: {
               baseSha: state.baseSha,
               commit: candidateCommitSha,
               evidence: acceptanceEvidence,
+              contentStore,
               criteria: objectiveCriteria(issue.body),
               sources: planningSources(
                 issue.body,

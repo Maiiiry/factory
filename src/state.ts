@@ -1,3 +1,4 @@
+import { assertReviewArtifacts } from "./review-artifacts.js";
 import { assertAgentSessions } from "./agent-session.js";
 import { assertFinalAcceptance } from "./completion.js";
 import { type Capacity, validateCapacity } from "./config.js";
@@ -528,6 +529,11 @@ function validationEvidence(value: unknown, label: string): string[] {
         `${label}.commands[${index}] is not bound to the exact tree and order`,
       );
   }
+  assertReviewArtifacts(
+    evidence.reviewArtifacts,
+    treeSha,
+    evidence.commands as unknown as import("./contracts.js").ValidationCommandReceipt[],
+  );
   return evidence.commands.map(
     (raw) => (raw as Record<string, unknown>).command as string,
   );

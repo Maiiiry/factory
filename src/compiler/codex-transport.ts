@@ -24,6 +24,7 @@ import type {
   ModelInvocationContext,
   ModelInvocationUsage,
   PlanningRequest,
+  ReviewImageInput,
 } from "../contracts.js";
 import { codexCaptureEvent } from "../execution/interaction-capture.js";
 import { currentProcessSignal, UnsettledSubprocessError } from "../process.js";
@@ -42,6 +43,8 @@ import {
   type PlanningTransport,
   type PlanningTurn,
   structuredRequestDigest,
+  assertReviewImages,
+  unsupportedReviewImages,
 } from "./transport.js";
 import {
   assertDeliveredPlanningSources,
@@ -62,6 +65,7 @@ const LOWER_EFFORT_REVIEW_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
  */
 export class CodexPlanningTransport implements PlanningTransport {
   readonly provider = CODEX_PLANNING_PROVIDER;
+  readonly reviewImageInput = "png-local-file-v1" as const;
   get adapter(): string {
     return this.transport === "exec"
       ? CODEX_PLANNING_ADAPTER
@@ -418,6 +422,7 @@ export class CodexPlanningTransport implements PlanningTransport {
     invocation: ModelInvocationContext;
     turn: PlanningTurn;
     tree?: string;
+    reviewImages?: ReviewImageInput[];
     session?: AgentSessionContinuation;
     signal?: AbortSignal;
     deadlineAt?: string;
@@ -425,6 +430,15 @@ export class CodexPlanningTransport implements PlanningTransport {
     const { invocation, turn: state } = args;
     const selection = this.selection(args.role);
     const selectedTransport = args.tree ? "exec" : this.transport;
+    if (args.reviewImages?.length) {
+      if (
+        !args.tree ||
+        args.role !== "reviewer" ||
+        selectedTransport !== "exec"
+      )
+        throw unsupportedReviewImages(this.adapter);
+      assertReviewImages(args.reviewImages, args.tree);
+    }
     const continuation =
       this.sessionRoot && args.session ? args.session : undefined;
     let sourceRead = false;
@@ -508,7 +522,11 @@ export class CodexPlanningTransport implements PlanningTransport {
         currentTurn: {
           invocationId: invocation.invocationId,
           ...(args.deadlineAt ? { deadlineAt: args.deadlineAt } : {}),
-          requestDigest: structuredRequestDigest(args.prompt, args.schema),
+          requestDigest: structuredRequestDigest(
+            args.prompt,
+            args.schema,
+            args.reviewImages,
+          ),
           schemaDigest: createHash("sha256")
             .update(JSON.stringify(args.schema))
             .digest("hex"),
@@ -767,6 +785,7 @@ export class CodexPlanningTransport implements PlanningTransport {
         },
         prompt: args.prompt,
         schema: args.schema,
+        reviewImages: args.reviewImages,
         threadId: sessionData?.threadId,
         redactionValues: this.redactionValues,
         stderr: (diagnostic) =>

@@ -313,6 +313,8 @@ export async function runQaItem(args: {
           args.store,
           workspacePackageAdditions(args.objectiveBody),
           packageManagerUpdate(args.objectiveBody),
+          true,
+          args.config.reviewArtifacts,
         );
       },
       {
@@ -354,6 +356,7 @@ export async function runQaItem(args: {
         baseSha: state.baseSha,
         commit,
         evidence: validation,
+        contentStore: args.store,
         criteria: item.acceptance,
         sources: planningSources(
           args.objectiveBody,
