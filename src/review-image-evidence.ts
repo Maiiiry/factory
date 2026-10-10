@@ -7,7 +7,7 @@ import type {
   ReviewImageInput,
   ResultReviewEvidenceSource,
 } from "./contracts.js";
-import { pinnedGitRaw } from "./process.js";
+import { pinnedGit, pinnedGitRaw } from "./process.js";
 import {
   assertReviewArtifacts,
   assertReviewImageBytes,
@@ -17,8 +17,25 @@ import {
 } from "./review-artifacts.js";
 import type { ValidationEvidence } from "./validation-evidence.js";
 
+export interface AcceptedWorkItemImageObservation {
+  itemId: string;
+  resultCommitSha: string;
+  integratedCommitSha: string | null;
+  evidence: Pick<
+    ValidationEvidence,
+    "treeSha" | "commands" | "reviewArtifacts"
+  >;
+}
+
 interface LoadedReviewArtifact {
   identity: ReviewArtifactEvidence;
+  origin?: {
+    kind: "accepted-work-item-validation";
+    itemId: string;
+    resultCommitSha: string;
+    integratedCommitSha: string | null;
+    resultTreeSha: string;
+  };
   evidencePath: string;
   receiptBytes: Buffer;
   imageBytes: Buffer;
@@ -112,26 +129,99 @@ export async function loadReviewArtifacts(
   return loaded;
 }
 
+/** Carry original observations forward only for the same exact candidate tree. */
+export async function loadReviewArtifactObservations(
+  checkout: string,
+  current: ValidationEvidence,
+  observations: readonly AcceptedWorkItemImageObservation[] = [],
+  store?: ContentStore,
+): Promise<LoadedReviewArtifact[]> {
+  const loaded = await loadReviewArtifacts(checkout, current, store);
+  const key = (artifact: ReviewArtifactEvidence) =>
+    JSON.stringify([
+      artifact.selectorIndex,
+      artifact.command,
+      artifact.candidate.path,
+    ]);
+  const supplied = new Set(loaded.map(({ identity }) => key(identity)));
+  let totalBytes = loaded.reduce(
+    (sum, artifact) => sum + artifact.imageBytes.length,
+    0,
+  );
+  for (const observation of observations) {
+    // Earlier trees are historical facts, never current image observations.
+    if (observation.evidence.treeSha !== current.treeSha) continue;
+    if (
+      pinnedGit(
+        checkout,
+        "rev-parse",
+        `${observation.resultCommitSha}^{tree}`,
+      ) !== current.treeSha
+    )
+      throw new Error(
+        "Accepted Work Item image result commit differs from its recorded exact tree",
+      );
+    const selected =
+      observation.evidence.reviewArtifacts?.filter((artifact) => {
+        const identity = key(artifact);
+        if (supplied.has(identity)) return false;
+        supplied.add(identity);
+        return true;
+      }) ?? [];
+    if (!selected.length) continue;
+    const original = await loadReviewArtifacts(
+      checkout,
+      { ...observation.evidence, reviewArtifacts: selected },
+      store,
+    );
+    for (const artifact of original) {
+      totalBytes += artifact.imageBytes.length;
+      if (
+        loaded.length >= MAX_REVIEW_IMAGES ||
+        totalBytes > MAX_REVIEW_TOTAL_IMAGE_BYTES
+      )
+        throw new Error(
+          "Combined review image observations exceed their finite input bounds",
+        );
+      artifact.evidencePath = `artifacts/${loaded.length}.png`;
+      artifact.origin = {
+        kind: "accepted-work-item-validation",
+        itemId: observation.itemId,
+        resultCommitSha: observation.resultCommitSha,
+        integratedCommitSha: observation.integratedCommitSha,
+        resultTreeSha: observation.evidence.treeSha,
+      };
+      supplied.add(key(artifact.identity));
+      loaded.push(artifact);
+    }
+  }
+  return loaded;
+}
+
 /** Literal identity citations accompany pixels; identities do not prove visual semantics. */
 export function reviewArtifactEvidence(
   artifacts: LoadedReviewArtifact[],
 ): ResultReviewEvidenceSource[] {
-  return artifacts.flatMap(({ identity, evidencePath, receiptBytes }) => [
-    {
-      path: evidencePath,
-      complete: true,
-      content: JSON.stringify({
-        purpose:
-          "Direct image observation from the exact passed validation command; visual semantics require inspecting the supplied image",
-        ...identity,
-      }),
-    },
-    {
-      path: `${evidencePath} receipt`,
-      complete: true,
-      content: receiptBytes.toString("utf8"),
-    },
-  ]);
+  return artifacts.flatMap(
+    ({ identity, origin, evidencePath, receiptBytes }) => [
+      {
+        path: evidencePath,
+        complete: true,
+        content: JSON.stringify({
+          purpose: origin
+            ? "Original accepted Work Item validation observation on this same exact tree; not a fresh final-validation command or an accepted Objective verdict. Inspect the supplied pixels independently."
+            : "Direct image observation from the exact passed validation command; visual semantics require inspecting the supplied image",
+          ...identity,
+          ...(origin ? { origin } : {}),
+        }),
+      },
+      {
+        path: `${evidencePath} receipt`,
+        complete: true,
+        content: receiptBytes.toString("utf8"),
+      },
+    ],
+  );
 }
 
 /** Export only already authenticated retained bytes into the existing read-only review workspace. */

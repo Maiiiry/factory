@@ -381,6 +381,7 @@ export async function finalizeObjective(args: {
                   : []),
               ],
               decisions: state.finalAcceptanceDecisions,
+              acceptedWorkItemImages: objectiveEvidence.acceptedWorkItemImages,
               observations: objectiveEvidence.observations,
               invocation: {
                 invocationId: randomUUID(),

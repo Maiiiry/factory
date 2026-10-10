@@ -145,7 +145,7 @@ The validator must print a JSON object whose direct `receipt` field identifies i
 
 Only the exact matching passed, non-preparation command supplies review images. Factory verifies the candidate against its result tree and retains the complete receipt and PNG before checkout cleanup. Missing, oversized or mismatched evidence cannot become visual proof. The existing review provider receives those pixels directly with their evidence identities; no image-reading tool, browser or network permission is added. An adapter without image-input support refuses before dispatch.
 
-Work Item review uses its candidate's observations. Final Objective review obtains fresh observations from validation of the exact integrated tree. A passing execution receipt or earlier image does not establish the current scene's visual quality. Changing selectors changes the configuration binding; use a fresh corrected Objective rather than resuming an existing one with changed configuration.
+Work Item review uses its candidate's observations. Final Objective review prefers fresh observations from validation of the exact integrated tree. If no fresh image is supplied for a selector, it may inspect complete retained pixels from an accepted Work Item whose exact tree is the same final tree, preserving the original command and receipt provenance. This adds no final commands and makes no claim of a fresh final execution. Different-tree images and earlier review opinions do not establish current visual quality; final review judges the supplied pixels independently. Changing selectors changes the configuration binding; use a fresh corrected Objective rather than resuming an existing one with changed configuration.
 
 ### Execution profiles and adapters
 
