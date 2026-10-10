@@ -51,6 +51,7 @@ import {
 } from "../dist/codex-planning-isolation.js";
 import {
   loadReviewArtifacts,
+  loadReviewArtifactObservations,
   reviewArtifactEvidence,
   materializeReviewImages,
 } from "../dist/review-image-evidence.js";
@@ -1922,6 +1923,132 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
     );
     assertReviewImages(normalInputs, normalReviewRoot);
     assert.deepEqual(readFileSync(normalInputs[0].path), imageBytes);
+    // A final-only review can reuse these exact-tree runtime pixels without
+    // relabeling the Work Item command as a new final command execution.
+    const emptyFinalEvidence = await validateTree(
+      checkout,
+      join(root, "empty-final-validation"),
+      commit,
+      treeSha,
+      [],
+      undefined,
+      undefined,
+      [],
+      imageStore,
+      commit,
+    );
+    assert.deepEqual(emptyFinalEvidence.commands, []);
+    assert.equal(emptyFinalEvidence.reviewArtifacts, undefined);
+    const itemImageObservation = {
+      itemId: "local",
+      resultCommitSha: commit,
+      integratedCommitSha: commit,
+      evidence: imageEvidence,
+    };
+    const reusedFinalImages = await loadReviewArtifactObservations(
+      checkout,
+      emptyFinalEvidence,
+      [itemImageObservation],
+      imageStore,
+    );
+    assert.equal(reusedFinalImages.length, 1);
+    assert.deepEqual(reusedFinalImages[0].identity, artifact);
+    const reusedIdentity = JSON.parse(
+      reviewArtifactEvidence(reusedFinalImages)[0].content,
+    );
+    assert.deepEqual(reusedIdentity.origin, {
+      kind: "accepted-work-item-validation",
+      itemId: "local",
+      resultCommitSha: commit,
+      integratedCommitSha: commit,
+      resultTreeSha: treeSha,
+    });
+    assert.equal(reusedIdentity.command, imageCommand);
+    assert.equal(reusedIdentity.commandIndex, artifact.commandIndex);
+    assert.equal(reusedIdentity.treeSha, treeSha);
+    assert.match(
+      reusedIdentity.purpose,
+      /not a fresh final-validation command/,
+    );
+    const reusedFinalRoot = join(root, "reused-final-image-review");
+    mkdirSync(reusedFinalRoot);
+    const reusedFinalInputs = materializeReviewImages(
+      reusedFinalRoot,
+      reusedFinalImages,
+    );
+    assertReviewImages(reusedFinalInputs, reusedFinalRoot);
+    assert.deepEqual(readFileSync(reusedFinalInputs[0].path), imageBytes);
+    assert.deepEqual(emptyFinalEvidence.commands, []);
+    const freshFinalEvidence = await validateTree(
+      checkout,
+      join(root, "fresh-final-image-validation"),
+      commit,
+      treeSha,
+      [imageCommand],
+      undefined,
+      undefined,
+      [],
+      imageStore,
+      commit,
+      true,
+      { commands: [] },
+      [selector],
+    );
+    const finalOwnImages = await loadReviewArtifactObservations(
+      checkout,
+      freshFinalEvidence,
+      [itemImageObservation],
+      imageStore,
+    );
+    assert.equal(finalOwnImages.length, 1);
+    assert.deepEqual(
+      finalOwnImages[0].identity,
+      freshFinalEvidence.reviewArtifacts[0],
+    );
+    assert.equal(
+      JSON.parse(reviewArtifactEvidence(finalOwnImages)[0].content).origin,
+      undefined,
+    );
+    const changedTree = execFileSync(
+      "git",
+      ["-C", checkout, "hash-object", "-t", "tree", "-w", "--stdin"],
+      { input: "", encoding: "utf8" },
+    ).trim();
+    assert.notEqual(changedTree, treeSha);
+    const changedCommit = git(
+      "-c",
+      "user.name=Integration",
+      "-c",
+      "user.email=integration@example.invalid",
+      "commit-tree",
+      changedTree,
+      "-p",
+      commit,
+      "-m",
+      "Different final candidate tree",
+    );
+    const changedFinalEvidence = await validateTree(
+      checkout,
+      join(root, "changed-final-validation"),
+      changedCommit,
+      changedTree,
+      [],
+      undefined,
+      undefined,
+      [],
+      imageStore,
+      commit,
+    );
+    assert.deepEqual(
+      await loadReviewArtifactObservations(
+        checkout,
+        changedFinalEvidence,
+        [itemImageObservation],
+        imageStore,
+      ),
+      [],
+    );
+    assert.equal(git("rev-parse", "HEAD"), commit);
     const mismatchedCandidate = structuredClone(imageEvidence);
     mismatchedCandidate.reviewArtifacts[0].candidate.sha256 = "0".repeat(64);
     await assert.rejects(

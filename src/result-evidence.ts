@@ -1,3 +1,4 @@
+import type { AcceptedWorkItemImageObservation } from "./review-image-evidence.js";
 import { objectiveCandidate } from "./qa.js";
 import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
 import { nativePrerequisiteReviewEvidence } from "./native-prerequisite-evidence.js";
@@ -2339,6 +2340,7 @@ export function objectiveReviewEvidence(args: {
 }): {
   observations: string;
   evidence: ResultReviewEvidenceSource[];
+  acceptedWorkItemImages: AcceptedWorkItemImageObservation[];
 } {
   const { state, checkout, candidateCommitSha, candidateTreeSha } = args;
   const candidate = objectiveCandidate(state);
@@ -2398,6 +2400,7 @@ export function objectiveReviewEvidence(args: {
     for (const entry of current.validation.reviewEvidence ?? [])
       if (entry.complete) supplyLiteral(item.id, entry);
   }
+  const acceptedWorkItemImages: AcceptedWorkItemImageObservation[] = [];
   const work = state.graph.items.map((item) => {
     const current = state.work[item.id];
     if (
@@ -2462,6 +2465,24 @@ export function objectiveReviewEvidence(args: {
       throw new Error(
         `Work Item ${item.id} retained review differs from acceptance`,
       );
+    // Supply retained pixels only when their accepted result is this exact
+    // final tree. Preserve original command provenance; prior verdicts prove
+    // no new final criterion and no fresh validation is manufactured.
+    if (
+      current.treeSha === candidateTreeSha &&
+      current.validation.reviewArtifacts?.length
+    ) {
+      acceptedWorkItemImages.push({
+        itemId: item.id,
+        resultCommitSha: current.changeRef,
+        integratedCommitSha: current.integratedSha ?? null,
+        evidence: {
+          treeSha: current.validation.treeSha,
+          commands: current.validation.commands,
+          reviewArtifacts: current.validation.reviewArtifacts,
+        },
+      });
+    }
     for (const entry of current.validation.reviewEvidence ?? [])
       supplyLiteral(item.id, entry);
     const supplied = suppliedByItem.get(item.id) ?? new Set<string>();
@@ -2506,6 +2527,7 @@ export function objectiveReviewEvidence(args: {
       work,
     }),
     evidence,
+    acceptedWorkItemImages,
   };
 }
 

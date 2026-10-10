@@ -6,7 +6,8 @@ import type {
   ResultReviewEvidenceSource,
 } from "./contracts.js";
 import {
-  loadReviewArtifacts,
+  loadReviewArtifactObservations,
+  type AcceptedWorkItemImageObservation,
   reviewArtifactEvidence,
   materializeReviewImages,
 } from "./review-image-evidence.js";
@@ -53,6 +54,7 @@ export async function reviewAcceptance(args: {
   commit: string;
   evidence: ValidationEvidence;
   contentStore?: ContentStore;
+  acceptedWorkItemImages?: AcceptedWorkItemImageObservation[];
   criteria: string[];
   sources: { path: string; content: string }[];
   evidenceSources?: ResultReviewEvidenceSource[];
@@ -79,9 +81,17 @@ export async function reviewAcceptance(args: {
       evidence.treeSha,
       "Preparation",
     );
-  const retainedArtifacts = await loadReviewArtifacts(
+  if (
+    args.acceptedWorkItemImages?.length &&
+    args.reviewPhase !== "objective-review"
+  )
+    throw new Error(
+      "Accepted Work Item images may supply only independent Objective review",
+    );
+  const retainedArtifacts = await loadReviewArtifactObservations(
     checkout,
     evidence,
+    args.acceptedWorkItemImages,
     args.contentStore,
   );
   const selectedLfsEvidence = selectedLfsReviewEvidence(checkout, evidence);
