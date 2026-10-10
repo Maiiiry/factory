@@ -221,6 +221,9 @@ writeFileSync(join(checkout, "package-lock.json"), JSON.stringify({ name: "packa
 git("add", "package-lock.json");
 const bootstrapBase = commit("Establish tracked root npm lockfile");
 assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, [bootstrap, "npm test"], authority);
+// Final validation must guard preparation plus acceptance as one sequence.
+assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, ["pnpm test"]);
+assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, [bootstrap, "pnpm test"], authority), /cannot mix package managers/);
 assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, [bootstrap]), /exact source-declared command authority/);
 assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, bootstrapBase, ["npm test", bootstrap], authority), /bootstrap must run first/);
 const bootstrapSources = planningSources(body, bootstrapBase, checkout);
@@ -229,7 +232,7 @@ item.validation = [{ command: bootstrap, provenance: "source-declared", source: 
 hydrateWorkerInputSources(graph, bootstrapSources);
 validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase);
 item.validation[0].provenance = "base-observed";
-assert.throws(() => validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase), /no exact source-declared command authority/);
+assert.throws(() => validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase), /no exact base-observed command authority/);
 item.validation[0].provenance = "source-declared";
 item.validation[0].command = bootstrap + " --offline";
 assert.throws(() => validateGraphSources(graph, bootstrapSources, checkout, body, bootstrapBase), /no exact source-declared command authority/);
