@@ -39,6 +39,32 @@ export interface ValidationEvidence {
   reviewEvidence?: ReviewPacket["evidence"];
 }
 
+/** Validate observed scope only; an absent control remains unknown. */
+export function assertValidationExecutionControl(value: unknown): void {
+  if (value === undefined) return;
+  const control = value as NonNullable<
+    ValidationCommandReceipt["executionControl"]
+  >;
+  if (
+    !control ||
+    typeof control !== "object" ||
+    Array.isArray(control) ||
+    Object.keys(control).sort().join() !==
+      (control.deadlineAt === undefined
+        ? "cancellation,scope,settlement"
+        : "cancellation,deadlineAt,scope,settlement") ||
+    control.scope !== "controller-owned-process-group" ||
+    control.cancellation !== "active-at-dispatch" ||
+    control.settlement !== "verified" ||
+    (control.deadlineAt !== undefined &&
+      (typeof control.deadlineAt !== "string" ||
+        !Number.isFinite(Date.parse(control.deadlineAt))))
+  )
+    throw new Error(
+      "Validation execution control is not an observed owned scope",
+    );
+}
+
 /** Retention never manufactures missing bodies or changes a citation's identity. */
 export function assertRetainedReviewEvidence(
   value: Pick<ValidationEvidence, "criteria" | "reviewEvidence">,

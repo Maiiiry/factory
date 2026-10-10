@@ -446,6 +446,14 @@ export interface ValidationCommandReceipt {
   passed: true;
   exitCode: 0;
   treeSha: string;
+  /** Observed controller controls, not candidate timers or escaped-resource proof. */
+  executionControl?: {
+    scope: "controller-owned-process-group";
+    cancellation: "active-at-dispatch";
+    settlement: "verified";
+    /** Omitted unless the armed controller deadline matches the current step. */
+    deadlineAt?: string;
+  };
   /**
    * Processes the command left running that Factory stopped once the
    * command had exited and its grace period passed. Absent when none.

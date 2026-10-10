@@ -1143,6 +1143,8 @@ export class UnsettledSubprocessError extends Error {
 interface ProcessScope {
   unresolved?: boolean;
   signal?: AbortSignal;
+  /** Observational metadata for a deadline already armed by the controller. */
+  deadlineAt?: string;
   observe?: (process: OwnedSubprocess, settled: boolean) => void;
 }
 const processCancellation = new AsyncLocalStorage<ProcessScope>();
@@ -1153,13 +1155,20 @@ export function currentProcessSignal(): AbortSignal | undefined {
   return processCancellation.getStore()?.signal;
 }
 
+/** Does not install a timer or prove that a deadline has elapsed. */
+export function currentProcessDeadlineAt(): string | undefined {
+  return processCancellation.getStore()?.deadlineAt;
+}
+
 /** Bind controller subprocesses to the current coordinator cancellation request. */
 export function withProcessCancellation<T>(
   signal: AbortSignal | undefined,
   operation: () => Promise<T>,
   observe?: ProcessScope["observe"],
+  /** The caller's already armed deadline for this exact cancellation signal. */
+  deadlineAt?: string,
 ): Promise<T> {
-  return processCancellation.run({ signal, observe }, operation);
+  return processCancellation.run({ signal, observe, deadlineAt }, operation);
 }
 
 /** How long an exited command's leftover descendants may run before they are stopped; tests shorten it. */

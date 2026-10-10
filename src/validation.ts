@@ -16,6 +16,7 @@ import { StringDecoder } from "node:string_decoder";
 import { isDeepStrictEqual } from "node:util";
 import type {
   ContentStore,
+  ValidationCommandReceipt,
   ValidationLfsMember,
   WorkItem,
 } from "./contracts.js";
@@ -27,6 +28,8 @@ import {
 } from "./package-manager-update.js";
 import {
   addWorktree,
+  currentProcessDeadlineAt,
+  currentProcessSignal,
   hasUnresolvedSubprocesses,
   localValidationEnvironment,
   localValidationShellArguments,
@@ -36,6 +39,7 @@ import {
   subprocessAsync,
   withWorktreeRegistry,
 } from "./process.js";
+import { stepDeadlineAt } from "./step.js";
 import {
   type SelectedLfsValidation,
   safeValidationPath,
@@ -446,6 +450,23 @@ export async function validateCheckout(
       : observeOutput;
     const worktreeStatusBefore = candidateStatus();
     const started = Date.now();
+    const cancellation = currentProcessSignal();
+    const controllerDeadline = currentProcessDeadlineAt();
+    const executionControl: ValidationCommandReceipt["executionControl"] =
+      cancellation && !cancellation.aborted
+        ? {
+            scope: "controller-owned-process-group",
+            cancellation: "active-at-dispatch",
+            settlement: "verified",
+            ...(controllerDeadline === stepDeadlineAt() &&
+              controllerDeadline !== undefined &&
+              Number.isFinite(Date.parse(controllerDeadline)) &&
+              Date.parse(controllerDeadline) > started && {
+                deadlineAt: controllerDeadline,
+              }),
+          }
+        : undefined;
+    const settlement = { verified: false };
     let stdout = "";
     let stderr = "";
     const decoders = {
@@ -466,6 +487,10 @@ export async function validateCheckout(
         else stderr += text;
         if (text)
           outputObserver?.({ index, stream, output: text, final: false });
+      },
+      (entry) => {
+        if (entry.event === "cessation" && entry.status === "verified")
+          settlement.verified = true;
       },
     );
     for (const stream of ["stdout", "stderr"] as const) {
@@ -523,6 +548,7 @@ export async function validateCheckout(
       passed: true,
       exitCode: 0,
       treeSha,
+      ...(executionControl && settlement.verified && { executionControl }),
       ...(result.stoppedLeftovers && {
         stoppedLeftovers: result.stoppedLeftovers,
       }),

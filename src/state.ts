@@ -60,7 +60,10 @@ import {
   assertValidationWorktreeObservation,
   validStoppedLeftovers,
 } from "./validation.js";
-import { assertRetainedReviewEvidence } from "./validation-evidence.js";
+import {
+  assertRetainedReviewEvidence,
+  assertValidationExecutionControl,
+} from "./validation-evidence.js";
 import { assertRepairReadiness } from "./work-repair.js";
 
 export type WorkStatus =
@@ -512,6 +515,7 @@ function validationEvidence(value: unknown, label: string): string[] {
     throw new Error(`${label}.commands must be an array`);
   for (const [index, raw] of evidence.commands.entries()) {
     const receipt = record(raw, `${label}.commands[${index}]`);
+    assertValidationExecutionControl(receipt.executionControl);
     string(receipt.command, `${label}.commands[${index}].command`);
     if (
       receipt.index !== index ||
