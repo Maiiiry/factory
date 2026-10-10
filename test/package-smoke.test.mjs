@@ -245,6 +245,25 @@ writeFileSync(join(checkout, "npm-shrinkwrap.json"), "{}\\n");
 git("add", "package-lock.json", "npm-shrinkwrap.json");
 const shrinkwrap = commit("Introduce npm lock override");
 assert.throws(() => assertPinnedNpmScripts(checkout, bootstrapBase, shrinkwrap, [bootstrap], authority), /does not authorize npm-shrinkwrap.json/);
+
+// Distinct invalid UTF-8 bytes can decode identically; immutable inputs compare
+// actual Git blob bytes, never only the decoded JSON string.
+rmSync(join(checkout, "npm-shrinkwrap.json"));
+git("add", "-u");
+const ambiguousLock = Buffer.from('{"lockfileVersion":3,"description":"x"}\\n');
+const marker = ambiguousLock.indexOf('x');
+ambiguousLock[marker] = 255;
+writeFileSync(join(checkout, "package-lock.json"), ambiguousLock);
+git("add", "package-lock.json");
+const rawBase = commit("Pin raw lockfile bytes");
+assertPinnedNpmScripts(checkout, rawBase, rawBase, [bootstrap], authority);
+const originalDecoded = ambiguousLock.toString("utf8");
+ambiguousLock[marker] = 254;
+assert.equal(ambiguousLock.toString("utf8"), originalDecoded);
+writeFileSync(join(checkout, "package-lock.json"), ambiguousLock);
+git("add", "package-lock.json");
+const rawChanged = commit("Change raw lockfile bytes with identical decoding");
+assert.throws(() => assertPinnedNpmScripts(checkout, rawBase, rawChanged, [bootstrap], authority), /unchanged tracked package-lock.json/);
 `,
       ],
       { encoding: "utf8", env: environment },

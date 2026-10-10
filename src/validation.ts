@@ -757,7 +757,7 @@ export function assertPinnedNpmScripts(
     authority.workspacePackageAdditions,
     authority.predecessorSha,
   );
-  const file = (revision: string, path: string): string | undefined => {
+  const fileBytes = (revision: string, path: string): Buffer | undefined => {
     try {
       const entry = pinnedGit(checkout, "ls-tree", revision, "--", path);
       if (!entry) return undefined;
@@ -765,9 +765,7 @@ export function assertPinnedNpmScripts(
         throw new Error(
           `Package script validation blocked: ${path} is not a regular file`,
         );
-      return pinnedGitRaw(checkout, "show", `${revision}:${path}`).toString(
-        "utf8",
-      );
+      return pinnedGitRaw(checkout, "show", `${revision}:${path}`);
     } catch (error) {
       if (
         authority.packageManagerUpdate !== undefined ||
@@ -777,6 +775,8 @@ export function assertPinnedNpmScripts(
       return undefined;
     }
   };
+  const file = (revision: string, path: string): string | undefined =>
+    fileBytes(revision, path)?.toString("utf8");
   const original = packageMetadata(checkout, acceptedBaseSha);
   const predecessor =
     authority.predecessorSha && authority.predecessorSha !== acceptedBaseSha
@@ -867,8 +867,9 @@ export function assertPinnedNpmScripts(
         "Package script validation blocked: npm bootstrap requires an existing root npm package without workspaces or a manager update",
       );
     for (const path of ["package.json", "package-lock.json"]) {
-      const before = file(acceptedBaseSha, path);
-      if (!before || before !== file(commit, path))
+      const before = fileBytes(acceptedBaseSha, path);
+      const after = fileBytes(commit, path);
+      if (!before?.length || !after || !before.equals(after))
         throw new Error(
           `Package script validation blocked: npm bootstrap needs unchanged tracked ${path} from the accepted base`,
         );
