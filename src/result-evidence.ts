@@ -40,6 +40,7 @@ import { deliveredHead } from "./delivery/branch-update.js";
 import {
   type ValidationEvidence,
   assertRetainedReviewEvidence,
+  assertValidationExecutionControl,
   assertSelectedLfsValidation,
 } from "./validation-evidence.js";
 
@@ -1627,7 +1628,8 @@ export function assertCommandReceipts(
 ): void {
   if (evidence.treeSha !== expectedTree)
     throw new Error(`${label} is not bound to the exact result tree`);
-  for (const [index, receipt] of evidence.commands.entries())
+  for (const [index, receipt] of evidence.commands.entries()) {
+    assertValidationExecutionControl(receipt.executionControl);
     if (
       receipt.index !== index ||
       !receipt.command ||
@@ -1639,6 +1641,7 @@ export function assertCommandReceipts(
       throw new Error(
         `${label} command receipt ${index} is not bound to the exact result tree and order`,
       );
+  }
 }
 
 /** Absent, or a positive count of stopped leftover processes. */

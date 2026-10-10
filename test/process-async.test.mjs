@@ -97,7 +97,7 @@ import {
   synchronizeWorkItemPause,
 } from "../dist/runner/ownership.js";
 import { decideResult, rereviewWorkItem } from "../dist/runner.js";
-import { setCoordinatorMode } from "../dist/state.js";
+import { parseFactoryState, setCoordinatorMode } from "../dist/state.js";
 import { readState, saveState, statePath } from "../dist/state-store.js";
 import {
   assertStepAdmission,
@@ -110,6 +110,10 @@ import {
   validateTree,
   validateWorkItem,
 } from "../dist/validation.js";
+import {
+  assertCommandReceipts,
+  commandPassEvidence,
+} from "../dist/result-evidence.js";
 import {
   actionableReadiness,
   applyWorkCorrection,
@@ -1559,6 +1563,97 @@ test("settled validation reuses its exact Git result once and retains the failed
     );
     assert.equal(evidence.treeSha, treeSha);
     assert.equal(evidence.commands[0].exitCode, 0);
+    assert.equal(evidence.commands[0].executionControl, undefined);
+    const deadlineAt = new Date(Date.now() + 10_000).toISOString();
+    const boundedState = {
+      ...structuredClone(state),
+      coordinator: {
+        mode: "running",
+        phase: "validate",
+        phaseStartedAt: new Date().toISOString(),
+        deadlineAt,
+      },
+    };
+    const cancellation = new AbortController();
+    const deadlineTimer = setTimeout(
+      () => cancellation.abort(new Error("Controller deadline elapsed")),
+      Date.parse(deadlineAt) - Date.now(),
+    );
+    const settledGroups = [];
+    let bounded;
+    try {
+      bounded = await withProcessCancellation(
+        cancellation.signal,
+        () =>
+          step(
+            boundedState,
+            { scope: "objective", name: "bounded-validation" },
+            () => validate(),
+            { save: () => undefined, signal: cancellation.signal },
+          ),
+        (owned, settled) => {
+          if (settled) settledGroups.push(owned.pid);
+        },
+        deadlineAt,
+      );
+      assert.deepEqual(bounded.commands[0].executionControl, {
+        scope: "controller-owned-process-group",
+        cancellation: "active-at-dispatch",
+        settlement: "verified",
+        deadlineAt,
+      });
+      assert.ok(settledGroups.length > 0);
+      assert.ok(settledGroups.every((pid) => !processGroupExists(pid)));
+      assertCommandReceipts(bounded, treeSha, "Actual bounded validation");
+      const retained = structuredClone(state);
+      retained.work.local.validation = bounded;
+      assert.deepEqual(
+        parseFactoryState(retained, state.repository, state.objective).work
+          .local.validation.commands[0].executionControl,
+        bounded.commands[0].executionControl,
+      );
+      const receiptText = commandPassEvidence(bounded.commands).content;
+      assert.ok(receiptText.includes(deadlineAt));
+      assert.ok(receiptText.includes("controller-owned-process-group"));
+      const wrongTree = structuredClone(bounded);
+      wrongTree.commands[0].treeSha = "0".repeat(40);
+      assert.throws(() =>
+        assertCommandReceipts(wrongTree, treeSha, "Wrong tree"),
+      );
+      const invalidControl = structuredClone(bounded);
+      invalidControl.commands[0].executionControl.deadlineAt = "not-a-date";
+      assert.throws(
+        () => assertCommandReceipts(invalidControl, treeSha, "Invalid control"),
+        /execution control/,
+      );
+      retained.work.local.validation = invalidControl;
+      assert.throws(
+        () => parseFactoryState(retained, state.repository, state.objective),
+        /execution control/,
+      );
+      const mismatched = await withProcessCancellation(
+        cancellation.signal,
+        () =>
+          step(
+            boundedState,
+            { scope: "objective", name: "mismatched-bound-validation" },
+            () => validate(),
+            { save: () => undefined, signal: cancellation.signal },
+          ),
+        undefined,
+        new Date(Date.parse(deadlineAt) + 1_000).toISOString(),
+      );
+      assert.equal(
+        mismatched.commands[0].executionControl.deadlineAt,
+        undefined,
+      );
+      assert.equal(
+        mismatched.commands[0].executionControl.cancellation,
+        "active-at-dispatch",
+      );
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
     assert.equal(git("rev-parse", "HEAD"), commit);
     // Passing commands do not prove this source criterion. The supported
     // exact-tree operator refusal produces semantic evidence, without a model

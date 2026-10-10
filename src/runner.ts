@@ -929,6 +929,7 @@ async function runObjectiveOwned(
           if (!settled) disposition.processes.push(process);
           persist();
         },
+        owner.deadlineAt,
       ).catch((error: unknown) => {
         const current = owner.snapshot;
         // A pass stopped by the cancel request (a step answers `cancelled`):
