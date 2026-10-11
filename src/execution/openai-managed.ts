@@ -17,6 +17,7 @@ import {
   StepFault,
 } from "../fault.js";
 import { hasUnresolvedSubprocesses, removeWorktree } from "../process.js";
+import { isCheckpointAdmissionFailure } from "../recovery-checkpoint.js";
 import { refuseUnknownFields } from "../unknown-fields.js";
 import { endAttempt, stoppedFault, transportFailure } from "./attempt.js";
 import { executionFault, missingCredential } from "./fault.js";
@@ -156,6 +157,12 @@ function id(value: unknown): string {
   return value;
 }
 interface Active {
+  checkpointAdmission?: {
+    phase: string;
+    boundary: "before-effect" | "settled";
+    knownNotDispatched: boolean;
+    at: string;
+  };
   request: ExecutionRequest;
   root: string;
   inputDigest: string;
@@ -183,6 +190,7 @@ interface Active {
 }
 export class OpenAIManagedExecutionDriver implements ExecutionDriver {
   readonly childAgents = "disabled" as const;
+  readonly effectAdmission = "controller-checkpoint-v1" as const;
   private client: OpenAIManagedTransport;
   constructor(
     private args: {
@@ -223,12 +231,63 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       throw new Error("OpenAI managed handle binding is invalid");
     return data;
   }
-  private save(handle: ExecutionHandle, context?: ExecutionContext): void {
+  private cessationContext(
+    context?: ExecutionContext,
+  ): ExecutionContext | undefined {
+    if (!context) return undefined;
+    return {
+      ...context,
+      admitEffect: async (reason) => {
+        try {
+          await context.admitEffect?.(reason);
+        } catch (error) {
+          if (!isCheckpointAdmissionFailure(error)) throw error;
+        }
+      },
+    };
+  }
+  private async saveCessation(
+    handle: ExecutionHandle,
+    context?: ExecutionContext,
+  ): Promise<void> {
+    try {
+      await this.save(handle, context, "before-effect");
+    } catch (error) {
+      if (!isCheckpointAdmissionFailure(error)) throw error;
+      delete this.active(handle).checkpointAdmission;
+      context?.checkpoint(handle);
+    }
+  }
+  private async save(
+    handle: ExecutionHandle,
+    context?: ExecutionContext,
+    reason: "before-effect" | "settled" = "settled",
+  ): Promise<void> {
     if (!context)
       throw new Error(
         "Managed execution requires controller checkpoint authority",
       );
+    const data = this.active(handle);
+    if (
+      data.checkpointAdmission &&
+      data.checkpointAdmission.phase !== data.phase
+    )
+      delete data.checkpointAdmission;
     context.checkpoint(handle);
+    try {
+      await context.admitEffect?.(reason);
+    } catch (error) {
+      if (isCheckpointAdmissionFailure(error) && context.checkpointedEffects) {
+        data.checkpointAdmission = {
+          phase: data.phase,
+          boundary: reason,
+          knownNotDispatched: reason === "before-effect",
+          at: new Date().toISOString(),
+        };
+        context.checkpoint(handle);
+      }
+      throw error;
+    }
   }
   private remaining(data: Active): number {
     const cleanup =
@@ -257,6 +316,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     handle: ExecutionHandle,
     context: ExecutionContext,
   ): Promise<never> {
+    if (isCheckpointAdmissionFailure(error)) throw error;
     return endAttempt(error, {
       expired: this.expired(this.active(handle)),
       cancelled: context.cancelled(),
@@ -279,7 +339,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
         detail: `Session create for attempt ${handle.identity} has an unknown outcome at ${new Date().toISOString()}; a session with metadata factory_attempt=${handle.identity} may hold the input archive`,
       });
     data.stopped ??= { detail, interrupted };
-    this.save(handle, context);
+    await this.save(handle, context);
     await this.stop(handle, "failed", context);
     throw stoppedFault(data.stopped.detail, data.stopped.interrupted);
   }
@@ -354,7 +414,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       identity: attemptId,
       data,
     };
-    this.save(handle, context);
+    await this.save(handle, context, "before-effect");
     // Kept beside the attempt so a restart can still submit the same input.
     writeFileSync(
       join(root, "input-prompt.txt"),
@@ -414,7 +474,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       data.sessionId = id(session.id);
       data.environmentId = id(object(session.environment).id);
       data.phase = "prepared";
-      this.save(handle, context);
+      await this.save(handle, context);
       await this.submitInput(handle, context);
     } catch (error) {
       if (
@@ -459,7 +519,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       throw cancelledFault("Managed input cancelled before submission");
     this.remaining(data);
     data.phase = "input-submitted";
-    this.save(handle, context);
+    await this.save(handle, context, "before-effect");
     await this.request(
       data,
       "POST",
@@ -487,7 +547,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       },
     );
     data.phase = "input-accepted";
-    this.save(handle, context);
+    await this.save(handle, context);
   }
   private async wait(data: Active): Promise<void> {
     await new Promise((resolve) =>
@@ -544,7 +604,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     if (!turn) {
       if (data.phase === "cancel-submitted" && session.status === "idle") {
         data.terminal = "cancelled";
-        this.save(handle, context);
+        await this.save(handle, context);
         return { state: "cancelled" };
       }
       if (session.status === "failed")
@@ -580,7 +640,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     if (terminal) data.terminal = terminal;
     if (data.phase === "input-accepted" || data.phase === "input-submitted")
       data.phase = "running";
-    this.save(handle, context);
+    await this.save(handle, context);
     const raw =
       turn.usage && typeof turn.usage === "object"
         ? object(turn.usage)
@@ -636,11 +696,11 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     data.cleanupStartedAt ??= Date.now();
     if (data.sessionId) {
       data.phase = "delete-submitted";
-      this.save(handle, context);
+      await this.save(handle, context, "before-effect");
       await this.request(data, "DELETE", `/agents/sessions/${data.sessionId}`);
       data.phase = "delete-acknowledged";
     }
-    this.save(handle, context);
+    await this.save(handle, context);
     this.physicalCessationUnconfirmed(handle);
   }
   @classifyFaults(executionFault)
@@ -693,7 +753,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       data.phase !== "delete-submitted"
     ) {
       data.phase = "cancel-submitted";
-      this.save(handle, context);
+      await this.saveCessation(handle, context);
       try {
         await this.request(
           data,
@@ -709,7 +769,10 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       }
     }
     while (data.phase !== "delete-submitted") {
-      const observed = await this.observeActive(handle, context);
+      const observed = await this.observeActive(
+        handle,
+        this.cessationContext(context),
+      );
       if (observed.state !== "running") break;
       await this.wait(data);
     }
@@ -743,7 +806,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       } catch (error) {
         await this.fail(error, handle, context);
       }
-      this.save(handle, context);
+      await this.save(handle, context);
     }
     await this.dispose(handle, context);
     return data.result!;
@@ -814,7 +877,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
       bytes: size,
       turnId: data.turnId!,
     };
-    this.save(handle, context);
+    await this.save(handle, context);
     const worktree = join(data.root, "result");
     try {
       await importOpenAIResult({
@@ -844,10 +907,18 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
           assets: readProducedAssets({ item: data.request.item, worktree }),
           evidence,
         },
+        async (collected) => {
+          data.result = collected;
+          await this.save(handle, context);
+          await context.admitEffect?.("explicit");
+        },
       );
     } finally {
-      if (!hasUnresolvedSubprocesses())
+      if (data.result && !hasUnresolvedSubprocesses()) {
+        await this.save(handle, context);
+        await context.admitEffect?.("explicit");
         await removeWorktree(this.args.checkout, worktree);
+      }
     }
   }
 }

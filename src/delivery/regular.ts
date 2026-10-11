@@ -4,6 +4,7 @@ import type {
   DeliveryResult,
   DeliveryStrategy,
   GitHubGateway,
+  MergeControl,
   MergeResult,
 } from "../contracts.js";
 import { attachFault, decision, transient } from "../fault.js";
@@ -36,6 +37,10 @@ export async function pushBranch(
   branch: string,
   commit: string,
   earlierHeads: string[] = [],
+  effect?: {
+    before(remote: string | undefined): Promise<void>;
+    observed(): Promise<void>;
+  },
 ): Promise<void> {
   const remote = await remoteHead(checkout, branch);
   if (remote === commit) return;
@@ -47,6 +52,7 @@ export async function pushBranch(
         `remote head ${remote}; Factory pushed ${[commit, ...earlierHeads].join(", ")}`,
       ),
     );
+  await effect?.before(remote);
   try {
     await gitAsync(
       checkout,
@@ -55,6 +61,11 @@ export async function pushBranch(
       "origin",
       `${commit}:refs/heads/${branch}`,
     );
+    if ((await remoteHead(checkout, branch)) !== commit)
+      throw new Error(
+        "Pushed branch is not independently confirmed at the requested commit",
+      );
+    await effect?.observed();
   } catch (error) {
     if (pushRejected(error)) {
       // The branch moved after it was observed: observe it again. If it did
@@ -76,6 +87,7 @@ export async function pushBranch(
 }
 
 export class RegularDelivery implements DeliveryStrategy {
+  readonly effectAdmission = "controller-checkpoint-v1" as const;
   constructor(
     private checkout: string,
     private github: GitHubGateway,
@@ -106,14 +118,21 @@ export class RegularDelivery implements DeliveryStrategy {
     };
     publication.assertRequest(pullRequest);
     const reconcileOnly = publication.reconcileOnly;
-    if (!reconcileOnly) {
+    if (!reconcileOnly && !publication.expectedPublication) {
       // Only initial preparation: an unresolved PR intent forbids even LFS/branch replay.
       if (
         request.lfs ||
         (await addsLfsPointers(this.checkout, request.baseSha, commit))
       ) {
         publication.assertRequest(pullRequest);
+        const effect = {
+          kind: "lfs-upload" as const,
+          branch: request.branch,
+          headSha: commit,
+        };
+        await publication.beforeEffect(pullRequest, effect);
         await gitAsync(this.checkout, "lfs", "push", "origin", commit);
+        await publication.observedEffect(pullRequest, effect);
       }
       publication.assertRequest(pullRequest);
       await pushBranch(
@@ -121,6 +140,21 @@ export class RegularDelivery implements DeliveryStrategy {
         request.branch,
         commit,
         request.earlierHeads,
+        {
+          before: (remote) =>
+            publication.beforeEffect(pullRequest, {
+              kind: "branch-push",
+              branch: request.branch,
+              headSha: commit,
+              expectedRemoteHead: remote ?? null,
+            }),
+          observed: () =>
+            publication.observedEffect(pullRequest, {
+              kind: "branch-push",
+              branch: request.branch,
+              headSha: commit,
+            }),
+        },
       );
     }
     const pr = await this.github.publish({
@@ -133,7 +167,7 @@ export class RegularDelivery implements DeliveryStrategy {
         ? {}
         : { beforeCreate: () => publication.beforeCreate(pullRequest) }),
     });
-    publication.observed(pullRequest, pr);
+    await publication.observed(pullRequest, pr);
     return {
       branch: request.branch,
       pullRequest: pr.number,
@@ -155,7 +189,10 @@ export class RegularDelivery implements DeliveryStrategy {
   }
 
   /** Merge (or confirm the merge of) the published head. */
-  async merge(result: DeliveryResult): Promise<MergeResult> {
+  async merge(
+    result: DeliveryResult,
+    control?: MergeControl,
+  ): Promise<MergeResult> {
     return this.github.merge(
       {
         number: result.pullRequest,
@@ -164,6 +201,7 @@ export class RegularDelivery implements DeliveryStrategy {
         earlierHeads: result.earlierHeads,
       },
       result.headSha,
+      control,
     );
   }
 }

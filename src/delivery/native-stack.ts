@@ -1,9 +1,9 @@
 import * as time from "../clock.js";
-import { attachFault, attachedFault, decision } from "../fault.js";
+import { attachedFault, attachFault, decision } from "../fault.js";
 import {
   classifiedGitHubCall,
-  type GitHubClient,
   type GitHubCall,
+  type GitHubClient,
   GitHubRequestError,
   sharedGitHubClient,
   timelineMergeCommit,
@@ -131,7 +131,11 @@ export class NativeStackDelivery {
     }
   }
 
-  async ensureStack(layers: StackLayer[], baseBranch: string): Promise<number> {
+  async ensureStack(
+    layers: StackLayer[],
+    baseBranch: string,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<number> {
     if (layers.length < 2)
       throw new Error("Native stack requires two or more PRs");
     await this.assertLayers(layers, baseBranch);
@@ -152,6 +156,7 @@ export class NativeStackDelivery {
         );
       return stack.number;
     }
+    await beforeRequest?.();
     const created = await this.api<Stack>(
       `repos/${this.repository}/stacks`,
       "POST",
@@ -199,7 +204,8 @@ export class NativeStackDelivery {
     expectedStack: number,
     options: {
       resumeUuid?: string;
-      onPending: (uuid: string) => void;
+      beforeRequest?: () => void | Promise<void>;
+      onPending: (uuid: string) => void | Promise<void>;
       progress?: () => void;
       queued: (detail: string) => never;
       failed?: () => Promise<void>;
@@ -210,7 +216,11 @@ export class NativeStackDelivery {
     if (merged) return merged;
     if (
       !options.resumeUuid &&
-      (await this.ensureStack(layers, baseBranch)) !== expectedStack
+      (await this.ensureStack(layers, baseBranch, async () => {
+        throw new Error(
+          "Recorded native stack is unavailable; merge cannot authorize another stack creation",
+        );
+      })) !== expectedStack
     )
       throw foreignChange("Native stack identity changed before merge");
     const top = layers.at(-1)!;
@@ -226,6 +236,7 @@ export class NativeStackDelivery {
     if (uuid) observed = await this.api<AsyncResult>(`${route}/${uuid}`);
     else {
       await options.requireMergeCommits();
+      await options.beforeRequest?.();
       try {
         observed = await this.api<AsyncResult>(
           route,
@@ -256,7 +267,7 @@ export class NativeStackDelivery {
       if (observed.status === "pending" && observed.details.uuid) {
         submittedAt = time.now();
         uuid = observed.details.uuid;
-        options.onPending(uuid);
+        await options.onPending(uuid);
       }
     }
     while (observed.status === "pending" || observed.status === "queued") {

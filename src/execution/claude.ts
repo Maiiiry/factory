@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { readWorkerJson, workFault } from "../fault.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import { assertAgentSessionRef } from "../agent-session.js";
+import type { ClaudeAgentSdkConfig } from "../config.js";
 import type {
   AgentHarness,
   AgentSessionRef,
@@ -13,7 +14,7 @@ import type {
   HarnessResult,
 } from "../contracts.js";
 import { AuthenticationRequiredError } from "../contracts.js";
-import type { ClaudeAgentSdkConfig } from "../config.js";
+import { readWorkerJson, workFault } from "../fault.js";
 import { parseProducedAssetSets } from "../media.js";
 import { FACTORY_VERSION } from "../package-metadata.js";
 import {
@@ -21,25 +22,24 @@ import {
   processGroupExists,
   sanitizedWorkerEnvironment,
 } from "../process.js";
+import { serviceLoginEnvironment } from "../provider-credentials.js";
+import {
+  type ClaudeOwnedSession,
+  type ClaudeSessionData,
+  claudeDigest,
+  claudeHistoryDigest,
+  claudePrivateWrite,
+  prepareClaudeSession,
+  readClaudePrivate,
+  releaseClaudeStorage,
+  requireClaudeSession,
+} from "./claude-session.js";
+import { workItemPrompt } from "./harness-support.js";
 import {
   launchWorker,
   observeWorker,
   stopUnrecordedWorker,
 } from "./worker-process.js";
-import { assertAgentSessionRef } from "../agent-session.js";
-import {
-  claudeDigest,
-  claudeHistoryDigest,
-  prepareClaudeSession,
-  requireClaudeSession,
-  releaseClaudeStorage,
-  claudePrivateWrite,
-  readClaudePrivate,
-  type ClaudeOwnedSession,
-  type ClaudeSessionData,
-} from "./claude-session.js";
-import { workItemPrompt } from "./harness-support.js";
-import { serviceLoginEnvironment } from "../provider-credentials.js";
 
 interface ClaudeWorkerHandleData {
   pid: number;
@@ -243,6 +243,7 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
   }
 
   readonly capabilities = {
+    effectAdmission: "controller-checkpoint-v1",
     childAgents: "disabled",
     protocolVersion: 1,
     worktree: "factory-owned-read-write",

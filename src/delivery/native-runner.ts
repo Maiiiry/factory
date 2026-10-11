@@ -1,27 +1,4 @@
-import {
-  observeWorkflowReflection,
-  reconcileWorkRouting,
-} from "../runner/routing.js";
-import { publicationControl } from "./publication.js";
-import { packageManagerUpdate } from "../package-manager-update.js";
-import { deliveryDescription } from "./description.js";
-import { assertIntegrated, laterIntegration } from "./integration.js";
-import { assertCheckSourcesAtIntegration } from "./check-sources.js";
-import { deliveryReadiness, unreportedGates } from "./readiness.js";
-import {
-  runWorker as runSharedWorker,
-  stopWorker as stopSharedWorker,
-} from "../item-worker.js";
-import { recordWorkFailure, diagnoseWorkRepair } from "../work-repair.js";
-import {
-  reportCancelled,
-  reviewItem,
-  staysInPlace,
-  validateItem,
-} from "../item-steps.js";
-import { workspacePackageAdditions } from "../workspace-membership.js";
-import { graphDigest } from "../graph-amendments.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { planningSources } from "../compiler.js";
 import { closeWorkItem } from "../completion.js";
@@ -39,35 +16,62 @@ import type {
 } from "../contracts.js";
 import { AuthenticationRequiredError } from "../contracts.js";
 import type { DiagnosticEmitter } from "../diagnostics.js";
-import { materializeAssetSet, validationLfsMembersForItem } from "../media.js";
+import { expansionBlocksItem } from "../expansion-readiness.js";
 import { cancelledFault, faultOf } from "../fault.js";
+import { graphDigest } from "../graph-amendments.js";
+import {
+  reportCancelled,
+  reviewItem,
+  staysInPlace,
+  validateItem,
+} from "../item-steps.js";
+import {
+  runWorker as runSharedWorker,
+  stopWorker as stopSharedWorker,
+} from "../item-worker.js";
+import { materializeAssetSet, validationLfsMembersForItem } from "../media.js";
+import { packageManagerUpdate } from "../package-manager-update.js";
+import { phaseAdmission } from "../phase-admission.js";
 import { currentProcessSignal } from "../process.js";
 import { runQaItem } from "../qa-execution.js";
-import { runDiscoveryItem } from "../runner/discovery.js";
-import { phaseAdmission } from "../phase-admission.js";
 import {
-  workSettled,
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "../recovery-checkpoint.js";
+import { runDiscoveryItem } from "../runner/discovery.js";
+import {
+  observeWorkflowReflection,
+  reconcileWorkRouting,
+} from "../runner/routing.js";
+import {
   itemsConflict,
   pathsOverlap,
   pendingItemBlocker,
   rankPending,
   schedulingObservations,
+  workSettled,
 } from "../scheduler.js";
-import type { FactoryState } from "../state.js";
+import { type FactoryState, observedStackNumber } from "../state.js";
 import { type StepContext, StepPaused, step } from "../step.js";
+import {
+  validateWorkItem,
+  workItemReviewEvidence,
+  workItemReviewObservations,
+} from "../validation.js";
+import { diagnoseWorkRepair, recordWorkFailure } from "../work-repair.js";
+import { workspacePackageAdditions } from "../workspace-membership.js";
 import {
   deliveredHead,
   deliveryEarlierHeads,
   retireDeliveredHead,
   updateBehindBranch,
 } from "./branch-update.js";
-import {
-  validateWorkItem,
-  workItemReviewEvidence,
-  workItemReviewObservations,
-} from "../validation.js";
+import { assertCheckSourcesAtIntegration } from "./check-sources.js";
+import { deliveryDescription } from "./description.js";
+import { assertIntegrated, laterIntegration } from "./integration.js";
 import { linearDeliveryUnits } from "./plan.js";
-import { expansionBlocksItem } from "../expansion-readiness.js";
+import { mergeControl, publicationControl } from "./publication.js";
+import { deliveryReadiness, unreportedGates } from "./readiness.js";
 import { transplantIndependentChange } from "./transplant.js";
 
 export async function runNativeGraph(args: {
@@ -1210,6 +1214,8 @@ export async function runNativeGraph(args: {
       const layer = layers[index]!;
       layer.headSha = await updateBehindBranch({
         github,
+        repository: state.repository,
+        checkpointedEffects: state.schemaVersion === 17,
         work: state.work[unit.items[index]!.id]!,
         save,
         identity: { number: layer.pullRequest, branch: layer.branch },
@@ -1326,21 +1332,80 @@ export async function runNativeGraph(args: {
       let stackNumber: number | undefined;
       if (layers.length > 1) {
         stackNumber =
-          state.stackNumbers?.[unit.id] ??
+          observedStackNumber(state.stackNumbers?.[unit.id]) ??
           (await unitStep(
             unit,
             "stack",
-            async () =>
-              github.ensureNativeStack(layers, await github.defaultBranch()),
+            async () => {
+              const baseBranch = await github.defaultBranch();
+              const request = { layers: structuredClone(layers), baseBranch };
+              const retained = state.stackNumbers?.[unit.id];
+              if (
+                retained &&
+                typeof retained !== "number" &&
+                JSON.stringify(retained.request) !== JSON.stringify(request)
+              )
+                throw new Error(
+                  "Native stack publication differs from its retained exact topology",
+                );
+              return github.ensureNativeStack(layers, baseBranch, {
+                beforeRequest: async () => {
+                  if (state.schemaVersion !== 17) return;
+                  if (state.stackNumbers?.[unit.id])
+                    throw new Error(
+                      "Native stack creation is unresolved; read-only reconciliation must precede any replacement",
+                    );
+                  state.stackNumbers ??= {};
+                  const recordedAt = new Date().toISOString();
+                  state.stackNumbers[unit.id] = {
+                    request,
+                    disposition: "intent",
+                    effectId: createHash("sha256")
+                      .update(
+                        JSON.stringify({
+                          runId: state.runId,
+                          unit: unit.id,
+                          request,
+                          recordedAt,
+                        }),
+                      )
+                      .digest("hex"),
+                    recordedAt,
+                  };
+                  save();
+                  try {
+                    await awaitCheckpointAdmission(
+                      state.repository,
+                      "before-effect",
+                    );
+                  } catch (error) {
+                    if (isCheckpointAdmissionFailure(error)) {
+                      const slot = state.stackNumbers![unit.id];
+                      if (slot && typeof slot !== "number")
+                        slot.disposition = "blocked";
+                      save();
+                    }
+                    throw error;
+                  }
+                },
+                observed: async (number) => {
+                  state.stackNumbers ??= {};
+                  const current = state.stackNumbers[unit.id];
+                  state.stackNumbers[unit.id] =
+                    current && typeof current !== "number"
+                      ? { ...current, disposition: "observed", number }
+                      : number;
+                  save();
+                  await awaitCheckpointAdmission(state.repository, "settled");
+                },
+              });
+            },
             {
               operation: "github-stack",
               metadata: { unit: unit.id, layerCount: layers.length },
               summarize: (number) => ({ stack: number }),
             },
           ));
-        state.stackNumbers ??= {};
-        state.stackNumbers[unit.id] = stackNumber;
-        save();
       }
       // Merging an already merged PR or stack is confirmed, so a repeat or
       // a restart simply asks again.
@@ -1364,6 +1429,7 @@ export async function runNativeGraph(args: {
                         earlierHeads: deliveryEarlierHeads(topWork),
                       },
                       layers[0]!.headSha,
+                      mergeControl(state, top.id, save),
                     )
                   ).integratedSha
                 : await github.mergeNativeStack(
@@ -1372,14 +1438,59 @@ export async function runNativeGraph(args: {
                     stackNumber,
                     {
                       resumeUuid: state.stackMerges?.[unit.id]?.uuid,
-                      onPending: (uuid) => {
+                      beforeRequest: async () => {
+                        if (state.schemaVersion !== 17) return;
+                        if (state.stackMerges?.[unit.id])
+                          throw new Error(
+                            "Native stack merge intent is unresolved; reconcile its exact request before replacement",
+                          );
+                        state.stackMerges ??= {};
+                        state.stackMerges[unit.id] = {
+                          topPullRequest: layers.at(-1)!.pullRequest,
+                          expectedHeadSha: layers.at(-1)!.headSha,
+                          request: {
+                            layers: structuredClone(layers),
+                            baseBranch: defaultBranch,
+                            stackNumber: stackNumber!,
+                            submittedAt: new Date().toISOString(),
+                            disposition: "intent",
+                          },
+                        };
+                        save();
+                        try {
+                          await awaitCheckpointAdmission(
+                            state.repository,
+                            "before-effect",
+                          );
+                        } catch (error) {
+                          if (isCheckpointAdmissionFailure(error)) {
+                            state.stackMerges![unit.id]!.request!.disposition =
+                              "blocked";
+                            save();
+                          }
+                          throw error;
+                        }
+                      },
+                      onPending: async (uuid) => {
                         state.stackMerges ??= {};
                         state.stackMerges[unit.id] = {
                           topPullRequest: layers.at(-1)!.pullRequest,
                           expectedHeadSha: layers.at(-1)!.headSha,
                           uuid,
+                          ...(state.stackMerges?.[unit.id]?.request
+                            ? {
+                                request: {
+                                  ...state.stackMerges[unit.id]!.request!,
+                                  disposition: "observed" as const,
+                                },
+                              }
+                            : {}),
                         };
                         save();
+                        await awaitCheckpointAdmission(
+                          state.repository,
+                          "settled",
+                        );
                       },
                       progress: context.progress,
                       queued: (detail) =>

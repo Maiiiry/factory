@@ -16,20 +16,20 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { agentSessionContinuation } from "../dist/agent-session.js";
 import { analyzeInteractions } from "../dist/analysis.js";
 import { runAnalysisCommand } from "../dist/analysis-cli.js";
 import { readInteractionContent } from "../dist/capture.js";
+import { runCodexAppServer } from "../dist/codex-app-server.js";
 import {
   codexBoundaryTelemetry,
   codexJsonBoundaries,
 } from "../dist/codex-boundary-telemetry.js";
 import { codexStderrCapture } from "../dist/codex-exec.js";
-import { runCodexAppServer } from "../dist/codex-app-server.js";
 import {
-  assertReviewImages,
-  structuredRequestDigest,
-} from "../dist/compiler/transport.js";
-import { faultOf } from "../dist/fault.js";
+  CODEX_PLANNING_CONFIG,
+  createCodexHome,
+} from "../dist/codex-planning-isolation.js";
 import {
   CodexPlanningModel,
   renderCompilationCall,
@@ -43,19 +43,11 @@ import {
   hydrateWorkerInputSources,
   planningSources,
 } from "../dist/compiler/sources.js";
+import {
+  assertReviewImages,
+  structuredRequestDigest,
+} from "../dist/compiler/transport.js";
 import { factoryConfigDigest, stateRoot } from "../dist/config.js";
-import { agentSessionContinuation } from "../dist/agent-session.js";
-import {
-  CODEX_PLANNING_CONFIG,
-  createCodexHome,
-} from "../dist/codex-planning-isolation.js";
-import {
-  loadReviewArtifacts,
-  loadReviewArtifactObservations,
-  reviewArtifactEvidence,
-  materializeReviewImages,
-} from "../dist/review-image-evidence.js";
-import { assertReviewArtifactSelectors } from "../dist/review-artifacts.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { NativeStackDelivery } from "../dist/delivery/native-stack.js";
 import { RegularDelivery } from "../dist/delivery/regular.js";
@@ -66,17 +58,14 @@ import {
   summarizeFormalHistory,
   withDiagnosticSession,
 } from "../dist/diagnostics.js";
+import { workItemPrompt } from "../dist/execution/harness-support.js";
 import {
   CodexHarness,
   checkpointWorkerSession,
   LocalExecutionDriver,
 } from "../dist/execution/local.js";
 import { killGroup } from "../dist/execution/worker-process.js";
-import { workItemPrompt } from "../dist/execution/harness-support.js";
-import {
-  workerReadinessReceipt,
-  currentWorkerReadiness,
-} from "../dist/worker-readiness.js";
+import { faultOf } from "../dist/fault.js";
 import { RealGitHubGateway } from "../dist/github.js";
 import { withGitHubTransportObserver } from "../dist/github-client.js";
 import { graphDigest } from "../dist/graph-amendments.js";
@@ -99,8 +88,8 @@ import {
 import {
   assertCompletedCoverage,
   environmentValidationIndices,
-  reusableEnvironmentValidationIndices,
   objectivePreparationCommands,
+  reusableEnvironmentValidationIndices,
 } from "../dist/qa.js";
 import { preflightItemEnvironment } from "../dist/qa-execution.js";
 import {
@@ -111,6 +100,17 @@ import {
   repairScopes,
   resolveAutonomy,
 } from "../dist/repair-policy.js";
+import {
+  assertCommandReceipts,
+  commandPassEvidence,
+} from "../dist/result-evidence.js";
+import { assertReviewArtifactSelectors } from "../dist/review-artifacts.js";
+import {
+  loadReviewArtifactObservations,
+  loadReviewArtifacts,
+  materializeReviewImages,
+  reviewArtifactEvidence,
+} from "../dist/review-image-evidence.js";
 import {
   runObjectivePass,
   workItemPauseSignal,
@@ -144,10 +144,6 @@ import {
   validateWorkItem,
 } from "../dist/validation.js";
 import {
-  assertCommandReceipts,
-  commandPassEvidence,
-} from "../dist/result-evidence.js";
-import {
   actionableReadiness,
   applyWorkCorrection,
   CandidateValidationFailure,
@@ -156,6 +152,10 @@ import {
   repairEvidence,
   workRepairDiagnosisRequest,
 } from "../dist/work-repair.js";
+import {
+  currentWorkerReadiness,
+  workerReadinessReceipt,
+} from "../dist/worker-readiness.js";
 
 test("trusted child captures roundtrip through the configured private state root", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-worker-capture-"));
@@ -1698,7 +1698,7 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
     assert.equal(owner.workPause.signal.aborted, false);
     assert.equal(owner.pause.signal.aborted, true);
     await assert.rejects(validationStep, (error) => {
-      assert.ok(error instanceof CandidateValidationFailure);
+      assert.ok(error instanceof CandidateValidationFailure, error.stack);
       assert.equal(error.failedValidation.commands[0].exitCode, 1);
       // The delivery runner fails the admitted item after this real
       // validation command rejects, retaining its exact failed capture.
@@ -2542,11 +2542,11 @@ const control = publicationControl(state, "local", save);
 // Constructed before the first save: its empty history must never replace it.
 const stale = publicationControl(state, "local", save);
 const request = JSON.parse(process.argv[1]);
-control.beforeCreate(request);
+await control.beforeCreate(request);
 const retained = JSON.stringify(state.publicationIntents);
 assert.throws(() => stale.assertRequest(request), /control is stale/);
 assert.throws(() => stale.reconcileOnly, /control is stale/);
-assert.throws(() => stale.beforeCreate(request), /control is stale/);
+await assert.rejects(() => stale.beforeCreate(request), /control is stale/);
 assert.equal(JSON.stringify(state.publicationIntents), retained);
 assert.equal(JSON.stringify(readState(repository, 2).publicationIntents), retained);
 process.exit(23);`;

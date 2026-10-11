@@ -20,8 +20,8 @@ import {
   type PlanningRequest,
   type PlanReviewRequest,
   type ResultReviewEvidenceSource,
-  type ReviewImageInput,
   type ResultReviewFinding,
+  type ReviewImageInput,
   type ValidationCommandReceipt,
 } from "../contracts.js";
 import { attachedFault, attachFault, decision, transient } from "../fault.js";
@@ -796,7 +796,7 @@ export class StructuredPlanningModel implements PlanningModel {
         turn.stopped = true;
         throw new ProviderTurnElapsedTimeoutError(args.deadlineAt);
       }
-      invocation.beforeProviderAttempt?.();
+      await invocation.beforeProviderAttempt?.();
       await this.transport.run({
         role: args.role,
         prompt: args.prompt,
