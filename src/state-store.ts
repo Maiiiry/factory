@@ -291,7 +291,8 @@ export function readContinuation(
   if (!existsSync(path)) return undefined;
   const value = JSON.parse(readFileSync(path, "utf8"));
   assertCurrentVersion(repository, path, value);
-  if (!isPreparationState(value)) return readState(repository, objective);
+  if (!isPreparationState(value))
+    return parseExecutionAtPath(value, repository, objective, path);
   return parsePreparation(value, repository, objective);
 }
 
@@ -478,6 +479,15 @@ export function readState(
   if (!existsSync(path)) return undefined;
   const value = JSON.parse(readFileSync(path, "utf8"));
   assertCurrentVersion(repository, path, value);
+  return parseExecutionAtPath(value, repository, objective, path);
+}
+
+function parseExecutionAtPath(
+  value: unknown,
+  repository: string,
+  objective: number,
+  path: string,
+): FactoryState {
   try {
     return parseExecution(value, repository, objective);
   } catch (error) {
