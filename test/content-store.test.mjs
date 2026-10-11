@@ -11,6 +11,8 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -175,6 +177,53 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const store = new LocalContentStore(join(state, "content"));
   const source = readFileSync(join(checkout, "api.md"));
   const sourceRef = store.putBytes(source, { mediaType: "text/markdown" });
+  const retainedSourcePath = join(
+    state,
+    "content",
+    sourceRef.digest.slice(0, 2),
+    sourceRef.digest,
+  );
+  const retainedSourceIdentity = statSync(retainedSourcePath).ino;
+  assert.deepEqual(
+    store.putBytes(source, { mediaType: sourceRef.mediaType }),
+    sourceRef,
+  );
+  assert.equal(statSync(retainedSourcePath).ino, retainedSourceIdentity);
+  assert.deepEqual(store.readBytes(sourceRef), source);
+  chmodSync(retainedSourcePath, 0o644);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /owned private regular file/,
+    );
+  } finally {
+    chmodSync(retainedSourcePath, 0o600);
+  }
+  const changedSource = Buffer.from(source);
+  changedSource[0] ^= 1;
+  writeFileSync(retainedSourcePath, changedSource);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /digest verification/,
+    );
+  } finally {
+    writeFileSync(retainedSourcePath, source);
+  }
+  rmSync(retainedSourcePath);
+  symlinkSync(join(checkout, "api.md"), retainedSourcePath);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /regular file|symlink/,
+    );
+  } finally {
+    rmSync(retainedSourcePath);
+    assert.deepEqual(
+      store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      sourceRef,
+    );
+  }
   const memory = new LocalRepositoryMemory(state, "fixture/memory", store);
   const record = {
     schemaVersion: 1,
@@ -860,9 +909,22 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   // the same batch I/O used by full archive publication and verification.
   const opaque = Buffer.alloc(1024 * 1024, 0xff);
   opaque.set([0xff, 0x00, 0x0a, 0x80]);
-  const opaqueRef = store.putBytes(opaque, {
+  const opaqueRef = await store.put(Readable.toWeb(Readable.from([opaque])), {
     mediaType: "application/octet-stream",
   });
+  const opaquePath = join(
+    state,
+    "content",
+    opaqueRef.digest.slice(0, 2),
+    opaqueRef.digest,
+  );
+  const opaqueIdentity = statSync(opaquePath).ino;
+  assert.deepEqual(
+    store.putBytes(opaque, { mediaType: opaqueRef.mediaType }),
+    opaqueRef,
+  );
+  assert.equal(statSync(opaquePath).ino, opaqueIdentity);
+  assert.deepEqual(store.readBytes(opaqueRef), opaque);
   const batchObjects = join(root, "batch-objects.git");
   execFileSync(
     "git",

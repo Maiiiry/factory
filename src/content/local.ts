@@ -56,7 +56,7 @@ export class LocalContentStore implements ContentStore {
     return join(this.root, ref.digest.slice(0, 2), ref.digest);
   }
 
-  /** Retain small controller manifests before publishing the atomic snapshot. */
+  /** Retain complete controller bytes before publishing the atomic snapshot. */
   putBytes(bytes: Uint8Array, metadata: ContentMetadata): ContentRef {
     if (!metadata.mediaType) throw new Error("Content metadata is incomplete");
     const ref = {
@@ -66,6 +66,7 @@ export class LocalContentStore implements ContentStore {
     };
     const path = this.path(ref);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    if (this.retainExisting(ref)) return ref;
     const temporary = join(this.root, `${randomUUID()}.tmp`);
     const fd = openSync(temporary, "wx", 0o600);
     let complete = false;
@@ -85,44 +86,74 @@ export class LocalContentStore implements ContentStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
-      this.readBytes(ref);
-      const directory = openSync(dirname(path), "r");
-      try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
-      }
+      if (!this.retainExisting(ref))
+        throw new Error(`Content object ${ref.digest} is missing`);
       return ref;
     } finally {
       rmSync(temporary, { force: true });
     }
   }
 
-  /** Exact complete bytes for synchronous controller retention and lookup. */
-  readBytes(ref: ContentRef): Buffer {
+  private openObject(ref: ContentRef): number {
     const path = this.path(ref);
     if (realpathSync(dirname(path)) !== resolve(dirname(path)))
       throw new Error("Content object parent resolves through a symlink");
     if (!lstatSync(path).isFile())
       throw new Error("Content object must be a regular file");
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  }
+
+  private readDescriptor(fd: number, ref: ContentRef): Buffer {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077)
+      throw new Error("Content object must be an owned private regular file");
+    if (stat.size !== ref.bytes)
+      throw new Error(
+        `Content object ${ref.digest} failed digest verification`,
+      );
+    const bytes = readFileSync(fd);
+    if (
+      bytes.length !== ref.bytes ||
+      createHash("sha256").update(bytes).digest("hex") !== ref.digest
+    )
+      throw new Error(
+        `Content object ${ref.digest} failed digest verification`,
+      );
+    return bytes;
+  }
+
+  private retainExisting(ref: ContentRef): boolean {
+    let fd: number;
     try {
-      const stat = fstatSync(fd);
-      if (
-        !stat.isFile() ||
-        stat.uid !== process.getuid?.() ||
-        stat.mode & 0o077
-      )
-        throw new Error("Content object must be an owned private regular file");
-      const bytes = readFileSync(fd);
-      if (
-        bytes.length !== ref.bytes ||
-        createHash("sha256").update(bytes).digest("hex") !== ref.digest
-      )
-        throw new Error(
-          `Content object ${ref.digest} failed digest verification`,
-        );
-      return bytes;
+      fd = this.openObject(ref);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    try {
+      this.readDescriptor(fd, ref);
+      // Existing streamed imports also require a durable directory entry.
+      fsyncSync(fd);
+      const directory = openSync(
+        dirname(this.path(ref)),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+      return true;
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /** Exact complete bytes for synchronous controller retention and lookup. */
+  readBytes(ref: ContentRef): Buffer {
+    const fd = this.openObject(ref);
+    try {
+      return this.readDescriptor(fd, ref);
     } finally {
       closeSync(fd);
     }
