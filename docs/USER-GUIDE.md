@@ -800,6 +800,22 @@ Status distinguishes pending local changes, the attempted publication, failure o
 
 With `private-history`, critical external actions wait for the saved intent and charged allowance to be durably acknowledged. A `repository-knowledge` archive protects eligible memory only; execution still has local continuation storage. Ordinary settled writes can coalesce within the configured interval. A lost publication response retains its attempted base and candidate; reconciliation reads that exact revision rather than blindly pushing again. Conflicts stop publication without force push, reset or silently replacing another writer's history.
 
-Checkpoints preserve historical controller/provider owner receipts and unknown effects. Fetching them on another machine grants no foreign-process resume, watch consent, service activation, acceptance or replay. Fresh-host operational restoration is a separate supported recovery operation; do not copy old lock files, edit snapshots or start from a new state root to evade an unresolved owner. Archived queue observations are historical; restoring a checkpoint does not enqueue work or activate a service.
+Checkpoints preserve historical controller/provider owner receipts and unknown effects. Fetching them on another machine grants no foreign-process resume, watch consent, service activation, acceptance or replay. Archived queue observations are historical; current membership, order and control are read from the bound Project.
+
+### Restore on another installation
+
+Prepare the target's ordinary Git checkout and approved private configuration on the destination machine. Keep the same repository, archive binding, providers, model/profile choices, commands, permissions and limits. Only the local checkout and state-root layout may be rebound through restore. No installed packages, ignored runtime files or provider login are recovered from Git; use the supported setup and exact runtime preparation commands when continuation becomes eligible.
+
+```sh
+factory persistence restore --config /private/factory.json
+factory status --objective N --json --config /private/factory.json
+factory persistence reconcile --objective N --config /private/factory.json
+```
+
+Restore authenticates the complete checkpoint before installing private replicas, original accounting and learning records, exact source/result Git objects and rebuilt search indexes. It retains original snapshots and seals, recording any checked host-layout binding in the existing atomic continuation. Restored Objectives begin held for inspection. Status reports the checkpoint and precise reconciliation reason. Import does not restart an Objective, enqueue it, register a service or consume another provider attempt.
+
+New private checkpoints retain the original execution configuration and host-independent semantic authority. Reconciliation permits only an exactly bound continuation whose recorded resources and effects are authoritatively settled. An empty destination process table, old PID, elapsed lease, missing native home or opaque session ID is not proof that another host stopped. Unknown submissions and foreign native resources remain held; do not delete their records, copy credential-bearing homes, manually edit state or create another state root to evade that hold. Original charged starts, deadlines, failures and terminal outcomes remain intact. Older checkpoints missing an authority binding, or snapshots from a different historical configuration, remain inspection-only.
+
+A latest-tip restore records an independently verified local archive baseline after replica installation. That receipt is separate from an original push response; historical transport uncertainty stays unknown. To inspect an older retained checkpoint, use `factory persistence restore --checkpoint COMMIT_SHA --config /private/factory.json`. A historical selection cannot grant publication over a newer archive. Reconciliation and any later execution still use existing lifecycle, ownership, permission and allowance checks. Service activation and provider authentication remain separate explicit operations.
 
 `persistence inspect` performs a bounded authenticated read of the archive. It reports current manifest/file bytes, deduplicated body bytes, and reachable logical Git-object history separately. Those sizes do not measure the hosting service's physical allocation. An unavailable history measurement stays unavailable; Factory does not automatically delete checkpoints or rewrite published history.

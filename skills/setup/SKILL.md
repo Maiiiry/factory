@@ -20,6 +20,7 @@ Running `setup --background` is the service consent. It grants no provider spend
 
 - GitHub `OWNER/REPO` and the trusted absolute checkout path. Read the target's instructions.
 - For background operation, the existing Project, dedicated TEXT metadata and NUMBER order field IDs, and existing control card. Bind them under `queue.project` with explicit managed-field consent and a private-history Git checkpoint destination. Reuse approved bindings; verify access and actual field types. Missing Project/field or archive choices belong to the operator; setup does not create them or infer consent from roadmap cards.
+- On a replacement installation with an approved Git archive, use `factory persistence restore` and inspect retained ownership before activation. Restore supplies no provider login, runtime preparation, watch consent or proof that a foreign owner ceased. Never copy native homes or clear a restored hold by editing state.
 - Optional: `--concurrency N` (omit it and Factory sizes workers from the host), `--delivery regular|native-stack`, `--network host|off`, and role models with `--planning-model`, `--review-model`, `--worker-model` plus matching `--*-reasoning`.
 - For `--planning claude-agent-sdk`, ask for the planning and review models. It uses the operator's `claude auth login`.
 
