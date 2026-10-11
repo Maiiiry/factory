@@ -12,12 +12,14 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import type {
@@ -32,7 +34,10 @@ import type {
   WorkItem,
 } from "./contracts.js";
 import { CONTROLLER_CAPABILITIES_DIGEST } from "./controller-capabilities.js";
-import { checkStagedCandidate } from "./execution/staged-candidate.js";
+import {
+  checkStagedCandidate,
+  scanPrivateStaging,
+} from "./execution/staged-candidate.js";
 import {
   addWorktree,
   command,
@@ -445,6 +450,7 @@ export async function captureAssetSets(
     path: ".factory-assets.json";
     ref: ContentRef;
   }) => void | Promise<void>,
+  checkout: string = worktree,
 ): Promise<CapturedAssetSet[]> {
   const declaration = join(worktree, ".factory-assets.json");
   let declarationBytes: Buffer | undefined;
@@ -453,6 +459,22 @@ export async function captureAssetSets(
     declarationBytes = judgedAsWork(() =>
       readRegularStagingFile(declaration, "AssetSet manifest"),
     );
+    // Scan the exact safely read bytes that will be retained, rather than
+    // reopening worker-controlled staging during the asynchronous scan.
+    const scanRoot = mkdtempSync(
+      join(dirname(resolve(worktree)), "manifest-scan-"),
+    );
+    try {
+      const scanPath = join(scanRoot, ".factory-assets.json");
+      writeFileSync(scanPath, declarationBytes, { mode: 0o600, flag: "wx" });
+      await scanPrivateStaging(
+        resolve(worktree),
+        resolve(checkout),
+        relative(resolve(worktree), scanPath),
+      );
+    } finally {
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
     manifestRef = await store.put(
       new ReadableStream({
         start(controller) {

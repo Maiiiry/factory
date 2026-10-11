@@ -198,6 +198,44 @@ test("a complete selected AssetSet is retained by digest and committed through t
       ),
       true,
     );
+    const unsafeStaging = join(root, "unsafe-staging");
+    mkdirSync(unsafeStaging);
+    // The same deliberately invalid fixture value exercised by the real
+    // scanner integration; this is not an account credential.
+    const unsafeOriginal = Buffer.from(
+      JSON.stringify({
+        sets,
+        credentialFixture: "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      }),
+    );
+    writeFileSync(join(unsafeStaging, ".factory-assets.json"), unsafeOriginal);
+    let checkpointedUnsafeOriginal = false;
+    await assert.rejects(
+      captureAssetSets(
+        store,
+        unsafeStaging,
+        item,
+        sets,
+        {
+          harness: "integration-filesystem",
+        },
+        [],
+        () => {
+          checkpointedUnsafeOriginal = true;
+        },
+      ),
+      /Secretlint found suspected secret/,
+    );
+    assert.equal(checkpointedUnsafeOriginal, false);
+    assert.throws(
+      () =>
+        store.readBytes({
+          digest: createHash("sha256").update(unsafeOriginal).digest("hex"),
+          bytes: unsafeOriginal.length,
+          mediaType: "application/json",
+        }),
+      /ENOENT/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
