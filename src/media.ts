@@ -441,7 +441,41 @@ export async function captureAssetSets(
   sets: ProducedAssetSet[],
   evidence: unknown,
   inputs: { binding: SourceAssetBinding; ref: ContentRef }[] = [],
+  checkpointManifest?: (manifest: {
+    path: ".factory-assets.json";
+    ref: ContentRef;
+  }) => void | Promise<void>,
 ): Promise<CapturedAssetSet[]> {
+  const declaration = join(worktree, ".factory-assets.json");
+  let declarationBytes: Buffer | undefined;
+  let manifestRef: ContentRef | undefined;
+  if (existsSync(declaration)) {
+    declarationBytes = judgedAsWork(() =>
+      readRegularStagingFile(declaration, "AssetSet manifest"),
+    );
+    manifestRef = await store.put(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(declarationBytes!);
+          controller.close();
+        },
+      }),
+      { mediaType: "application/json" },
+    );
+    if (
+      manifestRef.digest !==
+        createHash("sha256").update(declarationBytes).digest("hex") ||
+      manifestRef.bytes !== declarationBytes.length ||
+      manifestRef.mediaType !== "application/json"
+    )
+      throw new Error(
+        "Retained AssetSet manifest differs from its original bytes",
+      );
+    await checkpointManifest?.({
+      path: ".factory-assets.json",
+      ref: manifestRef,
+    });
+  }
   parseProducedAssetSets(sets);
   if (new Set(sets.map((set) => set.id)).size !== sets.length)
     throw workFault("Produced AssetSet identifiers must be unique");
@@ -466,12 +500,8 @@ export async function captureAssetSets(
       .update(JSON.stringify(evidence ?? {}))
       .digest("hex"),
   };
-  const declaration = join(worktree, ".factory-assets.json");
   let declarationDigest = "";
-  if (sets.length && existsSync(declaration)) {
-    const declarationBytes = judgedAsWork(() =>
-      readRegularStagingFile(declaration, "AssetSet manifest"),
-    );
+  if (declarationBytes) {
     const value: unknown = judgedAsWork(() =>
       JSON.parse(declarationBytes.toString("utf8")),
     );
@@ -587,6 +617,7 @@ export async function captureAssetSets(
         throw workFault(`AssetSet ${set.id} lacks expected role ${role}`);
     captured.push({
       id: set.id,
+      ...(manifestRef && { manifestRef }),
       ...(inputs.length && { inputs }),
       members,
       ...(set.relationships && { relationships: set.relationships }),
@@ -613,7 +644,6 @@ export async function captureAssetSets(
       },
     });
   }
-  rmSync(mediaRoot, { recursive: true, force: true });
   if (
     new Set(
       captured.map((set) =>
@@ -624,6 +654,7 @@ export async function captureAssetSets(
     ).size !== captured.length
   )
     throw workFault("Candidate AssetSets must have distinct content");
+  rmSync(mediaRoot, { recursive: true, force: true });
   return captured;
 }
 
@@ -631,6 +662,15 @@ export async function captureAssetSets(
 export function assertAssetCaptureReceipt(set: CapturedAssetSet): void {
   const receipt = set.capture;
   if (!receipt) throw new Error("AssetSet lacks a controller capture receipt");
+  if (
+    set.manifestRef &&
+    (set.manifestRef.digest !== receipt.declarationDigest ||
+      !/^[a-f0-9]{64}$/.test(set.manifestRef.digest) ||
+      !Number.isSafeInteger(set.manifestRef.bytes) ||
+      set.manifestRef.bytes < 0 ||
+      set.manifestRef.mediaType !== "application/json")
+  )
+    throw new Error("AssetSet original manifest reference is invalid");
   if (
     receipt.authority !== "factory-controller" ||
     receipt.mediaRoot !== ".factory-media" ||
