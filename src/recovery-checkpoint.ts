@@ -2259,13 +2259,11 @@ async function freshArchiveOwned(
   const directory =
     context?.directory ??
     join(paths(config.repository).root, `verify-${randomUUID()}.git`);
-  initializeGit(directory, options);
-  if (context) {
-    context.directory = directory;
-    chmodSync(directory, 0o700);
-  }
+  if (context) context.directory = directory;
   let settled = true;
   try {
+    initializeGit(directory, options);
+    if (context) chmodSync(directory, 0o700);
     if (context) assertRemoteOnlyVerifier(directory, options);
     const tip = await remoteTip(directory, options);
     if (!tip) throw new Error("Configured Git archive ref has no checkpoint");
