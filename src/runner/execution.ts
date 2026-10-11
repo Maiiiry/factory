@@ -80,6 +80,7 @@ import {
   activateProjectedObjective,
 } from "./projection.js";
 import { finalizeObjective } from "./finalization.js";
+import { assertDiscoveryAdmission } from "./discovery.js";
 
 /** Publish the execution snapshot before yielding to live owner control. */
 export function checkpointExecutionState(
@@ -445,6 +446,8 @@ export async function runObjectivePass(
       });
     }
     const graph = state.graph;
+    for (const item of graph.items)
+      assertDiscoveryAdmission(config, state, item);
     verifyExecutionProfiles(graph, executionProfileChoices(config));
     await diagnostics.span(
       { runId: state.runId, operation: "execution-driver-preflight" },

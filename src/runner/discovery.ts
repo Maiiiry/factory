@@ -17,8 +17,32 @@ import { cancelledFault, StepFault, workFault } from "../fault.js";
 import { graphDigest } from "../graph-amendments.js";
 import { executeItem } from "../item-steps.js";
 import type { PhaseAdmission } from "../phase-admission.js";
+import { ownsPath } from "../ownership.js";
 import type { FactoryState } from "../state.js";
 import { step } from "../step.js";
+
+/** Accepted model selectors stay within the operator's immutable read ceiling. */
+export function assertDiscoveryAdmission(
+  config: FactoryConfig,
+  state: FactoryState,
+  item: WorkItem,
+): void {
+  if (item.kind !== "discovery") return;
+  const admitted = config.planningContext?.selectors;
+  if (
+    state.schemaVersion !== 9 ||
+    !config.planningContext?.enabled ||
+    !admitted ||
+    !item.discovery ||
+    item.discovery.selectors.some((selector) => !ownsPath(selector, admitted))
+  )
+    throw new StepFault({
+      kind: "config",
+      detail:
+        "Discovery selectors exceed the recorded adaptive source authority",
+      fix: "Use discovery selectors within the approved planningContext selector ceiling",
+    });
+}
 
 /** Discovery uses the ordinary Work Item ownership, step allowance and phase admission. */
 export async function runDiscoveryItem(args: {
@@ -36,6 +60,7 @@ export async function runDiscoveryItem(args: {
   diagnostics?: DiagnosticEmitter;
 }): Promise<void> {
   const { state, item, phases, save } = args;
+  assertDiscoveryAdmission(args.config, state, item);
   const spec = item.discovery;
   if (item.kind !== "discovery" || !spec)
     throw new Error("Discovery execution requires its accepted specification");
