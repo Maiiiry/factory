@@ -64,7 +64,11 @@ import type {
   PreparationState,
   WorkState,
 } from "./state.js";
-import { isPreparationState, projectionStarted } from "./state.js";
+import {
+  isPreparationState,
+  observedStackNumber,
+  projectionStarted,
+} from "./state.js";
 import type { PreState } from "./state-store.js";
 import {
   type PendingDecisionView,
@@ -2519,7 +2523,11 @@ export class StateDiagnostics {
         });
       this.previousReadiness.set(item.id, reason);
     }
-    for (const [unit, number] of Object.entries(this.state.stackNumbers ?? {}))
+    for (const [unit, receipt] of Object.entries(
+      this.state.stackNumbers ?? {},
+    )) {
+      const number = observedStackNumber(receipt);
+      if (number === undefined) continue;
       if (this.previousStacks.get(unit) !== number) {
         this.emitter.emit({
           runId: this.state.runId,
@@ -2529,6 +2537,7 @@ export class StateDiagnostics {
         });
         this.previousStacks.set(unit, number);
       }
+    }
     if (
       this.state.integratedSha !== this.previousIntegrated &&
       this.state.integratedSha
