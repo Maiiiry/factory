@@ -894,7 +894,9 @@ export async function restoreRecoveryCheckpoint(args: {
   const { installExactMemoryLearning } = await import(
     "./repository-memory-transfer.js"
   );
-  const { parseQueueRecord } = await import("./project-queue-state.js");
+  const { parseQueueRecord, authenticateQueueOwnerReferences } = await import(
+    "./project-queue-state.js"
+  );
   const assertProjectQueueWriteReceipt: typeof import("./github-project-queue.js").assertProjectQueueWriteReceipt =
     (await import("./github-project-queue.js")).assertProjectQueueWriteReceipt;
   const { proposalPersistenceReferences } = await import("./proposals.js");
@@ -1020,6 +1022,7 @@ export async function restoreRecoveryCheckpoint(args: {
             if (effect.rejectedOriginal)
               await readBytes(effect.rejectedOriginal);
           }
+        else await authenticateQueueOwnerReferences(record, readBytes);
         replicaFiles.push(file);
       } else if (
         file.kind === "historical" &&

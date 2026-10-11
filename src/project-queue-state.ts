@@ -35,16 +35,28 @@ import {
 } from "./github-project-queue.js";
 import {
   awaitCheckpointAdmission,
+  assertRecoveryCheckpointManifest,
   hasPrivateCheckpointScope,
   markCheckpointDirty,
   type RecoveryCheckpointClosure,
   readVerifiedRecoveryCheckpoint,
+  type QueueCheckpointWitness,
 } from "./recovery-checkpoint.js";
 import type { ContinuationState } from "./state.js";
 import {
   assertRestoredContinuationReady,
   continuationConfigurationMatches,
+  parsePortableContinuation,
+  readControllerOwner,
+  objectiveLockPath,
+  installationLockPath,
+  statePath,
+  restoredContinuationOwnershipHold,
+  type ControllerLock,
 } from "./state-store.js";
+import { canHandoff } from "./runner/ownership.js";
+import { isExecutionState } from "./state.js";
+import { linuxProcessIdentity } from "./process.js";
 
 export const queueDigest = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
@@ -148,7 +160,31 @@ export interface QueueOwnerClaim {
   at: string;
   deadlineAt: string | null;
   priorRunId?: string;
-  settled?: { at: string; runId?: string; disposition: "quiescent" };
+  runBinding?: { schemaVersion: 1; runId: string; initialSnapshot: ContentRef };
+  settled?: {
+    at: string;
+    runId?: string;
+    disposition: "quiescent";
+    cancellation?: QueueCancellationProof;
+  };
+}
+export interface QueueCancellationProof {
+  schemaVersion: 1;
+  originalClaim: ContentRef;
+  initialSnapshot: ContentRef;
+  cancelledSnapshot: ContentRef;
+  configDigest: string;
+  owner: { pid: number; startTime: string; tokenDigest: string };
+  lineage:
+    | { kind: "producer-bound" }
+    | {
+        kind: "verified-first-run";
+        checkpoints: {
+          before: QueueCheckpointWitness;
+          claimed: QueueCheckpointWitness;
+          initial: QueueCheckpointWitness;
+        };
+      };
 }
 type QueueRecord = QueueOperation | QueueOwnerClaim;
 const ref = (value: unknown): value is ContentRef => {
@@ -191,6 +227,7 @@ export function parseQueueRecord(
       "at",
       "deadlineAt",
       "priorRunId",
+      "runBinding",
       "settled",
     ]);
     if (
@@ -204,15 +241,79 @@ export function parseQueueRecord(
       (row.priorRunId !== undefined && !uuid(row.priorRunId))
     )
       throw new Error("Invalid Project queue owner identity");
+    if (row.runBinding !== undefined) {
+      const binding = object(row.runBinding);
+      only(binding, ["schemaVersion", "runId", "initialSnapshot"]);
+      if (
+        binding.schemaVersion !== 1 ||
+        !uuid(binding.runId) ||
+        !ref(binding.initialSnapshot)
+      )
+        throw new Error("Invalid immutable Project run binding");
+    }
     if (row.settled !== undefined) {
       const settled = object(row.settled);
-      only(settled, ["at", "runId", "disposition"]);
+      only(settled, ["at", "runId", "disposition", "cancellation"]);
       if (
         !date(settled.at) ||
         settled.disposition !== "quiescent" ||
         (settled.runId !== undefined && !uuid(settled.runId))
       )
         throw new Error("Invalid Project queue owner settlement");
+      if (settled.cancellation !== undefined) {
+        const proof = object(settled.cancellation);
+        only(proof, [
+          "schemaVersion",
+          "originalClaim",
+          "initialSnapshot",
+          "cancelledSnapshot",
+          "configDigest",
+          "owner",
+          "lineage",
+        ]);
+        const owner = object(proof.owner);
+        only(owner, ["pid", "startTime", "tokenDigest"]);
+        const lineage = object(proof.lineage);
+        only(
+          lineage,
+          lineage.kind === "verified-first-run"
+            ? ["kind", "checkpoints"]
+            : ["kind"],
+        );
+        if (
+          proof.schemaVersion !== 1 ||
+          !uuid(settled.runId) ||
+          !ref(proof.originalClaim) ||
+          !ref(proof.initialSnapshot) ||
+          !ref(proof.cancelledSnapshot) ||
+          !digest(proof.configDigest) ||
+          !Number.isSafeInteger(owner.pid) ||
+          Number(owner.pid) < 1 ||
+          typeof owner.startTime !== "string" ||
+          !owner.startTime ||
+          !digest(owner.tokenDigest) ||
+          !["producer-bound", "verified-first-run"].includes(
+            String(lineage.kind),
+          )
+        )
+          throw new Error("Invalid attributable Project cancellation proof");
+        if (lineage.kind === "verified-first-run") {
+          const witnesses = object(lineage.checkpoints);
+          only(witnesses, ["before", "claimed", "initial"]);
+          for (const name of ["before", "claimed", "initial"]) {
+            const witness = object(witnesses[name]);
+            only(witness, ["commitSha", "manifest"]);
+            if (
+              typeof witness.commitSha !== "string" ||
+              !/^[a-f0-9]{40,64}$/.test(witness.commitSha) ||
+              !ref(witness.manifest)
+            )
+              throw new Error(
+                "Invalid historical Project cancellation witness",
+              );
+          }
+        }
+      }
     }
   } else {
     only(row, [
@@ -414,10 +515,15 @@ function save(record: QueueRecord): void {
       previous.kind === "project-queue-owner" &&
       record.kind === "project-queue-owner"
     ) {
-      const { settled: oldSettled, ...oldBinding } = previous;
-      const { settled: newSettled, ...newBinding } = record;
+      const {
+        settled: oldSettled,
+        runBinding: oldRun,
+        ...oldBinding
+      } = previous;
+      const { settled: newSettled, runBinding: newRun, ...newBinding } = record;
       if (
         JSON.stringify(oldBinding) !== JSON.stringify(newBinding) ||
+        (oldRun && JSON.stringify(oldRun) !== JSON.stringify(newRun)) ||
         (oldSettled &&
           JSON.stringify(oldSettled) !== JSON.stringify(newSettled))
       )
@@ -444,6 +550,209 @@ function save(record: QueueRecord): void {
   markCheckpointDirty(record.repository, {
     path,
     kind: "project-queue-receipt",
+  });
+}
+function queueOwnerReferences(record: QueueOwnerClaim): ContentRef[] {
+  const refs = [
+    ...(record.runBinding ? [record.runBinding.initialSnapshot] : []),
+  ];
+  const proof = record.settled?.cancellation;
+  if (proof) {
+    refs.push(
+      proof.originalClaim,
+      proof.initialSnapshot,
+      proof.cancelledSnapshot,
+    );
+    if (proof.lineage.kind === "verified-first-run")
+      refs.push(
+        ...Object.values(proof.lineage.checkpoints).map(
+          (witness) => witness.manifest,
+        ),
+      );
+  }
+  const distinct = new Map<string, ContentRef>();
+  for (const reference of refs) {
+    const previous = distinct.get(reference.digest);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(reference))
+      throw new Error("Project ownership reference binding differs");
+    distinct.set(reference.digest, reference);
+  }
+  return [...distinct.values()];
+}
+function assertQueueOwnerReferenceBodies(
+  record: QueueOwnerClaim,
+  readReference: (ref: ContentRef) => Uint8Array,
+): ContentRef[] {
+  parseQueueRecord(
+    Buffer.from(JSON.stringify(record)),
+    record.repository,
+    record.id,
+  );
+  const bytes = (ref: ContentRef) => {
+    const data = Buffer.from(readReference(ref));
+    if (
+      data.length !== ref.bytes ||
+      createHash("sha256").update(data).digest("hex") !== ref.digest
+    )
+      throw new Error("Project ownership original bytes differ");
+    return data;
+  };
+  const json = (ref: ContentRef) =>
+    JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes(ref)));
+  const snapshot = (ref: ContentRef) =>
+    parsePortableContinuation(json(ref), record.repository, record.objective);
+  const matches = (state: ContinuationState, runId: string) => {
+    if (
+      state.runId !== runId ||
+      state.objectiveBodyDigest !== record.bodyDigest ||
+      (state.coordinator?.deadlineAt ?? null) !== record.deadlineAt ||
+      (record.priorRunId !== undefined && record.priorRunId !== runId)
+    )
+      throw new Error(
+        "Project claim differs from its original run/body/deadline",
+      );
+  };
+  if (record.runBinding)
+    matches(
+      snapshot(record.runBinding.initialSnapshot),
+      record.runBinding.runId,
+    );
+  const proof = record.settled?.cancellation;
+  if (proof) {
+    const original = parseQueueRecord(
+      bytes(proof.originalClaim),
+      record.repository,
+      record.id,
+    );
+    if (original.kind !== "project-queue-owner" || original.settled)
+      throw new Error(
+        "Cancellation requires the original unfinished Project claim",
+      );
+    const { settled: ignored, runBinding: run, ...binding } = record;
+    const {
+      settled: originalIgnored,
+      runBinding: originalRun,
+      ...originalBinding
+    } = original;
+    if (JSON.stringify(binding) !== JSON.stringify(originalBinding))
+      throw new Error("Cancellation cannot rewrite the original Project claim");
+    const initial = snapshot(proof.initialSnapshot);
+    const terminal = snapshot(proof.cancelledSnapshot);
+    matches(initial, record.settled!.runId!);
+    matches(terminal, record.settled!.runId!);
+    if (
+      initial.configDigest !== proof.configDigest ||
+      terminal.configDigest !== proof.configDigest ||
+      !terminal.cancelledAt ||
+      !terminal.cancelRequested ||
+      Date.parse(record.settled!.at) < Date.parse(terminal.cancelledAt) ||
+      (isExecutionState(terminal) && terminal.finalAcceptance) ||
+      !canHandoff(terminal) ||
+      restoredContinuationOwnershipHold(terminal)
+    )
+      throw new Error(
+        "Project cancellation has no authenticated terminal quiescent continuation",
+      );
+    if (proof.lineage.kind === "producer-bound") {
+      if (
+        !run ||
+        !originalRun ||
+        run.runId !== record.settled!.runId ||
+        JSON.stringify(run) !== JSON.stringify(originalRun) ||
+        JSON.stringify(run.initialSnapshot) !==
+          JSON.stringify(proof.initialSnapshot)
+      )
+        throw new Error(
+          "Cancellation differs from the producer-bound Project run",
+        );
+    } else {
+      if (
+        record.deadlineAt === null ||
+        original.priorRunId ||
+        original.runBinding ||
+        !initial.coordinator?.phaseStartedAt ||
+        Date.parse(initial.coordinator.phaseStartedAt) <
+          Date.parse(record.at) ||
+        Date.parse(initial.coordinator.phaseStartedAt) >
+          Date.parse(record.deadlineAt)
+      )
+        throw new Error("Historical first-run Project provenance is ambiguous");
+      const { checkpoints } = proof.lineage;
+      const manifests = Object.fromEntries(
+        Object.entries(checkpoints).map(([key, witness]) => [
+          key,
+          json(witness.manifest),
+        ]),
+      );
+      for (const manifest of Object.values(manifests)) {
+        assertRecoveryCheckpointManifest(manifest, manifests.initial.binding, {
+          maxBytes: Number.MAX_SAFE_INTEGER,
+          maxFiles: Number.MAX_SAFE_INTEGER,
+        });
+        if (
+          manifest.binding.repository !== record.repository ||
+          manifest.binding.scope !== "private-history" ||
+          manifest.binding.visibility !== "private"
+        )
+          throw new Error(
+            "Historical cancellation witnesses have invalid private binding",
+          );
+      }
+      const claimPath = `project-queue-history/${record.id}.json`;
+      const statePaths = [
+        `objectives/${record.objective}/state.json`,
+        `objectives/${record.objective}/pre-state.json`,
+      ];
+      if (
+        manifests.before.files.some(
+          (file: { path: string }) =>
+            file.path === claimPath || statePaths.includes(file.path),
+        ) ||
+        manifests.claimed.files.find(
+          (file: { path: string }) => file.path === claimPath,
+        )?.ref.digest !== proof.originalClaim.digest ||
+        manifests.initial.files.find(
+          (file: { path: string }) => file.path === claimPath,
+        )?.ref.digest !== proof.originalClaim.digest ||
+        manifests.initial.files.find((file: { path: string }) =>
+          statePaths.includes(file.path),
+        )?.ref.digest !== proof.initialSnapshot.digest ||
+        !(
+          manifests.before.sequence < manifests.claimed.sequence &&
+          manifests.claimed.sequence <= manifests.initial.sequence
+        ) ||
+        manifests.initial.authority?.configDigest !== proof.configDigest ||
+        manifests.initial.authority?.authorityDigest !==
+          record.authorityDigest ||
+        manifests.claimed.authority?.configDigest !== proof.configDigest ||
+        manifests.claimed.authority?.authorityDigest !==
+          record.authorityDigest ||
+        Date.parse(manifests.before.createdAt) > Date.parse(record.at) ||
+        Date.parse(manifests.claimed.createdAt) < Date.parse(record.at) ||
+        Date.parse(manifests.initial.createdAt) <
+          Date.parse(initial.coordinator.phaseStartedAt)
+      )
+        throw new Error(
+          "Historical cancellation witnesses differ from original claim/run cohort",
+        );
+    }
+  }
+  const refs = queueOwnerReferences(record);
+  for (const reference of refs) bytes(reference);
+  return refs;
+}
+export async function authenticateQueueOwnerReferences(
+  record: QueueOwnerClaim,
+  readReference: (ref: ContentRef) => Promise<Uint8Array> | Uint8Array,
+): Promise<ContentRef[]> {
+  const refs = queueOwnerReferences(record);
+  const bodies = new Map<string, Uint8Array>();
+  for (const reference of refs)
+    bodies.set(reference.digest, await readReference(reference));
+  return assertQueueOwnerReferenceBodies(record, (reference) => {
+    const bytes = bodies.get(reference.digest);
+    if (!bytes) throw new Error("Project ownership original is unavailable");
+    return bytes;
   });
 }
 export function projectQueuePersistenceClosure(
@@ -476,6 +785,12 @@ export function projectQueuePersistenceClosure(
       visibility: "private",
     });
     closure.contentRefs.push(body);
+    if (record.kind === "project-queue-owner")
+      closure.contentRefs.push(
+        ...assertQueueOwnerReferenceBodies(record, (reference) =>
+          store.readBytes(reference),
+        ),
+      );
     if (record.kind === "project-queue-operation")
       for (const effect of record.effects) {
         if (effect.original) {
@@ -545,6 +860,10 @@ export async function readQueueHistory(
             ),
           });
         }
+    if (record.kind === "project-queue-owner")
+      await authenticateQueueOwnerReferences(record, (reference) =>
+        archive.readVerifiedBlob(reference),
+      );
     if (records.some((previous) => previous.id === record.id))
       throw new Error("Duplicate archived Project queue receipt");
     records.push(record);
@@ -988,6 +1307,210 @@ export async function settleProjectQueueRun(
     disposition: "quiescent",
     ...(runId ? { runId } : {}),
   };
+  save(claim);
+  await awaitCheckpointAdmission(config.repository, "explicit");
+}
+
+/** Freeze the literal first canonical snapshot before the controller admits work. */
+export function bindProjectQueueRun(
+  config: FactoryConfig,
+  claim: QueueOwnerClaim,
+  ownerToken: string,
+  state: ContinuationState,
+): void {
+  if (
+    claim.settled ||
+    claim.ownerTokenDigest !== queueDigest(ownerToken) ||
+    state.repository !== config.repository ||
+    state.objective !== claim.objective ||
+    !continuationConfigurationMatches(state, config) ||
+    state.objectiveBodyDigest !== claim.bodyDigest ||
+    (state.coordinator?.deadlineAt ?? null) !== claim.deadlineAt ||
+    (claim.priorRunId !== undefined && claim.priorRunId !== state.runId)
+  )
+    throw new Error("Project producer cannot bind a different continuation");
+  if (claim.runBinding) {
+    if (claim.runBinding.runId !== state.runId)
+      throw new Error("Project producer run binding cannot change");
+    return;
+  }
+  const bytes = readFileSync(statePath(config.repository, state.objective));
+  const original = parsePortableContinuation(
+    JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+    config.repository,
+    state.objective,
+  );
+  if (JSON.stringify(original) !== JSON.stringify(state))
+    throw new Error(
+      "Project producer requires the saved original canonical snapshot",
+    );
+  const store = new LocalContentStore(
+    join(stateRoot(config.repository), "content"),
+  );
+  claim.runBinding = {
+    schemaVersion: 1,
+    runId: state.runId,
+    initialSnapshot: store.putBytes(bytes, { mediaType: "application/json" }),
+  };
+  save(claim);
+}
+
+/** Cancellation settles only the authenticated claim for this terminal run. */
+export async function settleCancelledProjectQueueRun(
+  config: FactoryConfig,
+  state: ContinuationState,
+  lock: ControllerLock,
+): Promise<void> {
+  if (!config.queue?.project) return;
+  requireProjectQueueEffects(config);
+  if (
+    !state.cancelledAt ||
+    !state.cancelRequested ||
+    (isExecutionState(state) && state.finalAcceptance) ||
+    !canHandoff(state) ||
+    restoredContinuationOwnershipHold(state) ||
+    !continuationConfigurationMatches(state, config)
+  )
+    throw new Error(
+      "Project cancellation requires a terminal run with authenticated resource cessation",
+    );
+  const identity = linuxProcessIdentity(process.pid);
+  const owner = [
+    objectiveLockPath(config.repository, state.objective),
+    installationLockPath(config.repository),
+  ]
+    .map((path) => readControllerOwner(path))
+    .find((candidate) => candidate?.token === lock.token);
+  if (
+    !identity ||
+    !owner ||
+    owner.pid !== process.pid ||
+    owner.startTime !== identity.startTime ||
+    owner.objective !== state.objective
+  )
+    throw new Error(
+      "Project cancellation requires its actual exclusive controller identity",
+    );
+  await awaitCheckpointAdmission(config.repository, "explicit");
+  const history = await readQueueHistory(config);
+  const pending = history.filter(
+    (record): record is QueueOwnerClaim =>
+      record.kind === "project-queue-owner" &&
+      record.objective === state.objective &&
+      !record.settled,
+  );
+  if (!pending.length) return;
+  if (pending.length !== 1)
+    throw new Error("Project cancellation has competing unfinished claims");
+  const claim = pending[0]!;
+  const admission = history.find(
+    (record): record is QueueOperation =>
+      record.kind === "project-queue-operation" &&
+      record.id === claim.receiptId,
+  );
+  const metadata = admission?.metadata
+    ? parseQueueMetadata(admission.metadata)
+    : undefined;
+  const effect = admission?.effects.at(-1);
+  if (
+    claim.authorityDigest !== factoryAuthorityDigest(config) ||
+    claim.bodyDigest !== state.objectiveBodyDigest ||
+    !admission?.completed ||
+    admission.action !== "admit" ||
+    admission.objective !== state.objective ||
+    admission.bodyDigest !== claim.bodyDigest ||
+    admission.authorityDigest !== claim.authorityDigest ||
+    JSON.stringify(admission.binding) !==
+      JSON.stringify(config.queue.project) ||
+    metadata?.kind !== "admission" ||
+    metadata.state !== "queued" ||
+    metadata.admissionId !== claim.admissionId ||
+    metadata.receiptId !== claim.receiptId ||
+    effect?.intent.action !== "set-metadata" ||
+    effect.intent.metadata !== admission.metadata ||
+    effect.receipt?.kind !== "response" ||
+    !effect.original
+  )
+    throw new Error(
+      "Project cancellation differs from its original authenticated admission receipt",
+    );
+  const archive = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    claim.runBinding
+      ? undefined
+      : { objective: state.objective, claimId: claim.id, runId: state.runId },
+  );
+  const store = new LocalContentStore(
+    join(stateRoot(config.repository), "content"),
+  );
+  const retain = async (reference: ContentRef) => {
+    const bytes = await archive.readVerifiedBlob(reference);
+    const retained = store.putBytes(bytes, { mediaType: "application/json" });
+    if (JSON.stringify(retained) !== JSON.stringify(reference))
+      throw new Error("Project original retention differs");
+    return reference;
+  };
+  const finalFile = archive.manifest.files.find(
+    (file) => file.path === `objectives/${state.objective}/state.json`,
+  );
+  const claimFile = archive.manifest.files.find(
+    (file) => file.path === `project-queue-history/${claim.id}.json`,
+  );
+  if (!finalFile || !claimFile)
+    throw new Error("Project cancellation originals are unavailable");
+  const cancelledSnapshot = await retain(finalFile.ref);
+  if (
+    !Buffer.from(store.readBytes(cancelledSnapshot)).equals(
+      readFileSync(statePath(config.repository, state.objective)),
+    )
+  )
+    throw new Error(
+      "Project cancellation checkpoint differs from the current terminal snapshot",
+    );
+  let originalClaim: ContentRef;
+  let initialSnapshot: ContentRef;
+  let lineage: QueueCancellationProof["lineage"];
+  if (claim.runBinding) {
+    originalClaim = await retain(claimFile.ref);
+    initialSnapshot = await retain(claim.runBinding.initialSnapshot);
+    lineage = { kind: "producer-bound" };
+  } else {
+    const verified = archive.queueOwnerLineage;
+    if (!verified)
+      throw new Error("Project historical first-run binding is unavailable");
+    for (const body of verified.bodies) {
+      const retained = store.putBytes(body.bytes, {
+        mediaType: "application/json",
+      });
+      if (JSON.stringify(retained) !== JSON.stringify(body.ref))
+        throw new Error("Project lineage original differs");
+    }
+    originalClaim = verified.originalClaim;
+    initialSnapshot = verified.initialSnapshot;
+    lineage = { kind: "verified-first-run", checkpoints: verified.checkpoints };
+  }
+  claim.settled = {
+    at: new Date().toISOString(),
+    runId: state.runId,
+    disposition: "quiescent",
+    cancellation: {
+      schemaVersion: 1,
+      originalClaim,
+      initialSnapshot,
+      cancelledSnapshot,
+      configDigest: state.configDigest,
+      owner: {
+        pid: owner.pid,
+        startTime: owner.startTime,
+        tokenDigest: queueDigest(owner.token),
+      },
+      lineage,
+    },
+  };
+  await authenticateQueueOwnerReferences(claim, (reference) =>
+    store.readBytes(reference),
+  );
   save(claim);
   await awaitCheckpointAdmission(config.repository, "explicit");
 }
