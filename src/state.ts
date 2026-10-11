@@ -1,3 +1,4 @@
+import { assertWorkItemScheduling } from "./scheduler.js";
 import { assertAdaptiveContextPacket } from "./adaptive-context.js";
 import { assertPlanningLookupRecord } from "./compiler/context.js";
 import {
@@ -831,6 +832,17 @@ export function parseFactoryState(
   assertCoverageShape(graph as unknown as WorkGraph);
   assertGraphRevisions(state as unknown as FactoryState);
   assertStateAdaptiveContexts(state as unknown as FactoryState);
+  for (const retainedGraph of [
+    graph as unknown as WorkGraph,
+    ...((state.graphRevisions as FactoryState["graphRevisions"]) ?? []).map(
+      (revision) => revision.graph,
+    ),
+  ]) {
+    for (const item of retainedGraph.items)
+      assertWorkItemScheduling(item.scheduling);
+    for (const expansion of retainedGraph.expansions ?? [])
+      assertWorkItemScheduling(expansion.template.scheduling);
+  }
   assertGraphProjectionIntents(state as unknown as FactoryState);
   assertExpansionState(state as unknown as FactoryState);
   assertAgentSessions(state as unknown as FactoryState);
