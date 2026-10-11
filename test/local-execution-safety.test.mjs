@@ -93,7 +93,7 @@ import {
   serveControl,
 } from "../dist/coordinator-control.js";
 import { checkpointExecutionState } from "../dist/runner/execution.js";
-import { canHandoff } from "../dist/runner/ownership.js";
+import { cancelKnownWork, canHandoff } from "../dist/runner/ownership.js";
 import { setCoordinatorMode } from "../dist/state.js";
 import {
   CoordinatorHandoff,
@@ -1996,6 +1996,59 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       receipt.identity,
     );
     assert.equal(Object.values(released.agentSessions)[0].status, "released");
+    // The real Git collection above is already settled. Terminal cleanup must
+    // reuse its released session instead of requesting a new unavailable turn.
+    const cancelledCollectionState = structuredClone(released);
+    cancelledCollectionState.cancelRequested = true;
+    cancelledCollectionState.cancelledAt = new Date().toISOString();
+    const terminalSession = agentSessionContinuation(
+      cancelledCollectionState,
+      "implementation",
+      "api",
+      () => saveState(snapshot, cancelledCollectionState),
+    );
+    const ended = {
+      identity: request.attemptId,
+      data: {
+        request: {
+          ...request,
+          session: {
+            scope: terminalSession.scope,
+            identity: receipt.identity,
+            retained: { ...receipt, status: "released" },
+          },
+        },
+        result,
+      },
+    };
+    const terminalContext = executionContext(
+      cancelledCollectionState.work.api,
+      () => saveState(snapshot, cancelledCollectionState),
+      () => cancelledCollectionState.cancelRequested,
+    );
+    terminalContext.checkpointSession = (ref) =>
+      terminalSession.checkpoint(ref);
+    cancelledCollectionState.work.api.execution = ended;
+    if (cancelledCollectionState.coordinator)
+      cancelledCollectionState.coordinator.processes = [];
+    const terminalOriginal = JSON.stringify(cancelledCollectionState);
+    await cancelKnownWork(
+      cancelledCollectionState,
+      blockedDriver,
+      () => saveState(snapshot, cancelledCollectionState),
+      true,
+    );
+    await cancelKnownWork(
+      cancelledCollectionState,
+      blockedDriver,
+      () => saveState(snapshot, cancelledCollectionState),
+      true,
+    );
+    assert.deepEqual(
+      await blockedDriver.collect(ended, terminalContext),
+      result,
+    );
+    assert.equal(JSON.stringify(cancelledCollectionState), terminalOriginal);
     const replacement = agentSessionContinuation(
       loaded,
       "implementation",
