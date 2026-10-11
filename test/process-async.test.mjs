@@ -72,6 +72,11 @@ import {
   LocalExecutionDriver,
 } from "../dist/execution/local.js";
 import { killGroup } from "../dist/execution/worker-process.js";
+import { workItemPrompt } from "../dist/execution/harness-support.js";
+import {
+  workerReadinessReceipt,
+  currentWorkerReadiness,
+} from "../dist/worker-readiness.js";
 import { RealGitHubGateway } from "../dist/github.js";
 import { withGitHubTransportObserver } from "../dist/github-client.js";
 import { graphDigest } from "../dist/graph-amendments.js";
@@ -94,6 +99,7 @@ import {
 import {
   assertCompletedCoverage,
   environmentValidationIndices,
+  reusableEnvironmentValidationIndices,
   objectivePreparationCommands,
 } from "../dist/qa.js";
 import { preflightItemEnvironment } from "../dist/qa-execution.js";
@@ -2676,6 +2682,54 @@ test("source readiness prepares each real fresh checkout before its phase checks
       checkout,
     });
     const { wire, call } = renderCompilationCall(request);
+    // The opt-in is bound through the original Objective and production
+    // compiler context; it adds source choices, not obligations or new fields.
+    const qualityRequest = prepareCompilationRequest({
+      objective: 1,
+      body: `${body}\n## Quality checkpoint\nenabled\n`,
+      baseSha,
+      checkout,
+    });
+    const qualityCall = renderCompilationCall(qualityRequest);
+    assert.ok(!call.prompt.includes("Quality checkpoint guidance"));
+    assert.ok(qualityCall.call.prompt.includes("Quality checkpoint guidance"));
+    assert.ok(qualityCall.call.prompt.includes("least convincing dimension"));
+    assert.deepEqual(
+      Object.keys(qualityCall.call.schema.properties),
+      Object.keys(call.schema.properties),
+    );
+    assert.deepEqual(qualityCall.call.schema.required, call.schema.required);
+    assert.deepEqual(
+      qualityRequest.coverageObligations.map((entry) => entry.source.text),
+      request.coverageObligations.map((entry) => entry.source.text),
+    );
+    assert.notEqual(qualityCall.wire.data.contextId, wire.data.contextId);
+    const disabledRequest = prepareCompilationRequest({
+      objective: 1,
+      body: `${body.replace(/^## /gm, "### ")}\n### Quality checkpoint\ndisabled\n`,
+      baseSha,
+      checkout,
+    });
+    assert.ok(
+      !renderCompilationCall(disabledRequest).call.prompt.includes(
+        "Quality checkpoint guidance",
+      ),
+    );
+    for (const declaration of [
+      "## Quality checkpoint\nenabled\ndisabled\n",
+      "## Quality checkpoint\nenabled\n## Quality checkpoint\ndisabled\n",
+      "## Quality checkpoint\n```\nenabled\n```\n",
+    ])
+      assert.throws(
+        () =>
+          prepareCompilationRequest({
+            objective: 1,
+            body: `${body}\n${declaration}`,
+            baseSha,
+            checkout,
+          }),
+        /Quality checkpoint/,
+      );
     const source = wire.data.sources.find(
       (entry) => entry.path === "README.md",
     );
@@ -2884,6 +2938,131 @@ test("source readiness prepares each real fresh checkout before its phase checks
       );
       assert.equal(existsSync(join(worker, ".runtime-ready")), true);
       assert.equal(existsSync(join(worker, "result.cjs")), false);
+      const reusableIndices = reusableEnvironmentValidationIndices(
+        graph,
+        item.id,
+      );
+      assert.deepEqual(reusableIndices, [0, 1]);
+      const receiptRequest = {
+        item,
+        baseSha,
+        attemptId: "recorded-checkout",
+        environmentReadiness: {
+          validationIndices: [0, 1],
+          reusableValidationIndices: reusableIndices,
+          acceptedBaseSha: baseSha,
+          lfsMembers: [],
+          workspacePackageAdditions: [],
+        },
+      };
+      const receipt = workerReadinessReceipt({
+        request: receiptRequest,
+        workerIdentity: "recorded-checkout",
+        worktree: worker,
+        validationRoot: join(root, "worker-receipts"),
+        evidence: readiness,
+      });
+      const harnessRequest = {
+        item,
+        worktree: worker,
+        attemptId: "recorded-checkout",
+        workerReadiness: receipt,
+      };
+      assert.equal(
+        currentWorkerReadiness(harnessRequest)?.digest,
+        receipt.digest,
+      );
+      assert.equal(receipt.treeSha, baseTree);
+      assert.equal(receipt.commands[0].source, "README.md");
+      assert.equal(receipt.runtime.ignoredEntries[0].path, ".runtime-ready");
+      const workerPrompt = workItemPrompt(harnessRequest);
+      const requiredChecks = workerPrompt
+        .split("Authoritative post-edit validation:")[1]
+        .split("Controller readiness in this exact checkout")[0];
+      assert.ok(requiredChecks.includes(acceptance));
+      assert.ok(!requiredChecks.includes(setup));
+      assert.ok(!requiredChecks.includes(probe));
+      assert.ok(workerPrompt.includes("not by you"));
+      assert.ok(workerPrompt.includes("source-required post-edit execution"));
+      const acceptanceProbe = structuredClone(graph);
+      acceptanceProbe.coverage[0].proof = {
+        kind: "result-command",
+        validationIndex: 1,
+      };
+      assert.deepEqual(
+        reusableEnvironmentValidationIndices(acceptanceProbe, item.id),
+        [0],
+      );
+      const literalSetupDuty = structuredClone(graph);
+      literalSetupDuty.items[0].acceptance.push(setup);
+      assert.deepEqual(
+        reusableEnvironmentValidationIndices(literalSetupDuty, item.id),
+        [1],
+      );
+      const corruptReceipt = { ...receipt, digest: "0".repeat(64) };
+      assert.equal(
+        currentWorkerReadiness({
+          ...harnessRequest,
+          workerReadiness: corruptReceipt,
+        }),
+        undefined,
+      );
+      assert.ok(
+        workItemPrompt({
+          ...harnessRequest,
+          workerReadiness: undefined,
+        }).includes(JSON.stringify(item.validation[0])),
+      );
+      assert.equal(
+        currentWorkerReadiness({ ...harnessRequest, worktree: checkout }),
+        undefined,
+      );
+      // Removing real ignored runtime makes the offer stale even though Git bytes match.
+      rmSync(join(worker, ".runtime-ready"));
+      assert.equal(currentWorkerReadiness(harnessRequest), undefined);
+      const stalePrompt = workItemPrompt(harnessRequest);
+      assert.ok(stalePrompt.includes(JSON.stringify(item.validation[0])));
+      assert.ok(
+        !stalePrompt.includes("Controller readiness in this exact checkout"),
+      );
+      // Restore only through the original real authorized sequence; setup refuses duplication.
+      const refreshedReadiness = await validateCheckout(
+        worker,
+        join(root, "worker-reprepared"),
+        baseSha,
+        baseTree,
+        [setup, probe],
+      );
+      assert.equal(currentWorkerReadiness(harnessRequest), undefined);
+      const refreshed = workerReadinessReceipt({
+        request: receiptRequest,
+        workerIdentity: "recorded-checkout",
+        worktree: worker,
+        validationRoot: join(root, "worker-reprepared"),
+        evidence: refreshedReadiness,
+      });
+      assert.ok(
+        currentWorkerReadiness({
+          ...harnessRequest,
+          workerReadiness: refreshed,
+        }),
+      );
+      // Changes to tracked inputs invalidate rendering rather than rewriting proof.
+      writeFileSync(
+        join(worker, "package.json"),
+        `${readFileSync(join(worker, "package.json"), "utf8")}\n`,
+      );
+      assert.equal(
+        currentWorkerReadiness({
+          ...harnessRequest,
+          workerReadiness: refreshed,
+        }),
+        undefined,
+      );
+      writeFileSync(
+        join(worker, "package.json"),
+        readFileSync(join(checkout, "package.json")),
+      );
       // A reviewed coverage-only revision leaves this recorded attempt intact.
       // Its real preparation receipt must not be reinterpreted as a new probe.
       // This stopped-attempt snapshot exercises the disk/parser contract only;
@@ -2949,6 +3128,7 @@ test("source readiness prepares each real fresh checkout before its phase checks
                   attemptId: "recorded-checkout",
                   environmentReadiness: {
                     validationIndices: [0, 1],
+                    reusableValidationIndices: reusableIndices,
                     acceptedBaseSha: baseSha,
                     lfsMembers: [],
                     workspacePackageAdditions: [],
@@ -2980,6 +3160,15 @@ test("source readiness prepares each real fresh checkout before its phase checks
       assert.deepEqual(
         environmentValidationIndices(retained.graph, item.id),
         [0, 1, 2],
+      );
+      const wrongReusable = structuredClone(state);
+      wrongReusable.work[
+        item.id
+      ].execution.data.request.environmentReadiness.reusableValidationIndices =
+        [2];
+      assert.throws(
+        () => saveState(statePath(repository, 1), wrongReusable),
+        /readiness differs from accepted command authority/,
       );
       const wrongRevision = structuredClone(state);
       wrongRevision.work[item.id].graphRevisionDigest = amendmentDigest;

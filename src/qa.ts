@@ -530,6 +530,34 @@ export function environmentValidationIndices(
   );
 }
 
+/** Readiness may replace setup only when that row is not substantive proof. */
+export function reusableEnvironmentValidationIndices(
+  graph: WorkGraph,
+  itemId: string,
+): number[] {
+  const indices = environmentValidationIndices(graph, itemId);
+  const item = graph.items.find((candidate) => candidate.id === itemId)!;
+  const coverage = itemCoverage(graph, itemId);
+  return indices.filter((index) => {
+    const command = normalizedCommand(item.validation[index]!.command);
+    return !coverage.some((entry) => {
+      const explicitCommand = entry.source.text
+        .trim()
+        .replace(/^`([^`]+)`$/, "$1");
+      return (
+        item.acceptance.some(
+          (criterion) =>
+            normalizedCommand(criterion.trim().replace(/^`([^`]+)`$/, "$1")) ===
+            command,
+        ) ||
+        ("validationIndex" in entry.proof &&
+          entry.proof.validationIndex === index) ||
+        normalizedCommand(explicitCommand) === command
+      );
+    });
+  });
+}
+
 /** Preparation authority only; no readiness or acceptance inferred from success. */
 export function objectivePreparationCommands(graph: WorkGraph): string[] {
   assertCoverageShape(graph);

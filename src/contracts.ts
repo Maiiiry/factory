@@ -656,6 +656,8 @@ export interface ExecutionRequest {
   /** Trusted graph selection; never commands inferred from the authored brief. */
   environmentReadiness?: {
     validationIndices: number[];
+    /** Readiness-only rows; excludes every substantive command proof. */
+    reusableValidationIndices?: number[];
     acceptedBaseSha: string;
     lfsMembers: ValidationLfsMember[];
     workspacePackageAdditions: string[];
@@ -734,6 +736,12 @@ export interface ExecutionContext {
     worktree: string;
     source: string;
   }): void;
+  observeReadinessOffer?(observation: {
+    workerIdentity: string;
+    status: "bound-current" | "ineligible" | "invalidated";
+    eligibleCommandCount: number;
+    receiptDigest?: string;
+  }): void;
   observeUsage?(observation: WorkerUsageObservation): void;
   /** Diagnostic only: records a possible orphan for operator cleanup. */
   observeOrphan?(orphan: ExecutionOrphan): void;
@@ -787,6 +795,8 @@ export interface ExecutionDriver {
 }
 
 export interface HarnessRequest {
+  /** Controller preparation in this exact checkout; never acceptance or lifetime proof. */
+  workerReadiness?: import("./worker-readiness.js").WorkerReadinessReceipt;
   session?: AgentSessionRequest;
   /** Pinned Objective section, parsed by the controller; never model-granted authority. */
   packageManagerUpdate?: string;

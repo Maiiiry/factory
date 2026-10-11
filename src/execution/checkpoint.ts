@@ -58,6 +58,18 @@ export function workerContext(
       },
       detail: entry.output,
     });
+  context.observeReadinessOffer = (entry) =>
+    diagnostics?.emit({
+      ...ids,
+      attemptId: work.attempt,
+      operation: "environment-readiness-offer",
+      outcome: "observed",
+      metadata: {
+        ...entry,
+        scope: "actual-worker-checkout-at-dispatch",
+        actualReuse: "unobserved",
+      },
+    });
   return context;
 }
 
