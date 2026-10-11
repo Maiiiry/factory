@@ -901,6 +901,15 @@ export async function restoreRecoveryCheckpoint(args: {
   const { verifyContinuationReferenceClosure } = await import(
     "./recovery-checkpoint-closure.js"
   );
+  const privateRoot = stateRoot(config.repository);
+  mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
+  if (
+    !lstatSync(privateRoot).isDirectory() ||
+    realpathSync(privateRoot) !== resolve(privateRoot)
+  )
+    throw new Error(
+      "Recovery installation root must be a real private directory",
+    );
   const lock = acquireInstallationLock(config.repository);
   let staging: string | undefined;
   try {
