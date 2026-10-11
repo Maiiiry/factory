@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { authenticateDiscoveryOutput } from "../discovery.js";
+import { assertWorkDiscoveryOutput } from "../state.js";
 import { agentSessionContinuation } from "../agent-session.js";
 import { reviewObjectiveKnowledge } from "../objective-knowledge.js";
 import { join } from "node:path";
@@ -95,6 +97,17 @@ export async function finalizeObjective(args: {
   )
     return state;
   stopIfCancelled();
+  // A loaded manifest is shape-checked state, not proof that its retained bodies remain available.
+  for (const item of graph.items.filter((item) => item.kind === "discovery")) {
+    assertWorkDiscoveryOutput(state, item.id, state.work[item.id]!);
+    await authenticateDiscoveryOutput({
+      checkout: config.checkout,
+      specification: item.discovery!,
+      manifest: state.work[item.id]!.discoveryOutput!,
+      store: contentStore,
+    });
+    stopIfCancelled();
+  }
   /**
    * Fetch the default branch. Commits others pushed on top of the
    * integrated Objective move the final candidate to that head, which is

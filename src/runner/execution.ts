@@ -51,7 +51,11 @@ import type {
   FactoryState,
   PreparationState,
 } from "../state.js";
-import { setCoordinatorMode } from "../state.js";
+import {
+  isExecutionState,
+  isPreparationState,
+  setCoordinatorMode,
+} from "../state.js";
 import {
   objectiveRoot,
   readContinuation,
@@ -193,7 +197,7 @@ export async function runObjectivePass(
         fn,
         {
           save: () => {
-            if (state?.schemaVersion === 7) save(state);
+            if (state && isExecutionState(state)) save(state);
             else if (state) saveState(path, state);
             else {
               // No state file yet: keep the records beside it for status, and
@@ -248,8 +252,11 @@ export async function runObjectivePass(
       saveState(path, continuation);
     }
     let preparation =
-      continuation?.schemaVersion === 8 ? continuation : undefined;
-    let state = continuation?.schemaVersion === 7 ? continuation : undefined;
+      continuation && isPreparationState(continuation)
+        ? continuation
+        : undefined;
+    let state =
+      continuation && isExecutionState(continuation) ? continuation : undefined;
     if (issue.state === "closed" && !state)
       throw new Error(
         "Objective issue is confirmed closed; operator direction required",
@@ -263,7 +270,7 @@ export async function runObjectivePass(
         saveState(path, state);
       }
       if (
-        state.schemaVersion !== 7 ||
+        !isExecutionState(state) ||
         state.repository !== config.repository ||
         state.configDigest !== installationConfigDigest
       ) {
@@ -346,6 +353,7 @@ export async function runObjectivePass(
         path,
         diagnostics,
         planningModel,
+        contentStore,
         github,
         owner,
         installationConfigDigest,
@@ -585,7 +593,7 @@ export async function runObjectivePass(
       await Promise.allSettled(active.values());
       saveState(path, owner.snapshot);
       // Paused planning: the owner serves control until resume.
-      if (owner.snapshot.schemaVersion === 8) throw error;
+      if (isPreparationState(owner.snapshot)) throw error;
       return owner.snapshot;
     }
     const current = owner.snapshot;
@@ -632,7 +640,7 @@ export async function runObjectivePass(
         (fault.kind === "decision" || fault.kind === "config") &&
         !awaitsOperator(waitOf(current, "objective")) &&
         !(
-          current.schemaVersion === 7 &&
+          isExecutionState(current) &&
           Object.values(current.work).some((work) => awaitsOperator(work.wait))
         )
       )
@@ -652,7 +660,7 @@ export async function runObjectivePass(
       saveState(path, current);
       return current;
     }
-    if (current?.schemaVersion === 7 && current.finalAcceptance) {
+    if (current && isExecutionState(current) && current.finalAcceptance) {
       // A rejected resume cannot turn immutable accepted evidence into a failed run.
       current.coordinator!.waitReason = `Sealed acceptance preserved: ${error instanceof Error ? error.message : String(error)}`;
       saveState(path, current);
@@ -669,7 +677,7 @@ export async function runObjectivePass(
         // This pass still carries the aborted process scope. The owner
         // finalizes cancellation after it unwinds: remote issue closure,
         // session disposal and terminal state must not inherit this signal.
-      } else if (current.schemaVersion === 8) {
+      } else if (isPreparationState(current)) {
         // Preparation resumes by repeating its step; record why it paused.
         current.coordinator.waitReason =
           error instanceof Error ? error.message : String(error);
@@ -683,7 +691,7 @@ export async function runObjectivePass(
           if (item !== undefined) current.errorItem = item;
         }
       }
-      if (current.schemaVersion === 7) save(current);
+      if (isExecutionState(current)) save(current);
       else saveState(path, current);
     }
     throw error;
