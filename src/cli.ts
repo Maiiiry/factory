@@ -25,7 +25,10 @@ import { type IntakeAuthorization, intakeControl } from "./intake.js";
 import { runDreamCommand } from "./learning.js";
 import { operatorName } from "./operator.js";
 import { runProposeCommand } from "./proposals.js";
-import { loadServiceLoginCredentials } from "./provider-credentials.js";
+import {
+  loadServiceLoginCredentials,
+  requiredProviderCredentials,
+} from "./provider-credentials.js";
 import { checkReadiness } from "./readiness.js";
 import {
   AwaitingBeforeState,
@@ -249,10 +252,35 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
     config,
     "status",
   )) as ServiceStatus["queue"];
-  if (json) console.log(JSON.stringify({ service, queue }));
-  else
-    for (const line of renderServiceStatus({ service, queue }))
-      console.log(line);
+  const objective = queue.activeObjective ?? queue.observation?.needsDecision;
+  let current: Pick<
+    ServiceStatus,
+    "currentObjective" | "currentObjectiveError"
+  > = {};
+  if (objective) {
+    try {
+      current = {
+        currentObjective: statusDocument(
+          config,
+          objective,
+          { serviceRegistered: service.registered === true },
+          path,
+        ).document,
+      };
+    } catch (error) {
+      current = {
+        currentObjectiveError: redactDiagnosticDetail(
+          error instanceof Error ? error.message : String(error),
+          config.policy.allowedSecretNames
+            .map((name) => process.env[name])
+            .filter((value): value is string => Boolean(value)),
+        ),
+      };
+    }
+  }
+  const document = { service, queue, ...current };
+  if (json) console.log(JSON.stringify(document));
+  else for (const line of renderServiceStatus(document)) console.log(line);
 }
 type ServiceStatus = Parameters<typeof renderServiceStatus>[0];
 
@@ -495,11 +523,20 @@ function waitBeforeState(error: unknown): AwaitingBeforeState {
 }
 
 /** The status view `factory status --objective N` shows, from the recorded state. */
-function statusDocument(config: FactoryConfig, objective: number) {
-  const secrets = config.policy.allowedSecretNames
+function statusDocument(
+  config: FactoryConfig,
+  objective: number,
+  guidanceContext: import("./prerequisite-guidance.js").PrerequisiteGuidanceContext = {},
+  configuration = option(process.argv.slice(3), "config"),
+) {
+  const requiredSecretNames = requiredProviderCredentials(config);
+  const secrets = [
+    ...new Set([...config.policy.allowedSecretNames, ...requiredSecretNames]),
+  ]
     .map((name) => process.env[name])
     .filter((value): value is string => Boolean(value));
   const continuation = readContinuation(config.repository, objective);
+  const currentConfigDigest = factoryConfigDigest(config);
   const document = continuationStatusDocument(
     continuation,
     config.repository,
@@ -509,9 +546,16 @@ function statusDocument(config: FactoryConfig, objective: number) {
     continuation?.capacity.concurrency,
     controllerActive(config.repository, objective),
     continuation ? undefined : readPreState(config.repository, objective),
-    factoryConfigDigest(config),
+    currentConfigDigest,
+    {
+      ...guidanceContext,
+      requiredSecretNames:
+        !continuation || continuation.configDigest === currentConfigDigest
+          ? requiredSecretNames
+          : [],
+      configuration,
+    },
   );
-  const configuration = option(process.argv.slice(3), "config");
   if (document.nextAction)
     document.nextAction.command = configurationCommand(
       document.nextAction.command,

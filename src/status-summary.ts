@@ -6,6 +6,7 @@
 
 import { type Refusal, settlesFirst } from "./amendment-admission.js";
 import type { Wait } from "./fault.js";
+import type { PrerequisiteGuidance } from "./prerequisite-guidance.js";
 
 /** A step in a run of transient faults (src/step.ts `outageOf`). */
 export interface OutageView {
@@ -22,6 +23,7 @@ export interface OutageView {
 export interface WaitView {
   wait?: Wait | null;
   outage?: OutageView | null;
+  prerequisiteGuidance?: PrerequisiteGuidance;
 }
 
 export type StatusPhase =
@@ -238,7 +240,7 @@ export function shellWord(text: string): string {
 }
 
 /** The decision that answers one pending criterion; several pending ones name theirs. */
-function decideCriterion(
+export function decideCriterion(
   objective: number,
   itemId: string | undefined,
   pending: PendingDecisionView,
@@ -1117,6 +1119,57 @@ export function summarizeStatus(view: StatusView): StatusSummary {
       },
     };
   }
+  const guidance = view.prerequisiteGuidance;
+  if (
+    guidance &&
+    guidance.control.mode === "running" &&
+    !view.configurationChanged &&
+    !(view.state === "preparing"
+      ? view.cancelledAt
+      : ["cancelled", "complete"].includes(view.state))
+  ) {
+    const unresolved = guidance.entries.find(
+      (entry) =>
+        entry.kind === "unknown-effect" &&
+        !["progress-publication", "project-status"].includes(entry.scope),
+    );
+    if (unresolved)
+      return {
+        phase: "waiting",
+        summary:
+          "submitted effect or native resources remain unresolved; exact reconciliation only",
+        nextAction: unresolved.nextAction ?? null,
+      };
+    const staleQuestion = guidance.entries.find(
+      (entry) =>
+        entry.scope === "planning" &&
+        entry.owner === "controller" &&
+        entry.kind === "unavailable-fact",
+    );
+    if (staleQuestion)
+      return {
+        phase: "waiting",
+        summary:
+          "retained planning dependency requires current evidence reconciliation",
+        nextAction: staleQuestion.nextAction ?? null,
+      };
+    const returned = guidance.entries.find(
+      (entry) => entry.kind === "propagation",
+    );
+    if (
+      returned &&
+      !guidance.entries.some((entry) => entry.owner === "operator") &&
+      !(view.state === "preparing" ? view.error : view.state === "failed")
+    )
+      return {
+        phase: "waiting",
+        summary: "a retained result awaits normal state propagation",
+        nextAction:
+          guidance.control.owner === "present"
+            ? null
+            : (returned.nextAction ?? null),
+      };
+  }
   if (view.state === "preparing") return summarizePreparation(view);
   if (view.state === "cancelled")
     return {
@@ -1215,10 +1268,18 @@ export function renderStatusText(
       `Next: ${view.nextAction.command}`,
       `      ${view.nextAction.reason}`,
     );
+  lines.push(
+    ...renderPrerequisiteGuidance(view.prerequisiteGuidance, configuration),
+  );
   if (view.state === "not-started") return lines;
   if (view.state === "preparing") {
     const review = view.planReview;
-    if (review?.findings?.length || review?.failure) {
+    if (
+      !view.prerequisiteGuidance?.entries.some(
+        (entry) => entry.scope === "plan-review",
+      ) &&
+      (review?.findings?.length || review?.failure)
+    ) {
       lines.push(
         "",
         `Plan handoff (${review.status})${["needs-human", "refused"].includes(review.status) ? " — planning is blocked; no Work Items are admitted" : " — retained review findings; readiness is not established by this text"}:`,
@@ -1240,7 +1301,8 @@ export function renderStatusText(
       lines.push(
         "  Resolve these against the pinned requirements through the existing decision/readiness path. Do not send secret values in chat; guidance grants no additional authority.",
       );
-    } else if (review?.question) lines.push("", `Question: ${review.question}`);
+    } else if (review?.question && !view.prerequisiteGuidance?.entries.length)
+      lines.push("", `Question: ${review.question}`);
     if (view.error) lines.push("", `Error: ${view.error}`);
     return lines;
   }
@@ -1298,7 +1360,14 @@ export function renderStatusText(
       );
   };
   for (const item of view.work) {
-    if (item.acceptancePending)
+    if (
+      item.acceptancePending &&
+      !view.prerequisiteGuidance?.entries.some(
+        (entry) =>
+          entry.scope === item.id &&
+          ["human-choice", "propagation"].includes(entry.kind),
+      )
+    )
       question(`${item.id}:`, item.id, item.acceptancePending);
     if (item.status === "waiting" && item.step === "approve-asset") {
       lines.push("", `${item.id}: candidate AssetSets`);
@@ -1314,15 +1383,76 @@ export function renderStatusText(
         `  Evidence: ${configurationCommand(`factory diagnostics --objective ${view.objective} --logs ${item.id}`, configuration)}`,
       );
   }
-  if (view.finalAcceptancePending)
+  if (
+    view.finalAcceptancePending &&
+    !view.prerequisiteGuidance?.entries.some(
+      (entry) =>
+        entry.scope === "objective-acceptance" ||
+        entry.scope === "objective-closure",
+    )
+  )
     question("Objective:", undefined, view.finalAcceptancePending);
   if (view.state === "failed" && view.lastError)
     lines.push("", `Error: ${view.lastError}`);
   return lines;
 }
 
+/** Render the exact same private derived packet for foreground, service and conversation consumers. */
+export function renderPrerequisiteGuidance(
+  guidance?: PrerequisiteGuidance,
+  configuration?: string,
+): string[] {
+  if (!guidance?.entries.length) return [];
+  const lines = [
+    "",
+    `Prerequisites (${guidance.digest.slice(0, 12)}; controller ${guidance.control.owner}; ${guidance.control.mode}):`,
+  ];
+  for (const entry of guidance.entries) {
+    lines.push(
+      `  ${entry.scope}: ${entry.kind}; owner ${entry.owner}; readiness ${entry.readiness}`,
+      `    ${entry.reason}`,
+      `    Complete when: ${entry.completion}`,
+    );
+    if (entry.question) lines.push(`    Question: ${entry.question}`);
+    if (entry.sources?.length)
+      lines.push(
+        `    Sources: ${entry.sources.map((source) => `${source.identity}${source.digest ? ` (${source.digest})` : ""}${source.disposition ? ` [${source.disposition}]` : ""}`).join(", ")}`,
+      );
+    if (entry.setupStep)
+      lines.push(`    Retained setup step: ${entry.setupStep}`);
+    for (const command of entry.setupCommands ?? [])
+      lines.push(
+        `    Source preparation in the actual phase environment: ${command}`,
+      );
+    if (entry.secretNames?.length)
+      lines.push(`    Secret names: ${entry.secretNames.join(", ")}`);
+    for (const destination of entry.secureDestinations ?? [])
+      lines.push(`    Destination: ${destination}`);
+    for (const command of entry.verification ?? [])
+      lines.push(
+        `    Source verification in the actual phase environment: ${command}`,
+      );
+    if (entry.nextAction)
+      lines.push(
+        `    Continue: ${configurationCommand(entry.nextAction.command, configuration)}`,
+        `      ${entry.nextAction.reason}`,
+      );
+  }
+  if (guidance.independentItems.length)
+    lines.push(
+      `  Structurally independent: ${guidance.independentItems.join(", ")}; dispatch still requires current owner, provider, resource and control gates`,
+    );
+  if (guidance.historicalEvidence.length)
+    lines.push(
+      "  Retained prerequisite/decision evidence is historical; current account, environment and authority still require the existing checks",
+    );
+  return lines;
+}
+
 /** What `factory status` without `--objective` reports: the background service and its queue. */
 export interface ServiceStatusDocument {
+  currentObjective?: StatusView & StatusSummary;
+  currentObjectiveError?: string;
   service: {
     supported?: boolean;
     unit?: string;
@@ -1358,13 +1488,20 @@ export function renderServiceStatus(document: ServiceStatusDocument): string[] {
     );
     for (const problem of service.bindingHealth?.diagnostics ?? [])
       lines.push(`  ${problem.message} ${problem.action}`);
-    if (service.waitingFor === "human-decision")
+    if (
+      service.waitingFor === "human-decision" &&
+      !document.currentObjective &&
+      !document.currentObjectiveError
+    )
       lines.push(
         queue.observation?.needsDecision
           ? `  Waiting for a decision on Objective #${queue.observation.needsDecision}: \`factory status --objective ${queue.observation.needsDecision}\` names the command; then \`factory queue resume\` and \`factory supervisor start\``
           : "  Waiting for a decision; `factory queue list` names the Objective",
       );
-    else if (service.active !== "active")
+    else if (
+      service.active !== "active" &&
+      service.waitingFor !== "human-decision"
+    )
       // A draining queue ends a started service at once: resume it first.
       lines.push(
         queue.mode === "draining"
@@ -1392,5 +1529,11 @@ export function renderServiceStatus(document: ServiceStatusDocument): string[] {
   if (!queued.length) lines.push("  `factory queue add N` queues an Objective");
   if (queue.observation?.error)
     lines.push(`  Last error: ${short(queue.observation.error, 160)}`);
+  if (document.currentObjective)
+    lines.push("", ...renderStatusText(document.currentObjective));
+  if (document.currentObjectiveError)
+    lines.push(
+      `  Current Objective state unavailable: ${document.currentObjectiveError}; ownership and readiness remain unknown`,
+    );
   return lines;
 }
