@@ -3,8 +3,8 @@ import {
   closeSync,
   constants,
   existsSync,
-  fsyncSync,
   fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -18,15 +18,16 @@ import {
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { LocalContentStore } from "./content/local.js";
 import { stateRoot } from "./config.js";
+import { LocalContentStore } from "./content/local.js";
 import type { ContentRef } from "./contracts.js";
+import { parseDiscoveryBody } from "./discovery.js";
 import { validOwnershipPath } from "./ownership.js";
 import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
-import { parseDiscoveryBody } from "./discovery.js";
+import { markCheckpointDirty } from "./recovery-checkpoint.js";
 import {
-  isExecutionState,
   type ContinuationState,
+  isExecutionState,
   type WorkState,
 } from "./state.js";
 
@@ -106,6 +107,32 @@ export interface RepositoryMemoryRecord {
 export interface RepositoryMemoryBinding {
   id: string;
   manifestRef: ContentRef;
+}
+
+/** Decode original immutable bytes without observation deduplication or authority promotion. */
+export function decodeRepositoryMemoryManifest(
+  binding: RepositoryMemoryBinding,
+  bytes: Uint8Array,
+): RepositoryMemoryRecord {
+  assertRepositoryMemoryBindings([binding]);
+  const body = Buffer.from(bytes);
+  if (
+    body.length !== binding.manifestRef.bytes ||
+    createHash("sha256").update(body).digest("hex") !== binding.id
+  )
+    throw new Error(
+      "Imported memory manifest differs from its original identity",
+    );
+  const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+    body,
+  );
+  const record: unknown = JSON.parse(raw);
+  assertRepositoryMemoryRecord(record);
+  if (!Buffer.from(raw).equals(body) || canonical(record) !== raw)
+    throw new Error(
+      "Imported memory manifest is not its original canonical bytes",
+    );
+  return record;
 }
 export interface MemoryAccess {
   repository: string;
@@ -562,6 +589,10 @@ export class LocalRepositoryMemory {
     });
     const binding = { id: manifestRef.digest, manifestRef };
     append(join(this.records, `${binding.id}.json`), canonical(binding));
+    markCheckpointDirty(this.repository, {
+      path: `memory/records/${binding.id}.json`,
+      kind: "memory-binding",
+    });
     this.retainedIdentities.set(meaningful, binding);
     // A failed derived index never prevents retention or changes continuation.
     try {
@@ -571,6 +602,105 @@ export class LocalRepositoryMemory {
       if (error instanceof MemoryStorageDenied) throw error;
     }
     return binding;
+  }
+  /** Complete eligible originals, without search ranking, body reads or result truncation. */
+  recordsForTransfer(selection: {
+    access: MemoryAccess;
+    ids?: string[];
+    scope?: MemoryLookup["scope"];
+  }): {
+    entries: {
+      binding: RepositoryMemoryBinding;
+      record: RepositoryMemoryRecord;
+      bindingBytes: Buffer;
+      manifestBytes: Buffer;
+    }[];
+    unavailable: string[];
+  } {
+    if (selection.ids?.some((id) => !isHash(id)))
+      throw new Error("Invalid memory transfer identity");
+    const retained = this.eligible({
+      access: selection.access,
+      scope: selection.scope,
+      // eligible() checks the shared lookup contract but does not truncate rows.
+      limit: 256,
+    });
+    const selected = new Set(selection.ids);
+    const entries = retained.entries.filter(
+      (entry) => selection.ids === undefined || selected.has(entry.binding.id),
+    );
+    if (
+      selection.ids?.some(
+        (id) => !entries.some((entry) => entry.binding.id === id),
+      )
+    )
+      throw new Error(
+        "Requested memory record is unavailable or outside authorized scope",
+      );
+    return {
+      entries: entries.map((entry) => ({
+        ...entry,
+        bindingBytes: Buffer.from(
+          privateRead(join(this.records, `${entry.binding.id}.json`)),
+        ),
+        manifestBytes: this.store.readBytes(entry.binding.manifestRef),
+      })),
+      // An unavailable manifest cannot disclose its visibility through its filename.
+      unavailable: retained.unavailable.length
+        ? ["memory manifest unavailable"]
+        : [],
+    };
+  }
+  /** Install the original binding; never recollect it as a new observation. */
+  assertTransferScope(
+    record: RepositoryMemoryRecord,
+    access: MemoryAccess,
+    scope?: MemoryLookup["scope"],
+  ): void {
+    assertRepositoryMemoryRecord(record);
+    if (
+      !this.accessible(access, record) ||
+      !this.inScope(record, { access, scope, limit: 1 })
+    )
+      throw new Error("Imported memory is outside authorized repository scope");
+  }
+  assertExactDestination(
+    binding: RepositoryMemoryBinding,
+    bytes: Uint8Array,
+    access: MemoryAccess,
+    scope?: MemoryLookup["scope"],
+  ): void {
+    this.assertTransferScope(
+      decodeRepositoryMemoryManifest(binding, bytes),
+      access,
+      scope,
+    );
+    const path = join(this.records, `${binding.id}.json`);
+    if (existsSync(path) && privateRead(path) !== canonical(binding))
+      throw new Error(
+        "Immutable memory destination already contains different original bytes",
+      );
+  }
+  installExact(
+    binding: RepositoryMemoryBinding,
+    bytes: Uint8Array,
+    access: MemoryAccess,
+    scope?: MemoryLookup["scope"],
+  ): void {
+    const record = decodeRepositoryMemoryManifest(binding, bytes);
+    this.assertExactDestination(binding, bytes, access, scope);
+    for (const body of record.bodies)
+      if (body.availability === "retained") this.store.readBytes(body.ref!);
+    for (const source of record.sources)
+      if (source.complete && source.ref) this.store.readBytes(source.ref);
+    const installed = this.store.putBytes(bytes, {
+      mediaType: binding.manifestRef.mediaType,
+    });
+    if (canonical(installed) !== canonical(binding.manifestRef))
+      throw new Error("Imported memory reference changed during installation");
+    append(join(this.records, `${binding.id}.json`), canonical(binding));
+    this.retainedIdentities = undefined;
+    this.catalogStatus = "unavailable";
   }
   private accessible(
     access: MemoryAccess,
@@ -587,11 +717,10 @@ export class LocalRepositoryMemory {
     record: RepositoryMemoryRecord;
   } {
     if (!isHash(id)) throw new Error("Invalid memory identity");
-    const binding: RepositoryMemoryBinding = JSON.parse(
-      privateRead(join(this.records, `${id}.json`)),
-    );
+    const rawBinding = privateRead(join(this.records, `${id}.json`));
+    const binding: RepositoryMemoryBinding = JSON.parse(rawBinding);
     assertRepositoryMemoryBindings([binding]);
-    if (binding.id !== id)
+    if (binding.id !== id || rawBinding !== canonical(binding))
       throw new Error("Memory filename differs from manifest identity");
     const bytes = this.store.readBytes(binding.manifestRef);
     const record: RepositoryMemoryRecord = JSON.parse(bytes.toString("utf8"));
