@@ -49,6 +49,7 @@ import {
 } from "../dist/compiler/transport.js";
 import { factoryConfigDigest, stateRoot } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
+import { requestControl, serveControl } from "../dist/coordinator-control.js";
 import { NativeStackDelivery } from "../dist/delivery/native-stack.js";
 import { RegularDelivery } from "../dist/delivery/regular.js";
 import {
@@ -121,14 +122,18 @@ import {
 } from "../dist/runner/ownership.js";
 import {
   cancelObjective,
+  CoordinatorHandoff,
   decideResult,
   rereviewWorkItem,
   runObjective,
 } from "../dist/runner.js";
 import { parseFactoryState, setCoordinatorMode } from "../dist/state.js";
 import {
+  acquireInstallationLock,
+  installationLockPath,
   readContinuation,
   readState,
+  releaseControllerLock,
   saveState,
   statePath,
 } from "../dist/state-store.js";
@@ -1248,6 +1253,99 @@ test("cancellation stops an owned shell and its process group", async () => {
           const savePreparation = () =>
             saveState(statePath(config.repository, 1), preparation);
           savePreparation();
+          if (route === "controller") {
+            // The real intake socket can receive handoff while registration is
+            // still awaiting startup. Replay it to the stock Objective handler
+            // before its next pass; no planner or gateway response is invented.
+            preparation.coordinator.mode = "running";
+            savePreparation();
+            const original = structuredClone(preparation);
+            const lock = acquireInstallationLock(config.repository, 1);
+            let server;
+            let objectiveControl;
+            let pendingHandoff = false;
+            let registrationEntered;
+            const entered = new Promise((resolve) => {
+              registrationEntered = resolve;
+            });
+            let releaseRegistration;
+            const held = new Promise((resolve) => {
+              releaseRegistration = resolve;
+            });
+            let running;
+            try {
+              server = await serveControl(
+                config.repository,
+                lock,
+                async (request) => {
+                  assert.equal(request.objective, 1);
+                  assert.equal(request.action, "handoff");
+                  pendingHandoff = true;
+                  if (objectiveControl) await objectiveControl(request);
+                  return "requested";
+                },
+              );
+              running = runObjective(config, 1, preparationServices, {
+                ownerLock: lock,
+                observeControl: async (handler) => {
+                  if (!handler) {
+                    objectiveControl = undefined;
+                    return;
+                  }
+                  registrationEntered();
+                  await held;
+                  objectiveControl = handler;
+                  if (pendingHandoff)
+                    await handler({ objective: 1, action: "handoff" });
+                },
+              }).then(
+                () => assert.fail("A handed-off Objective cannot complete"),
+                (error) => error,
+              );
+              await entered;
+              assert.equal(
+                (
+                  await requestControl(config.repository, {
+                    objective: 1,
+                    action: "handoff",
+                  })
+                ).handled,
+                true,
+              );
+              assert.equal(objectiveControl, undefined);
+              releaseRegistration();
+              assert.ok((await running) instanceof CoordinatorHandoff);
+              const handedOff = readContinuation(config.repository, 1);
+              assert.equal(handedOff.coordinator.mode, "draining");
+              assert.equal(handedOff.runId, original.runId);
+              assert.equal(handedOff.baseSha, original.baseSha);
+              assert.equal(
+                handedOff.objectiveBodyDigest,
+                original.objectiveBodyDigest,
+              );
+              assert.equal(
+                handedOff.coordinator.deadlineAt,
+                original.coordinator.deadlineAt,
+              );
+              assert.deepEqual(handedOff.autonomy, original.autonomy);
+              assert.equal(handedOff.agentSessions, undefined);
+              assert.deepEqual(observations, []);
+              Object.assign(preparation, handedOff);
+            } finally {
+              releaseRegistration();
+              if (running) await running;
+              if (server)
+                await new Promise((resolve, reject) =>
+                  server.close((error) => (error ? reject(error) : resolve())),
+                );
+              releaseControllerLock(
+                installationLockPath(config.repository),
+                lock,
+              );
+            }
+            preparation.coordinator.mode = "paused";
+            savePreparation();
+          }
           const session = agentSessionContinuation(
             preparation,
             "planning",
