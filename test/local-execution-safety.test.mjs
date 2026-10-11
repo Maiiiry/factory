@@ -26,10 +26,18 @@ import {
   graphDigest,
 } from "../dist/graph-amendments.js";
 import {
+  completeObjectiveKnowledge,
   objectiveKnowledgeView,
   publishObjectiveKnowledge,
   reviewObjectiveKnowledge,
 } from "../dist/objective-knowledge.js";
+import {
+  buildAdaptiveContext,
+  authenticateAdaptiveContextPacket,
+} from "../dist/adaptive-context.js";
+import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
+import { initializeContextLookup } from "../dist/compiler/context.js";
+import { validateConfig } from "../dist/config.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
 import { materializeGraphExpansion } from "../dist/graph-expansion.js";
 import { authenticateExpansionInputs } from "../dist/runner/expansion.js";
@@ -496,6 +504,173 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       state.repository,
       1,
     );
+    {
+      // Freeze complete selected role inputs through the ordinary atomic snapshot.
+      // Optional retrieval bounds never trim the required settled interface body.
+      git(
+        checkout,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/target.git",
+      );
+      const selection = { model: "unused-local-check", reasoningEffort: "low" };
+      const config = validateConfig({
+        schemaVersion: 1,
+        repository: loaded.repository,
+        checkout,
+        planning: {
+          kind: "codex-sdk",
+          planner: selection,
+          reviewer: selection,
+        },
+        execution: {
+          kind: "local",
+          concurrency: 1,
+          harness: { kind: "codex-sdk", ...selection },
+        },
+        delivery: { kind: "regular" },
+        policy: { network: "off", allowedSecretNames: [] },
+        planningContext: {
+          enabled: true,
+          memory: false,
+          selectors: ["README.md"],
+          bounds: {
+            maxRounds: 1,
+            maxRequestsPerRound: 1,
+            maxResults: 1,
+            maxBytes: 1,
+            maxElapsedMs: 5000,
+            maxProviderCalls: 1,
+          },
+        },
+      });
+      const adaptive = structuredClone(loaded);
+      adaptive.schemaVersion = 9;
+      const source = {
+        path: "README.md",
+        content: git(checkout, "show", `${adaptive.baseSha}:README.md`),
+      };
+      const resolver = createPlanningContextResolver({
+        config,
+        objective: adaptive.objective,
+        runId: adaptive.runId,
+        baseSha: adaptive.baseSha,
+        sources: [source],
+        objectiveBody: "## Adaptive workflow\nenabled\n",
+        contentStore: store,
+      });
+      adaptive.planningRecovery = {
+        phase: "ready",
+        history: [],
+        contextLookup: await initializeContextLookup(resolver),
+      };
+      adaptive.work.api = {
+        status: "running",
+        step: "execute",
+        attempt: "api-role-attempt",
+        baseSha: result.changeRef,
+        executionBaseSha: result.changeRef,
+        graphRevisionDigest: graphDigest(adaptive.graph),
+      };
+      const knowledge = await completeObjectiveKnowledge({
+        state: adaptive,
+        item: consumer,
+        checkout,
+        baseSha: result.changeRef,
+        store,
+      });
+      const rolePath = join(root, "private-state", "role-context.json");
+      const saveRole = () => saveState(rolePath, adaptive);
+      const selected = await buildAdaptiveContext({
+        state: adaptive,
+        role: "dispatch",
+        item: consumer,
+        baseSha: result.changeRef,
+        checkout,
+        store,
+        config,
+        sources: [source],
+        required: { sources: [source], knowledge: knowledge.view },
+        requiredSelections: knowledge.selections,
+        save: saveRole,
+      });
+      adaptive.work.api.adaptiveContextId = selected.packet.id;
+      saveRole();
+      const roleSnapshot = readFileSync(rolePath, "utf8");
+      const roleReload = parseFactoryState(
+        JSON.parse(roleSnapshot),
+        adaptive.repository,
+        adaptive.objective,
+      );
+      assert.deepEqual(
+        roleReload.adaptiveContexts[selected.packet.id],
+        selected.packet,
+      );
+      assert.equal(roleReload.work.api.adaptiveContextId, selected.packet.id);
+      assert.deepEqual(
+        await authenticateAdaptiveContextPacket(
+          store,
+          roleReload.adaptiveContexts[selected.packet.id],
+        ),
+        selected.payload,
+      );
+      assert.ok(
+        selected.packet.selections.some(
+          (entry) => entry.kind === "interface" && entry.required,
+        ),
+      );
+      const supplied = JSON.stringify(selected.payload.required);
+      assert.ok(
+        supplied.includes(
+          Buffer.from('{"timestamp":"UTC"}\n').toString("base64"),
+        ),
+      );
+      assert.ok(supplied.includes(source.content.replaceAll("\n", "\\n")));
+      const reused = await buildAdaptiveContext({
+        state: roleReload,
+        role: "dispatch",
+        item: consumer,
+        baseSha: result.changeRef,
+        checkout,
+        store,
+        config,
+        sources: [source],
+        required: { sources: [source], knowledge: knowledge.view },
+        requiredSelections: knowledge.selections,
+        save: () => saveState(rolePath, roleReload),
+      });
+      assert.equal(reused.packet.id, selected.packet.id);
+      assert.equal(readFileSync(rolePath, "utf8"), roleSnapshot);
+      const changedOwner = structuredClone(roleReload);
+      changedOwner.work.api.attempt = "foreign-attempt";
+      assert.throws(
+        () => saveState(rolePath, changedOwner),
+        /selected adaptive context differs/,
+      );
+      assert.equal(readFileSync(rolePath, "utf8"), roleSnapshot);
+      rmSync(
+        join(
+          root,
+          "private-content",
+          selected.packet.contentRef.digest.slice(0, 2),
+          selected.packet.contentRef.digest,
+        ),
+      );
+      // Historical ownership remains inspectable; another call cannot use missing bytes.
+      assert.equal(
+        parseFactoryState(
+          JSON.parse(roleSnapshot),
+          adaptive.repository,
+          adaptive.objective,
+        ).work.api.attempt,
+        "api-role-attempt",
+      );
+      await assert.rejects(
+        () => authenticateAdaptiveContextPacket(store, selected.packet),
+        /missing/,
+      );
+    }
     {
       // Reuse this real Git/ContentStore and atomic snapshot workflow for expansion:
       // the checkpoint records possible submission, not an invented GitHub response.

@@ -1,4 +1,10 @@
 import {
+  adaptiveContextEvidence,
+  authenticateAdaptiveContextPacket,
+  buildAdaptiveContext,
+  type AdaptiveContextRole,
+} from "./adaptive-context.js";
+import {
   amendmentAllowed,
   amendmentsUsedUp,
   archiveAttempt,
@@ -47,6 +53,7 @@ import type {
   PlanningModel,
   WorkDiscovery,
   WorkGraph,
+  ContentStore,
   WorkItem,
 } from "./contracts.js";
 import { linearDeliveryUnits } from "./delivery/plan.js";
@@ -100,11 +107,13 @@ export interface PendingAmendment {
   planningInvocation?: {
     id: string;
     requestDigest?: string;
+    adaptiveContextId?: string;
     response?: WorkGraph;
   };
   reviewInvocation?: {
     id: string;
     requestDigest: string;
+    adaptiveContextId?: string;
     packet: import("./review-evidence.js").ReviewPacket;
     response?: Awaited<ReturnType<PlanningModel["reviewGraph"]>>;
   };
@@ -193,6 +202,26 @@ export function assertGraphRevisions(state: FactoryState): void {
     assertDiscovery(proposal);
     if (proposal.scope !== "backlog")
       throw new Error("Backlog discovery cannot authorize execution");
+  }
+  for (const amendment of [
+    ...(state.pendingAmendment ? [state.pendingAmendment] : []),
+    ...(state.rejectedAmendments ?? []),
+  ]) {
+    for (const [invocation, role] of [
+      [amendment.planningInvocation, "compile"],
+      [amendment.reviewInvocation, "graph-review"],
+    ] as const) {
+      if (invocation?.adaptiveContextId === undefined) continue;
+      const packet = state.adaptiveContexts?.[invocation.adaptiveContextId];
+      if (
+        !packet ||
+        packet.role !== role ||
+        packet.binding.graphDigest !== amendment.proposal.expectedGraphDigest ||
+        packet.binding.baseSha !== state.baseSha ||
+        packet.binding.itemId !== undefined
+      )
+        throw new Error("Amendment invocation lost its retained role context");
+    }
   }
   const revisions = state.graphRevisions;
   if (revisions) {
@@ -718,6 +747,7 @@ async function advanceAmendment(args: {
   config: FactoryConfig;
   body: string;
   model: PlanningModel;
+  contentStore?: ContentStore;
   github: GitHubGateway;
   save: () => void;
   cancelled: () => boolean;
@@ -759,6 +789,50 @@ async function advanceAmendment(args: {
     } catch (error) {
       throw error instanceof Error ? refused(error) : error;
     }
+  };
+  const selectContext = async (
+    role: AdaptiveContextRole,
+    required: object,
+    retainedId?: string,
+  ) => {
+    if (!state.planningRecovery?.contextLookup && retainedId === undefined)
+      return undefined;
+    if (!args.contentStore)
+      throw new Error(
+        "Adaptive amendment role context requires the admitted ContentStore",
+      );
+    if (retainedId !== undefined) {
+      const packet = state.adaptiveContexts?.[retainedId];
+      if (
+        !packet ||
+        packet.role !== role ||
+        packet.binding.graphDigest !== graphDigest(state.graph) ||
+        packet.binding.baseSha !== state.baseSha
+      )
+        throw new Error(
+          "Retained amendment role context differs from the current admitted scope",
+        );
+      const payload = await authenticateAdaptiveContextPacket(
+        args.contentStore,
+        packet,
+      );
+      return {
+        packet,
+        payload,
+        evidence: adaptiveContextEvidence(packet, payload),
+      };
+    }
+    return buildAdaptiveContext({
+      state,
+      role,
+      baseSha: state.baseSha,
+      checkout: config.checkout,
+      store: args.contentStore,
+      config,
+      sources: planningSources(args.body, state.baseSha, config.checkout),
+      required,
+      save,
+    });
   };
   try {
     stopIfCancelled();
@@ -873,6 +947,31 @@ async function advanceAmendment(args: {
             approvedPlaybook: args.model.approvedPlaybook,
             approvedPlaybookPin: args.model.approvedPlaybookPin,
             generateStructured: async (request) => {
+              const selected = await selectContext(
+                "compile",
+                {
+                  sources: request.sources,
+                  proposal: pending.proposal,
+                  compileContext: request.compileContext,
+                },
+                pending.planningInvocation!.adaptiveContextId,
+              );
+              if (selected) {
+                pending.planningInvocation!.adaptiveContextId =
+                  selected.packet.id;
+                request = {
+                  ...request,
+                  adaptiveContext: selected.packet,
+                  compileContext: {
+                    ...request.compileContext!,
+                    currentImplementationEvidence: [
+                      ...(request.compileContext
+                        ?.currentImplementationEvidence ?? []),
+                      selected.evidence,
+                    ],
+                  },
+                };
+              }
               const requestDigest = createHash("sha256")
                 .update(JSON.stringify(request))
                 .digest("hex");
@@ -982,6 +1081,22 @@ async function advanceAmendment(args: {
           ]),
         ),
       };
+      const selected = await selectContext(
+        "graph-review",
+        {
+          sources: packet.sources,
+          amendment: packet.amendment,
+          graph: packet.graph,
+        },
+        pending.reviewInvocation?.adaptiveContextId,
+      );
+      if (selected) {
+        packet.adaptiveContext = selected.packet;
+        packet.amendment.currentImplementationEvidence = [
+          ...(packet.amendment.currentImplementationEvidence ?? []),
+          selected.evidence,
+        ];
+      }
       const requestDigest = createHash("sha256")
         .update(JSON.stringify(packet))
         .digest("hex");
@@ -1011,6 +1126,7 @@ async function advanceAmendment(args: {
       pending.reviewInvocation ??= {
         id: randomUUID(),
         requestDigest,
+        ...(selected ? { adaptiveContextId: selected.packet.id } : {}),
         packet: evidence,
       };
       save();

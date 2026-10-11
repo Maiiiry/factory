@@ -1,3 +1,4 @@
+import { assertAdaptiveContextPacket } from "./adaptive-context.js";
 import { assertPlanningLookupRecord } from "./compiler/context.js";
 import {
   assertDiscoveryOutputManifest,
@@ -113,6 +114,8 @@ export function pendingQuestions(
 }
 
 export interface WorkState {
+  /** Immutable selected dispatch packet; operational ownership remains here. */
+  adaptiveContextId?: string;
   knowledge?: import("./objective-knowledge.js").ObjectiveKnowledgeRecord;
   recovery?: import("./repair-policy.js").WorkRecovery;
   /** Reservation survives an uncertain effect; item ownership is separate. */
@@ -309,6 +312,11 @@ export function setCoordinatorMode(
 }
 
 export interface FactoryState {
+  /** Exact role packets selected before calls; historical absence stays absent. */
+  adaptiveContexts?: Record<
+    string,
+    import("./adaptive-context.js").AdaptiveContextPacket
+  >;
   /** Observational pointers; absence supplies no historical memory. */
   memoryBindings?: import("./repository-memory.js").RepositoryMemoryBinding[];
   graphProjectionIntents?: Record<
@@ -395,6 +403,65 @@ export interface FactoryState {
   /** Step repeat records for Work Items and the Objective (#515). */
   repeats?: Record<string, RepeatRecord>;
   wait?: Wait;
+}
+
+/** Validate retained packet identities without requiring advisory bodies for lifecycle reads. */
+export function assertStateAdaptiveContexts(state: FactoryState): void {
+  if (state.adaptiveContexts === undefined) return;
+  const packets = record(state.adaptiveContexts, "adaptiveContexts");
+  const graphs = new Set([
+    graphDigest(state.graph),
+    ...(state.graphRevisions ?? []).map((revision) => revision.digest),
+  ]);
+  for (const [id, packet] of Object.entries(packets)) {
+    assertAdaptiveContextPacket(packet);
+    const scope = packet.binding;
+    if (
+      id !== packet.id ||
+      scope.repository !== state.repository ||
+      scope.objective !== state.objective ||
+      scope.runId !== state.runId ||
+      scope.configDigest !== state.configDigest ||
+      !graphs.has(scope.graphDigest)
+    )
+      throw new Error(
+        "Retained adaptive context differs from its Objective scope",
+      );
+    if (scope.itemId !== undefined) {
+      const graph =
+        graphDigest(state.graph) === scope.graphDigest
+          ? state.graph
+          : state.graphRevisions?.find(
+              (revision) => revision.digest === scope.graphDigest,
+            )?.graph;
+      if (!graph?.items.some((item) => item.id === scope.itemId))
+        throw new Error(
+          "Retained adaptive context names an unadmitted Work Item",
+        );
+    }
+  }
+}
+
+/** A current or archived worker only consumes the packet frozen for its own attempt. */
+export function assertWorkAdaptiveContext(
+  state: FactoryState,
+  id: string,
+  work: WorkState,
+): void {
+  if (work.adaptiveContextId === undefined) return;
+  const packet = state.adaptiveContexts?.[work.adaptiveContextId];
+  if (
+    !packet ||
+    packet.role !== "dispatch" ||
+    packet.binding.itemId !== id ||
+    packet.binding.attemptId !== work.attempt ||
+    packet.binding.baseSha !== (work.executionBaseSha ?? work.baseSha) ||
+    (work.graphRevisionDigest !== undefined &&
+      packet.binding.graphDigest !== work.graphRevisionDigest)
+  )
+    throw new Error(
+      `Work Item ${id} selected adaptive context differs from its admitted attempt`,
+    );
 }
 
 /** Discovery completion is authenticated observation, separate from QA and delivery. */
@@ -763,6 +830,7 @@ export function parseFactoryState(
   assertPreIntegrationCheckShape(graph as unknown as WorkGraph);
   assertCoverageShape(graph as unknown as WorkGraph);
   assertGraphRevisions(state as unknown as FactoryState);
+  assertStateAdaptiveContexts(state as unknown as FactoryState);
   assertGraphProjectionIntents(state as unknown as FactoryState);
   assertExpansionState(state as unknown as FactoryState);
   assertAgentSessions(state as unknown as FactoryState);
@@ -926,6 +994,11 @@ export function parseFactoryState(
     );
   for (const id of ids) {
     assertObjectiveKnowledge(state as unknown as FactoryState, id);
+    assertWorkAdaptiveContext(
+      state as unknown as FactoryState,
+      id,
+      work[id] as WorkState,
+    );
     if (!Number.isSafeInteger(projected[id]) || Number(projected[id]) <= 0)
       throw new Error(`Work Item ${id} has no projected Issue identity`);
     const item = record(work[id], `work.${id}`);
@@ -1102,6 +1175,7 @@ export function parseFactoryState(
     if (!archivedFailure)
       assertSemanticRefusalRecord(controllerState, id, currentWork, failure);
     for (const prior of currentWork.recovery?.history ?? []) {
+      assertWorkAdaptiveContext(controllerState, id, prior.work);
       assertWorkDiscoveryOutput(controllerState, id, prior.work);
       assertObjectiveKnowledge(
         state as unknown as FactoryState,
@@ -1416,6 +1490,25 @@ export function parseFactoryState(
         const active = record(execution.data, `work.${id}.execution.data`);
         const request = record(active.request, `work.${id}.execution.request`);
         const attemptedItem = record(request.item, `work.${id}.execution.item`);
+        if (request.adaptiveContext !== undefined) {
+          assertAdaptiveContextPacket(request.adaptiveContext);
+          if (
+            request.adaptiveContext.id !== item.adaptiveContextId ||
+            JSON.stringify(request.adaptiveContext) !==
+              JSON.stringify(
+                (state.adaptiveContexts as FactoryState["adaptiveContexts"])?.[
+                  request.adaptiveContext.id
+                ],
+              )
+          )
+            throw new Error(
+              `Work Item ${id} active request lost its retained adaptive packet`,
+            );
+        } else if (item.adaptiveContextId !== undefined) {
+          throw new Error(
+            `Work Item ${id} active request omits its selected adaptive packet`,
+          );
+        }
         const acceptedItem = (graph.items as Record<string, unknown>[]).find(
           (candidate) => candidate.id === id,
         )!;
