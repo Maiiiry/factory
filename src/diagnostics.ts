@@ -15,6 +15,7 @@ import {
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import { readAccountingRecords, retainModelAccounting } from "./accounting.js";
 import { replacementRefusal } from "./amendment-admission.js";
 import {
   type CapturePolicy,
@@ -418,6 +419,10 @@ export class DiagnosticEmitter {
     return this.objective;
   }
 
+  get accountingConfigDigest(): string | undefined {
+    return this.configDigest;
+  }
+
   scheduling(args: {
     runId: string;
     itemId: string;
@@ -564,13 +569,25 @@ export class DiagnosticEmitter {
     attemptId?: string;
   }): import("./contracts.js").ModelInvocationObserver {
     return this.guardModelObserver((observation) => {
+      retainModelAccounting(
+        {
+          repository: this.repository,
+          objective: this.objective,
+          runId: context.runId ?? null,
+          itemId: context.itemId ?? null,
+          attemptId: context.attemptId ?? null,
+          configDigest: this.configDigest ?? null,
+          scopeId: context.scopeId,
+        },
+        observation,
+      );
       const { scopeId, ...diagnosticContext } = context;
-      const captureKey = `${observation.invocationId}:${observation.providerAttempt ?? 1}`;
+      const captureKey = `${observation.invocationId}:${observation.providerAttempt ?? "unknown"}`;
       const operationAttemptId = `model/${captureKey}`;
       const parentOperationAttemptId = currentObservedOperationAttemptId();
       const formal = { scope: scopeId, phase: observation.phase };
       let writer = this.captureWriters.get(captureKey);
-      if (!writer) {
+      if (!writer && observation.providerAttempt !== undefined) {
         const budget = this.captureBudgets.get(observation.invocationId) ?? {
           retained: 0,
         };
@@ -581,11 +598,11 @@ export class DiagnosticEmitter {
             objective: this.objective,
             ...context,
             invocationId: observation.invocationId,
-            providerAttempt: observation.providerAttempt ?? 1,
+            providerAttempt: observation.providerAttempt,
             phase: observation.phase,
-            adapter: observation.adapter ?? "@openai/codex-sdk@0.160.0",
+            adapter: observation.adapter ?? "not-exposed",
             configured: {
-              provider: observation.provider ?? "openai-codex-sdk",
+              provider: observation.provider ?? "not-exposed",
               model: observation.model ?? "not-exposed",
               reasoningEffort: observation.reasoningEffort,
             },
@@ -605,7 +622,7 @@ export class DiagnosticEmitter {
         this.captureWriters.set(captureKey, writer);
       }
       if (observation.capture)
-        writer.record(observation.capture.event, observation.capture.content);
+        writer?.record(observation.capture.event, observation.capture.content);
       const semantic = observation.capture?.event.outcome;
       if (semantic?.stage === "semantic" && semantic.status !== "pass")
         this.emit({
@@ -622,7 +639,7 @@ export class DiagnosticEmitter {
           outcome: "failed",
           metadata: {
             invocationId: observation.invocationId,
-            providerAttempt: observation.providerAttempt ?? 1,
+            providerAttempt: observation.providerAttempt ?? "unknown",
             semanticStatus: semantic.status,
           },
         });
@@ -646,7 +663,7 @@ export class DiagnosticEmitter {
                 ? "protocol"
                 : "semantic"
             : "provider";
-        writer.record({
+        writer?.record({
           kind: "outcome",
           durationMs: observation.durationMs,
           providerSessionId: observation.providerThreadId,
@@ -904,7 +921,10 @@ export interface ModelInvocationSummary {
   byScope: Record<string, ModelInvocationAggregate>;
 }
 
-type ModelEvent = Pick<DiagnosticEvent, "at" | "operation" | "metadata">;
+type ModelEvent = Pick<
+  DiagnosticEvent,
+  "at" | "operation" | "metadata" | "runId" | "attemptId"
+>;
 
 /** Derive observational totals without treating absent provider usage as zero. */
 export function summarizeModelInvocations(
@@ -941,8 +961,13 @@ export function summarizeModelInvocations(
     const providerAttempt =
       typeof event.metadata?.providerAttempt === "number"
         ? event.metadata.providerAttempt
-        : 1;
-    const invocationKey = `${invocationId}:${providerAttempt}`;
+        : "unknown";
+    const invocationKey = JSON.stringify([
+      event.runId ?? null,
+      event.attemptId ?? null,
+      invocationId,
+      providerAttempt,
+    ]);
     const entry = invocations.get(invocationKey) ?? {
       phase: phase as ModelInvocationPhase,
       scopeId,
@@ -1111,7 +1136,10 @@ export function summarizeDiagnosticUsage(events: Record<string, unknown>[]) {
     }
   >();
   for (const event of events) {
-    if (event.operation === "harness" && typeof event.attemptId === "string")
+    if (
+      ["harness", "recorded-work-attempt"].includes(String(event.operation)) &&
+      typeof event.attemptId === "string"
+    )
       knownAttempts.add(event.attemptId);
     if (
       event.operation !== "worker-usage" ||
@@ -1640,13 +1668,16 @@ export function* privateRecords(
 function usageEvent(
   event: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  const { at, operation, attemptId, runId, workItemId } = event;
+  const { at, operation, attemptId, runId } = event;
+  const workItemId = event.workItemId ?? event.itemId;
   if (operation === "harness") return { at, operation, attemptId };
   if (operation === "model-invocation") {
     const metadata = event.metadata as DiagnosticEvent["metadata"];
     return {
       at,
       operation,
+      attemptId,
+      runId,
       metadata:
         metadata &&
         Object.fromEntries(
@@ -1698,6 +1729,98 @@ function usageEvent(
   };
 }
 
+/** Typed original observations; optional diagnostic replicas cannot overwrite them. */
+function durableUsageEvents(
+  repository: string,
+  objective: number,
+): Record<string, unknown>[] {
+  const records = readAccountingRecords(repository, objective);
+  const events: Record<string, unknown>[] = [];
+  for (const record of records) {
+    const owner = {
+      at: record.at,
+      runId: record.binding.runId ?? undefined,
+      attemptId: record.binding.attemptId ?? undefined,
+      workItemId: record.binding.itemId ?? undefined,
+    };
+    if (record.kind === "model") {
+      const value = record.observation;
+      events.push({
+        ...owner,
+        operation: "model-invocation",
+        metadata: {
+          ...value,
+          scopeId: record.binding.scopeId,
+          observationType: value.type,
+          ...value.usage,
+        },
+      });
+    } else if (record.kind === "worker") {
+      events.push({
+        ...owner,
+        operation: "worker-usage",
+        workerUsage: record.observation,
+      });
+    } else {
+      const capture = record.capture;
+      if (capture.phase !== "implementation" || !record.binding.attemptId)
+        continue;
+      // Native per-response/thread/descendant counters have their own scopes.
+      // Only an adapter's invocation-cumulative receipt contributes worker totals.
+      if (
+        capture.kind !== "request" &&
+        capture.usage?.scope !== "invocation-cumulative" &&
+        capture.kind !== "outcome"
+      )
+        continue;
+      const type =
+        capture.kind === "request"
+          ? "started"
+          : capture.outcome?.stage === "provider"
+            ? capture.outcome.status === "failed"
+              ? "failed"
+              : capture.outcome.status === "completed"
+                ? "completed"
+                : "progress"
+            : capture.usage?.terminal
+              ? "completed"
+              : "progress";
+      events.push({
+        ...owner,
+        operation: "worker-usage",
+        workerUsage: {
+          type,
+          role: "worker",
+          phase: "implementation",
+          invocationId: capture.invocationId,
+          providerAttempt: capture.providerAttempt,
+          adapter: capture.adapter,
+          provider: capture.configured.provider,
+          model: capture.reportedModel ?? capture.configured.model,
+          reasoningEffort: capture.configured.reasoningEffort,
+          ...(capture.usage?.scope === "invocation-cumulative" && {
+            usage: capture.usage.normalized,
+          }),
+        },
+      });
+    }
+  }
+  return events;
+}
+function usageIdentity(event: Record<string, unknown>): string | undefined {
+  const body =
+    event.operation === "model-invocation" ? event.metadata : event.workerUsage;
+  if (!body || typeof body !== "object") return;
+  const value = body as Record<string, unknown>;
+  return JSON.stringify([
+    event.operation,
+    event.runId ?? null,
+    event.attemptId ?? null,
+    value.invocationId,
+    value.providerAttempt ?? null,
+  ]);
+}
+
 /** Summary input only: stream private files without retaining command detail. */
 export function readUsageSummaryEvents(
   repository: string,
@@ -1722,6 +1845,14 @@ export function readUsageSummaryEvents(
     }
   for (const [id, work] of Object.entries(state?.work ?? {}))
     if (work.attempt) {
+      // Existing snapshot proves a recorded owner, never its billed token total.
+      events.push({
+        operation: "recorded-work-attempt",
+        attemptId: work.attempt,
+        runId: state?.runId,
+        workItemId: id,
+        at: work.startedAt ?? "",
+      });
       itemByAttempt.set(work.attempt, id);
       if (state?.runId) runByAttempt.set(work.attempt, state.runId);
     }
@@ -1742,6 +1873,17 @@ export function readUsageSummaryEvents(
         if (selected) events.push(selected);
       }
     }
+  const durable = durableUsageEvents(repository, objective);
+  const originals = new Set(
+    durable.map(usageIdentity).filter((value) => value !== undefined),
+  );
+  const combined = [
+    ...events.filter((event) => {
+      const key = usageIdentity(event);
+      return key === undefined || !originals.has(key);
+    }),
+    ...durable,
+  ];
   // Old worker summaries omitted adapter identity. Use only retained matching
   // invocation/attempt capture metadata; never infer the provider from a model name.
   const adapters = new Map<string, Set<string>>();
@@ -1751,7 +1893,7 @@ export function readUsageSummaryEvents(
     values.add(capture.adapter);
     adapters.set(key, values);
   }
-  for (const event of events) {
+  for (const event of combined) {
     const observation = event.workerUsage as
       | Record<string, unknown>
       | undefined;
@@ -1761,7 +1903,7 @@ export function readUsageSummaryEvents(
     );
     if (values?.size === 1) observation.adapter = [...values][0];
   }
-  return events.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  return combined.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
 
 /**
