@@ -1,3 +1,4 @@
+import { retainWorkerAccounting } from "../accounting.js";
 import type {
   ExecutionContext,
   ExecutionHandle,
@@ -19,20 +20,43 @@ export function workerContext(
     itemId: string;
     repository?: string;
     checkpointedEffects?: true;
+    objective?: number;
+    configDigest?: string;
   },
 ): ExecutionContext {
   const context = executionContext(
     work,
     save,
     cancelled,
-    (workerUsage) =>
+    (workerUsage) => {
+      const repository = ids.repository ?? diagnostics?.repositoryIdentity;
+      const objective = ids.objective ?? diagnostics?.objectiveIdentity;
+      if (repository && objective !== undefined) {
+        try {
+          retainWorkerAccounting(
+            {
+              repository,
+              objective,
+              runId: ids.runId ?? null,
+              itemId: ids.itemId,
+              attemptId: work.attempt ?? null,
+              configDigest:
+                ids.configDigest ?? diagnostics?.accountingConfigDigest ?? null,
+            },
+            workerUsage,
+          );
+        } catch {
+          /* Mandatory retention gap is fenced by the checkpoint journal. */
+        }
+      }
       diagnostics?.emit({
         ...ids,
         attemptId: work.attempt,
         operation: "worker-usage",
         outcome: "observed",
         workerUsage,
-      }),
+      });
+    },
     (orphan) =>
       diagnostics?.emit({
         ...ids,

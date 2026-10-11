@@ -1643,7 +1643,7 @@ export function parseFactoryState(
           )
             throw new Error("AssetSet relationships are invalid");
         }
-        if (set.capture !== undefined)
+        if (set.capture !== undefined || set.manifestRef !== undefined)
           assertAssetCaptureReceipt(set as unknown as CapturedAssetSet);
       }
     }
@@ -1693,6 +1693,15 @@ export function parseFactoryState(
         jsonSafe(execution.data, `work.${id}.execution.data`);
       if (execution.data !== undefined) {
         const active = record(execution.data, `work.${id}.execution.data`);
+        if (
+          active.rejectedCollection !== undefined &&
+          (state.schemaVersion !== 17 ||
+            !["local", "openai-agents", "claude-managed-agents"].includes(
+              String(execution.provider),
+            ) ||
+            active.result !== undefined)
+        )
+          throw new Error("Invalid rejected collection disposition");
         if (
           active.admissionBlockedAt !== undefined &&
           (state.schemaVersion !== 17 ||
@@ -2184,6 +2193,7 @@ export function parseFactoryState(
     }
   }
   if (validated.finalValidation?.passed) assertCompletedCoverage(validated);
-  assertFinalAcceptance(validated);
+  // Portable metadata decoding precedes verified content hydration.
+  assertFinalAcceptance(validated, { verifyAccountingBodies: false });
   return validated;
 }

@@ -153,7 +153,11 @@ export async function runDiscoveryItem(args: {
         item,
         baseSha: work.baseSha!,
         attemptId,
-        captureContext: { objective: state.objective, runId: state.runId },
+        captureContext: {
+          objective: state.objective,
+          runId: state.runId,
+          attemptId: work.attempt,
+        },
         discovery: { manifest: work.discoveryOutput! },
       }),
     });

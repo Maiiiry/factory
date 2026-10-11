@@ -310,7 +310,11 @@ export async function runWorker(
             },
           }
         : {}),
-      captureContext: { objective: args.objective, runId: state.runId },
+      captureContext: {
+        objective: args.objective,
+        runId: state.runId,
+        attemptId: work.attempt,
+      },
       item: attemptedItem,
       ...(retained && args.driver.retainedFailedResultContext === true
         ? { retainedFailedResult: retained }
@@ -394,6 +398,9 @@ export async function stopWorker(args: ItemWorker): Promise<void> {
       {
         runId: state.runId,
         itemId: item.id,
+        repository: state.repository,
+        objective: state.objective,
+        configDigest: state.configDigest,
       },
     );
     if (session) context.checkpointSession = (ref) => session.checkpoint(ref);

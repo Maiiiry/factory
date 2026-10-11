@@ -733,7 +733,7 @@ export interface ExecutionRequest {
   /** Controller-authenticated selector-bound observation supplied to discovery. */
   discovery?: { manifest: import("./discovery.js").DiscoveryOutputManifest };
   session?: AgentSessionRequest;
-  captureContext?: { objective: number; runId: string };
+  captureContext?: { objective: number; runId: string; attemptId?: string };
   item: WorkItem;
   baseSha: string;
   attemptId?: string;
@@ -1141,6 +1141,8 @@ export interface ProducedAssetSet {
 
 export interface CapturedAssetSet {
   id: string;
+  /** Literal original declaration shared by every candidate, not reconstructed JSON. */
+  manifestRef?: ContentRef;
   inputs?: { binding: SourceAssetBinding; ref: ContentRef }[];
   members: {
     role: string;

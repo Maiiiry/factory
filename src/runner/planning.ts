@@ -687,7 +687,10 @@ export async function prepareObjective(args: {
                 config.checkout,
                 paidPlanningModel(planningModel, context),
                 installationConfigDigest,
-                diagnostics.modelObserver({ scopeId: planningScopeId }),
+                diagnostics.modelObserver({
+                  scopeId: planningScopeId,
+                  runId: preparation!.runId,
+                }),
                 executionProfileChoices(config),
                 {
                   contextResolver: createPlanningContextResolver({

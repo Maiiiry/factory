@@ -1,5 +1,3 @@
-import { workFault } from "../fault.js";
-import { ownsPath } from "../ownership.js";
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
@@ -13,9 +11,12 @@ import {
   readSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { workFault } from "../fault.js";
+import { ownsPath } from "../ownership.js";
 import {
   pinnedGit,
   pinnedGitEnvironment,
@@ -270,9 +271,31 @@ export async function checkStagedCandidate(
   checkout: string,
   ownedPaths: string[],
   acceptedIgnoredLinks?: string[],
+  observationBounds?: { maxBytes: number; maxFiles: number; deadline: number },
 ): Promise<string[]> {
   checkWorktreeEntries(worktree, acceptedIgnoredLinks);
   const paths = changedPaths(worktree);
+  if (observationBounds) {
+    const refuse = () => {
+      throw new Error(
+        "Rejected staged candidate exceeds its admitted checkpoint bounds",
+      );
+    };
+    if (
+      paths.length > observationBounds.maxFiles ||
+      Date.now() > observationBounds.deadline
+    )
+      refuse();
+    let bytes = 0;
+    for (const path of paths) {
+      if (Date.now() > observationBounds.deadline) refuse();
+      const entry = stagedEntry(worktree, path);
+      if (entry)
+        bytes += Number(pinnedGit(worktree, "cat-file", "-s", entry.blob));
+      if (bytes > observationBounds.maxBytes) refuse();
+    }
+    if (Date.now() > observationBounds.deadline) refuse();
+  }
   const unowned = paths.filter((path) => !ownsPath(path, ownedPaths));
   if (unowned.length)
     throw workFault(
@@ -326,4 +349,26 @@ export async function checkStagedCandidate(
     }
   }
   return paths;
+}
+
+/** Scan the exact bounded observation bytes before a canonical private reference exists. */
+export async function scanCollectionObservation(
+  worktree: string,
+  checkout: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const root = mkdtempSync(join(dirname(worktree), "secret-scan-"));
+  try {
+    const path = join(root, "observation.json");
+    writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+    await scanChangedFile(
+      worktree,
+      "collection observation",
+      path,
+      join(root, "report.txt"),
+      checkout,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }

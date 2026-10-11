@@ -55,6 +55,7 @@ import { checkIntakeServiceState, supervise } from "./supervision.js";
 import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
 import {
   gitPersistenceStatus,
+  inspectRecoveryCheckpoint,
   synchronizeRecoveryCheckpoint,
   withRecoveryCheckpointScope,
 } from "./recovery-checkpoint.js";
@@ -99,7 +100,7 @@ function help(): void {
       "      Collect terminal experience, propose a compact playbook, then explicitly approve its exact draft before advisory use",
       "  recipe --file ABSOLUTE_OBJECTIVE",
       "      Preview a pinned workflow recipe against the current checkout without model calls or admission",
-      "  persistence status | sync",
+      "  persistence status | sync | inspect",
       "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
       "  run --objective N [--deadline ISO_TIMESTAMP]",
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
@@ -354,13 +355,15 @@ async function dispatchMain(): Promise<void> {
     return runWorkflowRecipePreview(readConfig(path), args);
   if (command === "persistence") {
     const [action, ...rest] = queueWords(args);
-    if (rest.length || (action !== "status" && action !== "sync"))
-      throw new Error("Use factory persistence status | sync");
+    if (rest.length || !["status", "sync", "inspect"].includes(action ?? ""))
+      throw new Error("Use factory persistence status | sync | inspect");
     const config = readConfig(path);
     const result =
       action === "status"
         ? gitPersistenceStatus(config)
-        : await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+        : action === "inspect"
+          ? await inspectRecoveryCheckpoint(config)
+          : await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
     console.log(JSON.stringify(result, null, 2));
     return;
   }

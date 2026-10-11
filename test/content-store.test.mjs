@@ -16,6 +16,24 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
+import { analyzeInteractions } from "../dist/analysis.js";
+import { captureAssetSets } from "../dist/media.js";
+import {
+  assertAccountingSealContent,
+  buildAccountingSeal,
+  decodeAccountingRecord,
+  readAccountingRecords,
+} from "../dist/accounting.js";
+import {
+  CaptureWriter,
+  readInteractionContent,
+  readInteractionMetadata,
+} from "../dist/capture.js";
+import {
+  DiagnosticEmitter,
+  readUsageSummaryEvents,
+  summarizeDiagnosticUsage,
+} from "../dist/diagnostics.js";
 import {
   LocalRepositoryMemory,
   retainPlanningSourceMemory,
@@ -47,9 +65,13 @@ import {
   retainLearningMemory,
   savePlaybookProposal,
 } from "../dist/learning.js";
-import { buildRecoveryCheckpointClosure } from "../dist/recovery-checkpoint-closure.js";
+import {
+  buildRecoveryCheckpointClosure,
+  describeMemoryBodyReferences,
+} from "../dist/recovery-checkpoint-closure.js";
 import {
   gitPersistenceStatus,
+  inspectRecoveryCheckpoint,
   readVerifiedRecoveryCheckpoint,
   synchronizeRecoveryCheckpoint,
 } from "../dist/recovery-checkpoint.js";
@@ -428,6 +450,206 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     cancelledAt: new Date().toISOString(),
   };
   saveState(statePath(repository, 1), cancelled);
+  // These are observations of the actual local Git read, with no provider
+  // accounting claimed. Optional text retention uses the existing capture budget.
+  const observed = [];
+  const diagnostics = new DiagnosticEmitter(repository, 1);
+  const captureContext = {
+    repository,
+    objective: 1,
+    runId: cancelled.runId,
+    invocationId: "actual-local-git-source-read",
+    providerAttempt: 1,
+    phase: "integration",
+    adapter: "local-process",
+    configured: { provider: "not-invoked", model: "none" },
+    configDigest: cancelled.configDigest,
+    sourceDigest: sourceRef.digest,
+  };
+  const emitCapture = (capture) => {
+    observed.push(capture);
+    diagnostics.emit({
+      operation: "interaction",
+      outcome: "observed",
+      capture,
+    });
+  };
+  const captured = new CaptureWriter(
+    captureContext,
+    { enabled: true, retainInRecovery: true, maxBytesPerInvocation: 40 },
+    ["Complete reference"],
+    emitCapture,
+  );
+  captured.record({ kind: "request" }, () => ({
+    command: "git show HEAD:api.md",
+  }));
+  const started = performance.now();
+  const observedSource = execFileSync("git", [
+    "-C",
+    checkout,
+    "show",
+    "HEAD:api.md",
+  ]);
+  const durationMs = performance.now() - started;
+  assert.deepEqual(observedSource, source);
+  captured.record(
+    {
+      kind: "response",
+      boundary: {
+        source: "factory-process",
+        event: "process-exit",
+        elapsedMs: durationMs,
+        exitCode: 0,
+      },
+    },
+    () => ({ text: observedSource.toString("utf8") }),
+  );
+  const replicaOnly = new CaptureWriter(
+    { ...captureContext, invocationId: "actual-local-replica-only" },
+    { enabled: true, maxBytesPerInvocation: 1024 },
+    [],
+    emitCapture,
+  );
+  replicaOnly.record(
+    { kind: "outcome", outcome: { stage: "protocol", status: "completed" } },
+    () => ({ text: observedSource.toString("utf8") }),
+  );
+  assert.equal(observed[1].content.redacted, true);
+  assert.equal(observed[1].content.truncated, true);
+  const retainedCapture = observed[1].content.reference;
+  const retainedText = readInteractionContent(repository, retainedCapture);
+  assert.equal(retainedText.includes("Complete reference"), false);
+  assert.equal(observed[2].content.reference.payload, undefined);
+  const accountingBefore = readAccountingRecords(repository, 1);
+  const accountingSeal = buildAccountingSeal(
+    repository,
+    1,
+    cancelled.runId,
+    [],
+  );
+  assert.equal(accountingSeal.coverage.wholeWorkflowTotal, "unproven");
+  assert.equal(accountingSeal.coverage.usageUnavailableRecords > 0, true);
+  assert.equal(
+    accountingSeal.coverage.usageAvailableRecords +
+      accountingSeal.coverage.usageUnavailableRecords,
+    accountingBefore.length,
+  );
+  const usageBefore = summarizeDiagnosticUsage(
+    readUsageSummaryEvents(repository, 1),
+  );
+  assert.equal(
+    usageBefore.combinedUsage.coverage.byCategory.totalTokens,
+    "unavailable",
+  );
+  const metadataBefore = readInteractionMetadata(repository, 1);
+  assert.equal(
+    metadataBefore.find((entry) => entry.recordId === observed[1].recordId)
+      .boundary.elapsedMs,
+    durationMs,
+  );
+  const interactionBefore = analyzeInteractions(metadataBefore, [], {});
+  // Capture a declaration over the same actual source read, then retain the
+  // resulting observation as historical memory before its staging is removed.
+  const declared = [
+    {
+      id: "source-documentation",
+      members: [
+        {
+          role: "documentation",
+          path: ".factory-media/source/api.md",
+          mediaType: "text/markdown",
+          destination: "api.md",
+        },
+      ],
+      provenance: {
+        source: "api.md",
+        rights: "fixture authored for this test",
+        visibility: "repository",
+        lineage: ["api.md"],
+      },
+    },
+  ];
+  const declarationBytes = Buffer.from(
+    `${JSON.stringify({ sets: declared }, null, 2)}\n`,
+  );
+  mkdirSync(join(checkout, ".factory-media", "source"), { recursive: true });
+  writeFileSync(
+    join(checkout, ".factory-media", "source", "api.md"),
+    observedSource,
+  );
+  writeFileSync(join(checkout, ".factory-assets.json"), declarationBytes);
+  let checkpointedAssets;
+  const capturedAssets = await captureAssetSets(
+    store,
+    checkout,
+    { id: "documentation", ownedPaths: ["api.md"] },
+    declared,
+    { harness: captureContext.invocationId, exitCode: 0 },
+    undefined,
+    undefined,
+    undefined,
+    (sets) => {
+      assert.equal(existsSync(join(checkout, ".factory-media")), true);
+      for (const set of sets)
+        for (const member of set.members)
+          assert.deepEqual(store.readBytes(member.ref), observedSource);
+      checkpointedAssets = sets;
+    },
+  );
+  assert.deepEqual(checkpointedAssets, capturedAssets);
+  assert.deepEqual(
+    store.readBytes(capturedAssets[0].manifestRef),
+    declarationBytes,
+  );
+  const assetObservationBytes = Buffer.from(
+    JSON.stringify({ assets: capturedAssets }),
+  );
+  const assetObservationRef = store.putBytes(assetObservationBytes, {
+    mediaType: "application/json",
+  });
+  const originalDescription = describeMemoryBodyReferences(
+    "attempt-observation",
+    assetObservationBytes,
+  );
+  assert.equal(
+    originalDescription.contentRefs.some(
+      (ref) => ref.digest === capturedAssets[0].manifestRef.digest,
+    ),
+    true,
+  );
+  const legacyAssets = structuredClone(capturedAssets);
+  delete legacyAssets[0].manifestRef;
+  const legacyDescription = describeMemoryBodyReferences(
+    "attempt-observation",
+    Buffer.from(JSON.stringify({ assets: legacyAssets })),
+  );
+  assert.equal(legacyDescription.gaps[0].availability, "missing-legacy");
+  assert.equal(legacyDescription.gaps[0].required, false);
+  const mismatchedAssets = structuredClone(capturedAssets);
+  mismatchedAssets[0].manifestRef = sourceRef;
+  assert.throws(
+    () =>
+      describeMemoryBodyReferences(
+        "attempt-observation",
+        Buffer.from(JSON.stringify({ assets: mismatchedAssets })),
+      ),
+    /differs from its original declaration/,
+  );
+  memory.retain({
+    ...record,
+    kind: "episode",
+    summary:
+      "The actual local source read retains its original asset declaration",
+    bodies: [
+      {
+        role: "attempt-observation",
+        ref: assetObservationRef,
+        availability: "retained",
+      },
+    ],
+  });
+  rmSync(join(checkout, ".factory-assets.json"));
+  assert.equal(existsSync(join(checkout, ".factory-media")), false);
   const episode = recordRetrospective(config, 1);
   assert.equal(episode.outcome, "cancelled");
   const prepared = await prepareDreamInput(config, { budgetBytes: 16384 });
@@ -505,8 +727,42 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       scope: "private-history",
     });
   const closure = await buildClosure();
+  const knowledge = await buildRecoveryCheckpointClosure({
+    config,
+    scope: "repository-knowledge",
+  });
+  assert.equal(
+    knowledge.files.some((file) => file.path.startsWith("accounting/")),
+    false,
+  );
+  assert.equal(
+    knowledge.contentRefs.some(
+      (ref) => ref.digest === retainedCapture.payload.digest,
+    ),
+    false,
+  );
   assert.equal(
     closure.files.some((file) => file.kind === "git-pack"),
+    true,
+  );
+  assert.equal(
+    closure.files.some((file) => file.path.startsWith("accounting/")),
+    true,
+  );
+  assert.equal(
+    closure.files.some((file) => file.path.startsWith("captures/")),
+    false,
+  );
+  assert.equal(
+    closure.contentRefs.some(
+      (ref) => ref.digest === retainedCapture.payload.digest,
+    ),
+    true,
+  );
+  assert.equal(
+    closure.contentRefs.some(
+      (ref) => ref.digest === capturedAssets[0].manifestRef.digest,
+    ),
     true,
   );
   for (const kind of [
@@ -526,6 +782,23 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     buildClosure,
   });
   assert.equal(firstCheckpoint.status, "acknowledged");
+  const firstInspection = await inspectRecoveryCheckpoint(config);
+  const uniqueBodies = new Map(
+    closure.contentRefs.map((ref) => [ref.digest, ref.bytes]),
+  );
+  assert.equal(
+    firstInspection.current.uniqueBodyBytes,
+    [...uniqueBodies.values()].reduce((total, bytes) => total + bytes, 0),
+  );
+  assert.equal(firstInspection.current.logicalFiles, closure.files.length);
+  assert.equal(firstInspection.current.manifestBytes > 0, true);
+  assert.equal(firstInspection.storage, "git-logical-bytes");
+  assert.equal(firstInspection.reachableHistory.availability, "available");
+  assert.equal(
+    firstInspection.reachableHistory.logicalObjectBytes >
+      firstInspection.current.uniqueBodyBytes,
+    true,
+  );
   const unchangedCheckpoint = await synchronizeRecoveryCheckpoint(config, {
     reason: "explicit",
     buildClosure,
@@ -547,6 +820,13 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     buildClosure,
   });
   assert.equal(secondCheckpoint.status, "acknowledged");
+  const secondInspection = await inspectRecoveryCheckpoint(config);
+  assert.equal(secondInspection.reachableHistory.availability, "available");
+  assert.equal(
+    secondInspection.reachableHistory.logicalObjectBytes >
+      firstInspection.reachableHistory.logicalObjectBytes,
+    true,
+  );
   assert.notEqual(
     secondCheckpoint.lastAcknowledged.commitSha,
     firstCheckpoint.lastAcknowledged.commitSha,
@@ -654,6 +934,9 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const originals = closure.files
     .filter((file) => file.kind === "learning-original")
     .map((file) => ({ ...file, bytes: readFileSync(join(state, file.path)) }));
+  const accountingOriginals = closure.files
+    .filter((file) => file.path.startsWith("accounting/"))
+    .map((file) => ({ ...file, bytes: readFileSync(join(state, file.path)) }));
   // The only surviving originals are in the remote Git archive. Fetch into an
   // independent repository after both the source workspace and replicas are gone.
   rmSync(checkout, { recursive: true });
@@ -669,6 +952,14 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(recovered.manifest.binding.repository, repository);
   assert.equal(recovered.manifest.binding.ref, config.gitPersistence.ref);
   assert.equal(existsSync(join(state, "content")), false);
+  await assertAccountingSealContent(
+    repository,
+    1,
+    cancelled.runId,
+    accountingSeal,
+    recovered.readVerifiedBlob,
+  );
+  assert.equal(existsSync(join(state, "content")), false);
   await installExactMemoryLearning({
     repository,
     root: state,
@@ -677,6 +968,47 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     contentRefs: recovered.manifest.contentRefs,
     readVerifiedBlob: recovered.readVerifiedBlob,
   });
+  for (const file of recovered.manifest.files.filter((entry) =>
+    entry.path.startsWith("accounting/"),
+  )) {
+    const bytes = Buffer.from(await recovered.readVerifiedBlob(file.ref));
+    decodeAccountingRecord(repository, file.path, bytes);
+    mkdirSync(join(state, "accounting"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(state, file.path), bytes, { mode: 0o600 });
+  }
+  for (const ref of recovered.manifest.contentRefs)
+    store.putBytes(Buffer.from(await recovered.readVerifiedBlob(ref)), {
+      mediaType: ref.mediaType,
+    });
+  for (const original of accountingOriginals)
+    assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
+  assert.equal(existsSync(join(state, "captures")), false);
+  assert.equal(existsSync(join(state, "harness")), false);
+  assert.equal(
+    existsSync(join(state, "objectives", "1", "diagnostics.ndjson")),
+    false,
+  );
+  assert.deepEqual(readAccountingRecords(repository, 1), accountingBefore);
+  assert.deepEqual(readInteractionMetadata(repository, 1), metadataBefore);
+  assert.deepEqual(
+    analyzeInteractions(readInteractionMetadata(repository, 1), [], {}),
+    interactionBefore,
+  );
+  assert.deepEqual(
+    summarizeDiagnosticUsage(readUsageSummaryEvents(repository, 1)),
+    usageBefore,
+  );
+  assert.equal(
+    readInteractionContent(repository, retainedCapture),
+    retainedText,
+  );
+  assert.throws(() =>
+    readInteractionContent(repository, observed[2].content.reference),
+  );
+  assert.deepEqual(
+    store.readBytes(capturedAssets[0].manifestRef),
+    declarationBytes,
+  );
   for (const original of originals)
     assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
   const restored = new LocalRepositoryMemory(state, repository);

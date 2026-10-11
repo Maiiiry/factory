@@ -109,6 +109,33 @@ interface CheckpointJournal {
   };
   error?: string;
   hold?: "conflict";
+  retentionGaps?: CheckpointRetentionGap[];
+}
+export interface CheckpointRetentionGap {
+  kind: "accounting-receipt";
+  path: string;
+  digest: string;
+  reason: "local-retention-unavailable";
+  observedAt: string;
+}
+export interface RecoveryCheckpointInspection {
+  binding: RecoveryCheckpointBinding;
+  commitSha: string;
+  remoteTip: string;
+  current: {
+    manifestBytes: number;
+    logicalFileBytes: number;
+    uniqueBodyBytes: number;
+    uniqueBodies: number;
+    logicalFiles: number;
+  };
+  reachableHistory:
+    | { availability: "available"; logicalObjectBytes: number; objects: number }
+    | {
+        availability: "unavailable";
+        reason: "bounded-inspection-unavailable";
+      };
+  storage: "git-logical-bytes";
 }
 export interface RecoveryCheckpointStatus {
   enabled: boolean;
@@ -131,6 +158,7 @@ export interface RecoveryCheckpointStatus {
   overdue?: boolean;
   scope?: GitPersistenceConfig["scope"];
   protectedContinuation: boolean;
+  retentionGaps?: CheckpointRetentionGap[];
 }
 export class CheckpointAdmissionFailure extends Error {
   knownNotDispatched: boolean;
@@ -170,6 +198,19 @@ const scopes = new AsyncLocalStorage<{
 export function hasPrivateCheckpointScope(): boolean {
   const scope = scopes.getStore();
   return Boolean(scope && settings(scope.config)?.scope === "private-history");
+}
+export function privateCheckpointBounds():
+  | { maxBytes: number; maxFiles: number; timeoutMs: number }
+  | undefined {
+  const scope = scopes.getStore();
+  const options = scope ? settings(scope.config) : undefined;
+  return options?.scope === "private-history"
+    ? {
+        maxBytes: options.maxBytes,
+        maxFiles: options.maxFiles,
+        timeoutMs: options.timeoutMs,
+      }
+    : undefined;
 }
 const hash = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
@@ -375,7 +416,7 @@ function journal(
       "changed",
       "attempts",
     ],
-    ["dirtySince", "lastAcknowledged", "error", "hold"],
+    ["dirtySince", "lastAcknowledged", "error", "hold", "retentionGaps"],
   );
   if (
     value.schemaVersion !== 1 ||
@@ -432,6 +473,26 @@ function journal(
     safePath(changed.path);
     if (typeof changed.kind !== "string" || !changed.kind)
       throw new Error("Invalid pending checkpoint mutation");
+  }
+  if (value.retentionGaps !== undefined) {
+    if (
+      !Array.isArray(value.retentionGaps) ||
+      value.retentionGaps.length > options.maxFiles
+    )
+      throw new Error("Invalid required checkpoint retention gaps");
+    const identities = new Set<string>();
+    for (const gap of value.retentionGaps) {
+      keys(gap, ["kind", "path", "digest", "reason", "observedAt"]);
+      assertAccountingGapIdentity(gap);
+      if (
+        gap.kind !== "accounting-receipt" ||
+        gap.reason !== "local-retention-unavailable" ||
+        !Number.isFinite(Date.parse(gap.observedAt)) ||
+        identities.has(gap.path)
+      )
+        throw new Error("Invalid required checkpoint retention gap identity");
+      identities.add(gap.path);
+    }
   }
   if (value.hold !== undefined && value.hold !== "conflict")
     throw new Error("Invalid checkpoint conflict hold");
@@ -490,7 +551,9 @@ function status(
   options?: GitPersistenceConfig,
 ): RecoveryCheckpointStatus {
   const last = record.attempts.at(-1);
-  const pendingChanges = record.sequence > record.acknowledgedSequence;
+  const hasRetentionGap = Boolean(record.retentionGaps?.length);
+  const pendingChanges =
+    record.sequence > record.acknowledgedSequence || hasRetentionGap;
   return {
     enabled: true,
     durability: record.lastAcknowledged ? "verified-git" : "local-only",
@@ -499,12 +562,15 @@ function status(
         ? "conflict"
         : last && ["submitted", "prepared", "unknown"].includes(last.status)
           ? "unknown"
-          : record.error
+          : record.error || hasRetentionGap
             ? "failed"
             : pendingChanges
               ? "pending"
               : "acknowledged",
     pendingChanges,
+    ...(hasRetentionGap
+      ? { retentionGaps: structuredClone(record.retentionGaps) }
+      : {}),
     protectedContinuation:
       options?.scope === "private-history" &&
       Boolean(record.lastAcknowledged) &&
@@ -548,6 +614,119 @@ export function gitPersistenceStatus(
       protectedContinuation: false,
     };
   return status(journal(config, options), options);
+}
+function assertAccountingGapIdentity(value: {
+  path: string;
+  digest: string;
+}): void {
+  if (
+    typeof value.digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.digest) ||
+    value.path !== `accounting/${value.digest}.json`
+  )
+    throw new Error(
+      "Required accounting retention gap has an invalid identity",
+    );
+}
+function accountingGapScope(repository: string) {
+  const scope = scopes.getStore();
+  if (!scope) return undefined;
+  if (scope.config.repository !== repository)
+    throw new CheckpointAdmissionFailure(
+      "Accounting retention scope differs from its admitted repository",
+    );
+  const options = settings(scope.config);
+  if (!options || options.scope !== "private-history") return undefined;
+  return { ...scope, options };
+}
+function accountingGapIdentity(
+  repository: string,
+  value: { path: string; digest: string },
+) {
+  const identity = {
+    path: isAbsolute(value.path)
+      ? relative(stateRoot(repository), value.path)
+      : value.path,
+    digest: value.digest,
+  };
+  assertAccountingGapIdentity(identity);
+  return identity;
+}
+export function checkpointRetentionGaps(
+  repository: string,
+): CheckpointRetentionGap[] {
+  const scope = accountingGapScope(repository);
+  return scope
+    ? structuredClone(journal(scope.config, scope.options).retentionGaps ?? [])
+    : [];
+}
+export function markAccountingGap(
+  repository: string,
+  descriptor: {
+    path: string;
+    digest: string;
+    reason: "local-retention-unavailable";
+  },
+): void {
+  const scope = accountingGapScope(repository);
+  if (!scope) return;
+  const identity = accountingGapIdentity(repository, descriptor);
+  if (descriptor.reason !== "local-retention-unavailable")
+    throw new Error("Accounting retention gap reason must be sanitized");
+  mutate(scope.config, scope.options, (record) => {
+    if (record.retentionGaps?.some((gap) => gap.path === identity.path)) return;
+    if ((record.retentionGaps?.length ?? 0) >= scope.options.maxFiles)
+      throw new Error(
+        "Required accounting retention gaps exceed admitted bound",
+      );
+    record.sequence++;
+    if (!Number.isSafeInteger(record.sequence))
+      throw new Error("Checkpoint sequence overflow");
+    const observedAt = new Date().toISOString();
+    record.dirtySince ??= observedAt;
+    record.retentionGaps ??= [];
+    record.retentionGaps.push({
+      kind: "accounting-receipt",
+      ...identity,
+      reason: descriptor.reason,
+      observedAt,
+    });
+  });
+}
+export function resolveAccountingGap(
+  repository: string,
+  descriptor: { path: string; digest: string },
+): void {
+  const scope = accountingGapScope(repository);
+  if (!scope) return;
+  const identity = accountingGapIdentity(repository, descriptor);
+  const path = join(stateRoot(repository), identity.path);
+  if (lstatSync(path).size > scope.options.maxBytes)
+    throw new Error(
+      "Accounting original exceeds admitted checkpoint byte bound",
+    );
+  const bytes = privateFile(path);
+  if (hash(bytes) !== identity.digest)
+    throw new Error(
+      "Accounting original differs from its required retention gap",
+    );
+  new LocalContentStore(join(stateRoot(repository), "content")).readBytes({
+    digest: identity.digest,
+    bytes: bytes.length,
+    mediaType: "application/json",
+  });
+  mutate(scope.config, scope.options, (record) => {
+    record.retentionGaps = record.retentionGaps?.filter(
+      (gap) => gap.path !== identity.path,
+    );
+    if (!record.retentionGaps?.length) delete record.retentionGaps;
+  });
+}
+function assertRetentionResolved(record: CheckpointJournal): void {
+  if (record.retentionGaps?.length)
+    throw new Error(
+      "Required accounting original retention remains unavailable; checkpoint acknowledgement is held",
+    );
 }
 export function markCheckpointDirty(
   repository: string,
@@ -657,6 +836,7 @@ async function boundedCommand(
   args: string[],
   options: GitPersistenceConfig,
   env?: NodeJS.ProcessEnv,
+  input?: string,
 ): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs);
@@ -666,7 +846,7 @@ async function boundedCommand(
       file,
       args,
       { env, signal: controller.signal },
-      undefined,
+      input,
       (_stream, chunk) => {
         bytes += chunk.length;
         if (bytes > options.maxBytes + 65536) controller.abort();
@@ -683,13 +863,14 @@ async function gitRemote(
   directory: string,
   options: GitPersistenceConfig,
   args: string[],
+  input?: string,
 ): Promise<string> {
   const command = pinnedGitCommand(directory, [
     "-c",
     "protocol.file.allow=always",
     ...args,
   ]);
-  return boundedCommand("git", command.args, options, command.env);
+  return boundedCommand("git", command.args, options, command.env, input);
 }
 function githubRepository(remote: string): string | undefined {
   return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(
@@ -953,6 +1134,7 @@ function readArchive(
 ): {
   manifest: RecoveryCheckpointManifest;
   blobs: Map<string, Buffer>;
+  manifestBytes: number;
   payloadDigest: string;
 } {
   const manifestBytes = git(directory, options, [
@@ -1003,12 +1185,72 @@ function readArchive(
       );
     blobs.set(ref.digest, bytes);
   }
-  return { manifest, blobs, payloadDigest: hash(manifestBytes) };
+  return {
+    manifest,
+    blobs,
+    manifestBytes: manifestBytes.length,
+    payloadDigest: hash(manifestBytes),
+  };
+}
+async function inspectReachableHistory(
+  directory: string,
+  options: GitPersistenceConfig,
+  tip: string,
+): Promise<RecoveryCheckpointInspection["reachableHistory"]> {
+  try {
+    const output = await gitRemote(directory, options, [
+      "rev-list",
+      "--objects",
+      "--no-object-names",
+      tip,
+    ]);
+    const objects = output.trim().split("\n");
+    if (
+      !objects.length ||
+      objects.some((object) => !/^[a-f0-9]{40,64}$/.test(object)) ||
+      new Set(objects).size !== objects.length
+    )
+      throw new Error("Reachable Git object identities are invalid");
+    const measured = await gitRemote(
+      directory,
+      options,
+      ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+      `${objects.join("\n")}\n`,
+    );
+    const rows = measured.trim().split("\n");
+    if (rows.length !== objects.length)
+      throw new Error("Reachable Git object sizes are incomplete");
+    let logicalObjectBytes = 0;
+    for (const [index, row] of rows.entries()) {
+      const match = /^([a-f0-9]{40,64}) ([0-9]+)$/.exec(row);
+      const bytes = match ? Number(match[2]) : Number.NaN;
+      if (
+        !match ||
+        match[1] !== objects[index] ||
+        !Number.isSafeInteger(bytes) ||
+        !Number.isSafeInteger(logicalObjectBytes + bytes)
+      )
+        throw new Error("Reachable Git object size is unavailable");
+      logicalObjectBytes += bytes;
+    }
+    return {
+      availability: "available",
+      logicalObjectBytes,
+      objects: objects.length,
+    };
+  } catch (error) {
+    if (error instanceof UnsettledSubprocessError) throw error;
+    return {
+      availability: "unavailable",
+      reason: "bounded-inspection-unavailable",
+    };
+  }
 }
 async function freshArchive(
   config: FactoryConfig,
   options: GitPersistenceConfig,
   expectedCommit?: string,
+  inspectHistory = false,
 ) {
   const directory = join(
     paths(config.repository).root,
@@ -1039,10 +1281,22 @@ async function freshArchive(
         expectedCommit,
         tip,
       ]);
-    return {
+    const archive = {
       ...readArchive(directory, commit, config, options),
       commitSha: commit,
       remoteTip: tip,
+    };
+    return {
+      ...archive,
+      ...(inspectHistory
+        ? {
+            reachableHistory: await inspectReachableHistory(
+              directory,
+              options,
+              tip,
+            ),
+          }
+        : {}),
     };
   } catch (error) {
     if (error instanceof UnsettledSubprocessError) settled = false;
@@ -1081,6 +1335,44 @@ export async function readVerifiedRecoveryCheckpoint(
     },
   };
 }
+/** Logical reachable Git bytes; compression, remote allocation and caches are not measured. */
+export async function inspectRecoveryCheckpoint(
+  config: FactoryConfig,
+): Promise<RecoveryCheckpointInspection> {
+  const options = settings(config);
+  if (!options) throw new Error("Git persistence is not configured");
+  await verifyDestination(config, options);
+  const archive = await freshArchive(config, options, undefined, true);
+  if (!archive.reachableHistory)
+    throw new Error("Reachable archive history inspection is unavailable");
+  const refs = allRefs(archive.manifest);
+  const logicalFileBytes = archive.manifest.files.reduce(
+    (bytes, file) => bytes + file.ref.bytes,
+    0,
+  );
+  const uniqueBodyBytes = refs.reduce((bytes, ref) => bytes + ref.bytes, 0);
+  if (
+    !Number.isSafeInteger(logicalFileBytes) ||
+    !Number.isSafeInteger(uniqueBodyBytes)
+  )
+    throw new Error(
+      "Current checkpoint logical size exceeds exact integer range",
+    );
+  return {
+    binding: archive.manifest.binding,
+    commitSha: archive.commitSha,
+    remoteTip: archive.remoteTip,
+    current: {
+      manifestBytes: archive.manifestBytes,
+      logicalFileBytes,
+      uniqueBodyBytes,
+      uniqueBodies: refs.length,
+      logicalFiles: archive.manifest.files.length,
+    },
+    reachableHistory: archive.reachableHistory,
+    storage: "git-logical-bytes",
+  };
+}
 function acknowledge(
   config: FactoryConfig,
   options: GitPersistenceConfig,
@@ -1088,6 +1380,7 @@ function acknowledge(
 ): RecoveryCheckpointStatus {
   return status(
     mutate(config, options, (record) => {
+      assertRetentionResolved(record);
       const current = record.attempts.find(
         (entry) => entry.candidate === attempt.candidate,
       );
@@ -1158,6 +1451,22 @@ async function publishCheckpoint(
   try {
     await verifyDestination(config, options);
     let record = journal(config, options);
+    const build =
+      scopes.getStore()?.buildClosure ??
+      input.buildClosure ??
+      (async () => {
+        const { buildRecoveryCheckpointClosure } = await import(
+          "./recovery-checkpoint-closure.js"
+        );
+        return buildRecoveryCheckpointClosure({ config, scope: options.scope });
+      });
+    const buildScoped = () =>
+      withRecoveryCheckpointScope({ config, buildClosure: build }, build);
+    if (record.retentionGaps?.length) {
+      await buildScoped();
+      record = journal(config, options);
+      assertRetentionResolved(record);
+    }
     const previous = record.attempts.at(-1);
     if (previous && previous.status !== "acknowledged") {
       // Observation can establish an old submission. It never grants a second push.
@@ -1190,18 +1499,10 @@ async function publishCheckpoint(
       Date.now() - Date.parse(record.dirtySince) < options.coalesceMs
     )
       return status(record, options);
-    const build =
-      input.buildClosure ??
-      scopes.getStore()?.buildClosure ??
-      (async () => {
-        const { buildRecoveryCheckpointClosure } = await import(
-          "./recovery-checkpoint-closure.js"
-        );
-        return buildRecoveryCheckpointClosure({ config, scope: options.scope });
-      });
     let sequence = record.sequence;
-    const closure = await build();
+    const closure = await buildScoped();
     record = journal(config, options);
+    assertRetentionResolved(record);
     const manifest: RecoveryCheckpointManifest = {
       ...closure,
       schemaVersion: 1,

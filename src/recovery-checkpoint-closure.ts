@@ -11,6 +11,12 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
+import {
+  type AccountingSeal,
+  assertAccountingSealBinding,
+  assertAccountingSealContent,
+  decodeAccountingRecord,
+} from "./accounting.js";
 import type { FactoryConfig } from "./config.js";
 import { stateRoot } from "./config.js";
 import type {
@@ -28,6 +34,11 @@ import {
   type DiscoveryOutputManifest,
 } from "./discovery.js";
 import { decodeRepositoryMemoryManifest } from "./repository-memory.js";
+import {
+  assertRejectedCollectionReceipt,
+  authenticateRejectedCollectionReceipt,
+  type RejectedCollectionReceipt,
+} from "./execution/local.js";
 import type { RepositoryMemoryBinding } from "./repository-memory.js";
 import type {
   RecoveryCheckpointClosure,
@@ -48,11 +59,13 @@ export interface RecoveryClosureGap {
   path: string;
   availability: "missing-legacy" | "unavailable" | "transient";
   reason: string;
+  required?: boolean;
 }
 interface BodyRoot {
   ref: ContentRef;
-  kind: "discovery" | "expansion" | "memory";
+  kind: "discovery" | "expansion" | "memory" | "accounting";
   binding?: RepositoryMemoryBinding;
+  accounting?: AccountingSeal;
 }
 export interface ContinuationReferences {
   contentRefs: ContentRef[];
@@ -79,6 +92,79 @@ function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Recovery checkpoint has an invalid typed record");
   return value as Record<string, unknown>;
+}
+
+function assetReferences(
+  sets: CapturedAssetSet[] | undefined,
+  add: (ref: ContentRef | undefined) => void,
+  gaps: RecoveryClosureGap[],
+  excludedManifestDigests?: ReadonlySet<string>,
+): void {
+  for (const set of sets ?? []) {
+    if (
+      set.capture?.declarationDigest !== undefined &&
+      !/^[a-f0-9]{64}$/.test(set.capture.declarationDigest)
+    )
+      throw new Error("Asset declaration digest is invalid");
+    if (set.manifestRef) {
+      assertRef(set.manifestRef);
+      if (
+        set.manifestRef.mediaType !== "application/json" ||
+        (set.capture?.declarationDigest !== undefined &&
+          set.manifestRef.digest !== set.capture.declarationDigest)
+      )
+        throw new Error("Asset manifest differs from its original declaration");
+      if (!excludedManifestDigests?.has(set.manifestRef.digest))
+        add(set.manifestRef);
+    } else if (set.capture?.declarationDigest) {
+      gaps.push({
+        path: `media/manifests/${set.capture.declarationDigest}.json`,
+        availability: "missing-legacy",
+        required: false,
+        reason:
+          "Historical asset receipt retained a declaration digest without its original bytes",
+      });
+    }
+    for (const input of set.inputs ?? []) add(input.ref);
+    for (const member of set.members) add(member.ref);
+    for (const input of set.capture?.inputs ?? []) add(input.ref);
+  }
+}
+
+function rejectedManifestDigests(
+  receipt: RejectedCollectionReceipt | undefined,
+): ReadonlySet<string> {
+  return new Set(
+    (receipt?.staging ?? []).flatMap((entry) =>
+      entry.path === ".factory-assets.json" &&
+      entry.availability === "unavailable" &&
+      entry.digest !== undefined
+        ? [entry.digest]
+        : [],
+    ),
+  );
+}
+
+function accountingReferences(
+  usage: unknown,
+  add: (ref: ContentRef | undefined) => void,
+  roots: BodyRoot[],
+): void {
+  if (usage === undefined) return;
+  const value = object(usage);
+  if (value.source !== "durable-accounting") return;
+  const seal = object(value.accounting) as unknown as AccountingSeal;
+  if (typeof value.runId !== "string")
+    throw new Error("Accounting observation lacks its original run binding");
+  assertAccountingSealBinding(
+    seal.repository,
+    seal.objective,
+    value.runId,
+    seal,
+  );
+  for (const ref of seal.records) add(ref);
+  if (seal.records[0])
+    roots.push({ ref: seal.records[0], kind: "accounting", accounting: seal });
 }
 
 /** Only declared record fields supply reads; opaque evidence and session data do not. */
@@ -135,11 +221,59 @@ function continuationReferences(value: unknown): ContinuationReferences & {
     git(manifest.source.treeSha, "tree", "discovery-source-tree");
   };
   const assets = (sets: CapturedAssetSet[] | undefined) => {
-    for (const set of sets ?? []) {
-      for (const input of set.inputs ?? []) add(input.ref);
-      for (const member of set.members) add(member.ref);
-      for (const input of set.capture?.inputs ?? []) add(input.ref);
+    assetReferences(sets, add, gaps);
+  };
+  const rejectedCollection = (
+    value: unknown,
+    admitted: ExecutionRequest | undefined,
+    identity: string,
+  ): RejectedCollectionReceipt | undefined => {
+    if (value === undefined) return undefined;
+    if (!admitted)
+      throw new Error("Rejected collection lacks its admitted request");
+    assertRejectedCollectionReceipt(value, admitted, identity);
+    const path = `rejections/${value.requestDigest}`;
+    for (const [role, body] of [
+      ["raw-return", value.rawReturn],
+      ...value.staging.map((entry) => [entry.path, entry] as const),
+    ] as const) {
+      if (body.availability === "available") add(body.ref);
+      else
+        gaps.push({
+          path: `${path}/${role}`,
+          availability: "unavailable",
+          required: false,
+          reason: `Authenticated rejected output is ineligible for retention: ${body.reason}`,
+        });
     }
+    git(value.candidate.baseSha, "commit", "rejected-source-base");
+    if (value.candidate.availability === "available") {
+      git(value.candidate.commitSha, "commit", "rejected-source-observation");
+      git(value.candidate.treeSha, "tree", "rejected-source-tree");
+    } else
+      gaps.push({
+        path: `${path}/candidate`,
+        availability: "unavailable",
+        required: false,
+        reason:
+          "Authenticated rejected source candidate failed its collector safety admission",
+      });
+    if (value.media.availability === "available")
+      assetReferences(
+        value.media.sets,
+        add,
+        gaps,
+        rejectedManifestDigests(value),
+      );
+    else
+      gaps.push({
+        path: `${path}/media`,
+        availability: "unavailable",
+        required: false,
+        reason:
+          "Rejected media was not collected; member bytes have no authenticated portable references",
+      });
+    return value;
   };
   const validation = (evidence: ValidationEvidence | undefined) => {
     if (!evidence) return;
@@ -237,8 +371,34 @@ function continuationReferences(value: unknown): ContinuationReferences & {
         });
       else {
         const active = object(entry.execution.data);
-        request(active.request as ExecutionRequest | undefined);
+        const admitted = active.request as ExecutionRequest | undefined;
+        request(admitted);
         result(active.result as ExecutionResult | undefined);
+        const rejected = rejectedCollection(
+          active.rejectedCollection,
+          admitted,
+          entry.execution.identity,
+        );
+        const excludedManifestDigests = rejectedManifestDigests(rejected);
+        assetReferences(
+          active.collectedAssets as CapturedAssetSet[] | undefined,
+          add,
+          gaps,
+          excludedManifestDigests,
+        );
+        if (active.assetManifest !== undefined) {
+          const manifest = object(active.assetManifest);
+          if (
+            manifest.path !== ".factory-assets.json" ||
+            object(manifest.ref).mediaType !== "application/json"
+          )
+            throw new Error(
+              "Retained asset manifest has an invalid declaration path",
+            );
+          const ref = manifest.ref as ContentRef;
+          assertRef(ref);
+          if (!excludedManifestDigests.has(ref.digest)) add(ref);
+        }
         const prepared = active.preparedHarnessRequest as
           | HarnessRequest
           | undefined;
@@ -290,6 +450,7 @@ function continuationReferences(value: unknown): ContinuationReferences & {
     git(state.integratedSha, "commit", "objective-integration");
     git(state.finalAcceptance?.commit, "commit", "accepted-result");
     git(state.finalAcceptance?.tree, "tree", "accepted-tree");
+    accountingReferences(state.finalAcceptance?.usage, add, roots);
     git(state.finalHead?.integratedSha, "commit", "final-integrated-base");
     git(state.finalHead?.asked, "commit", "pending-final-head");
     for (const sha of state.finalHead?.heads ?? [])
@@ -416,6 +577,7 @@ function memoryReferences(
   const refs = new Map<string, ContentRef>();
   const gitObjects: RecoveryGitObject[] = [];
   const roots: BodyRoot[] = [];
+  const gaps: RecoveryClosureGap[] = [];
   const add = (ref: ContentRef | undefined) => {
     if (!ref) return;
     assertRef(ref);
@@ -452,11 +614,7 @@ function memoryReferences(
         git(failed[key], "commit", "memory-failed-base");
       validation(failed.evidence);
     }
-    for (const set of (value.assets as CapturedAssetSet[] | undefined) ?? []) {
-      for (const member of set.members) add(member.ref);
-      for (const input of set.inputs ?? []) add(input.ref);
-      for (const input of set.capture?.inputs ?? []) add(input.ref);
-    }
+    assetReferences(value.assets as CapturedAssetSet[] | undefined, add, gaps);
   } else if (role === "objective-observation") {
     if (value.planningRecovery !== undefined) {
       const recovery = object(value.planningRecovery);
@@ -478,6 +636,7 @@ function memoryReferences(
       const acceptance = object(value.acceptance);
       git(acceptance.commit, "commit", "memory-acceptance");
       git(acceptance.tree, "tree", "memory-acceptance-tree");
+      accountingReferences(acceptance.usage, add, roots);
     }
   } else if (role === "handoff") {
     add(value.recordRef as ContentRef | undefined);
@@ -492,7 +651,7 @@ function memoryReferences(
     git(value.source.commitSha, "commit", "memory-discovery-source");
     git(value.source.treeSha, "tree", "memory-discovery-tree");
   }
-  return { contentRefs: [...refs.values()], gitObjects, gaps: [], roots };
+  return { contentRefs: [...refs.values()], gitObjects, gaps, roots };
 }
 export function describeMemoryBodyReferences(
   role: string,
@@ -530,11 +689,34 @@ async function verifyDescription(
   };
   for (let index = 0; index < roots.length; index++) {
     const root = roots[index]!;
-    const key = `${root.kind}:${refKey(root.ref)}`;
+    const key =
+      root.kind === "accounting"
+        ? `accounting:${root.accounting!.digest}`
+        : `${root.kind}:${refKey(root.ref)}`;
     if (visited.has(key)) continue;
     visited.add(key);
     const bytes = await readReference(source, root.ref);
-    if (root.kind === "discovery")
+    if (root.kind === "accounting") {
+      const seal = root.accounting!;
+      await assertAccountingSealContent(
+        seal.repository,
+        seal.objective,
+        seal.runId,
+        seal,
+        (ref) => readReference(source, ref),
+      );
+      for (const ref of seal.records) {
+        const record = decodeAccountingRecord(
+          seal.repository,
+          `accounting/${ref.digest}.json`,
+          await readReference(source, ref),
+        );
+        if (record.kind === "interaction") {
+          const payload = record.capture.content.reference?.payload;
+          if (payload) add(payload);
+        }
+      }
+    } else if (root.kind === "discovery")
       for (const entry of parseDiscoveryBody(bytes).entries) add(entry.content);
     else if (root.kind === "memory") {
       const record = decodeRepositoryMemoryManifest(root.binding!, bytes);
@@ -683,6 +865,11 @@ export async function buildRecoveryCheckpointClosure(input: {
   for (const ref of memory.contentRefs) refs.set(refKey(ref), ref);
   gaps.push(...(memory.gaps as RecoveryClosureGap[]));
   if (scope === "private-history") {
+    const { accountingPersistenceClosure } = await import("./accounting.js");
+    const accounting = accountingPersistenceClosure(config.repository);
+    files.push(...accounting.files);
+    for (const ref of accounting.contentRefs) refs.set(refKey(ref), ref);
+    gaps.push(...(accounting.gaps as RecoveryClosureGap[]));
     for (const entry of memory.typedGitObjects ?? [])
       objects.set(`${entry.kind}:${entry.sha}`, entry);
     for (const entry of memory.gitObjects ?? [])
@@ -720,14 +907,24 @@ export async function buildRecoveryCheckpointClosure(input: {
           );
           const description = await verifyContinuationReferenceClosure(
             state,
-            store,
+            reader,
           );
           for (const ref of description.contentRefs) refs.set(refKey(ref), ref);
           for (const entry of description.gitObjects)
             objects.set(`${entry.kind}:${entry.sha}`, entry);
           gaps.push(...description.gaps);
+          if (input.store)
+            for (const ref of description.contentRefs)
+              await retainBytes(
+                store,
+                await readReference(reader, ref),
+                ref.mediaType,
+              );
           if (!isPreparationState(state)) {
-            for (const work of Object.values(state.work)) {
+            for (const work of Object.values(state.work).flatMap((work) => [
+              work,
+              ...(work.recovery?.history ?? []).map((entry) => entry.work),
+            ])) {
               if (
                 !work.execution ||
                 !["local", "openai-agents", "claude-managed-agents"].includes(
@@ -736,6 +933,23 @@ export async function buildRecoveryCheckpointClosure(input: {
               )
                 continue;
               const active = object(work.execution.data);
+              let rejected: RejectedCollectionReceipt | undefined;
+              if (active.rejectedCollection !== undefined) {
+                const request = active.request as ExecutionRequest;
+                assertRejectedCollectionReceipt(
+                  active.rejectedCollection,
+                  request,
+                  work.execution.identity,
+                );
+                rejected = active.rejectedCollection;
+                await authenticateRejectedCollectionReceipt(
+                  rejected,
+                  request,
+                  work.execution.identity,
+                  config.checkout,
+                  store,
+                );
+              }
               // A returned result is evidence, not a restored native process.
               if (work.execution.provider === "local") {
                 const handle = active.handle
@@ -754,17 +968,36 @@ export async function buildRecoveryCheckpointClosure(input: {
                       "Returned worker evidence is outside its authenticated root",
                     );
                   const returnedBytes = privateBytes(resultPath, root);
-                  await include(
-                    relative(root, resultPath),
-                    "historical",
-                    returnedBytes,
-                  );
+                  if (
+                    rejected &&
+                    (rejected.rawReturn.provenance !==
+                      "controller-worker-result" ||
+                      rejected.rawReturn.identity !== work.execution.identity ||
+                      rejected.rawReturn.digest !==
+                        createHash("sha256")
+                          .update(returnedBytes)
+                          .digest("hex") ||
+                      rejected.rawReturn.bytes !== returnedBytes.length)
+                  )
+                    throw new Error(
+                      "Rejected collection differs from its original returned worker bytes",
+                    );
+                  if (
+                    !rejected ||
+                    rejected.rawReturn.availability === "available"
+                  )
+                    await include(
+                      relative(root, resultPath),
+                      "historical",
+                      returnedBytes,
+                    );
                   const returned = object(
                     JSON.parse(returnedBytes.toString("utf8")),
                   );
                   if (
                     returned.state === "complete" &&
-                    active.result === undefined
+                    active.result === undefined &&
+                    rejected === undefined
                   )
                     gaps.push({
                       path: relative(root, resultPath),
@@ -803,6 +1036,18 @@ export async function buildRecoveryCheckpointClosure(input: {
                     throw new Error(
                       "Returned provider evidence differs from its recorded artifact",
                     );
+                  if (
+                    rejected &&
+                    (rejected.rawReturn.provenance !==
+                      "managed-original-artifact" ||
+                      rejected.rawReturn.digest !== digest ||
+                      rejected.rawReturn.bytes !== bytes.length)
+                  )
+                    throw new Error(
+                      "Rejected collection differs from its original provider artifact",
+                    );
+                  if (rejected?.rawReturn.availability === "unavailable")
+                    continue;
                   const ref = await retainBytes(
                     store,
                     bytes,

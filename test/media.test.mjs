@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -12,7 +13,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
-import { captureAssetSets, materializeAssetSet } from "../dist/media.js";
+import {
+  assertAssetCaptureReceipt,
+  captureAssetSets,
+  materializeAssetSet,
+} from "../dist/media.js";
 
 function git(path, ...args) {
   return execFileSync("git", ["-C", path, ...args], {
@@ -85,14 +90,36 @@ test("a complete selected AssetSet is retained by digest and committed through t
       };
     });
     const store = new LocalContentStore(join(root, "content"));
-    writeFileSync(
-      join(staging, ".factory-assets.json"),
-      `${JSON.stringify({ sets })}\n`,
+    const originalManifest = Buffer.from(
+      "  " + JSON.stringify({ sets }, null, 2) + "\n\n",
     );
+    writeFileSync(join(staging, ".factory-assets.json"), originalManifest);
     const captured = await captureAssetSets(store, staging, item, sets, {
       harness: "integration-filesystem",
     });
     assert.equal(captured.length, 2);
+    assert.equal(existsSync(join(staging, ".factory-media")), false);
+    assert.deepEqual(captured[0].manifestRef, captured[1].manifestRef);
+    for (const set of captured) {
+      assertAssetCaptureReceipt(set);
+      assert.equal(set.capture.declarationDigest, set.manifestRef.digest);
+      assert.equal(set.manifestRef.bytes, originalManifest.length);
+    }
+    rmSync(join(staging, ".factory-assets.json"));
+    assert.deepEqual(
+      store.readBytes(captured[0].manifestRef),
+      originalManifest,
+    );
+    assert.deepEqual(
+      store.readBytes(captured[1].manifestRef),
+      originalManifest,
+    );
+    const rebound = structuredClone(captured[0]);
+    rebound.manifestRef.digest = "0".repeat(64);
+    assert.throws(
+      () => assertAssetCaptureReceipt(rebound),
+      /original manifest/,
+    );
     assert.equal(
       captured[0].members[0].ref.digest,
       createHash("sha256").update(source).digest("hex"),
@@ -117,6 +144,98 @@ test("a complete selected AssetSet is retained by digest and committed through t
       '{"id":"second"}',
     );
     assert.notEqual(selected.changeRef, base);
+    const rejectedStaging = join(root, "rejected-staging");
+    mkdirSync(rejectedStaging);
+    const malformedOriginal = Buffer.from('  {"sets": [\n');
+    writeFileSync(
+      join(rejectedStaging, ".factory-assets.json"),
+      malformedOriginal,
+    );
+    let rejectedOriginal;
+    await assert.rejects(
+      captureAssetSets(
+        store,
+        rejectedStaging,
+        item,
+        sets,
+        { harness: "integration-filesystem" },
+        [],
+        (original) => {
+          rejectedOriginal = original;
+        },
+      ),
+      /JSON/,
+    );
+    assert.equal(rejectedOriginal.path, ".factory-assets.json");
+    rmSync(rejectedStaging, { recursive: true });
+    assert.deepEqual(store.readBytes(rejectedOriginal.ref), malformedOriginal);
+    const duplicateStaging = join(root, "duplicate-staging");
+    for (const set of sets) {
+      const directory = join(duplicateStaging, ".factory-media", set.id);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "image.png"), source);
+      writeFileSync(join(directory, "metadata.json"), '{"id":"same"}');
+    }
+    writeFileSync(
+      join(duplicateStaging, ".factory-assets.json"),
+      originalManifest,
+    );
+    await assert.rejects(
+      captureAssetSets(store, duplicateStaging, item, sets, {
+        harness: "integration-filesystem",
+      }),
+      /distinct content/,
+    );
+    assert.equal(
+      existsSync(
+        join(duplicateStaging, ".factory-media", "first", "image.png"),
+      ),
+      true,
+    );
+    assert.equal(
+      existsSync(
+        join(duplicateStaging, ".factory-media", "second", "image.png"),
+      ),
+      true,
+    );
+    const unsafeStaging = join(root, "unsafe-staging");
+    mkdirSync(unsafeStaging);
+    // The same deliberately invalid fixture value exercised by the real
+    // scanner integration; this is not an account credential.
+    const unsafeOriginal = Buffer.from(
+      JSON.stringify({
+        sets,
+        credentialFixture: "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      }),
+    );
+    writeFileSync(join(unsafeStaging, ".factory-assets.json"), unsafeOriginal);
+    let checkpointedUnsafeOriginal = false;
+    await assert.rejects(
+      captureAssetSets(
+        store,
+        unsafeStaging,
+        item,
+        sets,
+        {
+          harness: "integration-filesystem",
+        },
+        [],
+        () => {
+          checkpointedUnsafeOriginal = true;
+        },
+      ),
+      /Secretlint found suspected secret/,
+    );
+    assert.equal(checkpointedUnsafeOriginal, false);
+    assert.throws(
+      () =>
+        store.readBytes({
+          digest: createHash("sha256").update(unsafeOriginal).digest("hex"),
+          bytes: unsafeOriginal.length,
+          mediaType: "application/json",
+        }),
+      /ENOENT/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

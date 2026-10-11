@@ -266,6 +266,8 @@ export interface FactoryConfig {
     enabled: boolean;
     maxBytesPerInvocation: number;
     nativeBoundaryTelemetry?: boolean;
+    /** Explicit recovery retention of already redacted/truncated captures. */
+    retainInRecovery?: boolean;
   };
   /** Polling and an optional elapsed limit frozen before each fresh Objective starts. */
   queue?: { pollSeconds: number; objectiveDeadlineSeconds?: number };
@@ -928,12 +930,19 @@ export function validateConfig(value: unknown): FactoryConfig {
     assertObject(value.capture, "capture");
     assertOnlyKeys(
       value.capture,
-      ["enabled", "maxBytesPerInvocation", "nativeBoundaryTelemetry"],
+      [
+        "enabled",
+        "maxBytesPerInvocation",
+        "nativeBoundaryTelemetry",
+        "retainInRecovery",
+      ],
       "capture",
     );
     if (
       (value.capture.nativeBoundaryTelemetry !== undefined &&
         typeof value.capture.nativeBoundaryTelemetry !== "boolean") ||
+      (value.capture.retainInRecovery !== undefined &&
+        typeof value.capture.retainInRecovery !== "boolean") ||
       typeof value.capture.enabled !== "boolean" ||
       !Number.isSafeInteger(value.capture.maxBytesPerInvocation) ||
       (value.capture.maxBytesPerInvocation as number) <= 0

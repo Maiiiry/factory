@@ -14,6 +14,7 @@ import type {
   SessionCreateParams,
 } from "@anthropic-ai/sdk/resources/beta/sessions/sessions";
 import type {
+  CapturedAssetSet,
   ContentStore,
   ExecutionContext,
   ExecutionDriver,
@@ -24,6 +25,7 @@ import type {
   ModelInvocationUsage,
 } from "../contracts.js";
 import {
+  attachedFault,
   cancelledFault,
   classifyFaults,
   decision,
@@ -35,7 +37,10 @@ import {
   hasUnresolvedSubprocesses,
   removeWorktree,
 } from "../process.js";
-import { isCheckpointAdmissionFailure } from "../recovery-checkpoint.js";
+import {
+  isCheckpointAdmissionFailure,
+  privateCheckpointBounds,
+} from "../recovery-checkpoint.js";
 import { endAttempt, stoppedFault, transportFailure } from "./attempt.js";
 import { verifyClaudeBootstrap } from "./claude-managed-bootstrap.js";
 import {
@@ -58,7 +63,12 @@ import {
 } from "./claude-managed-transfer.js";
 import { executionFault } from "./fault.js";
 import { readProducedAssets, workItemPrompt } from "./harness-support.js";
-import { collectWorktreeResult } from "./local.js";
+import {
+  authenticateRejectedCollectionReceipt,
+  collectWorktreeResult,
+  freezeRejectedCollection,
+  type RejectedCollectionReceipt,
+} from "./local.js";
 
 export { validateClaudeManagedConfig } from "./claude-managed-client.js";
 
@@ -131,6 +141,8 @@ interface Active {
   /** Why the attempt was ended; recorded before stopping so a restart finishes it. */
   stopped?: { detail: string; interrupted: boolean };
   result?: ExecutionResult;
+  rejectedCollection?: RejectedCollectionReceipt;
+  collectedAssets?: CapturedAssetSet[];
 }
 const digest = (value: unknown) =>
   claudeByteDigest(Buffer.from(JSON.stringify(value)));
@@ -267,6 +279,9 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     context: ExecutionContext,
   ): Promise<never> {
     if (isCheckpointAdmissionFailure(error)) throw error;
+    const rejection = this.active(handle).rejectedCollection;
+    if (rejection)
+      return this.settle(handle, context, rejection.fault.detail, false);
     const data = this.active(handle);
     return endAttempt(error, {
       expired: this.expired(data),
@@ -1055,6 +1070,28 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionResult> {
     const data = this.active(handle);
+    if (data.rejectedCollection) {
+      if (data.result)
+        throw new Error("Rejected collection cannot claim an execution result");
+      if (!context)
+        throw new Error(
+          "Rejected collection requires controller checkpoint authority",
+        );
+      await authenticateRejectedCollectionReceipt(
+        data.rejectedCollection,
+        data.request,
+        handle.identity,
+        this.args.checkout,
+        this.args.contentStore,
+      );
+      await context.admitEffect?.("explicit");
+      await this.settle(
+        handle,
+        context,
+        data.rejectedCollection.fault.detail,
+        false,
+      );
+    }
     if (!data.result) {
       if (!context)
         throw new Error(
@@ -1124,6 +1161,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     const stage = join(data.root, "result-files");
     materializeClaudeSnapshot(stage, snapshot);
     const worktree = join(data.root, "result");
+    let collectionAcknowledged = false;
     await addWorktree(this.args.checkout, worktree, data.request.baseSha);
     try {
       for (const name of readdirSync(worktree))
@@ -1160,10 +1198,46 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
           data.result = collected;
           await this.save(handle, context);
           await context.admitEffect?.("explicit");
+          collectionAcknowledged = true;
+        },
+        undefined,
+        async (assets) => {
+          if (!privateCheckpointBounds() || !assets.length) return;
+          data.collectedAssets = structuredClone(assets);
+          // Freeze source or rejection before requiring a complete remote ACK.
+          context.checkpoint(handle);
         },
       );
+    } catch (error) {
+      if (
+        privateCheckpointBounds() &&
+        attachedFault(error)?.kind === "work" &&
+        !hasUnresolvedSubprocesses()
+      ) {
+        data.rejectedCollection = await freezeRejectedCollection({
+          checkout: this.args.checkout,
+          worktree,
+          request: data.request,
+          store: this.args.contentStore,
+          error,
+          capturedAssets: data.collectedAssets,
+          rawReturn: {
+            provenance: "managed-original-artifact",
+            identity: data.artifact!.fileId,
+            bytes,
+          },
+        });
+        await this.save(handle, context);
+        await context.admitEffect?.("explicit");
+        collectionAcknowledged = true;
+      }
+      throw error;
     } finally {
-      if (data.result && !hasUnresolvedSubprocesses()) {
+      if (
+        (data.result || data.rejectedCollection) &&
+        collectionAcknowledged &&
+        !hasUnresolvedSubprocesses()
+      ) {
         await this.save(handle, context);
         await context.admitEffect?.("explicit");
         await removeWorktree(this.args.checkout, worktree);
