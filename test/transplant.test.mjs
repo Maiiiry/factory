@@ -861,7 +861,7 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   const { createPlanningContextResolver } = await import(
     "../dist/compiler/context-runtime.js"
   );
-  const { validateConfig } = await import("../dist/config.js");
+  const { validateConfig, stateRoot } = await import("../dist/config.js");
   git(
     checkout,
     "remote",
@@ -950,6 +950,66 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   assert.equal(exactSource.disposition, "complete");
   assert.equal(exactSource.matches[0].content, originalBody);
   assert.equal(exactSource.matches[0].provenance.sourceIndex, 1);
+  const memoryConfig = validateConfig({
+    ...config,
+    planningContext: { ...config.planningContext, memory: true },
+  });
+  const memoryResolver = createPlanningContextResolver({
+    ...runtimeInput,
+    config: memoryConfig,
+  });
+  const { LocalRepositoryMemory } = await import(
+    "../dist/repository-memory.js"
+  );
+  const retainedMemory = new LocalRepositoryMemory(
+    stateRoot(config.repository),
+    config.repository,
+  );
+  const memoryAccess = {
+    repository: config.repository,
+    visibility: ["repository", "private"],
+  };
+  const sourceReference = retainedMemory
+    .metadata({ access: memoryAccess, limit: 8 })
+    .entries.find(
+      (entry) =>
+        entry.record.kind === "reference" &&
+        entry.record.sources.some(
+          (source) => source.path === "api/contract.txt",
+        ),
+    );
+  assert.ok(
+    sourceReference,
+    "the actual supplied source reference survives in repository memory",
+  );
+  const retainedSource = retainedMemory.read({
+    access: memoryAccess,
+    id: sourceReference.binding.id,
+    maxBytes: 4096,
+  });
+  assert.equal(retainedSource.content[0].text, originalBody);
+  assert.ok(
+    !memoryResolver.catalog
+      .find((collection) => collection.id === "memory")
+      .selectors.includes(sourceReference.binding.id),
+    "already supplied source identity is excluded before ranking or body reads",
+  );
+  const automaticMemory = await initializeContextLookup(memoryResolver);
+  assert.ok(
+    automaticMemory.packet.automatic.every((result) =>
+      result.matches.every(
+        (match) => match.identity !== `memory:${sourceReference.binding.id}`,
+      ),
+    ),
+    "automatic delivery does not reload an already supplied source body",
+  );
+  const memoryPinned = await memoryResolver.resolve(
+    { ...exactSource.request, id: "memory-pinned" },
+    remaining,
+  );
+  assert.equal(memoryPinned.disposition, "complete");
+  assert.equal(memoryPinned.matches[0].content, originalBody);
+
   const outside = await runtimeResolver.resolve(
     {
       id: "outside",
