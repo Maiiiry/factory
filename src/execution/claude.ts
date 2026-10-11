@@ -259,6 +259,15 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
     private config: ClaudeAgentSdkConfig,
   ) {}
 
+  originalCollectionReturn(handle: HarnessHandle) {
+    return {
+      provenance: "controller-worker-result" as const,
+      path: this.require(handle).resultPath,
+      root: this.root,
+      attemptId: handle.identity,
+    };
+  }
+
   private require(handle: HarnessHandle): ClaudeWorkerHandleData {
     const data = handle.data;
     if (!data || typeof data !== "object" || Array.isArray(data))

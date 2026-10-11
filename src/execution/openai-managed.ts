@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
+  CapturedAssetSet,
   ContentStore,
   ExecutionContext,
   ExecutionDriver,
@@ -11,18 +12,27 @@ import type {
   ExecutionResult,
 } from "../contracts.js";
 import {
+  attachedFault,
   cancelledFault,
   classifyFaults,
   decision,
   StepFault,
 } from "../fault.js";
 import { hasUnresolvedSubprocesses, removeWorktree } from "../process.js";
-import { isCheckpointAdmissionFailure } from "../recovery-checkpoint.js";
+import {
+  isCheckpointAdmissionFailure,
+  privateCheckpointBounds,
+} from "../recovery-checkpoint.js";
 import { refuseUnknownFields } from "../unknown-fields.js";
 import { endAttempt, stoppedFault, transportFailure } from "./attempt.js";
 import { executionFault, missingCredential } from "./fault.js";
 import { readProducedAssets, workItemPrompt } from "./harness-support.js";
-import { collectWorktreeResult } from "./local.js";
+import {
+  authenticateRejectedCollectionReceipt,
+  collectWorktreeResult,
+  freezeRejectedCollection,
+  type RejectedCollectionReceipt,
+} from "./local.js";
 import {
   importOpenAIResult,
   OPENAI_OUTPUT_MAX_BYTES,
@@ -186,6 +196,8 @@ interface Active {
   stopped?: { detail: string; interrupted: boolean };
   usage?: unknown;
   result?: ExecutionResult;
+  rejectedCollection?: RejectedCollectionReceipt;
+  collectedAssets?: CapturedAssetSet[];
   artifact?: { id: string; digest: string; bytes: number; turnId: string };
 }
 export class OpenAIManagedExecutionDriver implements ExecutionDriver {
@@ -317,6 +329,9 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     context: ExecutionContext,
   ): Promise<never> {
     if (isCheckpointAdmissionFailure(error)) throw error;
+    const rejection = this.active(handle).rejectedCollection;
+    if (rejection)
+      return this.settle(handle, context, rejection.fault.detail, false);
     return endAttempt(error, {
       expired: this.expired(this.active(handle)),
       cancelled: context.cancelled(),
@@ -789,6 +804,28 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionResult> {
     const data = this.active(handle);
+    if (data.rejectedCollection) {
+      if (data.result)
+        throw new Error("Rejected collection cannot claim an execution result");
+      if (!context)
+        throw new Error(
+          "Rejected collection requires controller checkpoint authority",
+        );
+      await authenticateRejectedCollectionReceipt(
+        data.rejectedCollection,
+        data.request,
+        handle.identity,
+        this.args.checkout,
+        this.args.contentStore,
+      );
+      await context.admitEffect?.("explicit");
+      await this.settle(
+        handle,
+        context,
+        data.rejectedCollection.fault.detail,
+        false,
+      );
+    }
     if (!data.result) {
       if (!context)
         throw new Error(
@@ -879,6 +916,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     };
     await this.save(handle, context);
     const worktree = join(data.root, "result");
+    let collectionAcknowledged = false;
     try {
       await importOpenAIResult({
         file,
@@ -911,10 +949,46 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
           data.result = collected;
           await this.save(handle, context);
           await context.admitEffect?.("explicit");
+          collectionAcknowledged = true;
+        },
+        undefined,
+        async (assets) => {
+          if (!privateCheckpointBounds() || !assets.length) return;
+          data.collectedAssets = structuredClone(assets);
+          // Freeze source or rejection before requiring a complete remote ACK.
+          context.checkpoint(handle);
         },
       );
+    } catch (error) {
+      if (
+        privateCheckpointBounds() &&
+        attachedFault(error)?.kind === "work" &&
+        !hasUnresolvedSubprocesses()
+      ) {
+        data.rejectedCollection = await freezeRejectedCollection({
+          checkout: this.args.checkout,
+          worktree,
+          request: data.request,
+          store: this.args.contentStore,
+          error,
+          capturedAssets: data.collectedAssets,
+          rawReturn: {
+            provenance: "managed-original-artifact",
+            identity: data.artifact!.id,
+            bytes,
+          },
+        });
+        await this.save(handle, context);
+        await context.admitEffect?.("explicit");
+        collectionAcknowledged = true;
+      }
+      throw error;
     } finally {
-      if (data.result && !hasUnresolvedSubprocesses()) {
+      if (
+        (data.result || data.rejectedCollection) &&
+        collectionAcknowledged &&
+        !hasUnresolvedSubprocesses()
+      ) {
         await this.save(handle, context);
         await context.admitEffect?.("explicit");
         await removeWorktree(this.args.checkout, worktree);

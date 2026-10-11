@@ -14,7 +14,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { checkStagedCandidate } from "../dist/execution/staged-candidate.js";
-import { collectWorktreeResult } from "../dist/execution/local.js";
+import {
+  collectWorktreeResult,
+  freezeRejectedCollection,
+  authenticateRejectedCollectionReceipt,
+} from "../dist/execution/local.js";
+import {
+  withRecoveryCheckpointScope,
+  awaitCheckpointAdmission,
+  gitPersistenceStatus,
+} from "../dist/recovery-checkpoint.js";
+import {
+  describeContinuationReferences,
+  buildRecoveryCheckpointClosure,
+} from "../dist/recovery-checkpoint-closure.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import {
   discoverRepository,
@@ -37,7 +50,11 @@ import {
 } from "../dist/adaptive-context.js";
 import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
 import { initializeContextLookup } from "../dist/compiler/context.js";
-import { stateRoot, validateConfig } from "../dist/config.js";
+import {
+  stateRoot,
+  validateConfig,
+  factoryConfigDigest,
+} from "../dist/config.js";
 import {
   recordRetrospective,
   prepareDreamInput,
@@ -481,6 +498,233 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     const imported = join(root, "imported-target");
     git(checkout, "worktree", "add", "--detach", imported, request.baseSha);
     cpSync(materialized, imported, { recursive: true });
+    {
+      // The real export above is a literal controller artifact, rather than a
+      // reconstructed HarnessResult. Reject its staged handoff without accepting
+      // or advancing the imported source, and retain only permitted observations.
+      const previousRejectedStateHome = process.env.XDG_STATE_HOME;
+      process.env.XDG_STATE_HOME = join(root, "rejected-state-root");
+      try {
+        const rejectedWorktree = join(
+          stateRoot(state.repository),
+          "worktrees",
+          request.attemptId,
+        );
+        mkdirSync(join(stateRoot(state.repository), "worktrees"), {
+          recursive: true,
+          mode: 0o700,
+        });
+        git(
+          checkout,
+          "worktree",
+          "add",
+          "--detach",
+          rejectedWorktree,
+          request.baseSha,
+        );
+        cpSync(materialized, rejectedWorktree, { recursive: true });
+        writeFileSync(
+          join(rejectedWorktree, ".factory-handoff.json"),
+          "{malformed handoff\n",
+        );
+        const rejectedSecret =
+          '{"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}';
+        writeFileSync(
+          join(rejectedWorktree, ".factory-discovery.json"),
+          rejectedSecret,
+        );
+        const rejectedOutput = join(root, "rejected-original.json");
+        execFileSync(process.execPath, [script, bindingPath, rejectedOutput], {
+          cwd: rejectedWorktree,
+        });
+        let rejectedError;
+        try {
+          await collectWorktreeResult(
+            checkout,
+            rejectedWorktree,
+            request,
+            store,
+            {},
+          );
+          assert.fail("Malformed staged handoff must reject collection");
+        } catch (error) {
+          rejectedError = error;
+        }
+        const originalHead = git(rejectedWorktree, "rev-parse", "HEAD");
+        const rejectedConfig = {
+          repository: state.repository,
+          checkout,
+          execution: { kind: "local" },
+          policy: { allowedSecretNames: [] },
+          gitPersistence: {
+            remote: join(root, "private-history.git"),
+            ref: "refs/heads/history",
+            visibility: "private",
+            scope: "private-history",
+            maxBytes: 16 * 1024 * 1024,
+            maxFiles: 4096,
+            timeoutMs: 30000,
+            coalesceMs: 0,
+          },
+        };
+        git(
+          root,
+          "init",
+          "--bare",
+          "-b",
+          "main",
+          rejectedConfig.gitPersistence.remote,
+        );
+        const receipt = await withRecoveryCheckpointScope(
+          {
+            config: rejectedConfig,
+            buildClosure: async () => {
+              throw new Error(
+                "Observation freeze performs no external transport",
+              );
+            },
+          },
+          () =>
+            freezeRejectedCollection({
+              checkout,
+              worktree: rejectedWorktree,
+              request,
+              store,
+              error: rejectedError,
+              rawReturn: {
+                provenance: "managed-original-artifact",
+                identity: rejectedOutput,
+                bytes: readFileSync(rejectedOutput),
+              },
+            }),
+        );
+        assert.equal(receipt.candidate.availability, "available");
+        assert.deepEqual(receipt.candidate.paths, ["schema.json"]);
+        assert.equal(git(rejectedWorktree, "rev-parse", "HEAD"), originalHead);
+        assert.equal(
+          receipt.staging.find(
+            (entry) => entry.path === ".factory-handoff.json",
+          ).availability,
+          "available",
+        );
+        assert.equal(receipt.media.availability, "unavailable");
+        const rejectedSnapshot = structuredClone(state);
+        rejectedSnapshot.schemaVersion = 17;
+        rejectedSnapshot.configDigest = factoryConfigDigest(rejectedConfig);
+        rejectedSnapshot.work.schema = {
+          status: "failed",
+          attempt: request.attemptId,
+          baseSha: request.baseSha,
+          error: receipt.fault.detail,
+          // The actual local file exporter is settled historical ownership. This
+          // metadata claims no provider session, usage, validation or result.
+          execution: {
+            provider: "local",
+            identity: request.attemptId,
+            data: {
+              request,
+              worktree: rejectedWorktree,
+              adapterIdentity: "actual-local-file-export",
+              handle: { identity: request.attemptId },
+              rejectedCollection: receipt,
+            },
+          },
+        };
+        const rejectedSnapshotFile = statePath(state.repository, 1);
+        saveState(rejectedSnapshotFile, rejectedSnapshot);
+        const rejectedReload = parseFactoryState(
+          JSON.parse(readFileSync(rejectedSnapshotFile, "utf8")),
+          state.repository,
+          1,
+        );
+        const reloadedReceipt =
+          rejectedReload.work.schema.execution.data.rejectedCollection;
+        await authenticateRejectedCollectionReceipt(
+          reloadedReceipt,
+          request,
+          request.attemptId,
+          checkout,
+          store,
+        );
+        const retained = describeContinuationReferences(rejectedReload);
+        assert.ok(
+          retained.gitObjects.some(
+            (entry) => entry.sha === receipt.candidate.commitSha,
+          ),
+        );
+        assert.equal(receipt.rawReturn.availability, "unavailable");
+        assert.equal(receipt.rawReturn.reason, "unsafe-staging");
+        assert.equal(receipt.rawReturn.ref, undefined);
+        const forbiddenStage = receipt.staging.find(
+          (entry) => entry.path === ".factory-discovery.json",
+        );
+        assert.equal(forbiddenStage.availability, "unavailable");
+        assert.equal(forbiddenStage.reason, "secret-ineligible");
+        assert.equal(forbiddenStage.ref, undefined);
+        assert.equal(
+          retained.contentRefs.some(
+            (ref) =>
+              ref.digest === receipt.rawReturn.digest ||
+              ref.digest === forbiddenStage.digest,
+          ),
+          false,
+        );
+        await assert.rejects(() =>
+          store.verify({
+            digest: receipt.rawReturn.digest,
+            bytes: receipt.rawReturn.bytes,
+            mediaType: "application/octet-stream",
+          }),
+        );
+        await assert.rejects(() =>
+          store.verify({
+            digest: forbiddenStage.digest,
+            bytes: forbiddenStage.bytes,
+            mediaType: "application/json",
+          }),
+        );
+        assert.equal(
+          retained.gaps.some((gap) => gap.required),
+          false,
+        );
+        assert.equal(rejectedReload.work.schema.status, "failed");
+        assert.equal(rejectedReload.work.schema.changeRef, undefined);
+        assert.equal(rejectedReload.work.schema.treeSha, undefined);
+        assert.deepEqual(rejectedReload.autonomy, rejectedSnapshot.autonomy);
+        const snapshotBytes = readFileSync(rejectedSnapshotFile);
+        await assert.rejects(
+          () =>
+            authenticateRejectedCollectionReceipt(
+              reloadedReceipt,
+              { ...request, attemptId: "different-attempt" },
+              request.attemptId,
+              checkout,
+              store,
+            ),
+          /exact admitted request/,
+        );
+        assert.deepEqual(readFileSync(rejectedSnapshotFile), snapshotBytes);
+        // The existing real private-Git transport must acknowledge this failed
+        // observation before the only imported checkout is removed.
+        await withRecoveryCheckpointScope(
+          {
+            config: rejectedConfig,
+            buildClosure: () =>
+              buildRecoveryCheckpointClosure({ config: rejectedConfig, store }),
+          },
+          () => awaitCheckpointAdmission(state.repository, "explicit"),
+        );
+        assert.equal(
+          gitPersistenceStatus(rejectedConfig).protectedContinuation,
+          true,
+        );
+        git(checkout, "worktree", "remove", "--force", rejectedWorktree);
+      } finally {
+        if (previousRejectedStateHome === undefined)
+          delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = previousRejectedStateHome;
+      }
+    }
     const importedResult = await collectWorktreeResult(
       checkout,
       imported,

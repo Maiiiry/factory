@@ -66,10 +66,12 @@ import {
 } from "../fault.js";
 import { assertDiscovery } from "../graph-amendments.js";
 import {
+  assertAssetCaptureReceipt,
   captureAssetSets,
   importSourceAssets,
   parseProducedAssetSets,
 } from "../media.js";
+import { ownsPath } from "../ownership.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import {
   addWorktree,
@@ -88,6 +90,7 @@ import { DEFAULT_PROVIDER_TURN_IDLE_TIMEOUT_MS } from "../provider-turn.js";
 import {
   awaitCheckpointAdmission,
   isCheckpointAdmissionFailure,
+  privateCheckpointBounds,
 } from "../recovery-checkpoint.js";
 import { assertPinnedNpmScripts, validateCheckout } from "../validation.js";
 import type { ValidationEvidence } from "../validation-evidence.js";
@@ -95,10 +98,12 @@ import { workerReadinessReceipt } from "../worker-readiness.js";
 import { workspacePackageAdditions } from "../workspace-membership.js";
 import { stoppedFault } from "./attempt.js";
 import { assertDurableValue } from "./checkpoint.js";
+import { ClaudeAgentSdkHarness } from "./claude.js";
 import { executionFault } from "./fault.js";
 import { readWorkHandoff } from "./harness-support.js";
 import {
   checkStagedCandidate,
+  scanCollectionObservation,
   scanPrivateStaging,
 } from "./staged-candidate.js";
 import {
@@ -114,6 +119,12 @@ import {
  */
 type RecoverableHarness = AgentHarness & {
   cancelUnrecorded?(identity: string): Promise<void>;
+  originalCollectionReturn?(handle: HarnessHandle): {
+    provenance: "controller-worker-result";
+    path: string;
+    root: string;
+    attemptId: string;
+  };
 };
 
 export interface LocalProfileRegistration {
@@ -129,6 +140,10 @@ type Active = {
   adapterIdentity: string;
   handle: HarnessHandle;
   failure?: string;
+  /** Original declaration observation; collection acceptance is separate. */
+  assetManifest?: { path: ".factory-assets.json"; ref: ContentRef };
+  rejectedCollection?: RejectedCollectionReceipt;
+  collectedAssets?: CapturedAssetSet[];
   environmentReadiness?: {
     commitSha: string;
     worktree: string;
@@ -384,6 +399,15 @@ export class CodexHarness implements AgentHarness {
           request.discovery ? [] : this.allowedSecretNames,
         ),
       }),
+    };
+  }
+
+  originalCollectionReturn(handle: HarnessHandle) {
+    return {
+      provenance: "controller-worker-result" as const,
+      path: this.require(handle).resultPath,
+      root: this.harnessRoot,
+      attemptId: handle.identity,
     };
   }
 
@@ -697,6 +721,557 @@ function noChangeDetail(evidence: unknown): string {
     : "Worker produced no repository change";
 }
 
+/** A failed collection observation grants no result, validation or reuse authority. */
+export interface RejectedCollectionBody {
+  availability: "available" | "unavailable";
+  digest?: string;
+  bytes?: number;
+  ref?: ContentRef;
+  reason?: "secret-ineligible" | "unsafe-staging" | "not-collected";
+}
+export interface RejectedCollectionReceipt {
+  schemaVersion: 1;
+  attemptId: string;
+  requestDigest: string;
+  rawReturn: RejectedCollectionBody & {
+    provenance: "controller-worker-result" | "managed-original-artifact";
+    identity: string;
+  };
+  fault: { kind: "work"; detail: string };
+  candidate:
+    | {
+        availability: "available";
+        baseSha: string;
+        commitSha: string;
+        treeSha: string;
+        paths: string[];
+      }
+    | {
+        availability: "unavailable";
+        baseSha: string;
+        reason: "collector-safety-rejected";
+      };
+  staging: (RejectedCollectionBody & { path: string })[];
+  media:
+    | { availability: "unavailable"; reason: "not-collected" }
+    | { availability: "available"; sets: CapturedAssetSet[] };
+}
+const collectionDigest = (bytes: Uint8Array | string): string =>
+  createHash("sha256").update(bytes).digest("hex");
+const rejectedStaging = [
+  ".factory-assets.json",
+  ".factory-handoff.json",
+  ".factory-discovery.json",
+];
+function rejectionRecord(
+  value: unknown,
+  keys: string[],
+): Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).some((key) => !keys.includes(key))
+  )
+    throw new Error("Invalid rejected collection observation");
+  return value as Record<string, unknown>;
+}
+export function assertRejectedCollectionReceipt(
+  value: unknown,
+  request: ExecutionRequest,
+  executionIdentity: string,
+): asserts value is RejectedCollectionReceipt {
+  const receipt = rejectionRecord(value, [
+    "schemaVersion",
+    "attemptId",
+    "requestDigest",
+    "rawReturn",
+    "fault",
+    "candidate",
+    "staging",
+    "media",
+  ]);
+  if (
+    receipt.schemaVersion !== 1 ||
+    receipt.attemptId !== executionIdentity ||
+    request.attemptId !== executionIdentity ||
+    receipt.requestDigest !== collectionDigest(JSON.stringify(request))
+  )
+    throw new Error(
+      "Rejected collection differs from its exact admitted request",
+    );
+  const body = (value: unknown, extra: string[]) => {
+    const record = rejectionRecord(value, [
+      "availability",
+      "digest",
+      "bytes",
+      "ref",
+      "reason",
+      ...extra,
+    ]);
+    if (
+      record.digest !== undefined &&
+      (typeof record.digest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(record.digest))
+    )
+      throw new Error("Invalid rejected collection body digest");
+    if (
+      record.bytes !== undefined &&
+      (!Number.isSafeInteger(record.bytes) || (record.bytes as number) < 0)
+    )
+      throw new Error("Invalid rejected collection body size");
+    if (record.availability === "available") {
+      const ref = rejectionRecord(record.ref, ["digest", "bytes", "mediaType"]);
+      if (
+        !record.digest ||
+        record.bytes === undefined ||
+        ref.digest !== record.digest ||
+        ref.bytes !== record.bytes ||
+        typeof ref.mediaType !== "string" ||
+        !ref.mediaType ||
+        record.reason !== undefined
+      )
+        throw new Error(
+          "Rejected collection body reference differs from its original",
+        );
+    } else if (
+      record.availability !== "unavailable" ||
+      record.ref !== undefined ||
+      !["secret-ineligible", "unsafe-staging", "not-collected"].includes(
+        String(record.reason),
+      )
+    )
+      throw new Error("Rejected collection availability is invalid");
+    return record;
+  };
+  const raw = body(receipt.rawReturn, ["provenance", "identity"]);
+  if (
+    !["controller-worker-result", "managed-original-artifact"].includes(
+      String(raw.provenance),
+    ) ||
+    typeof raw.identity !== "string" ||
+    !raw.identity ||
+    !raw.digest ||
+    raw.bytes === undefined ||
+    (raw.availability === "unavailable" &&
+      !["secret-ineligible", "unsafe-staging"].includes(String(raw.reason)))
+  )
+    throw new Error(
+      "Rejected collection lacks its literal original return identity",
+    );
+  const fault = rejectionRecord(receipt.fault, ["kind", "detail"]);
+  if (
+    fault.kind !== "work" ||
+    typeof fault.detail !== "string" ||
+    !fault.detail.trim()
+  )
+    throw new Error("Rejected collection lacks its original work fault");
+  const candidate = rejectionRecord(receipt.candidate, [
+    "availability",
+    "baseSha",
+    "commitSha",
+    "treeSha",
+    "paths",
+    "reason",
+  ]);
+  if (candidate.baseSha !== request.baseSha)
+    throw new Error("Rejected collection baseline differs");
+  if (candidate.availability === "available") {
+    if (
+      typeof candidate.commitSha !== "string" ||
+      !/^[a-f0-9]{40}$/.test(candidate.commitSha) ||
+      typeof candidate.treeSha !== "string" ||
+      !/^[a-f0-9]{40}$/.test(candidate.treeSha) ||
+      !Array.isArray(candidate.paths) ||
+      new Set(candidate.paths).size !== candidate.paths.length ||
+      candidate.paths.some(
+        (path) =>
+          typeof path !== "string" ||
+          !path ||
+          path.startsWith("/") ||
+          path.includes("\\") ||
+          path
+            .split("/")
+            .some((part: string) => !part || part === "." || part === "..") ||
+          PRIVATE_STAGING.some(
+            (name) => path === name || path.startsWith(name + "/"),
+          ) ||
+          path === ".factory-media" ||
+          path.startsWith(".factory-media/") ||
+          !ownsPath(path, request.item.ownedPaths),
+      ) ||
+      candidate.reason !== undefined
+    )
+      throw new Error("Rejected collection candidate is invalid");
+  } else if (
+    candidate.availability !== "unavailable" ||
+    candidate.reason !== "collector-safety-rejected" ||
+    candidate.commitSha !== undefined ||
+    candidate.treeSha !== undefined ||
+    candidate.paths !== undefined
+  )
+    throw new Error("Rejected collection candidate availability is invalid");
+  if (
+    !Array.isArray(receipt.staging) ||
+    receipt.staging.length > rejectedStaging.length ||
+    new Set(receipt.staging.map((entry) => (entry as { path?: unknown }).path))
+      .size !== receipt.staging.length
+  )
+    throw new Error("Rejected staging inventory is invalid");
+  for (const entry of receipt.staging) {
+    const record = body(entry, ["path"]);
+    if (!rejectedStaging.includes(String(record.path)))
+      throw new Error("Rejected staging path is invalid");
+  }
+  const media = rejectionRecord(receipt.media, [
+    "availability",
+    "reason",
+    "sets",
+  ]);
+  if (media.availability === "available") {
+    if (
+      !Array.isArray(media.sets) ||
+      media.reason !== undefined ||
+      media.sets.length === 0
+    )
+      throw new Error("Invalid retained rejected media observation");
+    for (const set of media.sets)
+      assertAssetCaptureReceipt(set as CapturedAssetSet);
+  } else if (
+    media.availability !== "unavailable" ||
+    media.reason !== "not-collected" ||
+    media.sets !== undefined
+  )
+    throw new Error("Rejected media is not an accepted collection");
+}
+export async function authenticateRejectedCollectionReceipt(
+  receipt: RejectedCollectionReceipt,
+  request: ExecutionRequest,
+  identity: string,
+  checkout: string,
+  store: ContentStore,
+): Promise<void> {
+  assertRejectedCollectionReceipt(receipt, request, identity);
+  for (const body of [receipt.rawReturn, ...receipt.staging])
+    if (body.availability === "available") await store.verify(body.ref!);
+  if (receipt.media.availability === "available") {
+    const unavailableDeclaration = receipt.staging.find(
+      (entry) =>
+        entry.path === ".factory-assets.json" &&
+        entry.availability === "unavailable",
+    );
+    for (const set of receipt.media.sets) {
+      if (
+        set.manifestRef &&
+        set.manifestRef.digest !== unavailableDeclaration?.digest
+      )
+        await store.verify(set.manifestRef);
+      for (const member of set.members) await store.verify(member.ref);
+      for (const input of set.inputs ?? []) await store.verify(input.ref);
+    }
+  }
+  if (receipt.candidate.availability === "available") {
+    const candidate = receipt.candidate;
+    if (
+      pinnedGit(
+        checkout,
+        "show",
+        "-s",
+        "--format=%P%n%T%n%ae%n%s",
+        candidate.commitSha,
+      ) !==
+        `${request.baseSha}\n${candidate.treeSha}\n${FACTORY_EMAIL}\nFactory rejected collection observation` ||
+      JSON.stringify(
+        pinnedGitRaw(
+          checkout,
+          "diff",
+          "--name-only",
+          "--no-renames",
+          "-z",
+          request.baseSha,
+          candidate.commitSha,
+        )
+          .toString("utf8")
+          .split("\0")
+          .filter(Boolean),
+      ) !== JSON.stringify(candidate.paths)
+    )
+      throw new Error("Rejected candidate differs from its bound observation");
+    for (const path of candidate.paths) {
+      if (!ownsPath(path, request.item.ownedPaths))
+        throw new Error("Rejected candidate exceeds the admitted ownership");
+      const entry = pinnedGitRaw(
+        checkout,
+        "ls-tree",
+        "-z",
+        candidate.treeSha,
+        "--",
+        path,
+      ).toString("utf8");
+      if (entry && !/^(100644|100755) blob [a-f0-9]{40}\t/.test(entry))
+        throw new Error("Rejected candidate includes an unsafe Git entry");
+    }
+  }
+}
+/** Freeze permitted evidence of a settled rejection; forbidden bytes remain unavailable. */
+export async function freezeRejectedCollection(args: {
+  checkout: string;
+  worktree: string;
+  request: ExecutionRequest;
+  store: ContentStore;
+  error: unknown;
+  capturedAssets?: CapturedAssetSet[];
+  rawReturn: {
+    provenance: "controller-worker-result" | "managed-original-artifact";
+    identity: string;
+    bytes: Buffer;
+  };
+}): Promise<RejectedCollectionReceipt> {
+  const bounds = privateCheckpointBounds();
+  if (!bounds)
+    throw new Error(
+      "Rejected collection freezing requires its admitted private checkpoint scope",
+    );
+  const fault = attachedFault(args.error);
+  if (fault?.kind !== "work" || !args.request.attemptId)
+    throw new Error(
+      "Rejected collection lacks a settled original work failure",
+    );
+  // Failure text can contain worker quotations; it crosses the same privacy gate.
+  await scanCollectionObservation(
+    args.worktree,
+    args.checkout,
+    Buffer.from(fault.evidence.detail),
+  );
+  let usedBytes = 0,
+    usedFiles = 0;
+  const deadline = Date.now() + bounds.timeoutMs;
+  const bound = (bytes: number) => {
+    usedBytes += bytes;
+    usedFiles++;
+    if (
+      usedBytes > bounds.maxBytes ||
+      usedFiles > bounds.maxFiles ||
+      Date.now() > deadline
+    )
+      throw new Error(
+        "Rejected collection exceeds the admitted checkpoint bounds",
+      );
+  };
+  const retain = async (
+    bytes: Buffer,
+    mediaType: string,
+  ): Promise<RejectedCollectionBody> => {
+    bound(bytes.length);
+    const identity = { digest: collectionDigest(bytes), bytes: bytes.length };
+    try {
+      await scanCollectionObservation(args.worktree, args.checkout, bytes);
+    } catch (error) {
+      if (attachedFault(error)?.kind === "work")
+        return {
+          availability: "unavailable",
+          ...identity,
+          reason: "secret-ineligible",
+        };
+      throw error;
+    }
+    const ref = await args.store.put(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      { mediaType },
+    );
+    return { availability: "available", ...identity, ref };
+  };
+  // Managed originals encode file bodies (JSON/base64 or tar). Literal scanning
+  // cannot establish admission of all decoded members after collection failed.
+  let original: RejectedCollectionBody;
+  if (args.rawReturn.provenance === "managed-original-artifact") {
+    bound(args.rawReturn.bytes.length);
+    original = {
+      availability: "unavailable",
+      digest: collectionDigest(args.rawReturn.bytes),
+      bytes: args.rawReturn.bytes.length,
+      reason: "unsafe-staging",
+    };
+  } else original = await retain(args.rawReturn.bytes, "application/json");
+  const rawReturn = {
+    ...original,
+    provenance: args.rawReturn.provenance,
+    identity: args.rawReturn.identity,
+  };
+  const staging: RejectedCollectionReceipt["staging"] = [];
+  for (const path of rejectedStaging) {
+    const file = join(args.worktree, path);
+    if (!lstatSync(file, { throwIfNoEntry: false })) continue;
+    if (
+      !lstatSync(file).isFile() ||
+      realpathSync(file) !== file ||
+      pinnedGit(args.worktree, "ls-files", "--stage", "--", path)
+    ) {
+      staging.push({
+        path,
+        availability: "unavailable",
+        reason: "unsafe-staging",
+      });
+      continue;
+    }
+    if (lstatSync(file).size > bounds.maxBytes - usedBytes)
+      throw new Error(
+        "Rejected staging exceeds its admitted checkpoint bounds",
+      );
+    staging.push({
+      path,
+      ...(await retain(readFileSync(file), "application/json")),
+    });
+  }
+  let candidate: RejectedCollectionReceipt["candidate"] = {
+    availability: "unavailable",
+    baseSha: args.request.baseSha,
+    reason: "collector-safety-rejected",
+  };
+  try {
+    if (pinnedGit(args.worktree, "rev-parse", "HEAD") !== args.request.baseSha)
+      throw workFault("Rejected worker changed its admitted HEAD");
+    const prospective = [
+      ...new Set(
+        [
+          ...pinnedGitRaw(
+            args.worktree,
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "HEAD",
+          )
+            .toString("utf8")
+            .split("\0"),
+          ...pinnedGitRaw(
+            args.worktree,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+          )
+            .toString("utf8")
+            .split("\0"),
+        ].filter(Boolean),
+      ),
+    ].filter(
+      (path) =>
+        ![...PRIVATE_STAGING, ".factory-media"].some(
+          (name) => path === name || path.startsWith(name + "/"),
+        ),
+    );
+    let prospectiveBytes = 0;
+    if (prospective.length + usedFiles > bounds.maxFiles)
+      throw new Error("Rejected candidate exceeds the admitted file bound");
+    for (const path of prospective) {
+      if (!ownsPath(path, args.request.item.ownedPaths))
+        throw workFault("Rejected candidate exceeds ownership");
+      const file = resolve(args.worktree, path);
+      if (!file.startsWith(`${resolve(args.worktree)}${sep}`))
+        throw workFault("Rejected candidate has an unsafe path");
+      const info = lstatSync(file, { throwIfNoEntry: false });
+      prospectiveBytes += info?.isFile() ? info.size : 0;
+    }
+    if (prospectiveBytes + usedBytes > bounds.maxBytes)
+      throw new Error("Rejected candidate exceeds the admitted byte bound");
+    await pinnedGitMagicAsync(
+      args.worktree,
+      "add",
+      "-A",
+      "--",
+      ".",
+      ...[...PRIVATE_STAGING, ".factory-media"]
+        .filter(
+          (name) =>
+            pinnedGitRaw(
+              args.worktree,
+              "ls-files",
+              "--cached",
+              "--others",
+              "--exclude-standard",
+              "-z",
+              "--",
+              name,
+            ).length > 0,
+        )
+        .map((name) => `:(exclude,literal)${name}`),
+    );
+    for (const name of [...PRIVATE_STAGING, ".factory-media"])
+      if (
+        pinnedGitRaw(args.worktree, "ls-files", "--stage", "-z", "--", name)
+          .length
+      )
+        await pinnedGitAsync(args.worktree, "reset", "HEAD", "--", name);
+    const paths = await checkStagedCandidate(
+      args.worktree,
+      args.checkout,
+      args.request.item.ownedPaths,
+      undefined,
+      {
+        maxBytes: bounds.maxBytes - usedBytes,
+        maxFiles: bounds.maxFiles - usedFiles,
+        deadline,
+      },
+    );
+    if (Date.now() > deadline)
+      throw new Error(
+        "Rejected collection exceeds its admitted checkpoint deadline",
+      );
+    const treeSha = pinnedGit(args.worktree, "write-tree");
+    const commitSha = await pinnedGitAsync(
+      args.worktree,
+      "-c",
+      "user.name=Factory",
+      "-c",
+      `user.email=${FACTORY_EMAIL}`,
+      "commit-tree",
+      treeSha,
+      "-p",
+      args.request.baseSha,
+      "-m",
+      "Factory rejected collection observation",
+    );
+    candidate = {
+      availability: "available",
+      baseSha: args.request.baseSha,
+      commitSha: commitSha.trim(),
+      treeSha,
+      paths,
+    };
+  } catch (error) {
+    if (attachedFault(error)?.kind !== "work") throw error;
+  }
+  const receipt: RejectedCollectionReceipt = {
+    schemaVersion: 1,
+    attemptId: args.request.attemptId,
+    requestDigest: collectionDigest(JSON.stringify(args.request)),
+    rawReturn,
+    fault: { kind: "work", detail: fault.evidence.detail },
+    candidate,
+    staging,
+    media: args.capturedAssets?.length
+      ? {
+          availability: "available",
+          sets: structuredClone(args.capturedAssets),
+        }
+      : { availability: "unavailable", reason: "not-collected" },
+  };
+  await authenticateRejectedCollectionReceipt(
+    receipt,
+    args.request,
+    args.request.attemptId,
+    args.checkout,
+    args.store,
+  );
+  return receipt;
+}
+
 const FACTORY_EMAIL = "factory@users.noreply.github.com";
 const collectionMessage = (request: ExecutionRequest) =>
   `Factory: ${request.item.title}`;
@@ -709,6 +1284,11 @@ export async function collectWorktreeResult(
   store: ContentStore,
   result: HarnessResult,
   checkpointResult?: (result: ExecutionResult) => Promise<void>,
+  checkpointManifest?: (manifest: {
+    path: ".factory-assets.json";
+    ref: ContentRef;
+  }) => Promise<void>,
+  checkpointAssets?: (assets: CapturedAssetSet[]) => Promise<void>,
 ): Promise<ExecutionResult> {
   const handoffPath = join(worktree, ".factory-handoff.json");
   const handoffNotes = judgedAsWork(() => readWorkHandoff(worktree));
@@ -768,6 +1348,9 @@ export async function collectWorktreeResult(
     result.assets ?? [],
     result.evidence,
     request.sourceAssets,
+    checkpointManifest,
+    checkout,
+    checkpointAssets,
   );
   for (const [index, source] of (request.selectedAssets ?? []).entries()) {
     await verifyBoundInput(
@@ -1493,7 +2076,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
                 repository: this.captureSettings.repository,
                 ...request.captureContext,
                 itemId: request.item.id,
-                attemptId: identity,
+                attemptId: request.captureContext.attemptId ?? identity,
                 invocationId: identity,
                 providerAttempt: 1,
                 phase: "implementation",
@@ -1663,6 +2246,17 @@ export class LocalExecutionDriver implements ExecutionDriver {
   ): Promise<ExecutionHandle | undefined> {
     const data = handle.data as Partial<Settled> | undefined;
     if (data?.result) return handle;
+    const rejection = handle.data as Active | undefined;
+    if (rejection?.rejectedCollection) {
+      await authenticateRejectedCollectionReceipt(
+        rejection.rejectedCollection,
+        rejection.request,
+        handle.identity,
+        this.checkout,
+        this.contentStore,
+      );
+      return handle;
+    }
     if (data?.stopped !== undefined) {
       this.unavailableSession(handle, context);
       return undefined;
@@ -1728,6 +2322,20 @@ export class LocalExecutionDriver implements ExecutionDriver {
   async observe(handle: ExecutionHandle): Promise<ExecutionObservation> {
     const settled = handle.data as Partial<Settled> | undefined;
     if (settled?.result) return { state: "complete" };
+    const rejection = handle.data as Active | undefined;
+    if (rejection?.rejectedCollection) {
+      await authenticateRejectedCollectionReceipt(
+        rejection.rejectedCollection,
+        rejection.request,
+        handle.identity,
+        this.checkout,
+        this.contentStore,
+      );
+      return {
+        state: "failed",
+        detail: rejection.rejectedCollection.fault.detail,
+      };
+    }
     if (settled?.stopped !== undefined)
       return { state: "failed", interrupted: true, detail: settled.stopped };
     const active = this.require(handle);
@@ -1744,7 +2352,11 @@ export class LocalExecutionDriver implements ExecutionDriver {
   ): Promise<void> {
     const settled = handle.data as Partial<Settled> | undefined;
     // An attempt that ended has nothing left to stop.
-    if (settled?.result || settled?.stopped !== undefined) {
+    if (
+      settled?.result ||
+      settled?.stopped !== undefined ||
+      (handle.data as Active | undefined)?.rejectedCollection
+    ) {
       if (context?.cancelled()) this.unavailableSession(handle, context);
       return;
     }
@@ -1784,6 +2396,11 @@ export class LocalExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionResult> {
     const settled = handle.data as Partial<Settled> | undefined;
+    if (
+      settled?.result &&
+      (handle.data as Active | undefined)?.rejectedCollection
+    )
+      throw new Error("Rejected collection cannot claim an execution result");
     // An ended attempt: its worktree goes if a crash kept it.
     if (settled?.result || settled?.stopped !== undefined) {
       await context?.admitEffect?.("explicit");
@@ -1793,6 +2410,19 @@ export class LocalExecutionDriver implements ExecutionDriver {
       throw stoppedFault(settled.stopped!, true);
     }
     const active = this.require(handle);
+    if (active.rejectedCollection) {
+      await authenticateRejectedCollectionReceipt(
+        active.rejectedCollection,
+        active.request,
+        handle.identity,
+        this.checkout,
+        this.contentStore,
+      );
+      await context?.admitEffect?.("explicit");
+      if (existsSync(active.worktree))
+        await this.removeExecutionDirectory(active.worktree);
+      throw workFault(active.rejectedCollection.fault.detail);
+    }
     let collected: ExecutionResult | undefined;
     let collectionError: unknown;
     let sessionCheckpointed = false;
@@ -1868,6 +2498,17 @@ export class LocalExecutionDriver implements ExecutionDriver {
             });
             await context?.admitEffect?.("explicit");
           },
+          async (manifest) => {
+            active.assetManifest = structuredClone(manifest);
+            context?.checkpoint({ ...handle, data: active });
+            // Collection must finish freezing its source before complete ACK.
+            // A semantic rejection keeps this original and its owned checkout.
+          },
+          async (assets) => {
+            if (!privateCheckpointBounds() || !assets.length) return;
+            active.collectedAssets = structuredClone(assets);
+            context?.checkpoint({ ...handle, data: active });
+          },
         );
       if (result.session) collected.session = structuredClone(result.session);
     } catch (error) {
@@ -1917,8 +2558,74 @@ export class LocalExecutionDriver implements ExecutionDriver {
       !collected &&
       observed.interrupted !== true &&
       attachedFault(collectionError)?.kind === "work"
-    )
+    ) {
+      if (privateCheckpointBounds()) {
+        if (!active.rejectedCollection) {
+          const harness = this.resolveHarness(
+            active.request.item,
+            active.executionBinding,
+          ) as RecoverableHarness;
+          const source =
+            harness instanceof CodexHarness ||
+            harness instanceof ClaudeAgentSdkHarness
+              ? harness.originalCollectionReturn(active.handle)
+              : undefined;
+          if (
+            !source ||
+            source.attemptId !== handle.identity ||
+            !resolve(source.path).startsWith(`${resolve(source.root)}${sep}`) ||
+            !source.path.endsWith(".result.json")
+          )
+            throw new Error(
+              "Rejected collection has no authenticated original worker return; checkout retained",
+            );
+          const info = lstatSync(source.path);
+          const bounds = privateCheckpointBounds()!;
+          if (
+            !info.isFile() ||
+            realpathSync(source.path) !== resolve(source.path) ||
+            (process.getuid && info.uid !== process.getuid()) ||
+            info.size > bounds.maxBytes
+          )
+            throw new Error(
+              "Rejected worker return is unavailable or exceeds its admitted bounds",
+            );
+          const bytes = readFileSync(source.path);
+          const original = JSON.parse(bytes.toString("utf8")) as {
+            state?: unknown;
+          };
+          if (original.state !== "complete")
+            throw new Error(
+              "Rejected collection has no completed original wrapper return",
+            );
+          active.rejectedCollection = await freezeRejectedCollection({
+            checkout: this.checkout,
+            worktree: active.worktree,
+            request: active.request,
+            store: this.contentStore,
+            error: collectionError,
+            capturedAssets: active.collectedAssets,
+            rawReturn: {
+              provenance: source.provenance,
+              identity: handle.identity,
+              bytes,
+            },
+          });
+        }
+        await authenticateRejectedCollectionReceipt(
+          active.rejectedCollection,
+          active.request,
+          handle.identity,
+          this.checkout,
+          this.contentStore,
+        );
+        context?.checkpoint({ ...handle, data: active });
+        await context?.admitEffect?.("explicit");
+        this.active.delete(handle.identity);
+        await this.removeExecutionDirectory(active.worktree);
+      }
       throw collectionError;
+    }
     const interrupted = !collected && observed.interrupted === true;
     // Only a wrong result ends the attempt here. A transient, config or
     // defect fault from collecting a finished worker's result is not the

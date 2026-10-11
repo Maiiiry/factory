@@ -451,6 +451,7 @@ export async function captureAssetSets(
     ref: ContentRef;
   }) => void | Promise<void>,
   checkout: string = worktree,
+  checkpointAssets?: (sets: CapturedAssetSet[]) => void | Promise<void>,
 ): Promise<CapturedAssetSet[]> {
   const declaration = join(worktree, ".factory-assets.json");
   let declarationBytes: Buffer | undefined;
@@ -676,6 +677,7 @@ export async function captureAssetSets(
     ).size !== captured.length
   )
     throw workFault("Candidate AssetSets must have distinct content");
+  await checkpointAssets?.(structuredClone(captured));
   rmSync(mediaRoot, { recursive: true, force: true });
   return captured;
 }
