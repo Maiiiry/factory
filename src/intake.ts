@@ -972,8 +972,17 @@ async function runIntakeOwned(
             if (handingOff || localMode) continue;
             const result = await runObjective(config, selected, services, {
               ownerLock: lock,
-              observeControl: (handler) => {
+              observeControl: async (handler) => {
                 objectiveControl = handler;
+                if (handler && (handingOff || localMode))
+                  await handler({
+                    objective: selected,
+                    action: handingOff
+                      ? "handoff"
+                      : localMode === "paused"
+                        ? "pause"
+                        : "drain",
+                  });
               },
             });
             if (!terminal(result)) {

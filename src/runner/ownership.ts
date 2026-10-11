@@ -91,6 +91,8 @@ export function canHandoff(state: ContinuationState): boolean {
 
 export interface LocalOwner {
   handoff?: boolean;
+  /** Cessation received before the authentic first snapshot is published. */
+  initialMode?: "paused" | "draining";
   /** Exact Issue body admitted by the Project claim, before any planning. */
   admittedObjectiveBodyDigest?: string;
   /**

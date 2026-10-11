@@ -838,6 +838,22 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(firstInspection.current.logicalFiles, closure.files.length);
   assert.equal(firstInspection.current.manifestBytes > 0, true);
   assert.equal(firstInspection.storage, "git-logical-bytes");
+  assert.deepEqual(firstInspection.capacity.cancellationAncestry, {
+    availability: "unavailable",
+    reason: "not-traversed",
+  });
+  assert.equal(
+    firstInspection.capacity.current.bytes,
+    firstInspection.current.manifestBytes +
+      firstInspection.current.uniqueBodyBytes,
+  );
+  assert.equal(
+    firstInspection.capacity.current.fileHeadroom,
+    config.gitPersistence.maxFiles -
+      firstInspection.current.logicalFiles -
+      firstInspection.current.uniqueBodies -
+      1,
+  );
   // Round-trip the workflow's retained originals and an opaque body through
   // the same batch I/O used by full archive publication and verification.
   const opaque = Buffer.alloc(1024 * 1024, 0xff);
@@ -1212,12 +1228,130 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     producer: { ...record.producer, identity: "second-local-source-read" },
     summary: "A second local read confirms the complete orchard API reference",
   });
+  // A prior authenticated remote copy must never mask corruption in the
+  // current local original during the next publication.
+  const currentSourcePath = join(
+    state,
+    "content",
+    sourceRef.digest.slice(0, 2),
+    sourceRef.digest,
+  );
+  writeFileSync(currentSourcePath, "corrupt already archived API reference");
+  try {
+    await assert.rejects(
+      synchronizeRecoveryCheckpoint(config, {
+        reason: "explicit",
+        buildClosure,
+      }),
+      /digest verification|failed exact verification/,
+    );
+    assert.equal(
+      execFileSync(
+        "git",
+        ["--git-dir", remote, "rev-parse", config.gitPersistence.ref],
+        {
+          encoding: "utf8",
+        },
+      ).trim(),
+      boundArchive.commitSha,
+    );
+  } finally {
+    writeFileSync(currentSourcePath, source);
+  }
+  const publicationStarted = performance.now();
   const secondCheckpoint = await synchronizeRecoveryCheckpoint(config, {
     reason: "explicit",
     buildClosure,
   });
+  const publicationElapsedMs = performance.now() - publicationStarted;
   assert.equal(secondCheckpoint.status, "acknowledged");
   const secondInspection = await inspectRecoveryCheckpoint(config);
+  const publishedManifest = JSON.parse(
+    execFileSync(
+      "git",
+      [
+        "--git-dir",
+        remote,
+        "show",
+        `${secondCheckpoint.lastAcknowledged.commitSha}:checkpoint.json`,
+      ],
+      { encoding: "utf8" },
+    ),
+  );
+  const exactRefs = (manifest) =>
+    new Map(
+      [...manifest.contentRefs, ...manifest.files.map((file) => file.ref)].map(
+        (ref) => [ref.digest, ref],
+      ),
+    );
+  const priorRefs = exactRefs(boundArchive.manifest);
+  const currentRefs = exactRefs(publishedManifest);
+  const sharedRefs = [...currentRefs.values()].filter((ref) => {
+    const prior = priorRefs.get(ref.digest);
+    return prior?.bytes === ref.bytes && prior.mediaType === ref.mediaType;
+  });
+  assert.equal(sharedRefs.length > 0, true);
+  assert.equal(currentRefs.size > sharedRefs.length, true);
+  const blobOid = (commit, ref) =>
+    execFileSync(
+      "git",
+      ["--git-dir", remote, "rev-parse", `${commit}:blobs/${ref.digest}`],
+      { encoding: "utf8" },
+    ).trim();
+  assert.equal(
+    blobOid(boundArchive.commitSha, sourceRef),
+    blobOid(secondCheckpoint.lastAcknowledged.commitSha, sourceRef),
+  );
+  t.diagnostic(
+    `Changed checkpoint publication: ${publicationElapsedMs.toFixed(3)} ms; ${sharedRefs.length} exact bodies shared, ${currentRefs.size - sharedRefs.length} new or changed`,
+  );
+  // Whole current material remains charged even when nearly every body is
+  // already present in the verified publication base.
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(
+      {
+        ...config,
+        gitPersistence: {
+          ...config.gitPersistence,
+          maxFiles:
+            secondInspection.current.logicalFiles +
+            secondInspection.current.uniqueBodies,
+        },
+      },
+      { reason: "explicit", buildClosure },
+    ),
+    /Current materialized checkpoint exceeds admitted bounds/,
+  );
+  assert.equal(
+    gitPersistenceStatus(config).lastAcknowledged.commitSha,
+    secondCheckpoint.lastAcknowledged.commitSha,
+  );
+  assert.equal(
+    secondInspection.capacity.cancellationAncestry.availability,
+    "available",
+  );
+  for (const usage of secondInspection.capacity.cancellationAncestry
+    .traversals) {
+    assert.equal(usage.commits > 1, true);
+    assert.equal(usage.manifestTransportBytes > 0, true);
+    assert.equal(usage.retainedOriginalBytes > 0, true);
+    assert.equal(
+      usage.chargedBytes,
+      usage.manifestTransportBytes + usage.retainedOriginalBytes,
+    );
+    assert.equal(
+      usage.byteHeadroom,
+      config.gitPersistence.maxBytes - usage.chargedBytes,
+    );
+    assert.equal(
+      usage.commitHeadroom,
+      config.gitPersistence.maxFiles - usage.commits,
+    );
+    assert.equal(
+      usage.manifestBufferHeadroom,
+      config.gitPersistence.maxBytes + 65536 - usage.manifestTransportBytes,
+    );
+  }
   assert.equal(secondInspection.reachableHistory.availability, "available");
   assert.equal(
     secondInspection.reachableHistory.logicalObjectBytes >

@@ -197,6 +197,27 @@ export interface RecoveryCheckpointInspection {
         reason: "bounded-inspection-unavailable";
       };
   storage: "git-logical-bytes";
+  capacity: {
+    limits: { maxBytes: number; maxFiles: number; manifestBufferBytes: number };
+    current: {
+      bytes: number;
+      files: number;
+      byteHeadroom: number;
+      fileHeadroom: number;
+    };
+    cancellationAncestry:
+      | { availability: "available"; traversals: QueueLineageCapacity[] }
+      | { availability: "unavailable"; reason: "not-traversed" };
+  };
+}
+interface QueueLineageCapacity {
+  commits: number;
+  manifestTransportBytes: number;
+  retainedOriginalBytes: number;
+  chargedBytes: number;
+  byteHeadroom: number;
+  commitHeadroom: number;
+  manifestBufferHeadroom: number;
 }
 export interface RecoveryCheckpointStatus {
   enabled: boolean;
@@ -1281,14 +1302,15 @@ function assertManifest(
       throw new Error("Git identities require complete retained Git objects");
   }
   const refs = allRefs(value as unknown as RecoveryCheckpointManifest);
-  if (
-    value.files.length + refs.length + 1 > options.maxFiles ||
-    refs.reduce(
-      (sum, ref) => sum + ref.bytes,
-      Buffer.byteLength(canonical(value)),
-    ) > options.maxBytes
-  )
-    throw new Error("Complete checkpoint exceeds admitted file or byte bound");
+  const files = value.files.length + refs.length + 1;
+  const bytes = refs.reduce(
+    (sum, ref) => sum + ref.bytes,
+    Buffer.byteLength(canonical(value)),
+  );
+  if (files > options.maxFiles || bytes > options.maxBytes)
+    throw new Error(
+      `Current materialized checkpoint exceeds admitted bounds: files=${files}, maxFiles=${options.maxFiles}, bytes=${bytes}, maxBytes=${options.maxBytes}`,
+    );
 }
 /** Validates a retained manifest against an explicit binding and whole-closure bounds.
  * Publisher metadata describes its original host; it does not authorize restoration.
@@ -1495,6 +1517,7 @@ function readArchive(
 ): {
   manifest: RecoveryCheckpointManifest;
   blobs: Map<string, Buffer>;
+  blobEntries: { ref: ContentRef; oid: string }[];
   manifestBytes: number;
   originalManifestBytes: Buffer;
   payloadDigest: string;
@@ -1542,14 +1565,15 @@ function readArchive(
   ].sort();
   if (canonical(names) !== canonical(expected))
     throw new Error("Archive contains unexpected or missing bytes");
-  const blobs = readRecoveryCheckpointBodies(
-    directory,
-    options,
-    refs.map((ref) => ({ ref, oid: objectIds.get(`blobs/${ref.digest}`)! })),
-  );
+  const blobEntries = refs.map((ref) => ({
+    ref,
+    oid: objectIds.get(`blobs/${ref.digest}`)!,
+  }));
+  const blobs = readRecoveryCheckpointBodies(directory, options, blobEntries);
   return {
     manifest,
     blobs,
+    blobEntries,
     manifestBytes: manifestBytes.length,
     originalManifestBytes: manifestBytes,
     payloadDigest: hash(manifestBytes),
@@ -1616,6 +1640,7 @@ function queueOwnerLineage(
   config: FactoryConfig,
   tip: string,
   request: QueueOwnerLineageRequest,
+  observeCapacity?: (capacity: QueueLineageCapacity) => void,
 ): VerifiedQueueOwnerLineage {
   if (
     options.scope !== "private-history" ||
@@ -1634,20 +1659,50 @@ function queueOwnerLineage(
     .toString("utf8")
     .trim()
     .split("\n");
-  if (
-    commits.length > options.maxFiles ||
-    commits.some((sha) => !/^[a-f0-9]{40,64}$/.test(sha))
-  )
+  if (commits.some((sha) => !/^[a-f0-9]{40,64}$/.test(sha)))
+    throw new Error("Queue cancellation lineage commit inventory is invalid");
+  if (commits.length > options.maxFiles)
     throw new Error(
-      "Queue cancellation lineage exceeds admitted history bounds",
+      `Queue cancellation ancestry exceeds admitted commit bound: commits=${commits.length}, maxFiles=${options.maxFiles}`,
     );
-  const batch = git(
+  const inventory = `${commits.map((sha) => `${sha}:checkpoint.json`).join("\n")}\n`;
+  const metadata = git(
     directory,
     options,
-    ["cat-file", "--batch"],
-    `${commits.map((sha) => `${sha}:checkpoint.json`).join("\n")}\n`,
-  );
+    ["cat-file", "--batch-check"],
+    inventory,
+  )
+    .toString("utf8")
+    .split("\n");
+  if (metadata.pop() !== "" || metadata.length !== commits.length)
+    throw new Error("Queue lineage manifest size inventory is incomplete");
+  let manifestTransportBytes = 0;
+  const identities = metadata.map((row) => {
+    const match = /^([a-f0-9]{40,64}) blob ([0-9]+)$/.exec(row);
+    const size = match ? Number(match[2]) : Number.NaN;
+    const charge = Buffer.byteLength(row) + 2 + size;
+    if (
+      !match ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      !Number.isSafeInteger(manifestTransportBytes + charge)
+    )
+      throw new Error("Queue lineage manifest type or size is invalid");
+    manifestTransportBytes += charge;
+    return { oid: match[1]!, size };
+  });
+  const manifestBufferBytes = options.maxBytes + 65536;
+  if (manifestTransportBytes > manifestBufferBytes)
+    throw new Error(
+      `Queue cancellation ancestry exceeds admitted manifest transport buffer: predictedBytes=${manifestTransportBytes}, bufferBytes=${manifestBufferBytes}, maxBytes=${options.maxBytes}, commits=${commits.length}; original body bytes not read`,
+    );
+  const batch = git(directory, options, ["cat-file", "--batch"], inventory);
+  if (batch.length !== manifestTransportBytes)
+    throw new Error(
+      "Queue lineage manifest transport differs from size inventory",
+    );
   const bodies = new Map<string, { ref: ContentRef; bytes: Uint8Array }>();
+  let retainedOriginalBytes = 0;
   const body = (commit: string, ref: ContentRef) => {
     const retained = bodies.get(ref.digest);
     if (retained) {
@@ -1665,13 +1720,14 @@ function queueOwnerLineage(
     if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
       throw new Error("Queue lineage original failed exact verification");
     bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
-    if (
-      [...bodies.values()].reduce(
-        (total, entry) => total + entry.ref.bytes,
-        batch.length,
-      ) > options.maxBytes
-    )
-      throw new Error("Queue lineage originals exceed admitted byte bounds");
+    retainedOriginalBytes = [...bodies.values()].reduce(
+      (total, entry) => total + entry.ref.bytes,
+      0,
+    );
+    if (batch.length + retainedOriginalBytes > options.maxBytes)
+      throw new Error(
+        `Queue cancellation ancestry exceeds admitted cumulative byte bound: manifestTransportBytes=${batch.length}, retainedOriginalBytes=${retainedOriginalBytes}, chargedBytes=${batch.length + retainedOriginalBytes}, maxBytes=${options.maxBytes}, commits=${commits.length}`,
+      );
     return bytes;
   };
   const claimPath = `project-queue-history/${request.claimId}.json`;
@@ -1687,7 +1743,7 @@ function queueOwnerLineage(
   let initialSnapshot: ContentRef | undefined;
   let priorSequence = -1;
   let priorManifestDigest: string | undefined;
-  for (const commit of commits) {
+  for (const [index, commit] of commits.entries()) {
     const end = batch.indexOf(10, offset);
     const header = batch.subarray(offset, end).toString("utf8");
     const match = /^([a-f0-9]{40,64}) blob ([0-9]+)$/.exec(header);
@@ -1696,7 +1752,10 @@ function queueOwnerLineage(
       end < offset ||
       !Number.isSafeInteger(size) ||
       size < 0 ||
-      end + 1 + size >= batch.length
+      end + 1 + size >= batch.length ||
+      match?.[1] !== identities[index]!.oid ||
+      size !== identities[index]!.size ||
+      batch[end + 1 + size] !== 10
     )
       throw new Error("Queue lineage manifest transport is incomplete");
     const bytes = batch.subarray(end + 1, end + 1 + size);
@@ -1819,6 +1878,15 @@ function queueOwnerLineage(
     originalClaim,
     initialSnapshot,
   ];
+  observeCapacity?.({
+    commits: commits.length,
+    manifestTransportBytes: batch.length,
+    retainedOriginalBytes,
+    chargedBytes: batch.length + retainedOriginalBytes,
+    byteHeadroom: options.maxBytes - batch.length - retainedOriginalBytes,
+    commitHeadroom: options.maxFiles - commits.length,
+    manifestBufferHeadroom: manifestBufferBytes - batch.length,
+  });
   return {
     checkpoints: { before, claimed, initial },
     originalClaim,
@@ -1832,6 +1900,7 @@ async function freshArchive(
   expectedCommit?: string,
   inspectHistory = false,
   lineageRequest?: QueueOwnerLineageRequest,
+  observeCapacity?: (capacity: QueueLineageCapacity) => void,
 ) {
   const directory = join(
     paths(config.repository).root,
@@ -1868,7 +1937,14 @@ async function freshArchive(
       remoteTip: tip,
     };
     let lineage = lineageRequest
-      ? queueOwnerLineage(directory, options, config, tip, lineageRequest)
+      ? queueOwnerLineage(
+          directory,
+          options,
+          config,
+          tip,
+          lineageRequest,
+          observeCapacity,
+        )
       : undefined;
     // Retained cancellation witnesses must still be actual ancestor packets,
     // rather than manually shaped manifest text in the current body store.
@@ -1883,11 +1959,18 @@ async function freshArchive(
           ? record.settled?.cancellation
           : undefined;
       if (proof?.lineage?.kind !== "verified-first-run") continue;
-      const verified = queueOwnerLineage(directory, options, config, tip, {
-        objective: record.objective,
-        claimId: record.id,
-        runId: record.settled.runId,
-      });
+      const verified = queueOwnerLineage(
+        directory,
+        options,
+        config,
+        tip,
+        {
+          objective: record.objective,
+          claimId: record.id,
+          runId: record.settled.runId,
+        },
+        observeCapacity,
+      );
       if (
         canonical(verified.checkpoints) !==
           canonical(proof.lineage.checkpoints) ||
@@ -2162,7 +2245,15 @@ export async function inspectRecoveryCheckpoint(
   const options = settings(config);
   if (!options) throw new Error("Git persistence is not configured");
   await verifyDestination(config, options);
-  const archive = await freshArchive(config, options, undefined, true);
+  const traversals: QueueLineageCapacity[] = [];
+  const archive = await freshArchive(
+    config,
+    options,
+    undefined,
+    true,
+    undefined,
+    (capacity) => traversals.push(capacity),
+  );
   if (!archive.reachableHistory)
     throw new Error("Reachable archive history inspection is unavailable");
   const refs = allRefs(archive.manifest);
@@ -2191,6 +2282,24 @@ export async function inspectRecoveryCheckpoint(
     },
     reachableHistory: archive.reachableHistory,
     storage: "git-logical-bytes",
+    capacity: {
+      limits: {
+        maxBytes: options.maxBytes,
+        maxFiles: options.maxFiles,
+        manifestBufferBytes: options.maxBytes + 65536,
+      },
+      current: {
+        bytes: archive.manifestBytes + uniqueBodyBytes,
+        files: archive.manifest.files.length + refs.length + 1,
+        byteHeadroom:
+          options.maxBytes - archive.manifestBytes - uniqueBodyBytes,
+        fileHeadroom:
+          options.maxFiles - archive.manifest.files.length - refs.length - 1,
+      },
+      cancellationAncestry: traversals.length
+        ? { availability: "available", traversals }
+        : { availability: "unavailable", reason: "not-traversed" },
+    },
   };
 }
 function acknowledge(
@@ -2393,6 +2502,7 @@ async function publishCheckpoint(
     }
     initializeGit(p.git, options);
     const base = await remoteTip(p.git, options);
+    let verifiedBaseEntries: { ref: ContentRef; oid: string }[] = [];
     if (base) {
       if (!record.lastAcknowledged) {
         const missingBaseline =
@@ -2424,7 +2534,12 @@ async function publishCheckpoint(
         throw new CheckpointConflict(
           "Remote checkpoint changed during base fetch",
         );
-      readArchive(p.git, base, config, options);
+      verifiedBaseEntries = readArchive(
+        p.git,
+        base,
+        config,
+        options,
+      ).blobEntries;
     } else if (record.lastAcknowledged)
       throw new CheckpointConflict(
         "Acknowledged archive ref is missing; no branch recreation is admitted",
@@ -2438,7 +2553,26 @@ async function publishCheckpoint(
     )
       .toString("utf8")
       .trim();
-    const blobEntries = writeRecoveryCheckpointBodies(p.git, options, blobs);
+    // Reuse only identities fully authenticated by this publication's fresh
+    // base fetch. Current local bytes were independently checked above, and
+    // the complete collection remains bounded before selecting new bodies.
+    assertBodyBounds(
+      blobs.map(({ ref }) => ref),
+      options,
+    );
+    const verifiedBase = new Map(
+      verifiedBaseEntries.map((entry) => [entry.ref.digest, entry]),
+    );
+    const blobEntries: { ref: ContentRef; oid: string }[] = [];
+    const newBodies = blobs.filter(({ ref }) => {
+      const prior = verifiedBase.get(ref.digest);
+      if (!prior || canonical(prior.ref) !== canonical(ref)) return true;
+      blobEntries.push({ ref, oid: prior.oid });
+      return false;
+    });
+    blobEntries.push(
+      ...writeRecoveryCheckpointBodies(p.git, options, newBodies),
+    );
     const blobsTree = git(
       p.git,
       options,
