@@ -840,7 +840,8 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(firstInspection.storage, "git-logical-bytes");
   // Round-trip the workflow's retained originals and an opaque body through
   // the same batch I/O used by full archive publication and verification.
-  const opaque = Buffer.from([0xff, 0x00, 0x0a, 0x80]);
+  const opaque = Buffer.alloc(1024 * 1024, 0xff);
+  opaque.set([0xff, 0x00, 0x0a, 0x80]);
   const opaqueRef = store.putBytes(opaque, {
     mediaType: "application/octet-stream",
   });
