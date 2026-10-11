@@ -333,13 +333,17 @@ For an approved migration or cross-cutting fix whose file inventory is unknown, 
 
 Integration waits for authenticated expansion and every required child. A complete empty inventory creates no children and still requires the original acceptance proof. Partial or unreadable inputs, unknown semantic classifications and exhausted expansion bounds remain visible stops; scope changes use the existing amendment or human-decision paths. One immutable input materializes each envelope; changing that input requires an explicit successor or revalidation. Restarts retain the same child identities and input packets, and uncertain GitHub writes are reconciled without being submitted again.
 
-Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. Conditional routing, recipes and portable memory export remain deferred.
+Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. Recipes and portable memory export remain deferred.
 
 Adaptive workers automatically receive the relevant retained memory, verified human decisions, settled interface bodies and selected discovery entries for their batch. Role packets are retained before calls and authenticated on restart. Required source and acceptance inputs remain complete even when the advisory-memory allowance is exhausted; optional historical material stays an attributed lead. Already supplied content is reused rather than copied or requested again. Native session compaction remains the harness's responsibility.
 
 Scheduling preserves source priority and completion work, then favors useful remaining dependency paths. An optional `scheduling` hint contains a positive `estimatedDurationMs` and a concise `reason`; omitted estimates remain unknown. It grants no resources or deadline authority. Status and diagnostics distinguish dependency, ownership, named resource, host, provider and operator holds. Observed item elapsed time includes its full lifecycle, not only model or CPU time.
 
 For adaptive implementation, the driver and selected harness must support an enforced `childAgents: "disabled"` request or refuse before dispatch. Factory parallelizes independent DAG workers within the recorded limits. Native children cannot multiply those limits; logical hierarchy does not allocate a second controller or copied budget. Static implementation requests retain their configured behavior. Existing adapter session continuation and native cache counters remain available; unsupported cache warm-up causes no extra call.
+
+When an approved step depends on a discovery finding, describe the permitted alternatives and keep the original final acceptance explicit. The compiler can declare a complete-inventory or exhaustive-classification condition. Unknown or incomplete observations stop that route; they never count as an empty result. Selected and skipped branches retain their exact facts. Skipping an optional implementation does not skip the original integration and final proof.
+
+Factory reconsiders organization only at useful material events, using its existing dependency, diagnosis and amendment paths. It retains attributable proposals and available progress evidence without adding a mandatory coordination call. A cohesive task can keep one owner. This does not change configured models, permissions or consumed retry allowances.
 
 ### Writing Objectives that deliver
 

@@ -4,6 +4,7 @@ import {
   authenticateObjectiveInputs,
   graphExpansionPending,
 } from "./expansion.js";
+import { authenticateWorkRouting } from "./routing.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import { checkRequiredEnvironment } from "../repair-policy.js";
 import { stopRetryCommand } from "../run-outcome.js";
@@ -312,6 +313,14 @@ export async function runObjectivePass(
         state.capacity.concurrency,
       );
       const saveCurrent = () => save(state!);
+      if (state.conditionFacts)
+        await objectiveStep(state, "routing-inputs", () =>
+          authenticateWorkRouting({
+            config,
+            state: state!,
+            store: contentStore,
+          }),
+        );
       if (
         state.finalValidation?.passed &&
         !state.finalAcceptance &&
@@ -321,7 +330,7 @@ export async function runObjectivePass(
         stopIfCancelled();
       }
       for (const item of state.graph.items)
-        if (state.work[item.id]?.status === "done")
+        if (["done", "skipped"].includes(state.work[item.id]?.status ?? ""))
           await closeWorkItem(
             state,
             item.id,
