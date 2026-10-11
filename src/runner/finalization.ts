@@ -40,6 +40,11 @@ import {
 import { workspacePackageAdditions } from "../workspace-membership.js";
 import type { ObjectiveStep } from "./ownership.js";
 import { authenticateObjectiveInputs } from "./expansion.js";
+import {
+  discoveryContextBodies,
+  discoveryContextSelections,
+  objectiveDiscoveryInputs,
+} from "./discovery.js";
 
 /** Heads others push during final validation that Factory follows before asking. */
 const FOLLOWED_HEAD_LIMIT = 3;
@@ -349,6 +354,13 @@ export async function finalizeObjective(args: {
     );
     let adaptive: Awaited<ReturnType<typeof buildAdaptiveContext>>;
     if (state.planningRecovery?.contextLookup?.packet) {
+      const discoveryInputs = await objectiveDiscoveryInputs({
+        state,
+        checkout: config.checkout,
+        store: contentStore,
+      });
+      const discoveryBodies = discoveryContextBodies(discoveryInputs);
+      const discoverySelections = discoveryContextSelections(discoveryInputs);
       const knowledge = await completeObjectiveKnowledge({
         state,
         item: {
@@ -361,9 +373,12 @@ export async function finalizeObjective(args: {
         baseSha: candidateCommitSha,
         store: contentStore,
         review: "objective",
-        suppliedDigests: finalSources.map((source) =>
-          createHash("sha256").update(source.content).digest("hex"),
-        ),
+        suppliedDigests: [
+          ...discoveryBodies.map((body) => body.ref.digest),
+          ...finalSources.map((source) =>
+            createHash("sha256").update(source.content).digest("hex"),
+          ),
+        ],
       });
       adaptive = await buildAdaptiveContext({
         state,
@@ -373,9 +388,9 @@ export async function finalizeObjective(args: {
         store: contentStore,
         config,
         sources: finalSources,
-        suppliedBodies: knowledge.suppliedBodies,
-        required: { knowledge: knowledge.view },
-        requiredSelections: knowledge.selections,
+        suppliedBodies: [...discoveryBodies, ...knowledge.suppliedBodies],
+        required: { knowledge: knowledge.view, discoveryInputs },
+        requiredSelections: [...discoverySelections, ...knowledge.selections],
         save: () => save(state),
       });
     }

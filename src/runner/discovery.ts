@@ -256,6 +256,34 @@ export function discoveryContextBodies(
     }
   return [...bodies.values()];
 }
+/** Final review consumes each declared output role once, with the union of accepted fields. */
+export async function objectiveDiscoveryInputs(args: {
+  state: FactoryState;
+  checkout: string;
+  store: ContentStore;
+}): Promise<SelectedDiscoveryInput[]> {
+  const inputs: NonNullable<WorkItem["discoveryInputs"]> = [];
+  for (const item of args.state.graph.items)
+    for (const input of item.discoveryInputs ?? []) {
+      const existing = inputs.find(
+        (candidate) =>
+          candidate.producerItemId === input.producerItemId &&
+          candidate.role === input.role,
+      );
+      if (existing)
+        existing.fields = [...new Set([...existing.fields, ...input.fields])];
+      else inputs.push({ ...input, fields: [...input.fields] });
+    }
+  if (!inputs.length) return [];
+  const item: WorkItem = {
+    ...args.state.graph.items[0]!,
+    id: "__controller-objective-review",
+    dependencies: [...new Set(inputs.map((input) => input.producerItemId))],
+    discoveryInputs: inputs,
+    ownedPaths: [],
+  };
+  return selectedDiscoveryInputs({ ...args, item });
+}
 export async function selectedDiscoveryInputs(args: {
   state: FactoryState;
   item: WorkItem;

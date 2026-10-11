@@ -5,7 +5,13 @@ import {
   withPlannerAdmission,
 } from "./compiler/planning.js";
 import { planningGraphView } from "./compiler/sources.js";
-import type { PlanningModel, PlanningRequest, WorkItem } from "./contracts.js";
+import type {
+  ContentStore,
+  PlanningModel,
+  PlanningRequest,
+  WorkItem,
+} from "./contracts.js";
+import { buildAdaptiveContext } from "./adaptive-context.js";
 import {
   CONTROLLER_CAPABILITIES_DIGEST,
   installedControllerCapabilities,
@@ -1220,6 +1226,8 @@ export async function diagnoseWorkRepair(args: {
   sources?: { path: string; content: string; heading?: string }[];
   /** The target checkout: the failed result's files are read from it. */
   checkout?: string;
+  /** Existing retained-content seam for adaptive diagnosis context. */
+  contentStore?: ContentStore;
   /** The run's cancel signal: ends the diagnose step's wait or try. */
   signal?: AbortSignal;
   /** The run's pause signal: ends the diagnose step's wait; it resumes later. */
@@ -1362,6 +1370,35 @@ export async function diagnoseWorkRepair(args: {
                 }),
               },
             });
+            if (state.planningRecovery?.contextLookup?.packet) {
+              if (!args.checkout || !args.contentStore)
+                throw new StepFault({
+                  kind: "decision",
+                  evidence: [],
+                  question:
+                    "Adaptive diagnosis requires its admitted checkout and retained content store; preserve the current failure and restore those inputs before diagnosis",
+                });
+              const selected = await buildAdaptiveContext({
+                state,
+                role: "diagnosis",
+                item,
+                baseSha: work.changeRef ?? work.baseSha ?? state.baseSha,
+                checkout: args.checkout,
+                store: args.contentStore,
+                sources: request.sources,
+                required: {
+                  failureEvent: failure.event,
+                  suppliedCaseDigest: inputDigest(evidence),
+                  interpretation:
+                    "The complete failing case and authorized sources are already supplied by this diagnosis request; this binding reuses those bytes without repeating them.",
+                },
+                save,
+              });
+              if (selected) {
+                request.adaptiveContext = selected.packet;
+                request.objective += `\n${selected.evidence.content}`;
+              }
+            }
             const requestDigest = createHash("sha256")
               .update(JSON.stringify(request))
               .digest("hex");

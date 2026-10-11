@@ -425,6 +425,7 @@ export async function runObjectivePass(
     await applyPendingAmendment({
       state,
       config,
+      contentStore,
       body: issue.body,
       model: planningModel,
       github,
@@ -465,6 +466,7 @@ export async function runObjectivePass(
       await resumeDiagnoses({
         state: current,
         model: planningModel,
+        contentStore,
         diagnostics,
         sources: planningSources(issue.body, current.baseSha, config.checkout),
         checkout: config.checkout,

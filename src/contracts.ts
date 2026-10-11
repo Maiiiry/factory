@@ -71,6 +71,8 @@ export interface WorkItem {
   resources?: string[];
   /** Accepted pending priority: larger values run first, absent means zero. */
   priority?: number;
+  /** Advisory duration estimate for ranking, never a resource reservation. */
+  scheduling?: { estimatedDurationMs: number; reason: string };
   validation: {
     command: string;
     provenance: "base-observed" | "source-declared";
@@ -398,6 +400,8 @@ export function assertApprovedPlaybookPin(
 }
 
 export interface PlanningRequest<T> {
+  /** Authenticated role input; preserves source, command and effect authority. */
+  adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** Retained controller-selected facts, separate from normative source authority. */
   contextLookup?: import("./compiler/context.js").PlanningContextPacket;
   /** Controller-owned planner continuation; never model-authored or persisted in a graph. */
@@ -454,6 +458,8 @@ export interface PlanCommandAuthorization {
 }
 
 export interface PlanReviewRequest {
+  /** Authenticated role input; preserves source, command and effect authority. */
+  adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** The exact context packet used by compilation, independently reviewed. */
   contextLookup?: import("./compiler/context.js").PlanningContextPacket;
   approvedPlaybookPin?: ApprovedPlaybookPin;
@@ -655,6 +661,7 @@ export interface PlanningModel {
     request: PlanReviewRequest,
   ): Promise<{ packetId: string; findings: GraphReviewFinding[] }>;
   reviewResult?(request: {
+    adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
     reviewPhase?: "result-review" | "objective-review";
     criteria: string[];
     reviewPacket: ReviewPacket;
@@ -681,6 +688,10 @@ export interface PlanningModel {
 }
 
 export interface ExecutionRequest {
+  /** Authenticated role input; preserves source, command and effect authority. */
+  adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
+  /** Controller-required native child prohibition; never a copied parent allowance. */
+  childAgents?: "disabled";
   /** Controller-authenticated selector-bound observation supplied to discovery. */
   discovery?: { manifest: import("./discovery.js").DiscoveryOutputManifest };
   session?: AgentSessionRequest;
@@ -795,6 +806,8 @@ export interface ExecutionContext {
 }
 
 export interface ExecutionDriver {
+  /** Can enforce an explicitly requested child prohibition, or refuse before dispatch. */
+  readonly childAgents?: "disabled";
   /** Semantic discovery is admitted only after this driver's selector-bound read-only preflight. */
   readonly readonlyDiscovery?: "selector-bound-read-only-v1";
   readonly sessionCapabilities?: AgentSessionCapabilities;
@@ -842,6 +855,10 @@ export interface ExecutionDriver {
 }
 
 export interface HarnessRequest {
+  /** Authenticated role input; preserves source, command and effect authority. */
+  adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
+  /** Explicit attempt policy; absence preserves the configured static workflow. */
+  childAgents?: "disabled";
   /** Only authenticated selected blobs are exposed to a read-only discovery harness. */
   discovery?: {
     manifest: import("./discovery.js").DiscoveryOutputManifest;
@@ -891,6 +908,8 @@ export interface HarnessResult {
   evidence?: unknown;
 }
 export interface AgentHarnessCapabilities {
+  /** Can enforce HarnessRequest.childAgents; does not describe an omitted policy. */
+  childAgents?: "disabled";
   discovery?: {
     schema: "factory.repository-inventory/v1";
     worktree: "read-only";
