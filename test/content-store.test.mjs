@@ -72,6 +72,7 @@ import {
   authenticateQueueOwnerReferences,
   bindProjectQueueRun,
   parseQueueRecord,
+  retainProjectQueueOriginal,
 } from "../dist/project-queue-state.js";
 import {
   decidePlaybook,
@@ -914,13 +915,28 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.ok(lineage);
   for (const original of lineage.bodies)
     assert.deepEqual(
-      store.putBytes(original.bytes, { mediaType: "application/json" }),
+      retainProjectQueueOriginal(store, original.ref, original.bytes),
       original.ref,
     );
   assert.deepEqual(store.readBytes(lineage.initialSnapshot), initialBytes);
-  const terminalRef = store.putBytes(terminalBytes, {
-    mediaType: "application/json",
-  });
+  const terminalFile = lineageArchive.manifest.files.find(
+    (file) => file.path === "objectives/2/state.json",
+  );
+  assert.ok(terminalFile);
+  const archiveTerminalBytes = await lineageArchive.readVerifiedBlob(
+    terminalFile.ref,
+  );
+  assert.deepEqual(Buffer.from(archiveTerminalBytes), terminalBytes);
+  assert.deepEqual(Object.keys(terminalFile.ref), [
+    "bytes",
+    "digest",
+    "mediaType",
+  ]);
+  const terminalRef = retainProjectQueueOriginal(
+    store,
+    terminalFile.ref,
+    archiveTerminalBytes,
+  );
   claim.settled = {
     at: new Date().toISOString(),
     runId: claimInitial.runId,
@@ -1021,6 +1037,59 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         runId: randomUUID(),
       }),
     /cannot change/,
+  );
+  boundInitial.cancelRequested = true;
+  boundInitial.cancelledAt = new Date().toISOString();
+  saveState(statePath(repository, 3), boundInitial);
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const boundArchive = await readVerifiedRecoveryCheckpoint(config);
+  const originalBoundFile = boundArchive.manifest.files.find(
+    (file) => file.path === `project-queue-history/${boundClaim.id}.json`,
+  );
+  const finalBoundFile = boundArchive.manifest.files.find(
+    (file) => file.path === "objectives/3/state.json",
+  );
+  const canonicalInitialRef = boundArchive.manifest.contentRefs.find(
+    (reference) => reference.digest === bindingOriginal.initialSnapshot.digest,
+  );
+  assert.ok(originalBoundFile);
+  assert.ok(finalBoundFile);
+  assert.ok(canonicalInitialRef);
+  const boundProof = structuredClone(boundClaim);
+  boundProof.runBinding = {
+    runId: bindingOriginal.runId,
+    initialSnapshot: canonicalInitialRef,
+    schemaVersion: 1,
+  };
+  boundProof.settled = {
+    at: new Date().toISOString(),
+    runId: bindingOriginal.runId,
+    disposition: "quiescent",
+    cancellation: {
+      schemaVersion: 1,
+      originalClaim: retainProjectQueueOriginal(
+        store,
+        originalBoundFile.ref,
+        await boundArchive.readVerifiedBlob(originalBoundFile.ref),
+      ),
+      initialSnapshot: bindingOriginal.initialSnapshot,
+      cancelledSnapshot: retainProjectQueueOriginal(
+        store,
+        finalBoundFile.ref,
+        await boundArchive.readVerifiedBlob(finalBoundFile.ref),
+      ),
+      configDigest: boundInitial.configDigest,
+      owner: claim.settled.cancellation.owner,
+      lineage: { kind: "producer-bound" },
+    },
+  };
+  // Canonical manifest refs and locally produced refs authenticate the same
+  // original, including nested immutable run bindings and duplicate refs.
+  await authenticateQueueOwnerReferences(boundProof, (reference) =>
+    store.readBytes(reference),
   );
   new LocalRepositoryMemory(state, repository).retain({
     ...record,
