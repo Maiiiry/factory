@@ -833,6 +833,123 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   git(checkout, "commit", "-qm", "immutable context baseline");
   const baseSha = git(checkout, "rev-parse", "HEAD");
   const store = new LocalContentStore(join(root, "private-content"));
+  const originalBody = "version one\ncomplete interface body\n";
+  const originalBlob = git(
+    checkout,
+    "rev-parse",
+    `${baseSha}:api/contract.txt`,
+  );
+  const replacementBlob = execFileSync(
+    "git",
+    ["-C", checkout, "hash-object", "-w", "--stdin"],
+    { input: "replacement body\n", encoding: "utf8" },
+  ).trim();
+  git(checkout, "replace", originalBlob, replacementBlob);
+  const { createPlanningContextResolver } = await import(
+    "../dist/compiler/context-runtime.js"
+  );
+  const { validateConfig } = await import("../dist/config.js");
+  git(
+    checkout,
+    "remote",
+    "add",
+    "origin",
+    "https://github.com/factory-qualification/compiler-context.git",
+  );
+  const enabledBody = "## Adaptive workflow\nenabled\n";
+  const model = { model: "gpt-6.1-sol", reasoningEffort: "medium" };
+  const config = validateConfig({
+    schemaVersion: 1,
+    repository: "factory-qualification/compiler-context",
+    checkout,
+    planning: { kind: "codex-sdk", planner: model, reviewer: model },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...model },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    planningContext: {
+      enabled: true,
+      bounds: {
+        maxRounds: 3,
+        maxRequestsPerRound: 4,
+        maxResults: 8,
+        maxBytes: 4096,
+        maxElapsedMs: 5000,
+        maxProviderCalls: 1,
+      },
+      selectors: ["api/"],
+      memory: false,
+    },
+  });
+  const runtimeInput = {
+    config,
+    objective: 1,
+    runId: "scoped-context-integration",
+    baseSha,
+    objectiveBody: enabledBody,
+    sources: [
+      { path: "OBJECTIVE", content: enabledBody },
+      { path: "api/contract.txt", content: originalBody },
+    ],
+    contentStore: store,
+  };
+  assert.equal(
+    createPlanningContextResolver({
+      ...runtimeInput,
+      objectiveBody: "Static Objective",
+    }),
+    undefined,
+  );
+  assert.equal(
+    createPlanningContextResolver({
+      ...runtimeInput,
+      objectiveBody: "## Adaptive workflow\ndisabled\n",
+    }),
+    undefined,
+  );
+  const { planningContext: _planningContext, ...staticConfig } = config;
+  assert.throws(
+    () =>
+      createPlanningContextResolver({ ...runtimeInput, config: staticConfig }),
+    /admit planningContext/,
+  );
+  const runtimeResolver = createPlanningContextResolver(runtimeInput);
+  const remaining = {
+    maxResults: 8,
+    maxBytes: 4096,
+    deadlineAt: Date.now() + 5000,
+  };
+  const exactSource = await runtimeResolver.resolve(
+    {
+      id: "pinned",
+      operation: "read",
+      collection: "pinned-sources",
+      selector: "1",
+      query: "",
+      required: true,
+      reason: "Read the already supplied immutable interface",
+    },
+    remaining,
+  );
+  assert.equal(exactSource.disposition, "complete");
+  assert.equal(exactSource.matches[0].content, originalBody);
+  assert.equal(exactSource.matches[0].provenance.sourceIndex, 1);
+  const outside = await runtimeResolver.resolve(
+    {
+      id: "outside",
+      operation: "read",
+      collection: "repository",
+      selector: "secret.txt",
+      query: "",
+      required: false,
+      reason: "Verify scoped denial",
+    },
+    remaining,
+  );
+  assert.equal(outside.disposition, "denied");
   const required = {
     id: "contract",
     operation: "read",
@@ -866,6 +983,21 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     resolve: async (request, remaining) =>
       repositoryContextResult(checkout, baseSha, request, remaining),
   };
+  const oldGitDir = process.env.GIT_DIR;
+  try {
+    process.env.GIT_DIR = join(root, "unrelated-git-directory");
+    const pinned = repositoryContextResult(
+      checkout,
+      baseSha,
+      required,
+      remaining,
+    );
+    assert.equal(pinned.disposition, "complete");
+    assert.equal(pinned.matches[0].content, originalBody);
+  } finally {
+    if (oldGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = oldGitDir;
+  }
   const record = await initializeContextLookup(resolver);
   assertContextFactsResolved(record.packet);
   assert.equal(

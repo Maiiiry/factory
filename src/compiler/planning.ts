@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  assertDiscoveryContextScope,
   assertContextFactsResolved,
   type PlanningContextPacket,
   type PlanningTurnResponse,
@@ -533,6 +534,7 @@ export function validateCompiledGraph(args: {
   if (objective === undefined)
     throw new Error("Compilation requires trusted compile context");
   try {
+    assertDiscoveryContextScope(graph, request.contextLookup);
     hydrateCoverageSources(
       graph,
       coverageObligations(body, objectiveCriteria(body)),

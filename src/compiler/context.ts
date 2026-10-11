@@ -652,3 +652,44 @@ export function repositoryContextResult(
     );
   }
 }
+
+/** Discovery source selectors cannot widen the controller's immutable retrieval admission. */
+export function assertDiscoveryContextScope(
+  graph: WorkGraph,
+  packet?: PlanningContextPacket,
+): void {
+  const discoveries = graph.items.filter((item) => item.kind === "discovery");
+  if (!discoveries.length) return;
+  if (!packet)
+    throw new Error(
+      "Discovery requires this Objective's explicit admitted planning context",
+    );
+  assertPlanningContextPacket(packet);
+  const repository = packet.catalog.find(
+    (collection) => collection.id === "repository",
+  );
+  if (
+    !repository ||
+    !repository.operations.includes("read") ||
+    !repository.operations.includes("inventory")
+  )
+    throw new Error(
+      "Discovery requires an admitted read-only repository collection",
+    );
+  for (const item of discoveries) {
+    if (
+      !item.discovery ||
+      item.discovery.selectors.some(
+        (selector) =>
+          !repository.selectors.some(
+            (scope) =>
+              selector === scope ||
+              (scope.endsWith("/") && selector.startsWith(scope)),
+          ),
+      )
+    )
+      throw new Error(
+        `Discovery ${item.id} exceeds admitted repository selectors`,
+      );
+  }
+}

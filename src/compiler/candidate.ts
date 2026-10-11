@@ -1,4 +1,5 @@
 import {
+  assertDiscoveryContextScope,
   assertContextFactsResolved,
   type PlanningContextPacket,
 } from "./context.js";
@@ -182,6 +183,7 @@ export function verifyPlanCandidate(
   assertObjectiveCriteria(body);
   if (candidate.contextLookup)
     assertContextFactsResolved(candidate.contextLookup);
+  assertDiscoveryContextScope(candidate.graph, candidate.contextLookup);
   assertInstalledControllerCapabilities(
     candidate.controllerCapabilities,
     candidate.controllerCapabilitiesDigest,
