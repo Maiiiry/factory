@@ -314,6 +314,11 @@ export function createPlanningContextResolver(input: {
         detail: string,
       ): ContextResult => ({ request, disposition, matches: [], detail });
       const recipeRequest = recipeRequests.get(request.id);
+      if (request.id.startsWith("recipe-memory-") && !recipeRequest)
+        return answer(
+          "denied",
+          "Recipe memory identity is not declared by the admitted pin",
+        );
       if (
         recipeRequest &&
         contextDigest(recipeRequest.request) !== contextDigest(request)
