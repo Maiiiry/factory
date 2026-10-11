@@ -12,6 +12,12 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { stateRoot } from "./config.js";
+import { LocalContentStore } from "./content/local.js";
+import type { ContentRef } from "./contracts.js";
+import {
+  readAccountingRecords,
+  retainAccountingCapture,
+} from "./accounting.js";
 import {
   diagnosticPath,
   privateRecords,
@@ -230,10 +236,16 @@ export interface InteractionMetadata {
     originalBytes?: number;
     originalDigest?: string;
     retainedBytes?: number;
+    /** Hash of the actually captured text after redaction and UTF-8 truncation. */
+    retainedDigest?: string;
+    /** Separate explicit opt-in for recovery; omitted on historical records. */
+    payloadRetention?: "retained" | "disabled" | "not-exposed" | "unavailable";
     reference?: {
       invocationId: string;
       providerAttempt: number;
       recordId: string;
+      /** Exact retained text, never the original unredacted serialization. */
+      payload?: ContentRef;
     };
   };
   usage?: {
@@ -275,6 +287,7 @@ export interface InteractionMetadata {
 export interface CapturePolicy {
   enabled: boolean;
   maxBytesPerInvocation: number;
+  retainInRecovery?: boolean;
   nativeBoundaryTelemetry?: boolean;
 }
 export type CaptureContext = Pick<
@@ -361,6 +374,7 @@ export class CaptureWriter {
   ) {}
   record(event: CaptureEvent, content?: () => unknown): void {
     let record: InteractionMetadata | undefined;
+    let finalized = false;
     try {
       record = safeObject(
         {
@@ -376,6 +390,10 @@ export class CaptureWriter {
             status: this.policy?.enabled ? "not-exposed" : "capture-disabled",
             redacted: false,
             truncated: false,
+            payloadRetention:
+              this.policy?.enabled && this.policy.retainInRecovery === true
+                ? "not-exposed"
+                : "disabled",
           },
         } as InteractionMetadata,
         this.secrets,
@@ -394,7 +412,9 @@ export class CaptureWriter {
           while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80)
             end--;
           const text = bytes.subarray(0, end).toString("utf8");
-          const reference = {
+          const reference: NonNullable<
+            InteractionMetadata["content"]["reference"]
+          > = {
             invocationId: record.invocationId,
             providerAttempt: record.providerAttempt,
             recordId: record.recordId,
@@ -420,22 +440,62 @@ export class CaptureWriter {
             originalBytes: Buffer.byteLength(original),
             originalDigest: sha(original),
             retainedBytes: Buffer.byteLength(text),
+            retainedDigest: sha(text),
+            payloadRetention: "disabled",
             reference,
           };
+          if (this.policy.retainInRecovery === true) {
+            try {
+              const root = join(stateRoot(this.context.repository), "content");
+              mkdirSync(root, { recursive: true, mode: 0o700 });
+              const directory = lstatSync(root);
+              if (!directory.isDirectory() || (directory.mode & 0o077) !== 0)
+                throw new Error("Capture content directory is not private");
+              reference.payload = new LocalContentStore(root).putBytes(
+                Buffer.from(text),
+                {
+                  mediaType: "text/plain; charset=utf-8",
+                },
+              );
+              record.content.payloadRetention = "retained";
+            } catch {
+              // Optional retention cannot invalidate a successfully captured local record.
+              record.content.payloadRetention = "unavailable";
+            }
+          }
         }
+      }
+      finalized = true;
+      try {
+        retainAccountingCapture(record);
+      } catch {
+        /* Accounting availability never changes provider work. */
       }
       this.emit(record);
     } catch (error) {
       if (record)
         try {
-          this.emit({
-            ...record,
-            content: {
-              status: "unavailable",
-              redacted: false,
-              truncated: false,
-            },
-          });
+          const unavailable: InteractionMetadata = finalized
+            ? record
+            : {
+                ...record,
+                content: {
+                  status: "unavailable",
+                  redacted: false,
+                  truncated: false,
+                  payloadRetention:
+                    this.policy?.enabled &&
+                    this.policy.retainInRecovery === true
+                      ? "unavailable"
+                      : "disabled",
+                },
+              };
+          try {
+            retainAccountingCapture(unavailable);
+          } catch {
+            /* Accounting sink unavailable. */
+          }
+          this.emit(unavailable);
         } catch {
           /* diagnostic sink also unavailable */
         }
@@ -449,12 +509,24 @@ export class CaptureWriter {
     }
   }
 }
-/** Read only small existing diagnostic/progress records, never capture content. */
+/** Prefer canonical observations; local diagnostic/progress records are replicas. */
 export function readInteractionMetadata(
   repository: string,
   objective: number,
 ): InteractionMetadata[] {
-  const records: InteractionMetadata[] = [];
+  const records = new Map<string, InteractionMetadata>();
+  const identity = (capture: InteractionMetadata): string =>
+    JSON.stringify([
+      capture.runId ?? null,
+      capture.itemId ?? null,
+      capture.attemptId ?? null,
+      capture.invocationId,
+      capture.providerAttempt,
+      capture.recordId,
+    ]);
+  for (const record of readAccountingRecords(repository, objective))
+    if (record.kind === "interaction")
+      records.set(identity(record.capture), record.capture);
   const paths = [diagnosticPath(repository, objective)];
   const root = join(stateRoot(repository), "harness");
   if (existsSync(root))
@@ -471,10 +543,12 @@ export function readInteractionMetadata(
           capture?.schemaVersion === 1 &&
           capture.repository === repository &&
           capture.objective === objective
-        )
-          records.push(capture);
+        ) {
+          const key = identity(capture);
+          if (!records.has(key)) records.set(key, capture);
+        }
       }
-  return records.sort(
+  return [...records.values()].sort(
     (a, b) => a.at.localeCompare(b.at) || a.sequence - b.sequence,
   );
 }
@@ -488,6 +562,20 @@ export function readInteractionContent(
     reference.invocationId,
     reference.providerAttempt,
   );
+  if (reference.payload) {
+    if (reference.payload.mediaType !== "text/plain; charset=utf-8")
+      throw new Error("Retained capture payload has an unsupported media type");
+    const bytes = new LocalContentStore(
+      join(stateRoot(repository), "content"),
+    ).readBytes(reference.payload);
+    const text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(bytes);
+    if (!Buffer.from(text).equals(bytes))
+      throw new Error("Retained capture payload is not exact UTF-8 text");
+    return text;
+  }
   for (const record of privateRecords(path))
     if (
       record.recordId === reference.recordId &&

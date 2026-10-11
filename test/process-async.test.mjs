@@ -253,11 +253,18 @@ const retained = readFileSync(join(stateRoot(${JSON.stringify(repository)}), "ob
 assert.equal(retained.includes("private"), false);
 assert.deepEqual(JSON.parse(retained.trim()).transport, transport);
 const emitted = [];
-const writer = new CaptureWriter({ repository: ${JSON.stringify(repository)}, objective: 1, invocationId: "actual-child-capture", providerAttempt: 1, phase: "integration", adapter: "local-process", configured: { provider: "not-invoked", model: "none" } }, { enabled: true, maxBytesPerInvocation: 1024 }, [], metadata => emitted.push(metadata));
+const context = { repository: ${JSON.stringify(repository)}, objective: 1, invocationId: "actual-child-capture", providerAttempt: 1, phase: "integration", adapter: "local-process", configured: { provider: "not-invoked", model: "none" } };
+const writer = new CaptureWriter(context, { enabled: true, maxBytesPerInvocation: 1024 }, [], metadata => emitted.push(metadata));
 const { renderPrompt } = await import(${JSON.stringify(new URL("../dist/prompt-bytes.js", import.meta.url).href)});
 const { prompt, sections } = renderPrompt([["instructions", "real child process "], ["objective", "capture π"]]);
 writer.record({ kind: "request", promptComponents: { renderedPromptBytes: Buffer.byteLength(prompt), sections, exportedEvidenceFileBytes: Buffer.byteLength(readFileSync(new URL(${JSON.stringify(new URL("../dist/prompt-bytes.js", import.meta.url).href)}))), rolePreambleTaskSplit: "unavailable" } }, () => ({ text: "real child process capture" }));
 for (const event of nativeEvents) writer.record(event);
+const durable = new CaptureWriter({ ...context, invocationId: "actual-durable-capture" }, { enabled: true, retainInRecovery: true, maxBytesPerInvocation: 64 }, ["unshared-sensitive-token"], metadata => emitted.push(metadata));
+durable.record({ kind: "response" }, () => ({ text: "secret: unshared-sensitive-token " + "雪".repeat(50) }));
+let disabledRead = false;
+const disabled = new CaptureWriter({ ...context, invocationId: "actual-disabled-capture" }, { enabled: false, retainInRecovery: true, maxBytesPerInvocation: 64 }, [], metadata => emitted.push(metadata));
+disabled.record({ kind: "request" }, () => { disabledRead = true; return "Do not read disabled content"; });
+assert.equal(disabledRead, false);
 process.stdout.write(JSON.stringify(emitted));`,
       ],
       {
@@ -267,13 +274,65 @@ process.stdout.write(JSON.stringify(emitted));`,
     );
     assert.equal(result.status, 0, result.stderr.toString());
     assert.equal(result.stderr, "Factory model diagnostics unavailable\n");
-    const [metadata, unavailableNative] = JSON.parse(result.stdout.toString());
+    const emitted = JSON.parse(result.stdout.toString());
+    const [metadata, unavailableNative] = emitted;
     assert.equal(metadata.content.status, "captured");
+    assert.equal(metadata.content.payloadRetention, "disabled");
+    assert.equal(metadata.content.reference.payload, undefined);
     assert.deepEqual(
       JSON.parse(
         readInteractionContent(repository, metadata.content.reference),
       ),
       { text: "real child process capture" },
+    );
+    const durableCapture = emitted.find(
+      (record) => record.invocationId === "actual-durable-capture",
+    );
+    const disabledCapture = emitted.find(
+      (record) => record.invocationId === "actual-disabled-capture",
+    );
+    assert.equal(disabledCapture.content.status, "capture-disabled");
+    assert.equal(disabledCapture.content.payloadRetention, "disabled");
+    assert.equal(disabledCapture.content.reference, undefined);
+    assert.equal(durableCapture.content.status, "captured");
+    assert.equal(durableCapture.content.payloadRetention, "retained");
+    assert.equal(durableCapture.content.redacted, true);
+    assert.equal(durableCapture.content.truncated, true);
+    assert.equal(
+      durableCapture.content.reference.recordId,
+      durableCapture.recordId,
+    );
+    const retainedText = readInteractionContent(
+      repository,
+      durableCapture.content.reference,
+    );
+    assert.equal(retainedText.includes("unshared-sensitive-token"), false);
+    assert.equal(retainedText.includes("[REDACTED]"), true);
+    assert.equal(retainedText.includes("\uFFFD"), false);
+    assert.equal(
+      durableCapture.content.retainedDigest,
+      createHash("sha256").update(retainedText).digest("hex"),
+    );
+    assert.equal(
+      durableCapture.content.reference.payload.digest,
+      durableCapture.content.retainedDigest,
+    );
+    assert.equal(
+      durableCapture.content.reference.payload.bytes,
+      durableCapture.content.retainedBytes,
+    );
+    assert.equal(
+      Buffer.byteLength(retainedText),
+      durableCapture.content.retainedBytes,
+    );
+    assert.ok(durableCapture.content.retainedBytes <= 64);
+    assert.ok(
+      durableCapture.content.originalBytes >
+        durableCapture.content.retainedBytes,
+    );
+    assert.notEqual(
+      durableCapture.content.originalDigest,
+      durableCapture.content.retainedDigest,
     );
     // A real private process capture is not a native model tool call. Even the
     // explicit legacy-tool read must neither expose its text nor invent counts.
@@ -370,15 +429,16 @@ process.stdout.write(JSON.stringify(emitted));`,
       ["--json"],
     );
     const cliAnalysis = JSON.parse(analysisText);
-    assert.equal(cliAnalysis.invocationCount, 1);
+    assert.equal(cliAnalysis.invocationCount, 3);
+    const originalInvocation = cliAnalysis.invocations.find(
+      (invocation) =>
+        invocation.identity.invocationId === "actual-child-capture",
+    );
     assert.equal(cliAnalysis.nativeTools.calls, null);
     assert.equal(cliAnalysis.nativeTools.coverage, "unavailable");
-    assert.equal(cliAnalysis.invocations[0].native.tools.calls, null);
-    assert.equal(cliAnalysis.invocations[0].native.tools.observedOutputs, null);
-    assert.equal(
-      cliAnalysis.invocations[0].native.descendants.accountingUnion,
-      null,
-    );
+    assert.equal(originalInvocation.native.tools.calls, null);
+    assert.equal(originalInvocation.native.tools.observedOutputs, null);
+    assert.equal(originalInvocation.native.descendants.accountingUnion, null);
     assert.equal(analysisText.includes("real child process capture"), false);
     const captures = join(stateRoot(repository), "captures");
     assert.equal(statSync(captures).mode & 0o777, 0o700);
@@ -885,6 +945,31 @@ setTimeout(() => {
     assert.equal(interactiveOwners.filter((owner) => owner.settled).length, 2);
     for (const owner of interactiveOwners.filter((owner) => owner.settled))
       assert.equal(processGroupExists(owner.pid), false);
+    // Recovery uses the exact retained payload, independently of disposable local captures.
+    rmSync(captures, { recursive: true });
+    assert.equal(
+      readInteractionContent(repository, durableCapture.content.reference),
+      retainedText,
+    );
+    assert.throws(
+      () => readInteractionContent(repository, metadata.content.reference),
+      /Captured interaction|ENOENT/,
+    );
+    const payload = durableCapture.content.reference.payload;
+    writeFileSync(
+      join(
+        stateRoot(repository),
+        "content",
+        payload.digest.slice(0, 2),
+        payload.digest,
+      ),
+      "corrupt retained capture",
+    );
+    assert.throws(
+      () =>
+        readInteractionContent(repository, durableCapture.content.reference),
+      /digest verification/,
+    );
   } finally {
     if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = previousStateHome;
