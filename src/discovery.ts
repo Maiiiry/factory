@@ -245,7 +245,15 @@ function selectedTree(
   treeSha: string,
   selectors: string[],
 ): TreeEntry[] {
-  const raw = pinnedGitRaw(checkout, "ls-tree", "-r", "-z", treeSha);
+  const raw = pinnedGitRaw(
+    checkout,
+    "ls-tree",
+    "-r",
+    "-z",
+    treeSha,
+    "--",
+    ...selectors,
+  );
   const result: TreeEntry[] = [];
   const decoded = new TextDecoder("utf-8", { fatal: true }).decode(raw);
   for (const record of decoded
