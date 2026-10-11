@@ -5,19 +5,13 @@ import type {
   PlanningModel,
   ResultReviewEvidenceSource,
 } from "./contracts.js";
-import {
-  loadReviewArtifactObservations,
-  type AcceptedWorkItemImageObservation,
-  reviewArtifactEvidence,
-  materializeReviewImages,
-} from "./review-image-evidence.js";
 import { installedControllerCapabilities } from "./controller-capabilities.js";
+import { attachFault, StepFault, transient } from "./fault.js";
+import { pinnedGit } from "./process.js";
 import {
   awaitCheckpointAdmission,
   hasPrivateCheckpointScope,
 } from "./recovery-checkpoint.js";
-import { attachFault, StepFault, transient } from "./fault.js";
-import { pinnedGit } from "./process.js";
 import {
   assertCommandReceipts,
   commandPassEvidence,
@@ -36,6 +30,12 @@ import {
   resolveReviewReferences,
   reviewPacket,
 } from "./review-evidence.js";
+import {
+  type AcceptedWorkItemImageObservation,
+  loadReviewArtifactObservations,
+  materializeReviewImages,
+  reviewArtifactEvidence,
+} from "./review-image-evidence.js";
 import {
   SemanticAcceptanceFailure,
   type SemanticRefusalEvidence,
@@ -290,7 +290,7 @@ export async function reviewAcceptance(args: {
       checkpoint();
       await prior?.(receipt);
       // The native transport may release its last copy after this callback.
-      await awaitCheckpointAdmission(undefined, "before-effect");
+      await awaitCheckpointAdmission(undefined, "explicit");
     };
   }
   if (undecided && !model.reviewResult)
