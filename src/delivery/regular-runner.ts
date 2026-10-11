@@ -1,3 +1,7 @@
+import {
+  observeWorkflowReflection,
+  reconcileWorkRouting,
+} from "../runner/routing.js";
 import { publicationControl, confirmClosedPublication } from "./publication.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import { deliveryDescription } from "./description.js";
@@ -38,6 +42,7 @@ import { runQaItem } from "../qa-execution.js";
 import { runDiscoveryItem } from "../runner/discovery.js";
 import { phaseAdmission } from "../phase-admission.js";
 import {
+  workSettled,
   pendingItemBlocker,
   readyItems,
   schedulingObservations,
@@ -114,9 +119,24 @@ export async function runRegularGraph(args: {
   const stopped = () => Boolean(signal?.aborted || args.cancelled());
   /** Faults the Objective's re-observation raised: the Objective's, not an item's. */
   const objectiveFaults = new WeakSet<object>();
+  const route = async (): Promise<void> => {
+    await reconcileWorkRouting({
+      config,
+      state,
+      store: contentStore,
+      github,
+      save,
+      cancelled: stopped,
+      signal,
+      pause: args.pause,
+      diagnostics: args.diagnostics,
+      resolvedExpansionIds: args.resolvedExpansionIds,
+    });
+  };
   const reconcile = async (): Promise<void> => {
     try {
       await args.reconcile?.();
+      await route();
     } catch (error) {
       if (error !== null && typeof error === "object")
         objectiveFaults.add(error);
@@ -690,6 +710,15 @@ export async function runRegularGraph(args: {
     const work = state.work[item.id]!;
     try {
       await runStep(item, itemBase);
+      if (workSettled(work))
+        await observeWorkflowReflection({
+          state,
+          store: contentStore,
+          save,
+          event: { kind: "completion", itemId: item.id },
+          resolvedExpansionIds: args.resolvedExpansionIds,
+          diagnostics: args.diagnostics,
+        });
     } catch (error) {
       // The Objective's own fault leaves the item where it is; the Objective
       // answers it.
@@ -728,6 +757,20 @@ export async function runRegularGraph(args: {
       // A wrong result is repaired, published or not: the next attempt
       // republishes the same branch with a lease.
       const isolated = recordWorkFailure(state, item.id, error);
+      save();
+      await observeWorkflowReflection({
+        state,
+        store: contentStore,
+        save,
+        event: {
+          kind: work.recovery?.failure?.predecessor
+            ? "integration-contract-conflict"
+            : "blocker",
+          itemId: item.id,
+        },
+        resolvedExpansionIds: args.resolvedExpansionIds,
+        diagnostics: args.diagnostics,
+      });
       if (isolated && item.kind !== "discovery" && !stopped()) {
         phases.release(item.id);
         save();
@@ -807,10 +850,13 @@ export async function runRegularGraph(args: {
         `Work Item ${item.id} has ambiguous active state at ${work.step ?? "unknown"}; operator direction required`,
       );
   };
+  await route();
   for (const item of graph.items) resume(item);
-  while (graph.items.some((item) => state.work[item.id]?.status !== "done")) {
+  while (graph.items.some((item) => !workSettled(state.work[item.id]))) {
     if (failure) throw failure;
     if (stopped()) throw await cancelRun();
+    await route();
+    if (graph.items.every((item) => workSettled(state.work[item.id]))) break;
     const reported = await driver.availableSlots();
     args.diagnostics?.emit({
       runId: state.runId,
@@ -943,7 +989,17 @@ export async function runRegularGraph(args: {
       return true;
     if (!active.size && args.paused?.()) return true;
     if (failure) throw failure;
-    if (!active.size) return true;
+    if (!active.size) {
+      await observeWorkflowReflection({
+        state,
+        store: contentStore,
+        save,
+        event: { kind: "blocker" },
+        resolvedExpansionIds: args.resolvedExpansionIds,
+        diagnostics: args.diagnostics,
+      });
+      return true;
+    }
     await Promise.race([
       ...active.values(),
       phases.changed(),

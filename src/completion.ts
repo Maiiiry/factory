@@ -1,3 +1,4 @@
+import { assertSkippedWork, assertWorkRoutingState } from "./runner/routing.js";
 import { createHash } from "node:crypto";
 import { graphDigest, amendmentBlocksDispatch } from "./graph-amendments.js";
 import { assertCompletedCoverage, objectiveCandidate } from "./qa.js";
@@ -68,6 +69,7 @@ export function assertTerminalEligibility(state: FactoryState): void {
     state.planGraphDigest,
     Object.hasOwn(state, "approvedPlaybookPin"),
   );
+  assertWorkRoutingState(state);
   const candidate = objectiveCandidate(state);
   if (
     !state.finalValidation?.passed ||
@@ -96,6 +98,12 @@ export function assertTerminalEligibility(state: FactoryState): void {
   }
   for (const item of state.graph.items) {
     const work = state.work[item.id];
+    if (work?.status === "skipped") {
+      assertSkippedWork(state, item.id);
+      if (work.githubClosure !== "complete")
+        throw new Error(`Skipped Work Item ${item.id} is not closed`);
+      continue;
+    }
     if (item.kind === "discovery") {
       assertWorkDiscoveryOutput(state, item.id, work!);
       if (
@@ -126,7 +134,11 @@ export function assertTerminalEligibility(state: FactoryState): void {
   for (const [validation, decisions] of [
     [state.finalValidation, state.finalAcceptanceDecisions],
     ...state.graph.items
-      .filter((item) => item.kind !== "discovery")
+      .filter(
+        (item) =>
+          item.kind !== "discovery" &&
+          state.work[item.id]?.status !== "skipped",
+      )
       .map(
         ({ id }) =>
           [
@@ -241,7 +253,15 @@ export async function closeWorkItem(
   if (work.githubClosure === "complete") return;
   const kind = state.graph.items.find((item) => item.id === itemId)?.kind;
   const discovery = kind === "discovery";
-  const readOnly = discovery || kind === "qa" || kind === "aggregate";
+  const skipped = work.status === "skipped";
+  if (skipped) {
+    assertWorkRoutingState(state);
+    assertSkippedWork(state, itemId);
+    if (!state.issueByItemId[itemId])
+      throw new Error("Skipped branch lacks its projected issue identity");
+  }
+  const readOnly =
+    skipped || discovery || kind === "qa" || kind === "aggregate";
   if (discovery) {
     assertWorkDiscoveryOutput(state, itemId, work);
     if (
@@ -256,7 +276,7 @@ export async function closeWorkItem(
         `Completed discovery ${itemId} lacks complete immutable output`,
       );
   }
-  if (readOnly && !discovery) {
+  if (readOnly && !discovery && !skipped) {
     if (
       work.status !== "done" ||
       !work.changeRef ||
@@ -270,6 +290,7 @@ export async function closeWorkItem(
       throw new Error(`Completed QA ${itemId} lacks read-only proof identity`);
   } else if (
     !discovery &&
+    !skipped &&
     (work.status !== "done" ||
       !work.pullRequest ||
       !work.changeRef ||
@@ -277,13 +298,15 @@ export async function closeWorkItem(
       !state.issueByItemId[itemId])
   )
     throw new Error(`Completed Work Item ${itemId} lacks delivery identity`);
-  const comment = discovery
-    ? `Discovery completed at source commit ${work.discoveryOutput!.source.commitSha}; retained ${work.discoveryOutput!.selectedEntries} observed entries as immutable output ${work.discoveryOutput!.body.digest}.`
-    : readOnly
-      ? `QA completed at commit ${work.changeRef}; validated tree ${work.treeSha}.`
-      : native
-        ? `Completed by native delivery PR #${work.pullRequest}; integrated at ${work.integratedSha ?? state.integratedSha}.`
-        : `Completed by PR #${work.pullRequest}; validated tree ${work.treeSha}.`;
+  const comment = skipped
+    ? `Branch skipped by declared condition ${work.routing!.conditionId}; authenticated condition packet ${state.conditionFacts![work.routing!.conditionId]!.resultDigest} did not select this branch (predicate=${state.conditionFacts![work.routing!.conditionId]!.inputPacket.value}, required=${work.routing!.when}). No implementation result was accepted for this Work Item.`
+    : discovery
+      ? `Discovery completed at source commit ${work.discoveryOutput!.source.commitSha}; retained ${work.discoveryOutput!.selectedEntries} observed entries as immutable output ${work.discoveryOutput!.body.digest}.`
+      : readOnly
+        ? `QA completed at commit ${work.changeRef}; validated tree ${work.treeSha}.`
+        : native
+          ? `Completed by native delivery PR #${work.pullRequest}; integrated at ${work.integratedSha ?? state.integratedSha}.`
+          : `Completed by PR #${work.pullRequest}; validated tree ${work.treeSha}.`;
   await step(
     state,
     { scope: { item: itemId }, name: "close" },
@@ -309,6 +332,7 @@ export async function closeWorkItem(
       }
       await github.closeIssue(state.issueByItemId[itemId]!, comment, {
         workItem: { objective: state.objective, id: itemId },
+        ...(skipped ? { reason: "not_planned" as const } : {}),
         ...(state.issueAuthor ? { author: state.issueAuthor } : {}),
       });
     },
@@ -329,7 +353,10 @@ export async function closeCancelledWorkItems(
   github: GitHubGateway,
 ): Promise<void> {
   for (const [itemId, number] of Object.entries(state.issueByItemId)) {
-    if (isExecutionState(state) && state.work[itemId]?.status === "done")
+    if (
+      isExecutionState(state) &&
+      ["done", "skipped"].includes(state.work[itemId]?.status ?? "")
+    )
       continue;
     await github.closeIssue(
       number,
@@ -365,7 +392,7 @@ export async function closeObjectiveIssue(
     () =>
       github.closeIssue(
         state.objective,
-        `Factory completed ${state.graph.items.length} Work Items; final validation passed at ${candidate.commitSha} (${candidate.basis}).`,
+        `Factory completed ${state.graph.items.filter((item) => state.work[item.id]?.status === "done").length} Work Items${state.graph.items.some((item) => state.work[item.id]?.status === "skipped") ? ` and skipped ${state.graph.items.filter((item) => state.work[item.id]?.status === "skipped").length} branches by authenticated declared conditions` : ""}; final validation passed at ${candidate.commitSha} (${candidate.basis}).`,
         { body, ...(state.issueAuthor ? { author: state.issueAuthor } : {}) },
       ),
     { save, signal, pause },

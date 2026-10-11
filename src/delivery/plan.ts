@@ -33,6 +33,7 @@ export function linearDeliveryUnits(graph: WorkGraph): DeliveryUnit[] {
       item.kind === "qa" ||
       item.kind === "aggregate" ||
       item.kind === "discovery" ||
+      item.condition !== undefined ||
       expansionBlocksItem(graph, item.id) ||
       item.dependencies.length !== 1
     )
@@ -50,6 +51,7 @@ export function linearDeliveryUnits(graph: WorkGraph): DeliveryUnit[] {
       byId.get(parent)?.kind === "qa" ||
       byId.get(parent)?.kind === "aggregate" ||
       byId.get(parent)?.kind === "discovery" ||
+      byId.get(parent)?.condition !== undefined ||
       expansionBlocksItem(graph, parent) ||
       children.get(parent)?.length !== 1
     )

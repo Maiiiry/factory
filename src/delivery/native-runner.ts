@@ -1,3 +1,7 @@
+import {
+  observeWorkflowReflection,
+  reconcileWorkRouting,
+} from "../runner/routing.js";
 import { publicationControl } from "./publication.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import { deliveryDescription } from "./description.js";
@@ -42,6 +46,7 @@ import { runQaItem } from "../qa-execution.js";
 import { runDiscoveryItem } from "../runner/discovery.js";
 import { phaseAdmission } from "../phase-admission.js";
 import {
+  workSettled,
   itemsConflict,
   pathsOverlap,
   pendingItemBlocker,
@@ -305,7 +310,7 @@ export async function runNativeGraph(args: {
             new Set(),
             args.resolvedExpansionIds,
           ) &&
-          item.dependencies.every((id) => state.work[id]?.status === "done"),
+          item.dependencies.every((id) => workSettled(state.work[id])),
       )
     ) {
       observePreparationHold(
@@ -366,7 +371,7 @@ export async function runNativeGraph(args: {
         expansionBlocksItem(state.graph, item.id, args.resolvedExpansionIds),
       );
       const missingDependency = unit.externalDependencies.find(
-        (id) => state.work[id]?.status !== "done",
+        (id) => !workSettled(state.work[id]),
       );
       const conflictKind =
         conflict &&
@@ -477,6 +482,20 @@ export async function runNativeGraph(args: {
           else delete work.authentication;
           if (work.step === "execute") await stopWorker(item);
           const isolated = recordWorkFailure(state, item.id, error);
+          save();
+          await observeWorkflowReflection({
+            state,
+            store: contentStore,
+            save,
+            event: {
+              kind: state.work[item.id]?.recovery?.failure?.predecessor
+                ? "integration-contract-conflict"
+                : "blocker",
+              itemId: item.id,
+            },
+            resolvedExpansionIds: args.resolvedExpansionIds,
+            diagnostics: args.diagnostics,
+          });
           if (isolated && item.kind !== "discovery" && !stopped()) {
             await diagnose(item);
             return;
@@ -505,6 +524,26 @@ export async function runNativeGraph(args: {
   const remainingUnits = [...units];
   unitLoop: while (remainingUnits.length) {
     if (preparationFailure) throw preparationFailure;
+    await reconcileWorkRouting({
+      config,
+      state,
+      store: contentStore,
+      github,
+      save,
+      cancelled: stopped,
+      signal,
+      pause: args.pause,
+      diagnostics: args.diagnostics,
+      resolvedExpansionIds: args.resolvedExpansionIds,
+    });
+    for (let index = remainingUnits.length - 1; index >= 0; index--)
+      if (
+        remainingUnits[index]!.items.every((item) =>
+          workSettled(state.work[item.id]),
+        )
+      )
+        remainingUnits.splice(index, 1);
+    if (!remainingUnits.length) break;
     await prepareReadyUnits();
     const ranked = rankPending(state.graph, state.work);
     const eligible = remainingUnits.filter(
@@ -528,12 +567,9 @@ export async function runNativeGraph(args: {
         (!args.amendmentPending?.() ||
           unit.items.some(
             (item) =>
-              state.work[item.id]?.attempt ||
-              state.work[item.id]?.status === "done",
+              state.work[item.id]?.attempt || workSettled(state.work[item.id]),
           )) &&
-        unit.externalDependencies.every(
-          (id) => state.work[id]?.status === "done",
-        ) &&
+        unit.externalDependencies.every((id) => workSettled(state.work[id])) &&
         !units.some(
           (other) =>
             other !== unit &&
@@ -563,13 +599,24 @@ export async function runNativeGraph(args: {
     );
     const unit = completionReady[0] ?? eligible[0];
     if (!unit) {
+      await observeWorkflowReflection({
+        state,
+        store: contentStore,
+        save,
+        event: { kind: "blocker" },
+        resolvedExpansionIds: args.resolvedExpansionIds,
+        diagnostics: args.diagnostics,
+      });
       if (
         args.amendmentPending?.() ||
         Object.values(state.work).some(
           (work) =>
             work.wait && ["decision", "prerequisite"].includes(work.wait.kind),
         ) ||
-        Object.values(state.work).some((work) => work.status === "failed")
+        Object.values(state.work).some(
+          (work) =>
+            work.status === "failed" || work.routing?.disposition === "held",
+        )
       )
         return settlePrepared();
       throw new Error("No dependency-ready delivery unit");
@@ -582,8 +629,7 @@ export async function runNativeGraph(args: {
       continue;
     }
     remainingUnits.splice(remainingUnits.indexOf(unit), 1);
-    if (unit.items.every((item) => state.work[item.id]?.status === "done"))
-      continue;
+    if (unit.items.every((item) => workSettled(state.work[item.id]))) continue;
     if (
       args.amendmentPending?.() &&
       !unit.items.some((item) => state.work[item.id]?.attempt)
@@ -596,8 +642,8 @@ export async function runNativeGraph(args: {
     }
     if (preparationFailure) throw preparationFailure;
     if (
-      !unit.externalDependencies.every(
-        (dependency) => state.work[dependency]?.status === "done",
+      !unit.externalDependencies.every((dependency) =>
+        workSettled(state.work[dependency]),
       )
     ) {
       throw new Error(
@@ -672,6 +718,14 @@ export async function runNativeGraph(args: {
         throw error;
       }
       if (state.work[item.id]?.status !== "done") return settlePrepared();
+      await observeWorkflowReflection({
+        state,
+        store: contentStore,
+        save,
+        event: { kind: "completion", itemId: item.id },
+        resolvedExpansionIds: args.resolvedExpansionIds,
+        diagnostics: args.diagnostics,
+      });
       continue;
     }
     for (const [index, item] of unit.items.entries()) {
@@ -727,7 +781,7 @@ export async function runNativeGraph(args: {
           owned,
           args.resolvedExpansionIds,
           (id) =>
-            state.work[id]?.status === "done" ||
+            workSettled(state.work[id]) ||
             (unit.items.some((peer) => peer.id === id) &&
               state.work[id]?.status === "published"),
         );
@@ -1068,6 +1122,20 @@ export async function runNativeGraph(args: {
           // A wrong result is repaired, published or not: the next attempt
           // republishes the same branch with a lease.
           const isolated = recordWorkFailure(state, item.id, error);
+          save();
+          await observeWorkflowReflection({
+            state,
+            store: contentStore,
+            save,
+            event: {
+              kind: state.work[item.id]?.recovery?.failure?.predecessor
+                ? "integration-contract-conflict"
+                : "blocker",
+              itemId: item.id,
+            },
+            resolvedExpansionIds: args.resolvedExpansionIds,
+            diagnostics: args.diagnostics,
+          });
           if (isolated && item.kind !== "discovery" && !stopped()) {
             await diagnose(item);
             return;
@@ -1394,6 +1462,20 @@ export async function runNativeGraph(args: {
         phases.release(top.id);
         const isolated = recordWorkFailure(state, failed.id, error);
         save();
+        await observeWorkflowReflection({
+          state,
+          store: contentStore,
+          save,
+          event: {
+            kind: state.work[failed.id]?.recovery?.failure?.predecessor
+              ? "integration-contract-conflict"
+              : "blocker",
+            itemId: failed.id,
+          },
+          resolvedExpansionIds: args.resolvedExpansionIds,
+          diagnostics: args.diagnostics,
+        });
+        save();
         if (isolated && !stopped()) await diagnose(failed);
         // A repaired layer is delivered again in this pass; a failed one
         // keeps the unit out until the operator answers.
@@ -1411,6 +1493,15 @@ export async function runNativeGraph(args: {
     }
     phases.release(top.id);
     save();
+    for (const item of unit.items)
+      await observeWorkflowReflection({
+        state,
+        store: contentStore,
+        save,
+        event: { kind: "completion", itemId: item.id },
+        resolvedExpansionIds: args.resolvedExpansionIds,
+        diagnostics: args.diagnostics,
+      });
     for (const item of unit.items)
       await closeWorkItem(
         state,
