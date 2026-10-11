@@ -90,6 +90,8 @@ export function canHandoff(state: ContinuationState): boolean {
 
 export interface LocalOwner {
   handoff?: boolean;
+  /** Exact Issue body admitted by the Project claim, before any planning. */
+  admittedObjectiveBodyDigest?: string;
   /**
    * Aborts on pause, drain and handoff (SIGTERM, `handoff`): a step waiting
    * between tries stops with `StepPaused`, nothing charged or failed.

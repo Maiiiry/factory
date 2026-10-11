@@ -251,6 +251,19 @@ export async function runObjectivePass(
         : undefined;
     };
     const issue = await observeObjective();
+    if (
+      owner.admittedObjectiveBodyDigest &&
+      createHash("sha256").update(issue.body).digest("hex") !==
+        owner.admittedObjectiveBodyDigest
+    )
+      throw attachFault(
+        new Error(
+          "Objective contents differ from the approved Project admission",
+        ),
+        decision(
+          "Retain the original Project owner claim and reconcile its changed Objective contents through supported queue recovery before planning",
+        ),
+      );
     assertObjectiveCriteria(issue.body);
     const installationConfigDigest = factoryConfigDigest(config);
     const continuation = readContinuation(config.repository, objective);

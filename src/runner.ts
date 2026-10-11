@@ -479,6 +479,7 @@ async function runObjectiveOwned(
   let woke: { promise: Promise<void>; resolve: () => void } | undefined;
   const owner: LocalOwner = {
     changed: false,
+    admittedObjectiveBodyDigest: queueClaim?.bodyDigest,
     lock,
     abort: new AbortController(),
     pause: new AbortController(),
