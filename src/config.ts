@@ -670,7 +670,12 @@ export function validateConfig(value: unknown): FactoryConfig {
                 part === ".." ||
                 (!part && index !== parts.length - 1),
             ) ||
-          /[\u0000-\u001f\u007f*?\[\]{}]/.test(selector),
+          Array.from(selector).some(
+            (character) =>
+              character.codePointAt(0)! < 32 ||
+              character.codePointAt(0) === 127 ||
+              "*?[]{}".includes(character),
+          ),
       )
     )
       throw new Error(
