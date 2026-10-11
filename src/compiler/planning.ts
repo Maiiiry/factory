@@ -1,4 +1,10 @@
 import { assertDeclaredConditions } from "../adaptive-routing.js";
+import {
+  assertWorkflowRecipeGraph,
+  assertWorkflowRecipeContext,
+  assertWorkflowRecipeInput,
+  type WorkflowRecipeInput,
+} from "../workflow-recipes.js";
 import { assertGraphExpansions } from "../graph-expansion.js";
 import { createHash } from "node:crypto";
 import {
@@ -398,6 +404,7 @@ export async function compileObjective(
   observeDecodedGraph?: (graph: WorkGraph) => void,
   session?: AgentSessionContinuation,
   contextLookup?: PlanningContextPacket,
+  workflowRecipe?: WorkflowRecipeInput,
 ): Promise<WorkGraph> {
   const request = prepareCompilationRequest({
     objective,
@@ -415,6 +422,7 @@ export async function compileObjective(
     approvedPlaybookPin: model.approvedPlaybookPin,
     session,
     contextLookup,
+    workflowRecipe,
   });
   const result = await model
     .generateStructured<WorkGraph | PlanningTurnResponse>(request)
@@ -463,6 +471,7 @@ export function prepareCompilationRequest(args: {
   approvedPlaybookPin?: ApprovedPlaybookPin;
   session?: AgentSessionContinuation;
   contextLookup?: PlanningContextPacket;
+  workflowRecipe?: WorkflowRecipeInput;
 }): PlanningRequest<WorkGraph> {
   const {
     objective,
@@ -480,6 +489,17 @@ export function prepareCompilationRequest(args: {
     approvedPlaybookPin,
   } = args;
   if (executionBounds) assertPlanningExecutionBounds(executionBounds);
+  if (args.workflowRecipe) {
+    assertWorkflowRecipeInput(args.workflowRecipe);
+    assertWorkflowRecipeContext(args.contextLookup, args.workflowRecipe);
+    if (!args.contextLookup)
+      throw new Error("Recipe compilation requires admitted adaptive context");
+    if (
+      args.workflowRecipe.pin.origin.kind === "repository" &&
+      args.workflowRecipe.pin.origin.baseSha !== baseSha
+    )
+      throw new Error("Recipe origin differs from the compilation base");
+  }
   assertObjectiveCriteria(body);
   const sources = planningSources(body, baseSha, checkout);
   sources.push(...extraSources);
@@ -492,6 +512,7 @@ export function prepareCompilationRequest(args: {
   const prompt = `Objective #${objective}\n${body}${instructions}`;
   const scripts = fixedScripts(body, baseSha, checkout);
   return {
+    ...(args.workflowRecipe ? { workflowRecipe: args.workflowRecipe } : {}),
     ...(args.contextLookup ? { contextLookup: args.contextLookup } : {}),
     ...(prerequisites ? { prerequisites } : {}),
     ...(localExecutables ? { localExecutables } : {}),
@@ -541,6 +562,8 @@ export function validateCompiledGraph(args: {
   if (objective === undefined)
     throw new Error("Compilation requires trusted compile context");
   try {
+    if (request.workflowRecipe && !request.compileContext?.previousGraph)
+      assertWorkflowRecipeGraph(graph, request.workflowRecipe);
     assertDiscoveryContextScope(graph, request.contextLookup);
     hydrateCoverageSources(
       graph,
