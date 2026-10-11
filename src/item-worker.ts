@@ -20,7 +20,7 @@ import type {
 } from "./contracts.js";
 import type { DiagnosticEmitter } from "./diagnostics.js";
 import { workerContext } from "./execution/checkpoint.js";
-import { cancelledFault } from "./fault.js";
+import { cancelledFault, decision, StepFault } from "./fault.js";
 import {
   assertGraphRevisions,
   graphDigest,
@@ -147,29 +147,46 @@ export async function runWorker(
   const disableChildAgents =
     Boolean(state.planningRecovery?.contextLookup?.packet) ||
     adaptiveWorkflowEnabled(args.objectiveBody ?? "");
+  const work = state.work[item.id]!;
+  if (disableChildAgents && work.execution && !work.adaptiveContextId)
+    throw new StepFault(
+      decision(
+        "The retained adaptive worker lacks its original dispatch packet. Preserve its ownership and reconcile or cancel through the supported lifecycle before continuation.",
+        "No replacement context, attempt, provider call or worker cancellation was admitted.",
+      ),
+    );
   if (disableChildAgents && args.driver.childAgents !== "disabled")
     throw new Error(
       "Worker driver cannot enforce the adaptive native child-agent prohibition; no provider call was made",
     );
-  const work = state.work[item.id]!;
-  if (disableChildAgents && work.execution && !work.adaptiveContextId)
-    throw new Error(
-      "Retained adaptive worker lacks its original dispatch packet; preserve its ownership and reconcile or cancel through the supported lifecycle before continuation",
-    );
   const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
   if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
-    throw new Error(
-      "Adaptive dispatch lacks its recorded exact attempt and execution base",
+    throw new StepFault(
+      decision(
+        "Adaptive dispatch lacks its recorded exact attempt and execution base. Restore the admitted binding through supported recovery before continuing.",
+        "The original ownership and accounting remain unchanged; no new dispatch context was selected.",
+      ),
     );
-  let context = adaptive
-    ? await retainedAdaptiveDispatchContext({
+  let context: Awaited<ReturnType<typeof retainedAdaptiveDispatchContext>>;
+  if (adaptive) {
+    try {
+      context = await retainedAdaptiveDispatchContext({
         state,
         item,
         baseSha,
         store: args.store,
         sources: item.inputSources,
-      })
-    : undefined;
+      });
+    } catch (error) {
+      throw new StepFault(
+        decision(
+          "The original dispatch context cannot be authenticated. Restore its exact retained bytes and binding, or use supported reconciliation or cancellation before continuing.",
+          "The original packet pointer, worker handle, attempt and accounting are preserved; no live context was reselected.",
+        ),
+        { cause: error },
+      );
+    }
+  }
   const retained = work.recovery?.correction
     ? retainedFailedResultContext(work.recovery.history?.at(-1))
     : undefined;
