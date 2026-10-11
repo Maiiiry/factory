@@ -5,7 +5,10 @@
 
 import { isDeepStrictEqual } from "node:util";
 import { agentSessionContinuation } from "./agent-session.js";
-import { buildAdaptiveContext } from "./adaptive-context.js";
+import {
+  buildAdaptiveContext,
+  retainedAdaptiveDispatchContext,
+} from "./adaptive-context.js";
 import { adaptiveWorkflowEnabled } from "./adaptive-workflow.js";
 import { createHash } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
@@ -149,6 +152,24 @@ export async function runWorker(
       "Worker driver cannot enforce the adaptive native child-agent prohibition; no provider call was made",
     );
   const work = state.work[item.id]!;
+  if (disableChildAgents && work.execution && !work.adaptiveContextId)
+    throw new Error(
+      "Retained adaptive worker lacks its original dispatch packet; preserve its ownership and reconcile or cancel through the supported lifecycle before continuation",
+    );
+  const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
+  if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
+    throw new Error(
+      "Adaptive dispatch lacks its recorded exact attempt and execution base",
+    );
+  let context = adaptive
+    ? await retainedAdaptiveDispatchContext({
+        state,
+        item,
+        baseSha,
+        store: args.store,
+        sources: item.inputSources,
+      })
+    : undefined;
   const retained = work.recovery?.correction
     ? retainedFailedResultContext(work.recovery.history?.at(-1))
     : undefined;
@@ -173,52 +194,53 @@ export async function runWorker(
   // A reattached worker keeps the coding slot it holds while it runs remotely.
   if (work.phaseReservation !== "coding")
     await phases.reserve(item.id, "coding");
-  const discoveryInputs = await selectedDiscoveryInputs({
-    state,
-    item,
-    checkout: args.config.checkout,
-    store: args.store,
-  });
-  const discoverySelections = discoveryContextSelections(discoveryInputs);
-  const discoveryBodies = discoveryContextBodies(discoveryInputs);
-  const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
-  if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
-    throw new Error(
-      "Adaptive dispatch lacks its recorded exact attempt and execution base",
-    );
-  const knowledge = adaptive
-    ? await completeObjectiveKnowledge({
-        state,
-        item,
-        checkout: args.config.checkout,
-        baseSha,
-        store: args.store,
-        suppliedDigests: [
-          ...discoveryBodies.map((body) => body.ref.digest),
-          ...(item.inputSources ?? []).map((source) =>
-            createHash("sha256").update(source.content).digest("hex"),
-          ),
-        ],
-      })
-    : undefined;
-  const context = await buildAdaptiveContext({
-    state,
-    role: "dispatch",
-    item,
-    baseSha,
-    checkout: args.config.checkout,
-    store: args.store,
-    config: args.config,
-    sources: item.inputSources,
-    suppliedBodies: [...discoveryBodies, ...(knowledge?.suppliedBodies ?? [])],
-    required: { knowledge: knowledge?.view ?? {}, discoveryInputs },
-    requiredSelections: [
-      ...discoverySelections,
-      ...(knowledge?.selections ?? []),
-    ],
-    save: args.save,
-  });
-  if (context) {
+  let discoveryInputs: Awaited<ReturnType<typeof selectedDiscoveryInputs>> = [];
+  if (!context) {
+    discoveryInputs = await selectedDiscoveryInputs({
+      state,
+      item,
+      checkout: args.config.checkout,
+      store: args.store,
+    });
+    const discoverySelections = discoveryContextSelections(discoveryInputs);
+    const discoveryBodies = discoveryContextBodies(discoveryInputs);
+    const knowledge = adaptive
+      ? await completeObjectiveKnowledge({
+          state,
+          item,
+          checkout: args.config.checkout,
+          baseSha,
+          store: args.store,
+          suppliedDigests: [
+            ...discoveryBodies.map((body) => body.ref.digest),
+            ...(item.inputSources ?? []).map((source) =>
+              createHash("sha256").update(source.content).digest("hex"),
+            ),
+          ],
+        })
+      : undefined;
+    context = await buildAdaptiveContext({
+      state,
+      role: "dispatch",
+      item,
+      baseSha,
+      checkout: args.config.checkout,
+      store: args.store,
+      config: args.config,
+      sources: item.inputSources,
+      suppliedBodies: [
+        ...discoveryBodies,
+        ...(knowledge?.suppliedBodies ?? []),
+      ],
+      required: { knowledge: knowledge?.view ?? {}, discoveryInputs },
+      requiredSelections: [
+        ...discoverySelections,
+        ...(knowledge?.selections ?? []),
+      ],
+      save: args.save,
+    });
+  }
+  if (context && work.adaptiveContextId !== context.packet.id) {
     work.adaptiveContextId = context.packet.id;
     args.save();
   }

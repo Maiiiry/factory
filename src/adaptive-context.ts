@@ -255,6 +255,77 @@ export function adaptiveContextEvidence(
   };
 }
 
+/** One admitted attempt keeps its exact dispatch input across checkpoints and reattachment. */
+export async function retainedAdaptiveDispatchContext(input: {
+  state: FactoryState;
+  item: WorkItem;
+  baseSha: string;
+  store: ContentStore;
+  sources?: PlanningRequest<unknown>["sources"];
+}): Promise<
+  | {
+      packet: AdaptiveContextPacket;
+      payload: AdaptiveContextPayload;
+      evidence: ResultReviewEvidenceSource;
+    }
+  | undefined
+> {
+  const { state, item } = input;
+  const work = state.work[item.id];
+  if (work?.execution && !work.adaptiveContextId)
+    throw new Error(
+      "Retained adaptive worker lacks its original dispatch packet; preserve its ownership for supported reconciliation or cancellation",
+    );
+  if (!work?.attempt) return undefined;
+  const attemptGraph = work.graphRevisionDigest ?? graphDigest(state.graph);
+  const matches = (packet: AdaptiveContextPacket) =>
+    packet.role === "dispatch" &&
+    packet.binding.repository === state.repository &&
+    packet.binding.objective === state.objective &&
+    packet.binding.runId === state.runId &&
+    packet.binding.configDigest === state.configDigest &&
+    packet.binding.graphDigest === attemptGraph &&
+    packet.binding.baseSha === input.baseSha &&
+    packet.binding.baseSha === (work.executionBaseSha ?? work.baseSha) &&
+    packet.binding.itemId === item.id &&
+    packet.binding.attemptId === work.attempt;
+  const candidates = work.adaptiveContextId
+    ? []
+    : Object.values(state.adaptiveContexts ?? {}).filter(matches);
+  if (candidates.length > 1)
+    throw new Error(
+      "Pre-submit dispatch context is ambiguous; preserve the admitted attempt for supported reconciliation",
+    );
+  const packet = work.adaptiveContextId
+    ? state.adaptiveContexts?.[work.adaptiveContextId]
+    : candidates[0];
+  if (!packet && !work.adaptiveContextId) return undefined;
+  if (!packet || !matches(packet))
+    throw new Error(
+      "Retained dispatch context differs from the admitted attempt and source binding",
+    );
+  const supplied = (input.sources ?? item.inputSources ?? []).map(
+    (source) =>
+      `supplied:${source.path}#${source.heading ?? ""}:${byteHash(source.content)}`,
+  );
+  if (
+    JSON.stringify(
+      packet.selections
+        .filter((selection) => selection.kind === "supplied")
+        .map((selection) => selection.id),
+    ) !== JSON.stringify(supplied)
+  )
+    throw new Error(
+      "Retained dispatch context differs from complete supplied Source bytes",
+    );
+  const payload = await authenticateAdaptiveContextPacket(input.store, packet);
+  return {
+    packet,
+    payload,
+    evidence: adaptiveContextEvidence(packet, payload),
+  };
+}
+
 /** Controller-selected facts only. Required inputs stay complete and outside optional retrieval bounds. */
 export async function buildAdaptiveContext(input: {
   state: FactoryState;
@@ -281,6 +352,23 @@ export async function buildAdaptiveContext(input: {
   const { state, item, store } = input;
   const recorded = state.planningRecovery?.contextLookup?.packet;
   if (!recorded) return undefined;
+  if (input.role === "dispatch" && item) {
+    const retained = await retainedAdaptiveDispatchContext({
+      state,
+      item,
+      baseSha: input.baseSha,
+      store,
+      sources: input.sources,
+    });
+    if (retained) {
+      const work = state.work[item.id]!;
+      if (work.adaptiveContextId !== retained.packet.id) {
+        work.adaptiveContextId = retained.packet.id;
+        input.save();
+      }
+      return retained;
+    }
+  }
   const binding: AdaptiveContextPacket["binding"] = {
     repository: state.repository,
     objective: state.objective,
@@ -618,6 +706,8 @@ export async function buildAdaptiveContext(input: {
   assertAdaptiveContextPacket(packet);
   state.adaptiveContexts ??= {};
   state.adaptiveContexts[packet.id] = packet;
+  if (input.role === "dispatch" && item && state.work[item.id]?.attempt)
+    state.work[item.id]!.adaptiveContextId = packet.id;
   input.save();
   return {
     packet,
