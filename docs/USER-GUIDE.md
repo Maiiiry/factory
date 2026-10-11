@@ -650,7 +650,7 @@ A recipe selects a reusable workflow shape without changing the Objective's requ
 ```
 ````
 
-Repository recipes are regular Git files at `.factory/recipes/<id>.json`. An unqualified selector prefers the repository definition; `repository:` and `plugin:` choose their namespace explicitly. An invalid repository definition fails instead of silently selecting the packaged recipe. Typed arguments resolve selectors, stages and finite expansion limits; they are never shell interpolation or command authority.
+Repository recipes are regular Git files at `.factory/recipes/<id>.json`. An unqualified selector prefers the repository definition; `repository:` and `plugin:` choose their namespace explicitly. An invalid repository definition fails instead of silently selecting the packaged recipe. Typed arguments resolve selectors, stages and finite expansion limits; they are never shell interpolation or command authority. Use the installed [migration](../assets/recipes/repository-migration.json), [API feature](../assets/recipes/api-feature.json) and [bounded audit](../assets/recipes/bounded-audit.json) definitions as examples. The API shape declares a separate shared-interface owner before consumer batches; the audit shape requires verified semantic discovery.
 
 Preview the declaration against the current checkout before admission:
 
