@@ -321,6 +321,10 @@ A plan may also declare a discovery Work Item with literal read selectors, outpu
 
 Custom library adapters must implement the admission contracts: adaptive `PlanningModel` declares `providerAttemptAdmission: "controller-checkpoint-v1"`, and semantic discovery requires an `ExecutionDriver` declaring `readonlyDiscovery: "selector-bound-read-only-v1"` with actual adapter preflight enforcement. Opaque or unsupported adapters are refused before paid calls; a declaration alone supplies no permissions or enforced isolation.
 
+Memory lookup supplies verified text. Binary bodies remain retained under their exact content references and report an unavailable text body; they are never decoded into replacement text. Supplied documentation is retained with its exact path, selected heading, version digest and observation time. A complete heading selection does not claim the whole underlying file was supplied. Already supplied source bodies are excluded from optional memory ranking and remain reachable through their existing pinned-source indices.
+
+Discovery selectors must also fit the admitted `planningContext.selectors` ceiling. A missing-context human question must cite an actual required, unresolved lookup receipt; human-owned choices and permissions do not require an unnecessary search.
+
 Broader graph expansion, adaptive scheduling, recipes, speculative branches and portable memory export remain deferred.
 
 ### Writing Objectives that deliver
