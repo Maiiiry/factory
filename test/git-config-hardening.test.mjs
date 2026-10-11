@@ -14,7 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { gitAsync } from "../dist/process.js";
+import { gitAsync, pinnedGit, pinnedGitCommand } from "../dist/process.js";
 import { deliveryDescription } from "../dist/delivery/description.js";
 import { validateTree } from "../dist/validation.js";
 import {
@@ -113,6 +113,121 @@ test("controller Git ignores executable configuration shared by a worker worktre
   assert.equal(existsSync(marker), false);
   assert.equal(git(worker, "show", "HEAD:notes.txt"), "changed");
   assert.doesNotMatch(git(worker, "cat-file", "commit", "HEAD"), /gpgsig/);
+  // The same hardened controller restores only operator-owned remote auth.
+  // Exercise real Git helpers locally with fixture credentials, never a remote.
+  const globalConfig = join(root, "operator-global.gitconfig");
+  const systemConfig = join(root, "operator-system.gitconfig");
+  const globalCredentials = join(root, "operator-global.credentials");
+  const systemCredentials = join(root, "operator-system.credentials");
+  for (const [path, host, username] of [
+    [globalCredentials, "global.fixture.invalid", "fixture-global"],
+    [systemCredentials, "system.fixture.invalid", "fixture-system"],
+  ])
+    execFileSync("git", ["credential-store", "--file", path, "store"], {
+      input: `protocol=https\nhost=${host}\nusername=${username}\npassword=noncredential-fixture\n\n`,
+    });
+  git(worker, "config", "credential.helper", executable);
+  git(
+    worker,
+    "config",
+    "credential.https://global.fixture.invalid.helper",
+    executable,
+  );
+  git(worker, "config", "core.askPass", executable);
+  git(worker, "config", "core.sshCommand", executable);
+  execFileSync("git", [
+    "config",
+    "--file",
+    globalConfig,
+    "credential.helper",
+    `store --file=${globalCredentials}`,
+  ]);
+  execFileSync("git", [
+    "config",
+    "--file",
+    systemConfig,
+    "credential.https://system.fixture.invalid.helper",
+    `store --file=${systemCredentials}`,
+  ]);
+  execFileSync("git", [
+    "config",
+    "--file",
+    globalConfig,
+    "core.askPass",
+    executable,
+  ]);
+  execFileSync("git", [
+    "config",
+    "--file",
+    systemConfig,
+    "core.sshCommand",
+    "ssh -o BatchMode=yes",
+  ]);
+  const operatorKeys = [
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_ASKPASS",
+    "GIT_SSH_COMMAND",
+  ];
+  const originalOperator = Object.fromEntries(
+    operatorKeys.map((key) => [key, process.env[key]]),
+  );
+  const expectedWorkerHead = git(worker, "rev-parse", "HEAD");
+  try {
+    Object.assign(process.env, {
+      GIT_CONFIG_GLOBAL: globalConfig,
+      GIT_CONFIG_SYSTEM: systemConfig,
+      GIT_CONFIG_NOSYSTEM: "0",
+      GIT_DIR: join(root, "unapproved.git"),
+      GIT_WORK_TREE: root,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: executable,
+      GIT_ASKPASS: executable,
+    });
+    delete process.env.GIT_SSH_COMMAND;
+    assert.equal(pinnedGit(worker, "rev-parse", "HEAD"), expectedWorkerHead);
+    const local = pinnedGitCommand(worker, ["rev-parse", "HEAD"]);
+    assert.equal(local.env.GIT_CONFIG_GLOBAL, "/dev/null");
+    assert.equal(local.env.GIT_CONFIG_SYSTEM, "/dev/null");
+    assert.equal(local.env.GIT_ASKPASS, undefined);
+    const remote = pinnedGitCommand(worker, ["ls-remote", "origin"]);
+    assert.equal(remote.env.GIT_CONFIG_GLOBAL, "/dev/null");
+    assert.equal(remote.env.GIT_CONFIG_SYSTEM, "/dev/null");
+    assert.equal(remote.env.GIT_DIR, undefined);
+    assert.equal(remote.env.GIT_WORK_TREE, undefined);
+    assert.equal(remote.env.GIT_ASKPASS, executable);
+    assert.equal(remote.env.GIT_SSH_COMMAND, "ssh -o BatchMode=yes");
+    for (const [host, username] of [
+      ["global.fixture.invalid", "fixture-global"],
+      ["system.fixture.invalid", "fixture-system"],
+    ]) {
+      const filled = execFileSync("git", ["-C", worker, "credential", "fill"], {
+        env: remote.env,
+        input: `protocol=https\nhost=${host}\n\n`,
+        encoding: "utf8",
+      });
+      assert.ok(filled.includes(`username=${username}\n`));
+      assert.ok(filled.includes("password=noncredential-fixture\n"));
+    }
+    assert.equal(existsSync(marker), false);
+    process.env.GIT_SSH_COMMAND = "ssh -o ConnectTimeout=7";
+    assert.equal(
+      pinnedGitCommand(worker, ["ls-remote", "origin"]).env.GIT_SSH_COMMAND,
+      process.env.GIT_SSH_COMMAND,
+    );
+  } finally {
+    for (const key of operatorKeys) {
+      if (originalOperator[key] === undefined) delete process.env[key];
+      else process.env[key] = originalOperator[key];
+    }
+  }
   const changeRef = git(worker, "rev-parse", "HEAD");
   const treeSha = git(worker, "rev-parse", "HEAD^{tree}");
   // Read planning uses exact immutable regular-blob sizes, without invoking
