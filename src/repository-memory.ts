@@ -19,6 +19,7 @@ import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { LocalContentStore } from "./content/local.js";
+import { stateRoot } from "./config.js";
 import type { ContentRef } from "./contracts.js";
 import { validOwnershipPath } from "./ownership.js";
 import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
@@ -71,6 +72,10 @@ export interface RepositoryMemoryRecord {
   }[];
   sources: {
     identity: string;
+    path?: string;
+    heading?: string;
+    commitSha?: string;
+    treeSha?: string;
     version?: string;
     apiVersion?: string;
     dependencyVersion?: string;
@@ -136,6 +141,7 @@ export interface MemoryResult {
 }
 export interface MemoryLookup {
   access: MemoryAccess;
+  excludeIds?: string[];
   scope?: { objective?: number; paths?: string[]; kinds?: MemoryKind[] };
   applicability?: MemoryApplicability;
   limit: number;
@@ -267,6 +273,10 @@ export function assertRepositoryMemoryRecord(
   for (const value of record.sources) {
     const source = keys(value, [
       "identity",
+      "path",
+      "heading",
+      "commitSha",
+      "treeSha",
       "version",
       "apiVersion",
       "dependencyVersion",
@@ -275,6 +285,19 @@ export function assertRepositoryMemoryRecord(
       "ref",
     ]);
     text(source.identity);
+    if (
+      source.path !== undefined &&
+      (typeof source.path !== "string" || !validOwnershipPath(source.path))
+    )
+      throw new Error("Invalid memory source path");
+    if (source.heading !== undefined) text(source.heading);
+    for (const name of ["commitSha", "treeSha"])
+      if (
+        source[name] !== undefined &&
+        (typeof source[name] !== "string" ||
+          !/^[a-f0-9]{40,64}$/.test(source[name]))
+      )
+        throw new Error("Invalid memory source revision");
     for (const name of ["version", "apiVersion", "dependencyVersion"])
       if (source[name] !== undefined) text(source[name]);
     if (source.retrievedAt !== undefined) date(source.retrievedAt);
@@ -820,6 +843,11 @@ export class LocalRepositoryMemory {
         (!Number.isSafeInteger(lookup.maxBytes) || lookup.maxBytes < 0))
     )
       throw new Error("Invalid memory lookup bound");
+    if (
+      lookup.excludeIds !== undefined &&
+      (!Array.isArray(lookup.excludeIds) || !lookup.excludeIds.every(isHash))
+    )
+      throw new Error("Invalid excluded memory identity");
     if (lookup.access.repository !== this.repository)
       return { entries: [], unavailable: [] };
     if (
@@ -830,8 +858,10 @@ export class LocalRepositoryMemory {
     )
       throw new Error("Invalid memory visibility access");
     const retained = this.retained();
+    const excluded = new Set(lookup.excludeIds ?? []);
     retained.entries = retained.entries.filter(
       (entry) =>
+        !excluded.has(entry.binding.id) &&
         this.accessible(lookup.access, entry.record) &&
         this.inScope(entry.record, lookup),
     );
@@ -856,8 +886,15 @@ export class LocalRepositoryMemory {
       const repositoryPaths = [
         ...(record.bindings.paths ?? []).map((entry) => entry.path),
         ...record.sources
-          .filter((source) => source.identity.startsWith("repository:"))
-          .map((source) => source.identity.slice("repository:".length)),
+          .filter(
+            (source) =>
+              source.path !== undefined ||
+              source.identity.startsWith("repository:"),
+          )
+          .map(
+            (source) =>
+              source.path ?? source.identity.slice("repository:".length),
+          ),
       ];
       if (
         record.kind !== "decision" &&
@@ -1405,4 +1442,75 @@ export function retainStateMemory(
     retain(observation);
   }
   return bindings;
+}
+
+/** Retain already supplied, approved source bytes; never fetch or reread a source.
+ * Original Sources keep their normative authority outside this advisory catalog.
+ * A heading selection retains every supplied byte without inventing its whole file.
+ */
+export function retainPlanningSourceMemory(input: {
+  repository: string;
+  objective: number;
+  runId: string;
+  baseSha: string;
+  treeSha: string;
+  configDigest: string;
+  sources: { path: string; heading?: string; content: string }[];
+}): RepositoryMemoryBinding[] {
+  const root = stateRoot(input.repository);
+  const memory = new LocalRepositoryMemory(root, input.repository);
+  const store = new LocalContentStore(join(root, "content"));
+  const observedAt = new Date().toISOString();
+  return input.sources
+    .filter((source) => source.path !== "OBJECTIVE")
+    .map((source) => {
+      const sourceRef = store.putBytes(Buffer.from(source.content), {
+        mediaType: "text/plain; charset=utf-8",
+      });
+      const selectedSection = source.heading !== undefined;
+      return memory.retain({
+        schemaVersion: 1,
+        repository: input.repository,
+        visibility: "private",
+        kind: "reference",
+        producer: {
+          objective: input.objective,
+          runId: input.runId,
+          status: "observed-supplied-source",
+        },
+        createdAt: observedAt,
+        authority: "observation",
+        summary: `Retained ${selectedSection ? "complete supplied section of" : "complete supplied source"} ${source.path}${selectedSection ? `#${source.heading}; underlying whole file was not supplied` : ""}`,
+        bodies: [
+          {
+            role: "supplied-source-selection",
+            ref: sourceRef,
+            availability: "retained",
+          },
+        ],
+        sources: [
+          {
+            identity: `${source.path}#${source.heading ?? ""}`,
+            path: source.path,
+            ...(selectedSection ? { heading: source.heading } : {}),
+            version: sourceRef.digest,
+            commitSha: input.baseSha,
+            treeSha: input.treeSha,
+            retrievedAt: observedAt,
+            complete: !selectedSection,
+            ref: sourceRef,
+          },
+        ],
+        bindings: {
+          treeSha: input.treeSha,
+          selectors: [source.path],
+          ...(!selectedSection
+            ? { paths: [{ path: source.path, digest: sourceRef.digest }] }
+            : {}),
+          environment: { configDigest: input.configDigest },
+        },
+        validity: { state: "current", conditions: [] },
+        supersedes: [],
+      });
+    });
 }
