@@ -1,3 +1,8 @@
+import {
+  assertWorkflowRecipeInput,
+  type WorkflowRecipeInput,
+  type WorkflowRecipePin,
+} from "../workflow-recipes.js";
 import { randomUUID } from "node:crypto";
 import {
   MissingPlanningContext,
@@ -134,6 +139,7 @@ export interface PlanningRecoveryContext {
     planningRecovery?: PlanningRecoveryRecord;
     plan?: PlanCandidate;
     approvedPlaybookPin?: ApprovedPlaybookPin;
+    workflowRecipePin?: WorkflowRecipePin;
   };
   save: () => void;
   stopped?: () => boolean;
@@ -170,8 +176,17 @@ async function compilePlanAdmitted(
   prerequisites?: PlanningPrerequisites,
   localExecutables?: PlanningLocalExecutables,
   executionBounds?: PlanningExecutionBounds,
+  workflowRecipe?: WorkflowRecipeInput,
 ): Promise<PlanCandidate> {
   const { state, save } = context;
+  if (workflowRecipe) assertWorkflowRecipeInput(workflowRecipe);
+  if (
+    JSON.stringify(state.workflowRecipePin) !==
+    JSON.stringify(workflowRecipe?.pin)
+  )
+    throw new PlanningReviewBindingError(
+      "Planning recipe differs from its retained admission",
+    );
   if (
     JSON.stringify(state.approvedPlaybookPin) !==
     JSON.stringify(model.approvedPlaybookPin)
@@ -240,6 +255,7 @@ async function compilePlanAdmitted(
           localExecutables,
           executionBounds,
           contextLookup: record.contextLookup?.packet,
+          workflowRecipe,
         }),
       );
     } catch {
@@ -265,6 +281,7 @@ async function compilePlanAdmitted(
       executionBounds,
       state.approvedPlaybookPin,
       record.contextLookup?.packet,
+      workflowRecipe,
     );
     retainedPlanningReview(record, packet, configDigest);
     if (
@@ -455,6 +472,7 @@ async function compilePlanAdmitted(
         },
         undefined,
         record.contextLookup?.packet,
+        workflowRecipe,
       );
       packet = planReviewPacket(
         body,
@@ -468,6 +486,7 @@ async function compilePlanAdmitted(
         executionBounds,
         state.approvedPlaybookPin,
         record.contextLookup?.packet,
+        workflowRecipe,
       );
       record.review = retainedPlanningReview(record, packet, configDigest);
       save();
@@ -650,6 +669,7 @@ async function compilePlanAdmitted(
       .map((kind) => `${kind} (${correctionDescriptions[kind]})`)
       .join(", ");
     const diagnosisRequest = {
+      ...(workflowRecipe ? { workflowRecipe } : {}),
       ...(prerequisites ? { prerequisites } : {}),
       ...(localExecutables ? { localExecutables } : {}),
       ...(executionBounds ? { executionBounds } : {}),

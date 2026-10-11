@@ -43,6 +43,7 @@ import {
 import { assertRepairLedger } from "./repair-policy.js";
 import {
   assertCoordinator,
+  assertStateWorkflowRecipe,
   isPreparationState,
   type ContinuationState,
   type FactoryState,
@@ -183,7 +184,11 @@ const currentVersion = (value: unknown): boolean => {
     version === 9 ||
     version === 10 ||
     version === 11 ||
-    version === 12
+    version === 12 ||
+    version === 13 ||
+    version === 14 ||
+    version === 15 ||
+    version === 16
   );
 };
 
@@ -264,7 +269,8 @@ function parsePreparation(
     if (
       value.schemaVersion !== 10 &&
       value.schemaVersion !== 12 &&
-      value.schemaVersion !== 14
+      value.schemaVersion !== 14 &&
+      value.schemaVersion !== 16
     )
       throw new Error(
         "Adaptive context requires preparation schema version 10",
@@ -278,17 +284,25 @@ function parsePreparation(
       value.plan.contextLookup !== undefined ||
       value.plan.graph.items.some((item) => item.kind === "discovery");
     if (
-      (conditional
-        ? value.plan.schemaVersion !== 6
-        : expanded
-          ? value.plan.schemaVersion !== 5
-          : adaptive !== (value.plan.schemaVersion === 4)) ||
+      (value.workflowRecipePin
+        ? value.plan.schemaVersion !== 7
+        : conditional
+          ? value.plan.schemaVersion !== 6
+          : expanded
+            ? value.plan.schemaVersion !== 5
+            : adaptive !== (value.plan.schemaVersion === 4)) ||
       (value.schemaVersion === 8 && adaptive) ||
       (value.schemaVersion === 10 && value.plan.schemaVersion !== 4) ||
       (value.schemaVersion === 12 && value.plan.schemaVersion !== 5) ||
       (value.schemaVersion === 14 && value.plan.schemaVersion !== 6) ||
-      (conditional && value.schemaVersion !== 14) ||
-      (expanded && value.schemaVersion !== 12 && value.schemaVersion !== 14)
+      (value.schemaVersion === 16 && value.plan.schemaVersion !== 7) ||
+      (conditional &&
+        value.schemaVersion !== 14 &&
+        value.schemaVersion !== 16) ||
+      (expanded &&
+        value.schemaVersion !== 12 &&
+        value.schemaVersion !== 14 &&
+        value.schemaVersion !== 16)
     )
       throw new Error(
         "Preparation plan schema differs from adaptive semantics",
@@ -311,7 +325,8 @@ function parsePreparation(
     (value.schemaVersion !== 8 &&
       value.schemaVersion !== 10 &&
       value.schemaVersion !== 12 &&
-      value.schemaVersion !== 14) ||
+      value.schemaVersion !== 14 &&
+      value.schemaVersion !== 16) ||
     value.kind !== "preparing" ||
     value.repository !== repository ||
     value.objective !== objective ||
@@ -377,6 +392,7 @@ function parsePreparation(
   // never writes is refused when parsed, not judged as a plan.
   if (value.plan?.executionBounds !== undefined)
     assertPlanningExecutionBounds(value.plan.executionBounds);
+  assertStateWorkflowRecipe(value);
   assertCoordinator(value.coordinator);
   assertAgentSessions(value);
   validateCapacity(value.capacity);

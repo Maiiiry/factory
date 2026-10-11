@@ -1,3 +1,4 @@
+import { readPinnedWorkflowRecipe } from "../workflow-recipes.js";
 import type {
   ContentRef,
   ContentStore,
@@ -14,7 +15,7 @@ import {
   executionProfileChoices,
   verifyExecutionProfiles,
 } from "../execution-profiles.js";
-import { attachFault, decision } from "../fault.js";
+import { attachFault, decision, StepFault } from "../fault.js";
 import { graphDigest } from "../graph-amendments.js";
 import { graphProjectionControl } from "../graph-projection-control.js";
 import {
@@ -92,6 +93,7 @@ export function assertExpansionState(state: FactoryState): void {
   if (
     state.schemaVersion !== 11 &&
     state.schemaVersion !== 13 &&
+    state.schemaVersion !== 15 &&
     (expansions !== undefined ||
       state.pendingExpansion !== undefined ||
       state.expansionHistory !== undefined)
@@ -286,6 +288,11 @@ export async function authenticateObjectiveInputs(args: {
   config: FactoryConfig;
   contentStore: ContentStore;
 }): Promise<ReadonlySet<string>> {
+  if (args.state.workflowRecipePin)
+    await readPinnedWorkflowRecipe(
+      args.state.workflowRecipePin,
+      args.contentStore,
+    );
   const resolved = await authenticateExpansionInputs(args);
   assertExpansionsSettled(args.state.graph, resolved);
   const authenticatedProducers = new Set(
@@ -329,6 +336,18 @@ export async function applyPendingGraphExpansion(
   } & StepOptions,
 ): Promise<boolean> {
   const { state, config, contentStore, github, save } = args;
+  if (state.workflowRecipePin) {
+    try {
+      await readPinnedWorkflowRecipe(state.workflowRecipePin, contentStore);
+    } catch (error) {
+      throw new StepFault(
+        decision(
+          "Restore the retained recipe before graph expansion; preserve its original admission",
+        ),
+        { cause: error },
+      );
+    }
+  }
   if (
     !state.graph.expansions?.length ||
     state.pendingAmendment ||

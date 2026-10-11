@@ -174,7 +174,8 @@ export function assertWorkRoutingState(state: FactoryState): void {
       (state.schemaVersion === 9 &&
         (state.pendingAmendment?.graph?.expansions?.length ||
           state.pendingAmendment?.proposal.graph?.expansions?.length))) &&
-    state.schemaVersion !== 13
+    state.schemaVersion !== 13 &&
+    state.schemaVersion !== 15
   )
     throw new Error(
       "Pending declared routing requires execution snapshot version 13",
@@ -186,7 +187,8 @@ export function assertWorkRoutingState(state: FactoryState): void {
     (state.graph.conditions !== undefined ||
       state.conditionFacts !== undefined ||
       routed) &&
-    state.schemaVersion !== 13
+    state.schemaVersion !== 13 &&
+    state.schemaVersion !== 15
   )
     throw new Error("Declared routing requires execution snapshot version 13");
   const facts = state.conditionFacts ?? {};
@@ -567,7 +569,7 @@ export async function observeWorkflowReflection(
       ...args,
       save: () => {
         checkpointStarted = true;
-        args.state.schemaVersion = 13;
+        if (args.state.schemaVersion !== 15) args.state.schemaVersion = 13;
         args.save();
       },
     });

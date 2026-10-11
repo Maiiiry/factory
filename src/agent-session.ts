@@ -1,3 +1,7 @@
+import {
+  assertWorkflowRecipePin,
+  type WorkflowRecipePin,
+} from "./workflow-recipes.js";
 import { isExecutionState, isPreparationState } from "./state.js";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -51,6 +55,7 @@ export function planningSessionInputDigest(inputs: {
   objectiveBodyDigest?: string;
   sourcePacketDigest?: string;
   approvedPlaybookPin?: ApprovedPlaybookPin;
+  workflowRecipePin?: WorkflowRecipePin;
   contextLookup?: PlanningContextPacket;
   planningRecovery?: { contextLookup?: { packet: PlanningContextPacket } };
 }): string {
@@ -95,6 +100,10 @@ export function planningSessionInputDigest(inputs: {
         context.bounds.maxProviderCalls,
       ],
     });
+  }
+  if (inputs.workflowRecipePin) {
+    assertWorkflowRecipePin(inputs.workflowRecipePin);
+    frozen.push({ workflowRecipePin: inputs.workflowRecipePin });
   }
   return createHash("sha256").update(JSON.stringify(frozen)).digest("hex");
 }
