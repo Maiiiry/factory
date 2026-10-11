@@ -265,7 +265,8 @@ function parsePreparation(
       value.plan.graph.items.some((item) => item.kind === "discovery");
     if (
       adaptive !== (value.plan.schemaVersion === 4) ||
-      (value.schemaVersion === 8 && adaptive)
+      (value.schemaVersion === 8 && adaptive) ||
+      (value.schemaVersion === 10 && value.plan.schemaVersion !== 4)
     )
       throw new Error(
         "Preparation plan schema differs from adaptive semantics",

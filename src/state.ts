@@ -828,6 +828,16 @@ export function parseFactoryState(
     )
       throw new Error(`${id}.validation is invalid`);
   }
+  if (
+    state.schemaVersion === 9 &&
+    lookup === undefined &&
+    !(graph.items as Record<string, unknown>[]).some(
+      (item) => item.kind === "discovery",
+    )
+  )
+    throw new Error(
+      "Adaptive execution lacks its retained context or discovery semantics",
+    );
   for (const raw of graph.items) {
     const item = raw as Record<string, unknown>;
     if (
