@@ -888,6 +888,7 @@ function amendmentNativeHooks(
       owner.nativeReturns.push(ref);
       args.save();
       await awaitCheckpointAdmission(args.state.repository, "explicit");
+      return "admission-complete";
     },
   };
 }

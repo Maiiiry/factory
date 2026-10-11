@@ -1,3 +1,4 @@
+import { admitNativeReturn } from "./compiler/native-return.js";
 import type {
   AgentSessionContinuation,
   ContentStore,
@@ -8,10 +9,7 @@ import type {
 import { installedControllerCapabilities } from "./controller-capabilities.js";
 import { attachFault, StepFault, transient } from "./fault.js";
 import { pinnedGit } from "./process.js";
-import {
-  awaitCheckpointAdmission,
-  hasPrivateCheckpointScope,
-} from "./recovery-checkpoint.js";
+import { hasPrivateCheckpointScope } from "./recovery-checkpoint.js";
 import {
   assertCommandReceipts,
   commandPassEvidence,
@@ -288,9 +286,10 @@ export async function reviewAcceptance(args: {
       if (!evidence.nativeReturns.some((entry) => entry.digest === ref.digest))
         evidence.nativeReturns.push(ref);
       checkpoint();
-      await prior?.(receipt);
-      // The native transport may release its last copy after this callback.
-      await awaitCheckpointAdmission(undefined, "explicit");
+      // The prior callback sees the evidence checkpoint above; admission covers
+      // both owners before the native transport releases its last copy.
+      await admitNativeReturn(prior, receipt, undefined);
+      return "admission-complete";
     };
   }
   if (undecided && !model.reviewResult)

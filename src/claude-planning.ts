@@ -1,3 +1,4 @@
+import { admitNativeReturn } from "./compiler/native-return.js";
 import type { ReviewImageInput } from "./contracts.js";
 import { unsupportedReviewImages } from "./compiler/transport.js";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -961,12 +962,13 @@ class ClaudePlanningTransport implements PlanningTransport {
           );
         }
       }
-      if (nativeReturn) await invocation.retainNativeReturn?.(nativeReturn);
+      await admitNativeReturn(
+        invocation.retainNativeReturn?.bind(invocation),
+        nativeReturn,
+        continuation?.scope.repository,
+        checkpointRejected,
+      );
       if (!checkpointRejected) {
-        await awaitCheckpointAdmission(
-          continuation?.scope.repository,
-          "explicit",
-        );
         if (root) rmSync(root, { recursive: true, force: true });
       }
     }

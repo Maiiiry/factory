@@ -1,3 +1,4 @@
+import { admitNativeReturn } from "./native-return.js";
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -1030,21 +1031,23 @@ export class CodexPlanningTransport implements PlanningTransport {
               : "unavailable",
           );
         }
-        if (turnCompleted)
-          await invocation.retainNativeReturn?.({
-            representation: "literal-agent-text",
-            response: state.response,
-            ...(thread.id && { providerSessionId: thread.id }),
-            terminal: "completed",
-            ...(state.usage && { usage: state.usage }),
-          });
+        await admitNativeReturn(
+          invocation.retainNativeReturn?.bind(invocation),
+          turnCompleted
+            ? {
+                representation: "literal-agent-text",
+                response: state.response,
+                ...(thread.id && { providerSessionId: thread.id }),
+                terminal: "completed",
+                ...(state.usage && { usage: state.usage }),
+              }
+            : undefined,
+          continuation?.scope.repository,
+          checkpointRejected,
+        );
         // Preserve the original admission rejection and its before-dispatch
         // classification. Unsynchronized originals remain local; no disposal.
         if (!checkpointRejected) {
-          await awaitCheckpointAdmission(
-            continuation?.scope.repository,
-            "explicit",
-          );
           if (session && !thread.id) {
             releaseCodexHome(home.root, this.sessionOwner(session));
             checkpointSession("released");
