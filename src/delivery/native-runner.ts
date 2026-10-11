@@ -327,8 +327,12 @@ export async function runNativeGraph(args: {
     });
     phases.availableSlots(reported);
     const prepared: typeof units = [];
-    const runningUnits = units.filter((unit) =>
-      unit.items.some((item) => state.work[item.id]?.status === "running"),
+    const owningUnits = units.filter((unit) =>
+      unit.items.some((item) =>
+        ["running", "waiting", "published"].includes(
+          state.work[item.id]?.status ?? "",
+        ),
+      ),
     );
     const ranked = rankPending(state.graph, state.work);
     const facts = schedulingObservations(state.graph, state.work);
@@ -337,7 +341,7 @@ export async function runNativeGraph(args: {
     )) {
       if (state.work[unit.items[0]!.id]?.status !== "pending") continue;
       const owned = new Set(
-        [...runningUnits, ...prepared].flatMap((other) =>
+        [...owningUnits, ...prepared].flatMap((other) =>
           other.items.map((item) => item.id),
         ),
       );
@@ -349,7 +353,7 @@ export async function runNativeGraph(args: {
         owned,
         args.resolvedExpansionIds,
       );
-      const conflict = [...runningUnits, ...prepared].find((other) =>
+      const conflict = [...owningUnits, ...prepared].find((other) =>
         unit.items.some((item) =>
           other.items.some((candidate) => itemsConflict(item, candidate)),
         ),
