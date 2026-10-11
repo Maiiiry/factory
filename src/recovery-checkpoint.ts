@@ -17,9 +17,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { stateRoot, type FactoryConfig } from "./config.js";
+import {
+  factoryConfigDigest,
+  stateRoot,
+  type FactoryConfig,
+} from "./config.js";
 import { LocalContentStore } from "./content/local.js";
 import type { ContentRef } from "./contracts.js";
+import { attachFault, decision } from "./fault.js";
 import {
   pinnedGitCommand,
   pinnedGitEnvironment,
@@ -86,6 +91,7 @@ interface CheckpointAttempt {
   preparedAt: string;
   submittedAt?: string;
   status: "prepared" | "submitted" | "acknowledged" | "unknown" | "conflict";
+  transportOutcome: "not-dispatched" | "response-success" | "unknown";
 }
 interface CheckpointJournal {
   schemaVersion: 1;
@@ -119,6 +125,7 @@ export interface RecoveryCheckpointStatus {
   lastAcknowledged?: CheckpointJournal["lastAcknowledged"];
   attemptedCommit?: string;
   attemptedBase?: string;
+  attemptedTransportOutcome?: CheckpointAttempt["transportOutcome"];
   error?: string;
   coalesceMs?: number;
   overdue?: boolean;
@@ -126,7 +133,7 @@ export interface RecoveryCheckpointStatus {
   protectedContinuation: boolean;
 }
 export class CheckpointAdmissionFailure extends Error {
-  readonly knownNotDispatched: boolean;
+  knownNotDispatched: boolean;
   constructor(
     message: string,
     readonly boundary:
@@ -136,7 +143,19 @@ export class CheckpointAdmissionFailure extends Error {
   ) {
     super(message);
     this.knownNotDispatched = boundary === "before-effect";
+    attachFault(
+      this,
+      decision(
+        "Recovery checkpoint admission or retention is unavailable; preserve the retained owner and receipt",
+        `Checkpoint boundary: ${boundary}`,
+      ),
+    );
   }
+}
+export function markCheckpointEffectDispatched(
+  error: CheckpointAdmissionFailure,
+): void {
+  error.knownNotDispatched = false;
 }
 class CheckpointConflict extends Error {}
 export function isCheckpointAdmissionFailure(
@@ -148,6 +167,10 @@ const scopes = new AsyncLocalStorage<{
   config: FactoryConfig;
   buildClosure: () => Promise<RecoveryCheckpointClosure>;
 }>();
+export function hasPrivateCheckpointScope(): boolean {
+  const scope = scopes.getStore();
+  return Boolean(scope && settings(scope.config)?.scope === "private-history");
+}
 const hash = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
 const canonical = (value: unknown): string => {
@@ -371,7 +394,14 @@ function journal(
   for (const attempt of value.attempts) {
     keys(
       attempt,
-      ["candidate", "payloadDigest", "sequence", "preparedAt", "status"],
+      [
+        "candidate",
+        "payloadDigest",
+        "sequence",
+        "preparedAt",
+        "status",
+        "transportOutcome",
+      ],
       ["base", "submittedAt"],
     );
     if (
@@ -385,6 +415,9 @@ function journal(
         "unknown",
         "conflict",
       ].includes(attempt.status) ||
+      !["not-dispatched", "response-success", "unknown"].includes(
+        attempt.transportOutcome,
+      ) ||
       !Number.isSafeInteger(attempt.sequence) ||
       attempt.sequence < 0 ||
       attempt.sequence > value.sequence ||
@@ -486,6 +519,7 @@ function status(
     ...(last
       ? {
           attemptedCommit: last.candidate,
+          attemptedTransportOutcome: last.transportOutcome,
           ...(last.base ? { attemptedBase: last.base } : {}),
         }
       : {}),
@@ -560,6 +594,17 @@ export function withRecoveryCheckpointScope<T>(
   },
   task: () => T,
 ): T {
+  const admitted = scopes.getStore();
+  if (admitted) {
+    if (
+      admitted.config.repository !== input.config.repository ||
+      factoryConfigDigest(admitted.config) !== factoryConfigDigest(input.config)
+    )
+      throw new CheckpointAdmissionFailure(
+        "Nested checkpoint configuration differs from its admitted repository binding",
+      );
+    return task();
+  }
   return scopes.run(input, task);
 }
 export async function awaitCheckpointAdmission(
@@ -891,6 +936,15 @@ function allRefs(
   }
   return [...refs.values()].sort((a, b) => (a.digest < b.digest ? -1 : 1));
 }
+function closureIdentity(value: RecoveryCheckpointClosure): string {
+  const ordered = (items: unknown[]) => items.map(canonical).sort();
+  return canonical({
+    files: ordered(value.files),
+    contentRefs: ordered(value.contentRefs),
+    gitObjects: ordered(value.gitObjects ?? []),
+    gaps: ordered(value.gaps),
+  });
+}
 function readArchive(
   directory: string,
   commitSha: string,
@@ -1145,7 +1199,7 @@ async function publishCheckpoint(
         );
         return buildRecoveryCheckpointClosure({ config, scope: options.scope });
       });
-    const sequence = record.sequence;
+    let sequence = record.sequence;
     const closure = await build();
     record = journal(config, options);
     const manifest: RecoveryCheckpointManifest = {
@@ -1163,6 +1217,43 @@ async function publishCheckpoint(
       ref,
       bytes: store.readBytes(ref),
     }));
+    if (
+      input.reason === "explicit" &&
+      record.lastAcknowledged &&
+      record.sequence === record.acknowledgedSequence
+    ) {
+      const acknowledged = await freshArchive(
+        config,
+        options,
+        record.lastAcknowledged.commitSha,
+      );
+      if (acknowledged.remoteTip !== record.lastAcknowledged.commitSha)
+        throw new CheckpointConflict(
+          "Remote archive advanced outside the acknowledged writer; conflict requires inspection",
+        );
+      if (acknowledged.payloadDigest !== record.lastAcknowledged.payloadDigest)
+        throw new Error(
+          "Verified archived bytes differ from the retained acknowledgement",
+        );
+      if (closureIdentity(closure) === closureIdentity(acknowledged.manifest))
+        return status(journal(config, options), options);
+      let observedSequence = sequence;
+      record = mutate(config, options, (current) => {
+        if (current.sequence !== sequence) return;
+        current.sequence++;
+        if (!Number.isSafeInteger(current.sequence))
+          throw new Error("Checkpoint sequence overflow");
+        observedSequence = current.sequence;
+        current.dirtySince ??= new Date().toISOString();
+        current.changed.push({
+          path: "archive/explicit-material",
+          kind: "historical",
+        });
+      });
+      sequence = observedSequence;
+      manifest.sequence = sequence;
+      assertManifest(manifest, manifest.binding, options);
+    }
     initializeGit(p.git, options);
     const base = await remoteTip(p.git, options);
     if (base) {
@@ -1249,6 +1340,7 @@ async function publishCheckpoint(
       sequence,
       preparedAt: new Date().toISOString(),
       status: "prepared",
+      transportOutcome: "not-dispatched",
     };
     mutate(config, options, (current) => {
       current.attempts.push(attempt);
@@ -1268,6 +1360,7 @@ async function publishCheckpoint(
     mutate(config, options, (current) => {
       const active = current.attempts.at(-1)!;
       active.status = "submitted";
+      active.transportOutcome = "unknown";
       active.submittedAt = new Date().toISOString();
     });
     try {
@@ -1288,6 +1381,9 @@ async function publishCheckpoint(
         "Git publication outcome is unknown; no automatic retry is admitted",
       );
     }
+    mutate(config, options, (current) => {
+      current.attempts.at(-1)!.transportOutcome = "response-success";
+    });
     const verified = await freshArchive(config, options, candidate);
     if (verified.payloadDigest !== attempt.payloadDigest)
       throw new Error(
