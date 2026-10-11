@@ -1,4 +1,14 @@
 import { randomUUID } from "node:crypto";
+import {
+  MissingPlanningContext,
+  assertPlanningLookupRecord,
+  contextDigest,
+  initializeContextLookup,
+  resolveContextRequests,
+  retainContextPacket,
+  type PlanningLookupRecord,
+  type PlanningContextResolver,
+} from "./context.js";
 import { COMPILER_READINESS_GUIDANCE } from "../compiler-wire.js";
 import type {
   ApprovedPlaybookPin,
@@ -53,6 +63,7 @@ import {
   generatePlannerStructured,
   type PlanCorrection,
   PlanningNeedsDecision,
+  PlanningContextResponse,
   withPlannerAdmission,
 } from "./planning.js";
 import { planningSources } from "./sources.js";
@@ -65,6 +76,7 @@ export interface PlanningReviewRecord {
 }
 
 export interface PlanningRecoveryRecord {
+  contextLookup?: PlanningLookupRecord;
   phase: "ready" | "submitted" | "complete" | "stopped";
   invocation?: { id: string; phase: string };
   invocations?: { id: string; phase: string; resultDigest?: string }[];
@@ -116,6 +128,7 @@ function retainedPlanningReview(
 }
 
 export interface PlanningRecoveryContext {
+  contextResolver?: PlanningContextResolver;
   sessionState?: ContinuationState;
   state: RepairLedger & {
     planningRecovery?: PlanningRecoveryRecord;
@@ -168,6 +181,26 @@ async function compilePlanAdmitted(
     );
   state.planningRecovery ??= { phase: "ready", history: [] };
   const record = state.planningRecovery;
+  if (record.contextLookup) {
+    assertPlanningLookupRecord(record.contextLookup);
+    if (
+      !context.contextResolver ||
+      record.contextLookup.packet.binding !== context.contextResolver.binding ||
+      contextDigest(record.contextLookup.packet.bounds) !==
+        contextDigest(context.contextResolver.bounds)
+    )
+      throw new PlanningReviewBindingError(
+        "Retained lookup source/environment or frozen limits changed; no new dispatch is admitted",
+      );
+    await context.contextResolver.contentStore.verify(
+      record.contextLookup.packetRef!,
+    );
+  } else if (context.contextResolver) {
+    record.contextLookup = await initializeContextLookup(
+      context.contextResolver,
+    );
+    save();
+  }
   const recoverInvocationId =
     record.phase === "submitted" ? record.invocation?.id : undefined;
   // Submitted calls retain their original owner until authenticated settlement.
@@ -199,6 +232,7 @@ async function compilePlanAdmitted(
           prerequisites,
           localExecutables,
           executionBounds,
+          contextLookup: record.contextLookup?.packet,
         }),
       );
     } catch {
@@ -223,6 +257,7 @@ async function compilePlanAdmitted(
       localExecutables,
       executionBounds,
       state.approvedPlaybookPin,
+      record.contextLookup?.packet,
     );
     retainedPlanningReview(record, packet, configDigest);
     if (
@@ -275,6 +310,19 @@ async function compilePlanAdmitted(
         ordinal: consumption(state).planningRevisions,
         observe,
       };
+    }
+    if (phase === "compile" && record.contextLookup) {
+      if (
+        record.contextLookup.providerCalls >=
+        record.contextLookup.packet.bounds.maxProviderCalls
+      ) {
+        record.phase = "stopped";
+        save();
+        throw new PlanningNeedsDecision(
+          "Frozen planning lookup provider allowance is exhausted",
+        );
+      }
+      record.contextLookup.providerCalls++;
     }
     const id = randomUUID();
     record.phase = "submitted";
@@ -376,6 +424,8 @@ async function compilePlanAdmitted(
         (decoded) => {
           graph = decoded;
         },
+        undefined,
+        record.contextLookup?.packet,
       );
       packet = planReviewPacket(
         body,
@@ -388,6 +438,7 @@ async function compilePlanAdmitted(
         localExecutables,
         executionBounds,
         state.approvedPlaybookPin,
+        record.contextLookup?.packet,
       );
       record.review = retainedPlanningReview(record, packet, configDigest);
       save();
@@ -423,6 +474,60 @@ async function compilePlanAdmitted(
       // (paidPlanningModel); without a step it is kept for the operator.
       failure = JSON.stringify(review);
     } catch (error) {
+      if (error instanceof MissingPlanningContext) {
+        record.phase = "stopped";
+        save();
+        throw new PlanningNeedsDecision(error.message);
+      }
+      if (error instanceof PlanningContextResponse) {
+        const lookup = record.contextLookup;
+        const resolver = context.contextResolver;
+        if (!lookup || !resolver)
+          throw new Error("Context response has no admitted resolver");
+        if (error.response.kind === "human-dependency") {
+          record.phase = "stopped";
+          save();
+          throw new PlanningNeedsDecision(
+            `${error.response.question}: ${error.response.detail}`,
+          );
+        }
+        const requests = error.response.requests;
+        const identity = contextDigest(
+          requests.map(
+            ({ collection, operation, selector, query, required }) => ({
+              collection,
+              operation,
+              selector,
+              query,
+              required,
+            }),
+          ),
+        );
+        if (
+          lookup.packet.batches.length >= lookup.packet.bounds.maxRounds ||
+          requests.length > lookup.packet.bounds.maxRequestsPerRound ||
+          lookup.requestDigests.includes(identity)
+        ) {
+          record.phase = "stopped";
+          save();
+          throw new PlanningNeedsDecision(
+            "Context lookup exhausted its frozen rounds or repeated an unchanged no-progress request",
+          );
+        }
+        const results = await resolveContextRequests(
+          lookup,
+          resolver,
+          requests,
+        );
+        lookup.packet.batches.push(results);
+        lookup.requestDigests.push(identity);
+        await retainContextPacket(lookup, resolver.contentStore);
+        delete record.response;
+        delete record.invocation;
+        record.phase = "ready";
+        save();
+        continue;
+      }
       // Only an answered plan (refused or invalid) is revised against the
       // allowance; a transient or configuration fault is never charged.
       // checkedPlanReview turns every answered review into a finding or a

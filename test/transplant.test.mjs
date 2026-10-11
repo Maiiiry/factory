@@ -803,3 +803,145 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
     rmSync(privateSources, { recursive: true, force: true });
   }
 });
+
+test("compiler retrieves scoped immutable bodies and retains exact bounded context", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-context-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const { mkdirSync } = await import("node:fs");
+  const { LocalContentStore } = await import("../dist/content/local.js");
+  const {
+    assertContextFactsResolved,
+    assertPlanningLookupRecord,
+    contextDigest,
+    initializeContextLookup,
+    repositoryContextResult,
+    resolveContextRequests,
+    retainContextPacket,
+  } = await import("../dist/compiler/context.js");
+  const checkout = join(root, "target");
+  mkdirSync(checkout);
+  git(checkout, "init", "-q");
+  git(checkout, "config", "user.email", "test@example.invalid");
+  git(checkout, "config", "user.name", "Factory integration");
+  mkdirSync(join(checkout, "api"));
+  writeFileSync(
+    join(checkout, "api", "contract.txt"),
+    "version one\ncomplete interface body\n",
+  );
+  writeFileSync(join(checkout, "secret.txt"), "outside admitted selector\n");
+  git(checkout, "add", ".");
+  git(checkout, "commit", "-qm", "immutable context baseline");
+  const baseSha = git(checkout, "rev-parse", "HEAD");
+  const store = new LocalContentStore(join(root, "private-content"));
+  const required = {
+    id: "contract",
+    operation: "read",
+    collection: "repository",
+    selector: "api/contract.txt",
+    query: "",
+    required: true,
+    reason: "Missing material interface body",
+  };
+  const resolver = {
+    binding: contextDigest({ baseSha, selectors: ["api/"] }),
+    bounds: {
+      maxRounds: 3,
+      maxRequestsPerRound: 4,
+      maxResults: 8,
+      maxBytes: 4096,
+      maxElapsedMs: 5000,
+      maxProviderCalls: 1,
+    },
+    catalog: [
+      {
+        id: "repository",
+        selectors: ["api/"],
+        operations: ["read", "search", "inventory"],
+        freshness: `immutable:${baseSha}`,
+        completeness: "complete",
+      },
+    ],
+    automatic: [required],
+    contentStore: store,
+    resolve: async (request, remaining) =>
+      repositoryContextResult(checkout, baseSha, request, remaining),
+  };
+  const record = await initializeContextLookup(resolver);
+  assertContextFactsResolved(record.packet);
+  assert.equal(
+    record.packet.automatic[0].matches[0].content,
+    "version one\ncomplete interface body\n",
+  );
+  writeFileSync(
+    join(checkout, "api", "contract.txt"),
+    "uncommitted changed body\n",
+  );
+  const results = await resolveContextRequests(record, resolver, [
+    { ...required, id: "reused" },
+    { ...required, id: "inventory", operation: "inventory", selector: "api/" },
+    {
+      ...required,
+      id: "empty",
+      operation: "inventory",
+      selector: "api/missing/",
+    },
+    { ...required, id: "denied", selector: "secret.txt", required: false },
+  ]);
+  assert.match(results[0].detail, /Reused retained exact result/);
+  assert.equal(
+    results[0].matches[0].content,
+    record.packet.automatic[0].matches[0].content,
+  );
+  assert.equal(results[1].disposition, "complete");
+  assert.equal(
+    JSON.parse(results[1].matches[0].content)[0].path,
+    "api/contract.txt",
+  );
+  assert.equal(results[2].disposition, "no-match");
+  assert.equal(results[3].disposition, "denied");
+  record.packet.batches.push(results);
+  record.requestDigests.push(contextDigest(results.map((r) => r.request)));
+  await retainContextPacket(record, store);
+  const restarted = JSON.parse(JSON.stringify(record));
+  assertPlanningLookupRecord(restarted);
+  const persisted = await store.open(restarted.packetRef);
+  const persistedBytes = await new Response(persisted).text();
+  assert.equal(persistedBytes, JSON.stringify(restarted.packet));
+  await store.verify(restarted.packetRef);
+  assertContextFactsResolved(restarted.packet);
+  const missing = await resolveContextRequests(restarted, resolver, [
+    { ...required, id: "missing-body", selector: "api/missing.txt" },
+  ]);
+  restarted.packet.batches.push(missing);
+  await retainContextPacket(restarted, store);
+  assert.throws(
+    () => assertContextFactsResolved(restarted.packet),
+    /Mandatory planning facts remain unknown/,
+  );
+  const expired = JSON.parse(JSON.stringify(record.packet));
+  for (const result of [...expired.automatic, ...expired.batches.flat()]) {
+    for (const match of result.matches)
+      match.provenance.validUntil = "2000-01-01T00:00:00.000Z";
+  }
+  assert.throws(
+    () => assertContextFactsResolved(expired),
+    /Mandatory planning facts remain unknown/,
+  );
+  assert.equal(
+    repositoryContextResult(
+      checkout,
+      baseSha,
+      { ...required, selector: "../secret.txt" },
+      { maxResults: 1, maxBytes: 4096, deadlineAt: Date.now() + 5000 },
+    ).disposition,
+    "denied",
+  );
+  assert.equal(
+    repositoryContextResult(checkout, baseSha, required, {
+      maxResults: 1,
+      maxBytes: 2,
+      deadlineAt: Date.now() + 5000,
+    }).disposition,
+    "incomplete",
+  );
+});

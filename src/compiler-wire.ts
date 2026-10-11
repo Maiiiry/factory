@@ -1,4 +1,10 @@
 import { createHash } from "node:crypto";
+import { assertDiscoverySpecification } from "./discovery.js";
+import {
+  assertContextRequest,
+  assertPlanningContextPacket,
+  type PlanningTurnResponse,
+} from "./compiler/context.js";
 import {
   assertPlanningExecutionBounds,
   type CoverageProof,
@@ -119,6 +125,7 @@ export function compilerWire(
         ...(request.localExecutables ? [request.localExecutables] : []),
         ...(request.executionBounds ? [request.executionBounds] : []),
         request.sources,
+        ...(request.contextLookup ? [request.contextLookup] : []),
         request.executionProfiles,
         request.controllerCapabilitiesDigest,
         ...(request.fixedScripts?.length ? [request.fixedScripts] : []),
@@ -207,6 +214,24 @@ export function compilerWire(
     minimumAssetSets: { type: "integer", minimum: 0 },
     requiredLfsRoles: { type: "array", items: text },
   });
+  if (request.contextLookup) {
+    itemSchema.properties!.discoveryInputs = {
+      type: "array",
+      items: strict({
+        producerItemId: { ...text, minLength: 1 },
+        role: { ...text, minLength: 1 },
+        fields: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "string",
+            enum: ["path", "mode", "blobSha", "contentRef", "classification"],
+          },
+        },
+      }),
+    };
+    itemSchema.required!.push("discoveryInputs");
+  }
   if (request.executionProfiles) {
     itemSchema.properties!.executionProfile = strict({
       id: {
@@ -278,6 +303,7 @@ export function compilerWire(
       "final-review",
       "final-controller",
     ],
+    ...(request.contextLookup ? { discovery: [] } : {}),
     aggregate: [
       "result-command",
       "result-semantic",
@@ -351,6 +377,29 @@ export function compilerWire(
               item.required = item.required!.filter(
                 (field) => !readonlyFields.includes(field),
               );
+            }
+            if (kind === "discovery") {
+              item.properties!.validation = {
+                type: "array",
+                maxItems: 0,
+                items: strict({ kind: text }),
+              };
+              item.properties!.discovery = strict({
+                mode: { type: "string", enum: ["inventory", "semantic"] },
+                selectors: { type: "array", minItems: 1, items: text },
+                schema: {
+                  type: "string",
+                  enum: ["factory.repository-inventory/v1"],
+                },
+                role: { ...text, minLength: 1 },
+                completeness: { type: "string", enum: ["complete"] },
+                allowance: strict({
+                  maxEntries: { type: "integer", minimum: 1 },
+                  maxBytes: { type: "integer", minimum: 1 },
+                  maxAttempts: { type: "integer", minimum: 1 },
+                }),
+              });
+              item.required!.push("discovery");
             }
             if (kind === "aggregate") {
               delete item.properties!.acceptance;
@@ -433,7 +482,7 @@ export function compilerWire(
       : {}),
     contextId,
   };
-  return {
+  const graphWire = {
     schema,
     data,
     decode(value: unknown): WorkGraph {
@@ -526,7 +575,15 @@ export function compilerWire(
               (item.kind === "work" || !readonlyFields.includes(field)) &&
               (item.kind !== "aggregate" || field !== "acceptance"),
           );
+          if (item.kind === "discovery") expected.push("discovery");
           keys(item, expected, "item");
+          if (item.kind === "discovery") {
+            assertDiscoverySpecification(item.discovery);
+            if (!Array.isArray(item.validation) || item.validation.length)
+              throw new PlannerChoiceError(
+                "Discovery cannot run graph commands",
+              );
+          }
           if (item.kind === "aggregate")
             item.acceptance = aggregateAcceptance(
               item as unknown as WorkGraph["items"][number],
@@ -820,6 +877,93 @@ export function compilerWire(
           "Planner QA node has no acceptance coverage",
         );
       return graph;
+    },
+  };
+  if (!request.contextLookup) return graphWire;
+  assertPlanningContextPacket(request.contextLookup);
+  const requestSchema = strict({
+    id: { ...text, minLength: 1, maxLength: 128 },
+    operation: { type: "string", enum: ["read", "search", "inventory"] },
+    collection: { ...text, minLength: 1, maxLength: 128 },
+    selector: { ...text, maxLength: 4096 },
+    query: { ...text, maxLength: 1024 },
+    required: { type: "boolean" },
+    reason: { ...text, minLength: 1, maxLength: 4096 },
+  });
+  return {
+    schema: strict({
+      contextId: { type: "string", enum: [contextId] },
+      outcome: {
+        anyOf: [
+          strict({ kind: { type: "string", enum: ["graph"] }, graph: schema }),
+          strict({
+            kind: { type: "string", enum: ["context-request"] },
+            requests: {
+              type: "array",
+              minItems: 1,
+              maxItems: request.contextLookup.bounds.maxRequestsPerRound,
+              items: requestSchema,
+            },
+          }),
+          strict({
+            kind: { type: "string", enum: ["human-dependency"] },
+            question: { ...text, minLength: 1 },
+            detail: { ...text, minLength: 1 },
+          }),
+        ],
+      },
+    }),
+    data: { ...data, contextLookup: request.contextLookup },
+    decode(value: unknown): PlanningTurnResponse {
+      const outer = object(value, "context response");
+      keys(outer, ["contextId", "outcome"], "context response");
+      if (outer.contextId !== contextId)
+        throw new Error("Planner context identity differs from this request");
+      const outcome = object(outer.outcome, "outcome");
+      if (outcome.kind === "graph") {
+        keys(outcome, ["kind", "graph"], "graph outcome");
+        return { kind: "graph", graph: graphWire.decode(outcome.graph) };
+      }
+      if (outcome.kind === "context-request") {
+        keys(outcome, ["kind", "requests"], "context request outcome");
+        if (
+          !Array.isArray(outcome.requests) ||
+          !outcome.requests.length ||
+          outcome.requests.length >
+            request.contextLookup!.bounds.maxRequestsPerRound
+        )
+          throw new Error("Context request batch exceeds admitted bounds");
+        const ids = new Set<string>();
+        for (const entry of outcome.requests) {
+          assertContextRequest(entry);
+          if (ids.has(entry.id))
+            throw new Error("Context request batch repeats an identity");
+          ids.add(entry.id);
+        }
+        return { kind: "context-request", requests: outcome.requests };
+      }
+      if (outcome.kind === "human-dependency") {
+        keys(
+          outcome,
+          ["kind", "question", "detail"],
+          "human dependency outcome",
+        );
+        if (
+          typeof outcome.question !== "string" ||
+          !outcome.question.trim() ||
+          typeof outcome.detail !== "string" ||
+          !outcome.detail.trim()
+        )
+          throw new Error(
+            "Human dependency must state a concrete question and missing fact",
+          );
+        return {
+          kind: "human-dependency",
+          question: outcome.question,
+          detail: outcome.detail,
+        };
+      }
+      throw new Error("Invalid planning context response kind");
     },
   };
 }
