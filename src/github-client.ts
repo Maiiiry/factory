@@ -2,6 +2,10 @@ import { Octokit } from "@octokit/core";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as time from "./clock.js";
 import {
+  QUEUE_READ_QUERIES,
+  QUEUE_WRITE_QUERIES,
+} from "./github-project-queue-wire.js";
+import {
   attachedFault,
   attachFault,
   decision,
@@ -193,6 +197,14 @@ export class GitHubRequestError extends Error {
     readonly pendingMerge?: string,
   ) {
     super(`GitHub request failed (HTTP ${status})`);
+  }
+}
+
+/** A completed GraphQL envelope is retained even when it cannot settle a queue effect. */
+export class GitHubProjectQueueGraphqlError extends Error {
+  constructor(readonly original: unknown) {
+    super("GitHub Project queue returned an unavailable original response");
+    this.name = "GitHubProjectQueueGraphqlError";
   }
 }
 
@@ -633,6 +645,30 @@ export class GitHubClient {
       !response.data
     )
       throw new Error("GitHub Project field observation is unavailable");
+    return response.data;
+  }
+
+  /** Fixed queue adapter only; no caller-supplied GraphQL operation surface. */
+  async projectQueueGraphql<T>(
+    query: string,
+    variables: Record<string, unknown>,
+    readOnly: boolean,
+  ): Promise<T> {
+    if (!(readOnly ? QUEUE_READ_QUERIES : QUEUE_WRITE_QUERIES).includes(query))
+      throw new Error("Unsupported Project queue GraphQL operation");
+    const response = await this.dispatch<{ errors?: unknown[]; data?: T }>(
+      "POST",
+      "graphql",
+      { query, variables },
+      undefined,
+      readOnly,
+    );
+    if (
+      (response.errors !== undefined &&
+        (!Array.isArray(response.errors) || response.errors.length)) ||
+      !response.data
+    )
+      throw new GitHubProjectQueueGraphqlError(response);
     return response.data;
   }
 

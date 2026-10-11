@@ -1,59 +1,20 @@
-import {
-  awaitCheckpointAdmission,
-  isCheckpointAdmissionFailure,
-  withRecoveryCheckpointScope,
-} from "./recovery-checkpoint.js";
-import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
-import { graphExpansionPending } from "./runner/expansion.js";
+import { existsSync, mkdirSync } from "node:fs";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { releaseAgentSessions } from "./agent-session.js";
 import {
   bindPlanningPlaybook,
   resolvePlan,
   verifyPlanCandidate,
 } from "./compiler.js";
-import {
-  matchesPlanDecision,
-  phonePlanEligible,
-} from "./github-plan-decisions.js";
-import { progressDigest } from "./github-progress-state.js";
-import { projectGitHubProgress } from "./github-progress-projection.js";
-import { projectGitHubProjectStatus } from "./github-project-projection.js";
-import { hasReadinessWait } from "./delivery/readiness.js";
-import { executionContext } from "./execution/checkpoint.js";
-import {
-  archiveAttempt,
-  charge,
-  repairScopes,
-  type RepairCorrection,
-} from "./repair-policy.js";
-import { assertFailedValidationRecord } from "./failed-validation.js";
-import {
-  applyWorkCorrection,
-  recordSavedResultRefusal,
-  recordWorkFailure,
-} from "./work-repair.js";
-import { operatorName } from "./operator.js";
-import { approvedPlaybook, observeRetrospective } from "./learning.js";
-import {
-  amendmentBlocksDispatch,
-  graphDigest,
-  submitAmendment,
-  type AmendmentProposal,
-} from "./graph-amendments.js";
-import { existsSync, mkdirSync } from "node:fs";
-import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import { objectiveComplete } from "./completion.js";
-import { withGitHubTransportObserver } from "./github-client.js";
 import type { FactoryConfig } from "./config.js";
 import { factoryConfigDigest, stateRoot } from "./config.js";
-import { releaseAgentSessions } from "./agent-session.js";
 import type {
   ContentStore,
   ExecutionDriver,
   GitHubGateway,
   PlanningModel,
 } from "./contracts.js";
-import { cancelledFault } from "./fault.js";
-import { SemanticAcceptanceFailure } from "./semantic-refusal.js";
 import {
   type ControlRequest,
   ForegroundControllerError,
@@ -61,24 +22,75 @@ import {
   serveControl,
 } from "./coordinator-control.js";
 import { linearDeliveryUnits } from "./delivery/plan.js";
+import { hasReadinessWait } from "./delivery/readiness.js";
 import {
   continuationStatusDocument,
   DiagnosticEmitter,
   withDiagnosticSession,
 } from "./diagnostics.js";
+import { executionContext } from "./execution/checkpoint.js";
+import { assertFailedValidationRecord } from "./failed-validation.js";
+import { cancelledFault } from "./fault.js";
+import { withGitHubTransportObserver } from "./github-client.js";
 import {
-  awaitsOperator,
-  clearAllRepeats,
-  clearRepeats,
-  waitOf,
-} from "./step.js";
+  matchesPlanDecision,
+  phonePlanEligible,
+} from "./github-plan-decisions.js";
+import { projectGitHubProgress } from "./github-progress-projection.js";
+import { progressDigest } from "./github-progress-state.js";
+import { projectGitHubProjectStatus } from "./github-project-projection.js";
+import {
+  type AmendmentProposal,
+  amendmentBlocksDispatch,
+  graphDigest,
+  submitAmendment,
+} from "./graph-amendments.js";
+import { approvedPlaybook, observeRetrospective } from "./learning.js";
 import { assetSelectionDigest } from "./media.js";
+import { operatorName } from "./operator.js";
 import {
   linuxProcessIdentity,
   pinnedGit,
   withProcessCancellation,
 } from "./process.js";
+import {
+  assertProjectQueueRunLive,
+  claimProjectQueueRun,
+  type QueueOwnerClaim,
+  settleProjectQueueRun,
+} from "./project-queue-state.js";
 import { objectiveCandidate } from "./qa.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import {
+  archiveAttempt,
+  charge,
+  type RepairCorrection,
+  repairScopes,
+} from "./repair-policy.js";
+import { runObjectivePass } from "./runner/execution.js";
+import { graphExpansionPending } from "./runner/expansion.js";
+import {
+  type ApplicationServices,
+  CoordinatorHandoff,
+  cancelKnownWork,
+  canHandoff,
+  closeCancelledIssues,
+  configuredDiagnosticSecrets,
+  type LocalOwner,
+  mutationLock,
+  mutationState,
+  ownerKey,
+  owners,
+  releaseMutationLock,
+  synchronizeWorkItemPause,
+} from "./runner/ownership.js";
+import { decidePlan } from "./runner/planning.js";
+import { SemanticAcceptanceFailure } from "./semantic-refusal.js";
 import type { ContinuationState, WorkState } from "./state.js";
 import {
   isExecutionState,
@@ -100,25 +112,20 @@ import {
   statePath,
 } from "./state-store.js";
 import {
-  type ApplicationServices,
-  type LocalOwner,
-  synchronizeWorkItemPause,
-  CoordinatorHandoff,
-  canHandoff,
-  owners,
-  ownerKey,
-  mutationState,
-  mutationLock,
-  releaseMutationLock,
-  closeCancelledIssues,
-  cancelKnownWork,
-  configuredDiagnosticSecrets,
-} from "./runner/ownership.js";
-import { decidePlan } from "./runner/planning.js";
-import { runObjectivePass } from "./runner/execution.js";
+  awaitsOperator,
+  clearAllRepeats,
+  clearRepeats,
+  waitOf,
+} from "./step.js";
+import {
+  applyWorkCorrection,
+  recordSavedResultRefusal,
+  recordWorkFailure,
+} from "./work-repair.js";
+
 export type { ApplicationServices } from "./runner/ownership.js";
 export { CoordinatorHandoff } from "./runner/ownership.js";
-export { planObjective, decidePlan } from "./runner/planning.js";
+export { decidePlan, planObjective } from "./runner/planning.js";
 
 /** Local observations share the controller's async scope, never its mutation authority. */
 function withGitHubDiagnostics<T>(
@@ -427,8 +434,24 @@ async function runObjectiveOwned(
       throw new Error("Borrowed Objective owner identity differs");
   }
   let snapshot: ContinuationState | undefined;
+  let queueClaim: QueueOwnerClaim | undefined;
   try {
     snapshot = readContinuation(config.repository, objective);
+    queueClaim = await claimProjectQueueRun(
+      config,
+      services.github,
+      objective,
+      lock.token,
+      snapshot,
+    );
+    if (queueClaim) {
+      if (options.deadlineAt && options.deadlineAt !== queueClaim.deadlineAt)
+        throw new Error("Project dispatch cannot replace its frozen deadline");
+      options = {
+        ...options,
+        ...(queueClaim.deadlineAt ? { deadlineAt: queueClaim.deadlineAt } : {}),
+      };
+    }
     const current = snapshot ? undefined : approvedPlaybook(config.repository);
     const pin = snapshot
       ? snapshot.approvedPlaybookPin
@@ -456,6 +479,7 @@ async function runObjectiveOwned(
   let woke: { promise: Promise<void>; resolve: () => void } | undefined;
   const owner: LocalOwner = {
     changed: false,
+    admittedObjectiveBodyDigest: queueClaim?.bodyDigest,
     lock,
     abort: new AbortController(),
     pause: new AbortController(),
@@ -630,6 +654,8 @@ async function runObjectiveOwned(
         return "requested";
       }
       if (["pause", "drain", "resume", "handoff"].includes(request.action)) {
+        if (request.action === "resume" && queueClaim)
+          await assertProjectQueueRunLive(config, services.github, queueClaim);
         if (request.action === "handoff") releaseOwnership();
         else if (request.action === "resume") {
           if (
@@ -1053,12 +1079,22 @@ async function runObjectiveOwned(
     options.observeControl?.(undefined);
     if (server)
       await new Promise<void>((resolve) => server.close(() => resolve()));
-    await controlTail;
-    await progressTask;
-    await projectProgress();
-    observeRetrospective(config, objective);
-    owners.delete(ownerKey(config, objective));
-    if (!options.ownerLock) releaseControllerLock(lockPath, lock);
+    try {
+      await controlTail;
+      await progressTask;
+      await projectProgress();
+      observeRetrospective(config, objective);
+      if (queueClaim && owner.snapshot && canHandoff(owner.snapshot))
+        await settleProjectQueueRun(
+          config,
+          queueClaim,
+          lock.token,
+          owner.snapshot.runId,
+        );
+    } finally {
+      owners.delete(ownerKey(config, objective));
+      if (!options.ownerLock) releaseControllerLock(lockPath, lock);
+    }
   }
 }
 

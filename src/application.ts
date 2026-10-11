@@ -45,8 +45,11 @@ import { profileBinding } from "./execution-profiles.js";
 import { RealGitHubGateway } from "./github.js";
 import {
   enqueueIntake,
+  ensureProjectObjective,
+  intakeControl,
   type IntakeAuthorization,
   runIntake,
+  watchIntake,
 } from "./intake.js";
 import {
   executionCredential,
@@ -107,7 +110,19 @@ function checkpointOperations(config: FactoryConfig) {
 }
 
 export interface FactoryApplication {
-  enqueueIntake(objectives: number[]): Promise<IntakeAuthorization>;
+  enqueueIntake(
+    objectives: number[],
+    options?: { expectedBodyDigests?: Record<string, string> },
+  ): Promise<IntakeAuthorization>;
+  intakeControl(
+    action: Parameters<typeof intakeControl>[1],
+    objective?: number,
+  ): Promise<unknown>;
+  watchIntake(): Promise<IntakeAuthorization>;
+  ensureProjectObjective(
+    objective: number,
+    provenance?: Parameters<typeof ensureProjectObjective>[3],
+  ): Promise<unknown>;
   runIntake(): Promise<IntakeAuthorization>;
   proposeAmendment(
     objective: number,
@@ -255,9 +270,21 @@ export function createApplication(
   }
   const checkpoint = checkpointOperations(config);
   return {
-    enqueueIntake: (objectives) =>
+    enqueueIntake: (objectives, options) =>
       checkpoint.async(() =>
-        enqueueIntake(config, services.github, objectives),
+        enqueueIntake(config, services.github, objectives, options),
+      ),
+    intakeControl: (action, objective) =>
+      action === "status" || action === "sync"
+        ? intakeControl(config, action, objective, services.github)
+        : checkpoint.async(() =>
+            intakeControl(config, action, objective, services.github),
+          ),
+    watchIntake: () =>
+      checkpoint.async(() => watchIntake(config, services.github)),
+    ensureProjectObjective: (objective, provenance) =>
+      checkpoint.async(() =>
+        ensureProjectObjective(config, services.github, objective, provenance),
       ),
     runIntake: () => checkpoint.async(() => runIntake(config, services)),
     planObjective: (objective) => {
@@ -330,7 +357,10 @@ export function createApplication(
 /** Model-free intake binding does not construct a provider driver or require its credential. */
 export function composeIntake(
   config: FactoryConfig,
-): Pick<FactoryApplication, "enqueueIntake"> {
+): Pick<
+  FactoryApplication,
+  "enqueueIntake" | "intakeControl" | "watchIntake" | "ensureProjectObjective"
+> {
   validateTarget(config.repository, config.checkout);
   const github = new RealGitHubGateway(
     config.repository,
@@ -338,8 +368,21 @@ export function composeIntake(
   );
   const checkpoint = checkpointOperations(config);
   return {
-    enqueueIntake: (objectives) =>
-      checkpoint.async(() => enqueueIntake(config, github, objectives)),
+    enqueueIntake: (objectives, options) =>
+      checkpoint.async(() =>
+        enqueueIntake(config, github, objectives, options),
+      ),
+    intakeControl: (action, objective) =>
+      action === "status" || action === "sync"
+        ? intakeControl(config, action, objective, github)
+        : checkpoint.async(() =>
+            intakeControl(config, action, objective, github),
+          ),
+    watchIntake: () => checkpoint.async(() => watchIntake(config, github)),
+    ensureProjectObjective: (objective, provenance) =>
+      checkpoint.async(() =>
+        ensureProjectObjective(config, github, objective, provenance),
+      ),
   };
 }
 

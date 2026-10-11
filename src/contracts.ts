@@ -1307,7 +1307,71 @@ export interface IntakeIssuePage {
   etag?: string;
   data?: { number: number; state: "open" | "closed"; labels: string[] }[];
 }
+/** Explicit authority for an existing Project's two dedicated queue fields. */
+export interface ProjectQueueBinding {
+  repository: string;
+  projectId: string;
+  metadataFieldId: string;
+  orderFieldId: string;
+  controlItemId: string;
+  factoryManagedFields: true;
+}
+export interface ProjectQueueCard {
+  itemId: string;
+  issueNodeId: string;
+  objective: number;
+  repository: string;
+  title: string;
+  state: "open" | "closed";
+  body: string;
+  order: number | null;
+  metadata: string | null;
+  archived: boolean;
+}
+export interface ProjectQueueSnapshot {
+  binding: ProjectQueueBinding;
+  observedAt: string;
+  actorId: number;
+  owner: string;
+  control: { itemId: string; metadata: string | null };
+  cards: ProjectQueueCard[];
+  ignoredCards: {
+    itemId: string;
+    kind: "draft" | "foreign-issue" | "pull-request";
+    archived: boolean;
+  }[];
+}
+export type ProjectQueueAction =
+  | { action: "ensure-card"; issueNodeId: string }
+  | { action: "set-order"; itemId: string; order: number }
+  | { action: "set-metadata"; itemId: string; metadata: string };
+export type ProjectQueueIntent = ProjectQueueAction & {
+  binding: ProjectQueueBinding;
+  requestId: string;
+  actorId: number;
+  observedAt: string;
+  fieldId?: string;
+  /** Exact fixed adapter request retained before the effect, including selection variables. */
+  request: { query: string; variables: Record<string, unknown> };
+};
+export type ProjectQueueWriteRequest = ProjectQueueAction & {
+  binding: ProjectQueueBinding;
+  requestId: string;
+  /** The owner durably retains this exact intent and admits it before transport. */
+  beforeWrite(intent: ProjectQueueIntent): void | Promise<void>;
+  /** A submitted prior effect permits no further mutation. */
+  pending?: ProjectQueueIntent;
+};
+export interface ProjectQueueWriteReceipt {
+  intent: ProjectQueueIntent;
+  itemId: string;
+  observedAt: string;
+  kind: "response" | "existing-read";
+  /** The original authenticated GraphQL data, never a later confirmation read. */
+  original: unknown;
+}
 export interface ObjectiveIssue {
+  nodeId?: string;
   labels?: string[];
   state?: "open" | "closed";
   body: string;
@@ -1330,6 +1394,12 @@ export interface NamedCheckEvidence {
 export interface GitHubGateway {
   readonly effectAdmission?: "controller-checkpoint-v1";
   readonly projectionMutationAdmission?: "controller-checkpoint-v1";
+  projectQueueRead?(
+    binding: ProjectQueueBinding,
+  ): Promise<ProjectQueueSnapshot>;
+  projectQueueWrite?(
+    request: ProjectQueueWriteRequest,
+  ): Promise<ProjectQueueWriteReceipt>;
   projectStatus?(
     request: import("./github-project-state.js").ProjectStatusRequest,
   ): Promise<import("./github-project-state.js").ProjectStatusObservation>;

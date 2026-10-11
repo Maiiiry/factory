@@ -19,6 +19,7 @@ Running `setup --background` is the service consent. It grants no provider spend
 ## Gather
 
 - GitHub `OWNER/REPO` and the trusted absolute checkout path. Read the target's instructions.
+- For background operation, the existing Project, dedicated TEXT metadata and NUMBER order field IDs, and existing control card. Bind them under `queue.project` with explicit managed-field consent and a private-history Git checkpoint destination. Reuse approved bindings; verify access and actual field types. Missing Project/field or archive choices belong to the operator; setup does not create them or infer consent from roadmap cards.
 - Optional: `--concurrency N` (omit it and Factory sizes workers from the host), `--delivery regular|native-stack`, `--network host|off`, and role models with `--planning-model`, `--review-model`, `--worker-model` plus matching `--*-reasoning`.
 - For `--planning claude-agent-sdk`, ask for the planning and review models. It uses the operator's `claude auth login`.
 
@@ -61,4 +62,4 @@ Only for Objectives the operator named:
 factory queue add N [N ...]
 ```
 
-They run one at a time, in the order added, within the [autonomy limits](https://github.com/clockgrove/factory/blob/main/docs/USER-GUIDE.md#autonomy-limits). Labels and discovery never select an Objective. Manage the queue with `factory queue list|remove N|pause|resume|drain` and the service with `factory supervisor start|stop [--disable]|upgrade --cli ABSOLUTE_INSTALLED_CLI|uninstall`. Day-to-day operation is the `director` skill.
+They run one at a time, in Project order, within the [autonomy limits](https://github.com/clockgrove/factory/blob/main/docs/USER-GUIDE.md#autonomy-limits). Labels and roadmap cards never select an Objective. Manage the queue with `factory queue list|sync|remove N|pause|resume|drain` and the service with `factory supervisor start|stop [--disable]|upgrade --cli ABSOLUTE_INSTALLED_CLI|uninstall`. List/sync observe current Project data; they grant no authority or mutation replay. Legacy local queue files are ignored and preserved, never automatically imported or reapproved. Restored Git receipts do not activate a service or prove foreign ownership settled. Day-to-day operation is the `director` skill.

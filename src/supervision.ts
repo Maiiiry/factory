@@ -8,6 +8,7 @@ import {
   readIntake,
   intakeSettled,
   resumeWatcherAfterUpgrade,
+  type IntakeAuthorization,
 } from "./intake.js";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -467,16 +468,17 @@ function hasOwner(config: FactoryConfig): boolean {
     current && current.startTime === owner?.startTime && current.state !== "Z",
   );
 }
-export function checkIntakeServiceState(
+export async function checkIntakeServiceState(
   config: FactoryConfig,
   configPath: string,
-): void {
-  const intake = readIntake(config);
+): Promise<IntakeAuthorization> {
+  const intake = await readIntake(config);
   if (!intake?.watch)
     throw new Error(
       "The background service is not set up; run `factory setup --background`",
     );
   for (const id of intake.objectives) checkServiceState(config, id, configPath);
+  return intake;
 }
 
 /**
@@ -532,7 +534,7 @@ async function verifyServiceOwner(
     await pause(100);
   }
   throw new Error(
-    `Service has not established its exact coordinator owner. The service log has the reason (a package that refuses the retained state says so there): \`journalctl --user -u ${name} -n 50 --no-pager\`. Inspect \`factory status\` and retained evidence, which are untouched${readIntake(config)?.mode === "draining" ? "; the queue is draining, so `factory queue resume` is needed before the service stays up" : ""}`,
+    `Service has not established its exact coordinator owner. The service log has the reason (a package that refuses the retained state says so there): \`journalctl --user -u ${name} -n 50 --no-pager\`. Inspect \`factory status\` and retained evidence, which are untouched`,
   );
 }
 function saveUnit(path: string, value: ServiceBinding): void {
@@ -591,7 +593,7 @@ export async function supervise(
       ),
       environment,
     };
-    checkIntakeServiceState(config, configPath);
+    await checkIntakeServiceState(config, configPath);
     if (existsSync(path)) {
       if (JSON.stringify(binding(config)) !== JSON.stringify(value))
         throw new Error(
@@ -622,13 +624,13 @@ export async function supervise(
       validateCredentialFile(config, name, file);
     // Refuse retained state this installation cannot continue here, with its
     // remedy, instead of starting a service that exits with it in the log.
-    checkIntakeServiceState(config, configPath);
+    const intake = await checkIntakeServiceState(config, configPath);
     if (hasOwner(config) && inspect("is-active", name) !== "active")
       throw new Error(
         "An existing foreground owner must hand off before service start",
       );
     // A stopped service leaves its queue draining, and a draining queue ends the service at once.
-    if (!hasOwner(config) && readIntake(config)?.mode === "draining")
+    if (!hasOwner(config) && intake.mode === "draining")
       throw new Error(
         "The queue is draining, so a started service would exit at once; run `factory queue resume`, then `factory supervisor start`",
       );
@@ -649,19 +651,20 @@ export async function supervise(
     // A failed unit is one that should be running: upgrading it, as when returning from a
     // package that refused the retained state, starts it again.
     const wasActive = ["active", "failed"].includes(inspect("is-active", name));
-    const beforeIntake = candidate ? readIntake(config) : undefined;
+    const beforeIntake = candidate ? await readIntake(config) : undefined;
     const resumeIdleWatcher =
       wasActive &&
       beforeIntake?.watch &&
       beforeIntake.mode === "running" &&
-      intakeSettled(config);
+      (await intakeSettled(config));
     await handoffService(config, undefined, value.objective);
     systemctl("stop", name);
     if (candidate) {
       saveUnit(path, candidate);
       systemctl("daemon-reload");
       const restart = beforeIntake?.watch
-        ? !!resumeIdleWatcher && resumeWatcherAfterUpgrade(config, beforeIntake)
+        ? !!resumeIdleWatcher &&
+          (await resumeWatcherAfterUpgrade(config, beforeIntake))
         : wasActive;
       if (restart) {
         systemctl("start", name);

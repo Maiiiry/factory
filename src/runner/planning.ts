@@ -216,9 +216,12 @@ export async function planObjective(
     "planningModel" | "github" | "contentStore"
   > & { driver?: ExecutionDriver },
 ): Promise<PlanCandidate> {
-  if (config.gitPersistence?.scope === "private-history")
+  if (
+    config.queue?.project ||
+    config.gitPersistence?.scope === "private-history"
+  )
     throw new Error(
-      "Git-backed continuation requires a canonical Objective run; use runObjective instead of the transient planning preview",
+      "Project queues and Git-backed continuation require a canonical Objective run; use runObjective with its admission instead of the transient planning preview",
     );
   const digest = factoryConfigDigest(config);
   const emitter = new DiagnosticEmitter(

@@ -396,17 +396,44 @@ Run the same command again to resume from recorded state. A saved plan is reused
 
 The background service runs queued Objectives one at a time. Foreground runs of different Objectives can run in parallel, but the service and a live foreground run exclude each other. It needs a systemd user manager and keeps running after the terminal closes. Sleep pauses it, shutdown stops it, and logout behavior follows your host's linger setting. Factory changes neither.
 
+Bind an existing Project and its dedicated scheduling fields in the configuration before background setup:
+
+```json
+{
+  "queue": {
+    "pollSeconds": 30,
+    "project": {
+      "repository": "OWNER/REPO",
+      "projectId": "EXISTING_PROJECT_NODE_ID",
+      "metadataFieldId": "EXISTING_TEXT_FIELD_ID",
+      "orderFieldId": "EXISTING_NUMBER_FIELD_ID",
+      "controlItemId": "EXISTING_CONTROL_CARD_ID",
+      "factoryManagedFields": true
+    }
+  }
+}
+```
+
+The Project must belong to the target repository owner and be open and writable. Its TEXT and NUMBER fields must be distinct from derived progress/status fields. The control card is an existing nonarchived Issue or draft card. Mutating admission and dispatch also require configured [private-history Git checkpoints](#git-checkpoints). Setup verifies these bindings; it does not create Projects or fields.
+
+Issues supply Objective definitions. The Project supplies current membership, deterministic order and controls. Git preserves immutable approval, effect and ownership receipts; it does not contain a second pending queue. A roadmap card or a manual metadata edit grants no execution authority. Queue admission binds the exact Issue body and the configured providers, isolation and limits.
+
+When a Project queue is configured, foreground `run` also requires a current approved admission and running queue control. Use `queue add N` first for an explicitly authorized Objective; `run` never silently admits it or clears pause/drain. Foreground configurations without a Project retain their existing direct consent path.
+
 ```sh
 factory queue add N [N ...]   # consent to run these, in order, within the autonomy limits
-factory queue list | remove N | pause | resume | drain
+factory queue list | sync | remove N | pause | resume | drain
 factory supervisor start | stop [--disable] | upgrade --cli /abs/installed/dist/cli.js | uninstall
 ```
 
-- `queue add` never replaces the queue. An Objective already queued keeps its place and takes the issue's current body. `remove` withdraws a pending Objective and refuses an active one.
+- `queue add` never replaces the queue. An unchanged admission keeps its place; changed contents require explicit admission and cannot rewrite an active run's binding. `remove` withdraws a pending Objective and refuses an active one.
+- `queue list` and `queue sync` reread the Project and current definitions. They never approve work, reorder it or replay an uncertain mutation. Unavailable or incomplete GitHub observations hold new dispatch. Git fast-forward ownership claims prevent two hosts from consuming the same admission.
 - Queued Objectives that an earlier run left unfinished go first, one at a time in queue order. The service leaves an unfinished Objective that is not queued alone; `factory queue add N` hands it over.
 - With an empty queue the service only watches GitHub, makes no model calls and lists unqueued candidates. Labels and discovery never admit work. Polling uses `queue.pollSeconds` (default 30).
 - `supervisor stop` drains and keeps state. `--disable` also stops it starting at login. `upgrade` drains the owner, then switches the unit. The new package refuses state written by an incompatible version when it starts. If the restarted service does not take ownership, the error names `journalctl --user -u UNIT` and the `factory supervisor upgrade --cli PREVIOUS_CLI` command that returns to the previous package and restarts the service.
 - An Objective that needs a human exits the service with code 2. Decide it, run `factory queue resume`, then `factory supervisor start`.
+
+Legacy `intake.json` bytes are preserved but ignored. They are never automatically imported, uploaded, deleted or reapproved. A new host reads pending entries from the Project and authenticates their Git receipts; restoring those receipts does not activate a service or prove that a foreign controller has stopped.
 
 ## Status
 
@@ -627,7 +654,7 @@ Each send makes one request with a 30-second timeout, no redirects or retries an
 
 ## Propose Objectives
 
-Draft from a tracked roadmap section (repeat `--source` for referenced ADRs/runbooks whose complete contents govern the proposal), review/edit the private JSON Objectives and their displayed citation presence (primary-wave sections and supporting context are separate; citations alone do not prove semantic completeness), then approve the exact file digest. Drafting creates no issues or work; without `--output`, its editable file stays under the private proposal state directory. Approval publishes ordinary issues and native dependencies; `--enqueue` additionally authorizes their batch intake. Keep the proposal/source/configuration binding unchanged. Changed sources need a new draft; unknown submitted GitHub mutations refuse replay and retain their evidence. Existing provider limits and independent Objective reviews still apply.
+Draft from a tracked roadmap section (repeat `--source` for referenced ADRs/runbooks whose complete contents govern the proposal), review/edit the private JSON Objectives and their displayed citation presence (primary-wave sections and supporting context are separate; citations alone do not prove semantic completeness), then approve the exact file digest. Drafting creates no issues or work; without `--output`, its editable file stays under the private proposal state directory. Approval publishes ordinary issues and native dependencies and, with a Project queue configured, places the issues on that Project as roadmap cards. `--enqueue` additionally authorizes their batch intake, preserving the exact published body digests. Keep the proposal/source/configuration binding unchanged. Changed sources need a new draft; unknown submitted GitHub mutations refuse replay and retain their evidence. Existing provider limits and independent Objective reviews still apply.
 
 ```sh
 factory propose --source 'docs/waves/wave.md#Exact heading' --output /private/existing-dir/objectives.json --config /private/factory.json
@@ -710,9 +737,9 @@ Snapshots show accepted deliveries and PR links, active work, the next action, b
 
 An optional experimental GitHub planning-answer pilot remains disabled by default; its live decision-consumption journey has not been qualified. To opt into that separate route, set `progress.includeQuestions: true` and add `"decisions": { "enabled": true, "actorIds": [YOUR_IMMUTABLE_NUMERIC_GITHUB_USER_ID] }` beside `progress`. This separately authorizes only one genuine, structurally acceptable pending planning question before issue projection. The Objective needs a finite whole-run deadline. Copy the filled JSON template from the progress details into a new comment on that Objective and replace only `answer` and `reason`. Factory authenticates the allowlisted human ID and exact unedited comment, rechecks the plan/control/deadline, and retains the answer and original question packet atomically. It does not accept Work Item results or final delivery, refuse a plan, retry work, cancel, merge or increase limits. Multiple questions, failures, stale or edited comments, unknown effects and intentional pauses stay on the local supported path. Never treat an agent-authored comment as human approval.
 
-An enabled eligible phone hold retains the current controller without provider calls while waiting. To use local plan acceptance/refusal instead, stop the owner and verify `factory status` shows no active owner. For a foreground runner, use its supported SIGTERM handoff, then `factory resume --objective N`, local `factory decide`, and restart the same run. For a background service, use `factory supervisor stop` and keep it stopped while running `factory queue resume`, then local `factory decide`; finally use `factory supervisor start`. Queue resume restores both the queue and its admitted coordinators; Objective resume alone leaves the stopped queue draining. These resume commands start no work while the owner/service remains stopped. A Factory pause retains ownership. Use the same configuration throughout. See the exact authentication, disclosure and persistence contract in [GitHub management](GITHUB-MANAGEMENT.md).
+An enabled eligible phone hold retains the current controller without provider calls while waiting. To use local plan acceptance/refusal instead, stop the owner and verify `factory status` shows no active owner. For a foreground runner, use its supported SIGTERM handoff, then `factory resume --objective N`, local `factory decide`, and restart the same run. For a background service, use `factory supervisor stop` and keep it stopped while running `factory queue resume`, then local `factory decide`; finally use `factory supervisor start`. With the service stopped, queue resume restores the Project control; resume a paused Objective separately with `factory resume --objective N` before restarting the service. An active service forwards queue resume to its current Objective. Objective resume alone leaves the stopped queue draining. These resume commands start no work while the owner/service remains stopped. A Factory pause retains ownership. Use the same configuration throughout. See the exact authentication, disclosure and persistence contract in [GitHub management](GITHUB-MANAGEMENT.md).
 
-For background intake, an optional `"queue": { "pollSeconds": 30, "objectiveDeadlineSeconds": 1500 }` records an absolute whole-Objective deadline at first dispatch. Human waiting and host downtime count toward it. Restart or configuration changes never renew a saved deadline; configuration changes affect fresh Objectives only, and an already started uncapped Objective remains uncapped. A phone hold requires a finite deadline.
+For background intake, add `"objectiveDeadlineSeconds": 1500` to the configured Project queue to record an absolute whole-Objective deadline at first dispatch. Human waiting and host downtime count toward it. Restart or configuration changes never renew a saved deadline; configuration changes affect fresh Objectives only, and an already started uncapped Objective remains uncapped. A phone hold requires a finite deadline.
 
 An optional `githubManagement.projectStatus` can update the Objective's existing Project card independently of comments:
 
@@ -737,7 +764,7 @@ An optional `githubManagement.projectStatus` can update the Objective's existing
 }
 ```
 
-The Project must belong to the target repository owner, its field must be named Status and be single-select, and every option must exist. The accepted option must differ from all others. The Objective must already have one nonarchived Project card; Factory never adds/deletes cards or touches other fields. The explicit opt-in makes this field Factory-managed, so concurrent human edits may be overwritten. Unknown update outcomes hold only this field permanently; one later read remains an observation, not mutation confirmation or permission to retry. `factory status` reports Project tracking failures separately from app acceptance. Accepted Project status follows actual accepted Objective closure.
+The Project must belong to the target repository owner, its field must be named Status and be single-select, and every option must exist. The accepted option must differ from all others. The Objective must already have one nonarchived Project card; The status projection never adds/deletes cards or touches other fields; separately configured queue admission can add cards and write its dedicated scheduling fields. The explicit opt-in makes this field Factory-managed, so concurrent human edits may be overwritten. Unknown update outcomes hold only this field permanently; one later read remains an observation, not mutation confirmation or permission to retry. `factory status` reports Project tracking failures separately from app acceptance. Accepted Project status follows actual accepted Objective closure.
 
 ## Git checkpoints
 

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import type { ProjectQueueBinding } from "./contracts.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { availableParallelism, totalmem } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -269,8 +270,12 @@ export interface FactoryConfig {
     /** Explicit recovery retention of already redacted/truncated captures. */
     retainInRecovery?: boolean;
   };
-  /** Polling and an optional elapsed limit frozen before each fresh Objective starts. */
-  queue?: { pollSeconds: number; objectiveDeadlineSeconds?: number };
+  /** Project scheduling authority; polling is observational. */
+  queue?: {
+    pollSeconds: number;
+    objectiveDeadlineSeconds?: number;
+    project?: ProjectQueueBinding;
+  };
   schemaVersion: 1;
   repository: string;
   checkout: string;
@@ -955,7 +960,7 @@ export function validateConfig(value: unknown): FactoryConfig {
     assertObject(value.queue, "queue");
     assertOnlyKeys(
       value.queue,
-      ["pollSeconds", "objectiveDeadlineSeconds"],
+      ["pollSeconds", "objectiveDeadlineSeconds", "project"],
       "queue",
     );
     if (
@@ -973,6 +978,46 @@ export function validateConfig(value: unknown): FactoryConfig {
       throw new Error(
         "queue.objectiveDeadlineSeconds must be a positive integer no greater than 2147483647",
       );
+    if (value.queue.project !== undefined) {
+      const project = value.queue.project;
+      assertObject(project, "queue.project");
+      assertOnlyKeys(
+        project,
+        [
+          "repository",
+          "projectId",
+          "metadataFieldId",
+          "orderFieldId",
+          "controlItemId",
+          "factoryManagedFields",
+        ],
+        "queue.project",
+      );
+      if (
+        project.repository !== value.repository ||
+        project.factoryManagedFields !== true ||
+        ["projectId", "metadataFieldId", "orderFieldId", "controlItemId"].some(
+          (key) =>
+            typeof project[key] !== "string" ||
+            !/^[A-Za-z0-9_-]{1,256}$/.test(project[key] as string),
+        ) ||
+        project.metadataFieldId === project.orderFieldId
+      )
+        throw new Error(
+          "queue.project requires an exact repository, distinct fields and explicit managed-field consent",
+        );
+      const status = (
+        value.githubManagement as FactoryConfig["githubManagement"]
+      )?.projectStatus;
+      if (
+        status &&
+        status.projectId === project.projectId &&
+        [project.metadataFieldId, project.orderFieldId].includes(status.fieldId)
+      )
+        throw new Error(
+          "Queue scheduling fields must be separate from derived Project status",
+        );
+    }
   }
   if (value.autonomy !== undefined)
     resolveAutonomy(value.autonomy as AutonomyConfig);
@@ -1122,6 +1167,28 @@ export function factoryConfigDigest(config: FactoryConfig): string {
   const { autonomy: _autonomy, queue: _queue, ...bound } = config;
   assertJsonValue(bound, "configuration");
   return createHash("sha256").update(JSON.stringify(bound)).digest("hex");
+}
+
+/** Portable queue approval retains semantic choices while excluding host layout and polling. */
+export function factoryAuthorityDigest(config: FactoryConfig): string {
+  const { checkout: _checkout, queue, autonomy, ...declared } = config;
+  const { pollSeconds: _pollSeconds, ...queueAuthority } = queue ?? {};
+  const bound = {
+    ...declared,
+    autonomy: resolveAutonomy(autonomy),
+    ...(Object.keys(queueAuthority).length ? { queue: queueAuthority } : {}),
+  };
+  assertJsonValue(bound, "queue authority");
+  const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object")
+      return `{${Object.entries(value)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, child]) => `${JSON.stringify(key)}:${canonical(child)}`)
+        .join(",")}}`;
+    return JSON.stringify(value);
+  };
+  return createHash("sha256").update(canonical(bound)).digest("hex");
 }
 
 export function configPath(): string {

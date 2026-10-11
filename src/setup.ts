@@ -10,6 +10,7 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { option, options } from "./cli-flags.js";
+import { composeIntake } from "./application.js";
 import {
   hostSchedulingDefaults,
   readConfig,
@@ -23,7 +24,6 @@ import {
   type IntakeAuthorization,
   queuePollSeconds,
   readIntake,
-  watchIntake,
 } from "./intake.js";
 import { requiredProviderCredentials } from "./provider-credentials.js";
 import { checkReadiness } from "./readiness.js";
@@ -232,7 +232,16 @@ export async function setupTarget(
       : (service.binding?.credentials ?? []).map(
           ({ name, file }) => `${name}=${file}`,
         );
-    let intake = readIntake(config);
+    stage = "queue-binding";
+    if (!config.queue?.project)
+      throw new Error(
+        "Background setup requires queue.project with the existing Project, TEXT metadata field, NUMBER order field and control card. Configure the intended bindings, then repeat setup.",
+      );
+    if (config.gitPersistence?.scope !== "private-history")
+      throw new Error(
+        "Background setup requires an explicitly configured private-history Git checkpoint destination for approval and ownership receipts.",
+      );
+    let intake = await readIntake(config);
     stage = "execution-readiness";
     const proof = await checkReadiness(config, {
       credentialFiles,
@@ -252,7 +261,7 @@ export async function setupTarget(
       );
     completed.push("github-readable");
     stage = "queue-binding";
-    if (!intake?.watch) intake = await watchIntake(config);
+    if (!intake?.watch) intake = await composeIntake(config).watchIntake();
     result.queue = {
       watch: intake.watch,
       mode: intake.mode,
