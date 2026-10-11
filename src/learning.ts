@@ -40,6 +40,7 @@ import { operatorName } from "./operator.js";
 import { serviceLoginSecrets } from "./provider-credentials.js";
 import { configurationCommand, shellWord } from "./status-summary.js";
 import { objectiveComplete } from "./completion.js";
+import { isExecutionState } from "./state.js";
 import { LocalContentStore } from "./content/local.js";
 import {
   LocalRepositoryMemory,
@@ -391,13 +392,13 @@ export function recordRetrospective(
     !state ||
     (!state.cancelledAt &&
       !(
-        state.schemaVersion === 7 &&
+        isExecutionState(state) &&
         state.finalAcceptance &&
         objectiveComplete(state)
       )) ||
     state.coordinator?.processes?.length ||
     state.coordinator?.cancelError ||
-    (state.schemaVersion === 7 &&
+    (isExecutionState(state) &&
       Object.values(state.work).some(
         (work) => work.status === "running" || work.status === "published",
       )) ||
@@ -433,38 +434,37 @@ export function recordRetrospective(
     `https://github.com/${config.repository}/issues/${objective}`,
     snapshot,
   ];
-  const experiences =
-    state.schemaVersion === 7
-      ? Object.entries(state.work).map(([itemId, work]) => {
-          if (work.pullRequest)
+  const experiences = isExecutionState(state)
+    ? Object.entries(state.work).map(([itemId, work]) => {
+        if (work.pullRequest)
+          links.push(
+            `https://github.com/${config.repository}/pull/${work.pullRequest}`,
+          );
+        for (const past of work.recovery?.history ?? [])
+          if (past.work.pullRequest)
             links.push(
-              `https://github.com/${config.repository}/pull/${work.pullRequest}`,
+              `https://github.com/${config.repository}/pull/${past.work.pullRequest}`,
             );
-          for (const past of work.recovery?.history ?? [])
-            if (past.work.pullRequest)
-              links.push(
-                `https://github.com/${config.repository}/pull/${past.work.pullRequest}`,
-              );
-          return {
-            itemId,
-            status: work.status,
-            attempt: work.attempt ?? null,
-            pullRequest: work.pullRequest ?? null,
-            acceptedResult: work.integratedSha ?? null,
-            failure: work.recovery?.failure ?? null,
-            failedValidation: work.failedValidation ?? null,
-            correction: work.recovery?.correction ?? null,
-            prior: (work.recovery?.history ?? []).map((past) => ({
-              failure: past.failure,
-              correction: past.correction,
-              attempt: past.work.attempt ?? null,
-              status: past.work.status,
-              failedValidation: past.work.failedValidation ?? null,
-            })),
-            operatorDecisions: work.acceptanceDecisions ?? [],
-          };
-        })
-      : [];
+        return {
+          itemId,
+          status: work.status,
+          attempt: work.attempt ?? null,
+          pullRequest: work.pullRequest ?? null,
+          acceptedResult: work.integratedSha ?? null,
+          failure: work.recovery?.failure ?? null,
+          failedValidation: work.failedValidation ?? null,
+          correction: work.recovery?.correction ?? null,
+          prior: (work.recovery?.history ?? []).map((past) => ({
+            failure: past.failure,
+            correction: past.correction,
+            attempt: past.work.attempt ?? null,
+            status: past.work.status,
+            failedValidation: past.work.failedValidation ?? null,
+          })),
+          operatorDecisions: work.acceptanceDecisions ?? [],
+        };
+      })
+    : [];
   const episode: Retrospective = {
     schemaVersion: 1,
     repository: config.repository,
@@ -473,24 +473,25 @@ export function recordRetrospective(
     recordedAt: new Date().toISOString(),
     endedAt:
       state.cancelledAt ??
-      (state.schemaVersion === 7 ? state.finalAcceptance!.sealedAt : ""),
+      (isExecutionState(state) ? state.finalAcceptance!.sealedAt : ""),
     outcome: state.cancelledAt ? "cancelled" : "accepted",
-    objectiveClosure:
-      state.schemaVersion === 7
-        ? (state.objectiveClosure ?? "unobserved")
-        : "unobserved",
+    objectiveClosure: isExecutionState(state)
+      ? (state.objectiveClosure ?? "unobserved")
+      : "unobserved",
     sourceLinks: [...new Set(links)],
     snapshotDigest: learningDigest(raw),
     experiences: {
       items: experiences,
       planning: state.planningRecovery ?? null,
-      operatorDecisions:
-        state.schemaVersion === 7 ? (state.finalAcceptanceDecisions ?? []) : [],
+      operatorDecisions: isExecutionState(state)
+        ? (state.finalAcceptanceDecisions ?? [])
+        : [],
       charges: state.charges ?? [],
       repeats: state.repeats ?? {},
       error: state.error ?? null,
-      acceptance:
-        state.schemaVersion === 7 ? (state.finalAcceptance ?? null) : null,
+      acceptance: isExecutionState(state)
+        ? (state.finalAcceptance ?? null)
+        : null,
     },
   };
   append(path, encoded(episode));

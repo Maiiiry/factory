@@ -21,7 +21,13 @@ import type { DatabaseSync } from "node:sqlite";
 import { LocalContentStore } from "./content/local.js";
 import type { ContentRef } from "./contracts.js";
 import { validOwnershipPath } from "./ownership.js";
-import type { ContinuationState, WorkState } from "./state.js";
+import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
+import { parseDiscoveryBody } from "./discovery.js";
+import {
+  isExecutionState,
+  type ContinuationState,
+  type WorkState,
+} from "./state.js";
 
 export type MemoryVisibility = "repository" | "private";
 export type MemoryKind =
@@ -61,7 +67,7 @@ export interface RepositoryMemoryRecord {
   bodies: {
     role: string;
     ref?: ContentRef;
-    availability: "retained" | "missing-legacy";
+    availability: "retained" | "missing-legacy" | "unavailable";
   }[];
   sources: {
     identity: string;
@@ -73,6 +79,12 @@ export interface RepositoryMemoryRecord {
     ref?: ContentRef;
   }[];
   bindings: {
+    objective?: number;
+    runId?: string;
+    graphDigest?: string;
+    sourcePacketDigest?: string;
+    commitSha?: string;
+    selectors?: string[];
     treeSha?: string;
     paths?: { path: string; digest: string }[];
     dependencies?: Record<string, string>;
@@ -95,6 +107,11 @@ export interface MemoryAccess {
   visibility: MemoryVisibility[];
 }
 export interface MemoryApplicability {
+  objective?: number;
+  runId?: string;
+  graphDigest?: string;
+  sourcePacketDigest?: string;
+  commitSha?: string;
   treeSha?: string;
   paths?: Record<string, string>;
   dependencies?: Record<string, string>;
@@ -239,7 +256,9 @@ export function assertRepositoryMemoryRecord(
     const body = keys(value, ["role", "ref", "availability"]);
     text(body.role);
     if (
-      !["retained", "missing-legacy"].includes(String(body.availability)) ||
+      !["retained", "missing-legacy", "unavailable"].includes(
+        String(body.availability),
+      ) ||
       (body.availability === "retained" && body.ref === undefined)
     )
       throw new Error("Memory body availability is invalid");
@@ -264,11 +283,38 @@ export function assertRepositoryMemoryRecord(
     if (source.ref !== undefined) ref(source.ref);
   }
   const bindings = keys(record.bindings, [
+    "objective",
+    "runId",
+    "graphDigest",
+    "sourcePacketDigest",
+    "commitSha",
+    "selectors",
     "treeSha",
     "paths",
     "dependencies",
     "environment",
   ]);
+  if (bindings.selectors !== undefined) {
+    strings(bindings.selectors);
+    if (!bindings.selectors.every(validOwnershipPath))
+      throw new Error("Invalid memory source selector");
+  }
+  if (
+    bindings.objective !== undefined &&
+    (!Number.isSafeInteger(bindings.objective) ||
+      Number(bindings.objective) < 1)
+  )
+    throw new Error("Invalid memory Objective binding");
+  if (bindings.runId !== undefined) text(bindings.runId);
+  for (const name of ["graphDigest", "sourcePacketDigest"])
+    if (bindings[name] !== undefined && !isHash(bindings[name]))
+      throw new Error("Invalid memory source binding");
+  if (
+    bindings.commitSha !== undefined &&
+    (typeof bindings.commitSha !== "string" ||
+      !/^[a-f0-9]{40,64}$/.test(bindings.commitSha))
+  )
+    throw new Error("Invalid memory commit binding");
   if (
     bindings.treeSha !== undefined &&
     (typeof bindings.treeSha !== "string" ||
@@ -325,7 +371,7 @@ function canonical(value: unknown): string {
   if (value && typeof value === "object")
     return `{${Object.entries(value)
       .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
       .join(",")}}`;
   return JSON.stringify(value);
@@ -400,6 +446,7 @@ export class LocalRepositoryMemory {
   private readonly directory: string;
   private readonly records: string;
   private readonly store: LocalContentStore;
+  private retainedIdentities?: Map<string, RepositoryMemoryBinding>;
   catalogStatus: "ready" | "unavailable" = "unavailable";
   constructor(
     root: string,
@@ -426,16 +473,22 @@ export class LocalRepositoryMemory {
       if (source.ref !== undefined && source.complete)
         this.store.readBytes(source.ref);
     const meaningful = canonical({ ...record, createdAt: undefined });
-    const existing = this.retained().entries.find(
-      (entry) =>
-        canonical({ ...entry.record, createdAt: undefined }) === meaningful,
+    // One verified metadata pass per producer batch; this cache is derived and is
+    // never used to authenticate reads or continuation state.
+    this.retainedIdentities ??= new Map(
+      this.retained().entries.map((entry) => [
+        canonical({ ...entry.record, createdAt: undefined }),
+        entry.binding,
+      ]),
     );
-    if (existing) return existing.binding;
+    const existing = this.retainedIdentities.get(meaningful);
+    if (existing) return existing;
     const manifestRef = this.store.putBytes(Buffer.from(canonical(record)), {
       mediaType: "application/json",
     });
     const binding = { id: manifestRef.digest, manifestRef };
     append(join(this.records, `${binding.id}.json`), canonical(binding));
+    this.retainedIdentities.set(meaningful, binding);
     // A failed derived index never prevents retention or changes continuation.
     try {
       this.index(binding, record);
@@ -544,7 +597,10 @@ export class LocalRepositoryMemory {
       )
         continue;
       try {
-        bodies.push(this.store.readBytes(body.ref).toString("utf8"));
+        const bytes = this.store.readBytes(body.ref);
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        if (!decoded.includes("\0") && Buffer.from(decoded).equals(bytes))
+          bodies.push(decoded);
       } catch {
         /* Retained missing bodies remain visible at read time. */
       }
@@ -649,6 +705,21 @@ export class LocalRepositoryMemory {
         path.digest,
         applicability?.paths?.[path.path],
       );
+    for (const name of [
+      "objective",
+      "runId",
+      "graphDigest",
+      "sourcePacketDigest",
+      "commitSha",
+    ] as const)
+      if (record.bindings[name] !== undefined)
+        check(
+          name,
+          String(record.bindings[name]),
+          applicability?.[name] === undefined
+            ? undefined
+            : String(applicability[name]),
+        );
     for (const kind of ["dependencies", "environment"] as const)
       for (const [key, expected] of Object.entries(record.bindings[kind] ?? {}))
         check(`${kind} ${key}`, expected, applicability?.[kind]?.[key]);
@@ -663,13 +734,27 @@ export class LocalRepositoryMemory {
       gaps.push("superseded historical lead");
     const content: MemoryResult["content"] = [];
     for (const body of record.bodies) {
-      if (body.availability === "missing-legacy" || !body.ref) {
-        gaps.push(`${body.role}: missing legacy body`);
+      if (body.availability !== "retained" || !body.ref) {
+        gaps.push(
+          `${body.role}: ${body.availability === "missing-legacy" ? "missing legacy body" : "referenced bytes unavailable"}`,
+        );
         disposition = "unavailable";
         continue;
       }
       try {
         const bytes = this.store.readBytes(body.ref);
+        let decoded: string;
+        try {
+          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          if (decoded.includes("\0") || !Buffer.from(decoded).equals(bytes))
+            throw new Error("Binary body");
+        } catch {
+          gaps.push(
+            `${body.role}: exact binary bytes retained; text lookup unavailable`,
+          );
+          disposition = "unavailable";
+          continue;
+        }
         if (bytes.length > budget.bytes) {
           gaps.push(
             `${body.role}: complete body exceeds remaining byte allowance`,
@@ -681,7 +766,7 @@ export class LocalRepositoryMemory {
         content.push({
           role: body.role,
           ref: body.ref,
-          text: bytes.toString("utf8"),
+          text: decoded,
         });
       } catch {
         gaps.push(`${body.role}: referenced bytes unavailable or corrupt`);
@@ -753,6 +838,36 @@ export class LocalRepositoryMemory {
     const scope = lookup.scope;
     if (!scope) return true;
     if (scope.kinds && !scope.kinds.includes(record.kind)) return false;
+    // Relevance never grants source authority, including on a successor of the
+    // same Objective. Admit every retained repository body before returning it.
+    const admitted = (path: string) =>
+      (scope.paths ?? []).some(
+        (selector) =>
+          path === selector ||
+          (selector.endsWith("/") && path.startsWith(selector)),
+      );
+    if (scope.paths !== undefined) {
+      const repositoryPaths = [
+        ...(record.bindings.paths ?? []).map((entry) => entry.path),
+        ...record.sources
+          .filter((source) => source.identity.startsWith("repository:"))
+          .map((source) => source.identity.slice("repository:".length)),
+      ];
+      if (
+        record.kind !== "decision" &&
+        record.bodies.length &&
+        !repositoryPaths.length &&
+        !record.bindings.selectors?.length
+      )
+        return false;
+      if (
+        repositoryPaths.some((path) => !admitted(path)) ||
+        (record.bindings.selectors ?? []).some(
+          (selector) => !admitted(selector),
+        )
+      )
+        return false;
+    }
     if (
       scope.objective !== undefined &&
       scope.objective === record.producer.objective
@@ -763,11 +878,12 @@ export class LocalRepositoryMemory {
         (scope.paths ?? []).some(
           (selector) =>
             path === selector ||
-            path.startsWith(`${selector.replace(/\/$/, "")}/`),
+            (selector.endsWith("/") && path.startsWith(selector)),
         ),
       )
     )
       return true;
+    if ((record.bindings.selectors ?? []).some(admitted)) return true;
     if (scope.objective === undefined && scope.paths === undefined) return true;
     if (
       ![
@@ -783,6 +899,15 @@ export class LocalRepositoryMemory {
       return false;
     const expected = record.bindings;
     const supplied = lookup.applicability;
+    for (const name of [
+      "objective",
+      "runId",
+      "graphDigest",
+      "sourcePacketDigest",
+      "commitSha",
+    ] as const)
+      if (expected[name] !== undefined && expected[name] !== supplied?.[name])
+        return false;
     if (!expected.treeSha || expected.treeSha !== supplied?.treeSha)
       return false;
     if (
@@ -882,7 +1007,12 @@ export class LocalRepositoryMemory {
         "BEGIN IMMEDIATE; CREATE TEMP TABLE selected_scope (id TEXT PRIMARY KEY);",
       );
       for (const entry of retained.entries) {
-        this.insert(db, entry.binding, entry.record);
+        if (
+          !db
+            .prepare("SELECT id FROM memory WHERE id = ?")
+            .get(entry.binding.id)
+        )
+          this.insert(db, entry.binding, entry.record);
         db.prepare("INSERT INTO selected_scope VALUES (?)").run(
           entry.binding.id,
         );
@@ -985,7 +1115,7 @@ export function retainStateMemory(
       store.readBytes(contentRef);
       return { role, ref: contentRef, availability: "retained" };
     } catch {
-      return { role, ref: contentRef, availability: "missing-legacy" };
+      return { role, ref: contentRef, availability: "unavailable" };
     }
   };
   const now = new Date().toISOString();
@@ -1006,7 +1136,7 @@ export function retainStateMemory(
         work?.status ??
         (state.cancelledAt
           ? "cancelled"
-          : state.schemaVersion === 7 && state.finalAcceptance
+          : isExecutionState(state) && state.finalAcceptance
             ? "accepted"
             : "working"),
     },
@@ -1019,6 +1149,17 @@ export function retainStateMemory(
     sources: [],
     bindings: {
       ...(work?.treeSha ? { treeSha: work.treeSha } : {}),
+      ...(itemId && isExecutionState(state)
+        ? {
+            selectors:
+              (work?.graphRevisionDigest
+                ? state.graphRevisions?.find(
+                    (revision) => revision.digest === work.graphRevisionDigest,
+                  )?.graph
+                : state.graph
+              )?.items.find((item) => item.id === itemId)?.ownedPaths ?? [],
+          }
+        : {}),
       environment: { configDigest: state.configDigest },
     },
     validity: { state: "historical", conditions: [] },
@@ -1058,6 +1199,78 @@ export function retainStateMemory(
       }),
     ];
     retain(observation);
+    if (work.discoveryOutput) {
+      const output = work.discoveryOutput;
+      const discovery = base(itemId, work);
+      discovery.kind = "discovery";
+      discovery.authority = output.disposition;
+      discovery.producer = { ...output.producer, status: output.status };
+      discovery.summary = `Discovery ${output.role}: ${output.status}; ${output.selectedEntries} selected entries`;
+      const manifestBody = body("discovery-manifest", output);
+      const outputBody = retained(output.role, output.body);
+      discovery.bodies = [manifestBody, outputBody];
+      discovery.sources = [
+        {
+          identity: `discovery:${output.role}:${output.specificationDigest}`,
+          ref: output.body,
+          complete:
+            output.status === "complete" &&
+            outputBody.availability === "retained",
+        },
+      ];
+      discovery.bindings = {
+        commitSha: output.source.commitSha,
+        treeSha: output.source.treeSha,
+        selectors: output.source.selectors,
+        environment: { configDigest: state.configDigest },
+      };
+      discovery.validity = {
+        state: output.status === "complete" ? "current" : "historical",
+        conditions: [],
+      };
+      if (outputBody.availability === "retained") {
+        const inventory = parseDiscoveryBody(store.readBytes(output.body));
+        discovery.bindings.paths = inventory.entries.map((entry) => ({
+          path: entry.path,
+          digest: entry.content.digest,
+        }));
+        for (const entry of inventory.entries) {
+          const sourceBody = retained(`source:${entry.path}`, entry.content);
+          discovery.bodies.push(sourceBody);
+          discovery.sources.push({
+            identity: `repository:${entry.path}`,
+            ref: entry.content,
+            complete: sourceBody.availability === "retained",
+          });
+        }
+      }
+      retain(discovery);
+    }
+    for (const decision of work.acceptanceDecisions ?? []) {
+      const answer = base(itemId, work);
+      answer.kind = "decision";
+      answer.authority = "human-decision";
+      answer.createdAt = decision.at;
+      answer.summary = `Recorded ${decision.outcome} for original criterion: ${decision.criterion}`;
+      answer.bindings = {
+        objective: state.objective,
+        runId: state.runId,
+        treeSha: decision.treeSha,
+        environment: { configDigest: state.configDigest },
+      };
+      answer.bodies = [
+        body("original-criterion-decision", {
+          repository: state.repository,
+          objective: state.objective,
+          runId: state.runId,
+          itemId,
+          originalDecision: decision,
+          scope:
+            "The authenticated original human criterion decision applies only to its original Objective, run and tree; it supplies no inherited current validation or delivery proof.",
+        }),
+      ];
+      retain(answer);
+    }
     if (work.knowledge) {
       const knowledge = work.knowledge;
       const handoff = base(itemId, work);
@@ -1082,6 +1295,7 @@ export function retainStateMemory(
       }));
       handoff.bindings = {
         treeSha: knowledge.treeSha,
+        selectors: [...new Set(knowledge.notes.flatMap((note) => note.paths))],
         paths: knowledge.sources.map((source) => ({
           path: source.path,
           digest: source.ref.digest,
@@ -1108,14 +1322,69 @@ export function retainStateMemory(
     for (const previous of work.recovery?.history ?? [])
       observeWork(itemId, previous.work);
   };
-  if (state.schemaVersion === 7)
+  if (isExecutionState(state))
     for (const [itemId, work] of Object.entries(state.work))
       observeWork(itemId, work);
+  if (isExecutionState(state) && state.acceptedPlanningDecision) {
+    const context = acceptedPlanningDecisionContext(state);
+    const decision = state.acceptedPlanningDecision.decision;
+    const answer = base(undefined, undefined);
+    answer.kind = "decision";
+    answer.authority = "human-decision";
+    answer.createdAt = decision.at;
+    answer.summary = `Original planning reply: ${decision.question}\n${decision.answer}`;
+    answer.producer.status = "verified-original-planning-answer";
+    answer.bodies = [body("accepted-planning-decision", context)];
+    answer.sources = [
+      {
+        identity: `original-plan-review:${state.acceptedPlanningDecision.reviewDigest}`,
+        ref: answer.bodies[0]!.ref!,
+        complete: true,
+      },
+    ];
+    answer.bindings = {
+      objective: state.objective,
+      runId: state.runId,
+      graphDigest: state.acceptedPlanningDecision.graphDigest,
+      ...(state.sourcePacketDigest
+        ? { sourcePacketDigest: state.sourcePacketDigest }
+        : {}),
+      commitSha: state.baseSha,
+      environment: { configDigest: state.configDigest },
+    };
+    answer.validity = { state: "current", conditions: [] };
+    retain(answer);
+  }
+  if (isExecutionState(state))
+    for (const decision of state.finalAcceptanceDecisions ?? []) {
+      const answer = base(undefined, undefined);
+      answer.kind = "decision";
+      answer.authority = "human-decision";
+      answer.createdAt = decision.at;
+      answer.summary = `Recorded ${decision.outcome} for original Objective criterion: ${decision.criterion}`;
+      answer.bindings = {
+        objective: state.objective,
+        runId: state.runId,
+        treeSha: decision.treeSha,
+        environment: { configDigest: state.configDigest },
+      };
+      answer.bodies = [
+        body("original-objective-criterion-decision", {
+          repository: state.repository,
+          objective: state.objective,
+          runId: state.runId,
+          originalDecision: decision,
+          scope:
+            "Original human criterion decision only; no inherited current implementation acceptance or effect authority.",
+        }),
+      ];
+      retain(answer);
+    }
   if (
     state.error ||
     state.cancelledAt ||
     state.planningRecovery ||
-    (state.schemaVersion === 7 && state.finalAcceptance)
+    (isExecutionState(state) && state.finalAcceptance)
   ) {
     const observation = base(undefined, undefined);
     observation.kind = state.error ? "failure" : "observation";
@@ -1124,8 +1393,7 @@ export function retainStateMemory(
         error: state.error,
         cancelledAt: state.cancelledAt,
         planningRecovery: state.planningRecovery,
-        acceptance:
-          state.schemaVersion === 7 ? state.finalAcceptance : undefined,
+        acceptance: isExecutionState(state) ? state.finalAcceptance : undefined,
       }),
     ];
     retain(observation);

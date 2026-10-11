@@ -17,6 +17,12 @@ import { Readable } from "node:stream";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
 import { LocalRepositoryMemory } from "../dist/repository-memory.js";
+import {
+  authenticateDiscoveryOutput,
+  discoverRepository,
+} from "../dist/discovery.js";
+import { selectedDiscoveryInputs } from "../dist/runner/discovery.js";
+import { linearDeliveryUnits } from "../dist/delivery/plan.js";
 
 test("disk content survives storage and materialization, and corruption is refused", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-content-"));
@@ -283,4 +289,308 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     () => restarted.search({ access, query: "orchard", limit: 1 }),
     /owned private file/,
   );
+});
+
+test("selector-bound discovery retains exact bytes, distinguishes incomplete output, and transfers declared fields without delivery", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-discovery-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const checkout = join(root, "checkout");
+  mkdirSync(join(checkout, "src"), { recursive: true });
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.test");
+  const bytes = Buffer.from("export const observed = 7;\n");
+  writeFileSync(join(checkout, "src", "api.ts"), bytes);
+  writeFileSync(join(checkout, "private.txt"), "Outside selector\n");
+  git("add", ".");
+  git("commit", "-m", "Discovery source");
+  const baseSha = git("rev-parse", "HEAD");
+  const refsBefore = git("show-ref");
+  const store = new LocalContentStore(join(root, "content"));
+  const specification = {
+    mode: "inventory",
+    selectors: ["src/"],
+    schema: "factory.repository-inventory/v1",
+    role: "implementation-inventory",
+    completeness: "complete",
+    allowance: { maxEntries: 4, maxBytes: 1024, maxAttempts: 1 },
+  };
+  const producer = {
+    objective: 12,
+    runId: "inventory-run",
+    itemId: "inventory",
+    attemptId: "attempt-1",
+  };
+  const manifest = await discoverRepository({
+    checkout,
+    baseSha,
+    specification,
+    producer,
+    store,
+  });
+  const body = await authenticateDiscoveryOutput({
+    checkout,
+    specification,
+    manifest,
+    store,
+  });
+  assert.equal(manifest.status, "complete");
+  assert.deepEqual(
+    body.entries.map((entry) => entry.path),
+    ["src/api.ts"],
+  );
+  assert.equal(
+    body.entries[0].content.digest,
+    createHash("sha256").update(bytes).digest("hex"),
+  );
+  // Authentication and transfer use retained immutable Git bytes, even after the working copy changes.
+  writeFileSync(join(checkout, "src", "api.ts"), "Changed working copy\n");
+  const inventory = {
+    id: "inventory",
+    kind: "discovery",
+    dependencies: [],
+    discovery: specification,
+  };
+  const consumer = {
+    id: "consumer",
+    dependencies: ["inventory"],
+    discoveryInputs: [
+      {
+        producerItemId: "inventory",
+        role: specification.role,
+        fields: ["path", "contentRef"],
+      },
+    ],
+  };
+  const state = {
+    graph: { items: [inventory, consumer] },
+    work: {
+      inventory: { status: "done", discoveryOutput: manifest },
+      consumer: { status: "pending" },
+    },
+  };
+  const selected = await selectedDiscoveryInputs({
+    state,
+    item: consumer,
+    checkout,
+    store,
+  });
+  assert.deepEqual(selected[0].fields, ["path", "contentRef"]);
+  assert.deepEqual(Object.keys(selected[0].entries[0]), [
+    "path",
+    "contentRef",
+    "contentBody",
+  ]);
+  assert.deepEqual(
+    Buffer.from(selected[0].entries[0].contentBody.bytes, "base64"),
+    bytes,
+  );
+  assert.equal(selected[0].source.commitSha, baseSha);
+  assert.deepEqual(
+    linearDeliveryUnits(state.graph).map((unit) =>
+      unit.items.map((item) => item.id),
+    ),
+    [["inventory"], ["consumer"]],
+  );
+  const emptySpec = { ...specification, selectors: ["missing/"] };
+  const empty = await discoverRepository({
+    checkout,
+    baseSha,
+    specification: emptySpec,
+    producer,
+    store,
+  });
+  assert.equal(empty.status, "complete");
+  assert.equal(empty.selectedEntries, 0);
+  assert.deepEqual(
+    (
+      await authenticateDiscoveryOutput({
+        checkout,
+        specification: emptySpec,
+        manifest: empty,
+        store,
+      })
+    ).entries,
+    [],
+  );
+  const boundedSpec = {
+    ...specification,
+    allowance: { ...specification.allowance, maxBytes: 1 },
+  };
+  const truncated = await discoverRepository({
+    checkout,
+    baseSha,
+    specification: boundedSpec,
+    producer,
+    store,
+  });
+  assert.equal(truncated.status, "truncated");
+  await authenticateDiscoveryOutput({
+    checkout,
+    specification: boundedSpec,
+    manifest: truncated,
+    store,
+  });
+  state.work.inventory.discoveryOutput = truncated;
+  await assert.rejects(
+    selectedDiscoveryInputs({ state, item: consumer, checkout, store }),
+    /incomplete/,
+  );
+  await assert.rejects(
+    authenticateDiscoveryOutput({
+      checkout,
+      specification,
+      manifest: {
+        ...manifest,
+        source: { ...manifest.source, selectors: ["private.txt"] },
+      },
+      store,
+    }),
+    /binding differs/,
+  );
+  assert.equal(git("rev-parse", "HEAD"), baseSha);
+  assert.equal(git("show-ref"), refsBefore);
+  writeFileSync(
+    join(
+      root,
+      "content",
+      body.entries[0].content.digest.slice(0, 2),
+      body.entries[0].content.digest,
+    ),
+    "corrupt retained source",
+  );
+  state.work.inventory.discoveryOutput = manifest;
+  await assert.rejects(
+    selectedDiscoveryInputs({ state, item: consumer, checkout, store }),
+    /digest verification/,
+  );
+});
+
+test("memory source admission precedes same-Objective relevance and binary bodies stay exact", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-memory-admission-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const checkout = join(root, "checkout");
+  mkdirSync(join(checkout, "src"), { recursive: true });
+  mkdirSync(join(checkout, "secret"));
+  writeFileSync(
+    join(checkout, "src", "main.txt"),
+    "Authorized orchard source\n",
+  );
+  writeFileSync(
+    join(checkout, "secret", "detail.txt"),
+    "Private unrelated orchard source\n",
+  );
+  const opaque = Buffer.from([0xff, 0x00, 0x80, 0x50]);
+  writeFileSync(join(checkout, "src", "opaque.bin"), opaque);
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.test");
+  git("add", ".");
+  git("commit", "-m", "Retain observed sources");
+  const treeSha = git("rev-parse", "HEAD^{tree}");
+  const state = join(root, "state");
+  const store = new LocalContentStore(join(state, "content"));
+  const memory = new LocalRepositoryMemory(state, "fixture/admission", store);
+  const source = (path) => ({
+    path,
+    ref: store.putBytes(readFileSync(join(checkout, path)), {
+      mediaType: "application/octet-stream",
+    }),
+  });
+  const allowed = source("src/main.txt");
+  const denied = source("secret/detail.txt");
+  const record = (sources) => ({
+    schemaVersion: 1,
+    repository: "fixture/admission",
+    visibility: "private",
+    kind: "handoff",
+    producer: {
+      objective: 1,
+      runId: git("rev-parse", "HEAD"),
+      status: "working",
+    },
+    createdAt: new Date().toISOString(),
+    authority: "advisory",
+    summary: "Retained orchard handoff",
+    bodies: sources.map(({ path, ref }) => ({
+      role: `source:${path}`,
+      ref,
+      availability: "retained",
+    })),
+    sources: sources.map(({ path, ref }) => ({
+      identity: `repository:${path}`,
+      ref,
+      complete: true,
+    })),
+    bindings: {
+      treeSha,
+      paths: sources.map(({ path, ref }) => ({ path, digest: ref.digest })),
+    },
+    validity: { state: "current", conditions: [] },
+    supersedes: [],
+  });
+  const mixed = memory.retain(record([allowed, denied]));
+  const permitted = memory.retain(record([allowed]));
+  const lookup = {
+    access: { repository: "fixture/admission", visibility: ["private"] },
+    scope: { objective: 1, paths: ["src/"] },
+    applicability: { treeSha, paths: { "src/main.txt": allowed.ref.digest } },
+    limit: 10,
+  };
+  assert.deepEqual(
+    memory.metadata(lookup).entries.map((entry) => entry.binding.id),
+    [permitted.id],
+  );
+  assert.equal(memory.read({ ...lookup, id: mixed.id }), undefined);
+  assert.deepEqual(
+    memory
+      .search({ ...lookup, query: "orchard" })
+      .map((result) => result.binding.id),
+    [permitted.id],
+  );
+  assert.equal(
+    memory.read({
+      ...lookup,
+      scope: { objective: 1, paths: [] },
+      id: permitted.id,
+    }),
+    undefined,
+  );
+  assert.equal(
+    memory.read({
+      ...lookup,
+      scope: { objective: 1, paths: ["src"] },
+      id: permitted.id,
+    }),
+    undefined,
+  );
+  assert.equal(
+    memory.read({
+      ...lookup,
+      scope: { objective: 1, paths: ["src/main.txt"] },
+      id: permitted.id,
+    }).content[0].text,
+    "Authorized orchard source\n",
+  );
+  const opaqueSource = source("src/opaque.bin");
+  const binary = memory.retain(record([opaqueSource]));
+  const result = memory.read({
+    ...lookup,
+    id: binary.id,
+    applicability: {
+      treeSha,
+      paths: { "src/opaque.bin": opaqueSource.ref.digest },
+    },
+  });
+  assert.equal(result.disposition, "unavailable");
+  assert.equal(result.content.length, 0);
+  assert.match(
+    result.gaps.join("\n"),
+    /exact binary bytes retained; text lookup unavailable/,
+  );
+  assert.deepEqual(store.readBytes(result.record.bodies[0].ref), opaque);
 });
