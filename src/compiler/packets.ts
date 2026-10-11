@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import {
+  assertWorkflowRecipeInput,
+  type WorkflowRecipeInput,
+} from "../workflow-recipes.js";
+import {
   assertPlanningContextPacket,
   type PlanningContextPacket,
 } from "./context.js";
@@ -42,12 +46,15 @@ export function planReviewPacket(
   executionBounds?: PlanningExecutionBounds,
   approvedPlaybookPin?: ApprovedPlaybookPin,
   contextLookup?: PlanningContextPacket,
+  workflowRecipe?: WorkflowRecipeInput,
 ): PlanReviewRequest {
+  if (workflowRecipe) assertWorkflowRecipeInput(workflowRecipe);
   if (executionBounds) assertPlanningExecutionBounds(executionBounds);
   if (approvedPlaybookPin !== undefined)
     assertApprovedPlaybookPin(approvedPlaybookPin);
   if (contextLookup) assertPlanningContextPacket(contextLookup);
   return {
+    ...(workflowRecipe ? { workflowRecipe } : {}),
     ...(contextLookup ? { contextLookup } : {}),
     ...(approvedPlaybookPin !== undefined ? { approvedPlaybookPin } : {}),
     ...(prerequisites ? { prerequisites } : {}),
@@ -87,6 +94,7 @@ export function reviewResultDigest(
 export function planningReviewEvidence(
   packet: Pick<
     PlanReviewRequest,
+    | "workflowRecipe"
     | "contextLookup"
     | "sources"
     | "prerequisites"
@@ -96,6 +104,15 @@ export function planningReviewEvidence(
   >,
 ) {
   return [
+    ...(packet.workflowRecipe
+      ? [
+          {
+            origin: "controller" as const,
+            path: "FACTORY_PINNED_WORKFLOW_RECIPE",
+            content: JSON.stringify(packet.workflowRecipe),
+          },
+        ]
+      : []),
     ...(packet.contextLookup
       ? [
           {

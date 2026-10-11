@@ -19,6 +19,7 @@ export { createPlanningContextResolver } from "./compiler/context-runtime.js";
 export * from "./contracts.js";
 export * from "./prerequisite-guidance.js";
 export * from "./workflow-reflection.js";
+export * from "./workflow-recipes.js";
 export * from "./discovery.js";
 export * from "./graph-expansion.js";
 export * from "./adaptive-context.js";

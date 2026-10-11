@@ -32,7 +32,7 @@ function fence(detail: string): Error {
 export function assertGraphProjectionIntents(state: ContinuationState): void {
   const intents = state.graphProjectionIntents;
   if (intents === undefined) return;
-  if (![11, 12, 13, 14].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16].includes(state.schemaVersion))
     throw new Error(
       "Bound graph projection requires expansion snapshot semantics",
     );
@@ -152,7 +152,7 @@ export function graphProjectionControl(
 ): NonNullable<GraphProjection["expansionControl"]> {
   assertGraphProjectionIntents(state);
   const digest = graphDigest(graph);
-  if (![11, 12, 13, 14].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16].includes(state.schemaVersion))
     throw fence("Expanded graph has no admitted projection semantics");
   state.graphProjectionIntents ??= {};
   let intent = state.graphProjectionIntents[digest];

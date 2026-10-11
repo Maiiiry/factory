@@ -21,7 +21,11 @@ import {
   retainPlanningSourceMemory,
 } from "../dist/repository-memory.js";
 import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
-import { initializeContextLookup } from "../dist/compiler/context.js";
+import {
+  assertContextFactsResolved,
+  initializeContextLookup,
+  resolveContextRequests,
+} from "../dist/compiler/context.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
 import { parseFactoryState } from "../dist/state.js";
 import { saveState } from "../dist/state-store.js";
@@ -526,6 +530,298 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     baseSha,
     new Set(["OBJECTIVE"]),
   );
+  const {
+    assertWorkflowRecipeGraph,
+    assertWorkflowRecipeAdmission,
+    assertWorkflowRecipeContext,
+    objectiveWorkflowRecipeSelector,
+    previewWorkflowRecipe,
+    readPinnedWorkflowRecipe,
+    resolveWorkflowRecipe,
+    retainWorkflowRecipe,
+  } = await import("../dist/workflow-recipes.js");
+  const recipeBody =
+    '## Adaptive workflow\nenabled\n\n## Workflow recipe\n```json\n{"selector":"plugin:repository-migration","arguments":{"selectors":["src/"],"maxFilesPerChild":2,"maxChildren":2}}\n```\n';
+  const recipeSelection = objectiveWorkflowRecipeSelector(recipeBody);
+  const recipeResolution = resolveWorkflowRecipe({
+    selection: recipeSelection,
+    checkout,
+    baseSha,
+    maxBytes: 65536,
+  });
+  const recipeAdmission = {
+    adaptiveEnabled: true,
+    selectors: ["src/", "notes.txt"],
+    configuredConcurrency: 2,
+    executionProfileIds: [],
+    memoryEnabled: false,
+    capabilities: [
+      {
+        id: "inventory-discovery",
+        status: "available",
+        detail: "Installed immutable inventory reader",
+      },
+      {
+        id: "graph-expansion",
+        status: "available",
+        detail: "Installed bounded expansion controller",
+      },
+      {
+        id: "semantic-discovery",
+        status: "unknown",
+        detail: "No native discovery preflight in this storage workflow",
+      },
+    ],
+  };
+  const recipePreview = previewWorkflowRecipe({
+    resolution: recipeResolution,
+    admission: recipeAdmission,
+  });
+  assert.equal(recipePreview.status, "ready");
+  assert.equal(recipePreview.estimates.totalItems, "unknown");
+  assert.equal(recipePreview.estimates.cost, "unknown");
+  assert.equal(recipePreview.estimates.dynamicItems.maximum, 2);
+  assert.equal(git("show-ref"), refsBefore);
+  assert.throws(
+    () =>
+      assertWorkflowRecipeAdmission(recipeResolution.contract, {
+        ...recipeAdmission,
+        selectors: ["notes.txt"],
+      }),
+    /outside admitted scope/,
+  );
+  assert.throws(
+    () =>
+      resolveWorkflowRecipe({
+        selection: {
+          ...recipeSelection,
+          arguments: { selectors: ["src/"], maxChildren: 0 },
+        },
+        checkout,
+        baseSha,
+        maxBytes: 65536,
+      }),
+    /outside declared bounds/,
+  );
+  const pluginInput = await retainWorkflowRecipe(recipeResolution, store);
+  assert.deepEqual(
+    await readPinnedWorkflowRecipe(pluginInput.pin, store),
+    pluginInput,
+  );
+  for (const recipe of ["api-feature", "bounded-audit"]) {
+    const resolution = resolveWorkflowRecipe({
+      selection: {
+        selector: `plugin:${recipe}`,
+        arguments: {
+          selectors: ["src/"],
+          ...(recipe === "api-feature"
+            ? { sharedSelectors: ["notes.txt"] }
+            : {}),
+        },
+      },
+      checkout,
+      baseSha,
+      maxBytes: 65536,
+    });
+    const preview = previewWorkflowRecipe({
+      resolution,
+      admission: recipeAdmission,
+    });
+    assert.equal(
+      preview.status,
+      recipe === "bounded-audit" ? "blocked" : "ready",
+    );
+    assert.equal(preview.estimates.providerCalls, "unknown");
+    if (recipe === "bounded-audit")
+      assert.ok(
+        preview.missingPrerequisites.some((reason) =>
+          reason.includes("semantic-discovery"),
+        ),
+      );
+    const retained = await retainWorkflowRecipe(resolution, store);
+    assert.deepEqual(
+      await readPinnedWorkflowRecipe(retained.pin, store),
+      retained,
+    );
+  }
+  // Real repository recipe revisions use a separate Git index and unattached
+  // commits, preserving this workflow's checkout/refs and original discovery.
+  const localDefinition = structuredClone(recipeResolution.definition);
+  localDefinition.version = 3;
+  localDefinition.stages[0].id = inventory.id;
+  localDefinition.stages[0].discovery = specification;
+  localDefinition.stages[1].id = envelope.template.id;
+  localDefinition.stages[1].dependencies = [];
+  localDefinition.stages[2].id = "integration";
+  localDefinition.stages[2].dependencies = [inventory.id];
+  localDefinition.stages.push({
+    id: "join",
+    kind: "work",
+    title: "Shared notes owner",
+    goal: criterion,
+    nonGoals: [],
+    dependencies: [],
+    selectors: ["notes.txt"],
+  });
+  const { template: _recipeTemplate, ...declaredEnvelope } = envelope;
+  localDefinition.expansions = [
+    { ...declaredEnvelope, templateStageId: envelope.template.id },
+  ];
+  const recipePath = `.factory/recipes/${localDefinition.id}.json`;
+  const recipeIndex = join(root, "recipe-index");
+  const indexGit = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], {
+      env: { ...process.env, GIT_INDEX_FILE: recipeIndex },
+      encoding: "utf8",
+    }).trim();
+  const revision = (definition) => {
+    const blob = execFileSync(
+      "git",
+      ["-C", checkout, "hash-object", "-w", "--stdin"],
+      { input: JSON.stringify(definition), encoding: "utf8" },
+    ).trim();
+    indexGit("read-tree", baseSha);
+    indexGit(
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `100644,${blob},${recipePath}`,
+    );
+    return indexGit(
+      "commit-tree",
+      indexGit("write-tree"),
+      "-p",
+      baseSha,
+      "-m",
+      "Pinned recipe revision",
+    );
+  };
+  const recipeBase = revision(localDefinition);
+  const localResolution = resolveWorkflowRecipe({
+    selection: { ...recipeSelection, selector: localDefinition.id },
+    checkout,
+    baseSha: recipeBase,
+    maxBytes: 65536,
+  });
+  assert.equal(localResolution.origin.kind, "repository");
+  assert.equal(localResolution.contract.version, 3);
+  const localInput = await retainWorkflowRecipe(localResolution, store);
+  assert.doesNotThrow(() => assertWorkflowRecipeGraph(graph, localInput));
+  const widened = structuredClone(graph);
+  widened.expansions[0].limits.maxChildren++;
+  assert.throws(
+    () => assertWorkflowRecipeGraph(widened, localInput),
+    /widens or changes/,
+  );
+  const newRecipeBase = revision({ ...localDefinition, version: 4 });
+  assert.equal(
+    resolveWorkflowRecipe({
+      selection: { ...recipeSelection, selector: localDefinition.id },
+      checkout,
+      baseSha: newRecipeBase,
+      maxBytes: 65536,
+    }).contract.version,
+    4,
+  );
+  assert.equal(
+    (await readPinnedWorkflowRecipe(localInput.pin, store)).contract.version,
+    3,
+  );
+  const invalidBase = revision({
+    ...localDefinition,
+    commands: ["unauthorized command"],
+  });
+  assert.throws(
+    () =>
+      resolveWorkflowRecipe({
+        selection: { ...recipeSelection, selector: localDefinition.id },
+        checkout,
+        baseSha: invalidBase,
+        maxBytes: 65536,
+      }),
+    /unsupported fields/,
+  );
+  // Pin reads require exact bodies; a lost recipe cannot become latest advice.
+  const { readContinuation, statePath } = await import(
+    "../dist/state-store.js"
+  );
+  const { planningSessionInputDigest } = await import(
+    "../dist/agent-session.js"
+  );
+  const preparationRepository = "test-fixtures/recipe-discovery";
+  const preparation = {
+    schemaVersion: 16,
+    kind: "preparing",
+    repository: preparationRepository,
+    objective: producer.objective,
+    runId: "recipe-pre-provider-inputs",
+    configDigest: createHash("sha256")
+      .update(JSON.stringify(recipeAdmission))
+      .digest("hex"),
+    baseSha: recipeBase,
+    objectiveBodyDigest: createHash("sha256").update(recipeBody).digest("hex"),
+    sourcePacketDigest: createHash("sha256")
+      .update(JSON.stringify({ objective: recipeBody, pin: localInput.pin }))
+      .digest("hex"),
+    workflowRecipePin: localInput.pin,
+    autonomy: resolveAutonomy(),
+    capacity: { concurrency: recipeAdmission.configuredConcurrency },
+    charges: {},
+    issueByItemId: {},
+    coordinator: {
+      mode: "running",
+      phase: "planning",
+      phaseStartedAt: new Date().toISOString(),
+    },
+  };
+  const preparationPath = statePath(preparationRepository, producer.objective);
+  saveState(preparationPath, preparation);
+  const restoredPreparation = readContinuation(
+    preparationRepository,
+    producer.objective,
+  );
+  assert.equal(restoredPreparation.schemaVersion, 16);
+  assert.deepEqual(restoredPreparation.workflowRecipePin, localInput.pin);
+  assert.equal(
+    planningSessionInputDigest(restoredPreparation),
+    planningSessionInputDigest(preparation),
+  );
+  assert.deepEqual(
+    await readPinnedWorkflowRecipe(
+      restoredPreparation.workflowRecipePin,
+      store,
+    ),
+    localInput,
+  );
+  const savedPreparationBytes = readFileSync(preparationPath);
+  assert.throws(
+    () => saveState(preparationPath, { ...preparation, schemaVersion: 14 }),
+    /preparation16 or execution15/,
+  );
+  assert.deepEqual(readFileSync(preparationPath), savedPreparationBytes);
+  const resolvedPath = join(
+    root,
+    "content",
+    localInput.pin.resolvedRef.digest.slice(0, 2),
+    localInput.pin.resolvedRef.digest,
+  );
+  const resolvedBody = readFileSync(resolvedPath);
+  writeFileSync(resolvedPath, "corrupt retained recipe");
+  await assert.rejects(
+    readPinnedWorkflowRecipe(localInput.pin, store),
+    /digest verification/,
+  );
+  assert.deepEqual(
+    readContinuation(preparationRepository, producer.objective),
+    restoredPreparation,
+  );
+  assert.deepEqual(readFileSync(preparationPath), savedPreparationBytes);
+  assert.deepEqual(restoredPreparation.autonomy, preparation.autonomy);
+  assert.deepEqual(restoredPreparation.charges, {});
+  assert.deepEqual(restoredPreparation.issueByItemId, {});
+  writeFileSync(resolvedPath, resolvedBody);
+  assert.equal(git("rev-parse", "HEAD"), baseSha);
+  assert.equal(git("show-ref"), refsBefore);
   const waiting = Object.fromEntries(
     graph.items.map((item) => [
       item.id,
@@ -1096,6 +1392,156 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
       },
     },
   };
+  // Equal recipe queries retain separate controller scopes, including unresolved facts.
+  const memoryDefinition = {
+    ...localDefinition,
+    version: 5,
+    memoryInputs: [
+      {
+        id: "notes",
+        query: "Shared migration notes",
+        selectors: ["notes.txt"],
+        kinds: ["observation"],
+        required: true,
+      },
+      {
+        id: "source",
+        query: "Shared migration notes",
+        selectors: ["src/"],
+        kinds: ["observation"],
+        required: true,
+      },
+    ],
+  };
+  const memoryRecipeBase = revision(memoryDefinition);
+  const memoryRecipe = await retainWorkflowRecipe(
+    resolveWorkflowRecipe({
+      selection: { ...recipeSelection, selector: localDefinition.id },
+      checkout,
+      baseSha: memoryRecipeBase,
+      maxBytes: 65536,
+    }),
+    store,
+  );
+  const recipeMemoryConfig = {
+    ...routingConfig,
+    repository: "fixture/recipe-required-memory",
+    planningContext: {
+      ...routingConfig.planningContext,
+      memory: true,
+      selectors: ["src/", "notes.txt"],
+      bounds: {
+        ...routingConfig.planningContext.bounds,
+        maxResults: 8,
+        maxBytes: 65536,
+      },
+    },
+  };
+  const recipeMemoryStore = new LocalContentStore(
+    join(stateRoot(recipeMemoryConfig.repository), "content"),
+  );
+  const recipeMemoryBody = recipeMemoryStore.putBytes(
+    readFileSync(join(checkout, "notes.txt")),
+    { mediaType: "text/plain" },
+  );
+  const recipeMemoryCatalog = new LocalRepositoryMemory(
+    stateRoot(recipeMemoryConfig.repository),
+    recipeMemoryConfig.repository,
+    recipeMemoryStore,
+  );
+  recipeMemoryCatalog.retain({
+    schemaVersion: 1,
+    repository: recipeMemoryConfig.repository,
+    visibility: "repository",
+    kind: "observation",
+    producer: {
+      objective: producer.objective,
+      runId: producer.runId,
+      identity: "recipe-scoped-notes",
+      status: "observed",
+    },
+    createdAt: new Date().toISOString(),
+    authority: "observation",
+    summary: "Shared migration notes",
+    bodies: [
+      { role: "notes", ref: recipeMemoryBody, availability: "retained" },
+    ],
+    sources: [
+      {
+        identity: "repository:notes.txt",
+        path: "notes.txt",
+        commitSha: memoryRecipeBase,
+        complete: true,
+        ref: recipeMemoryBody,
+      },
+    ],
+    bindings: { treeSha: git("rev-parse", `${memoryRecipeBase}^{tree}`) },
+    validity: { state: "current", conditions: [] },
+    supersedes: [],
+  });
+  const recipeResolver = () =>
+    createPlanningContextResolver({
+      config: recipeMemoryConfig,
+      objective: producer.objective,
+      runId: producer.runId,
+      baseSha: memoryRecipeBase,
+      sources: [],
+      objectiveBody: recipeBody,
+      contentStore: store,
+      workflowRecipe: memoryRecipe,
+    });
+  const recipeMemoryPath = join(
+    stateRoot(recipeMemoryConfig.repository),
+    "content",
+    recipeMemoryBody.digest.slice(0, 2),
+    recipeMemoryBody.digest,
+  );
+  const recipeMemoryBytes = readFileSync(recipeMemoryPath);
+  writeFileSync(recipeMemoryPath, "corrupt scoped recipe body");
+  const unresolvedRecipe = await initializeContextLookup(recipeResolver());
+  const requiredReceipts = unresolvedRecipe.packet.automatic.filter(
+    (result) => result.request.required,
+  );
+  assert.equal(requiredReceipts[0].disposition, "unavailable");
+  assert.equal(requiredReceipts[1].disposition, "no-match");
+  assert.throws(
+    () => assertContextFactsResolved(unresolvedRecipe.packet),
+    /recipe-memory-notes/,
+  );
+  writeFileSync(recipeMemoryPath, recipeMemoryBytes);
+  const resolver = recipeResolver();
+  const resolvedRecipe = await initializeContextLookup(resolver);
+  assertWorkflowRecipeContext(resolvedRecipe.packet, memoryRecipe);
+  assertContextFactsResolved(resolvedRecipe.packet);
+  const scopedReceipts = resolvedRecipe.packet.automatic.filter(
+    (result) => result.request.required,
+  );
+  assert.equal(scopedReceipts[0].disposition, "complete");
+  assert.equal(scopedReceipts[1].disposition, "no-match");
+  assert.ok(
+    scopedReceipts[0].matches[0].content.includes("Shared migration notes"),
+  );
+  const [reserved] = await resolveContextRequests(resolvedRecipe, resolver, [
+    {
+      ...scopedReceipts[0].request,
+      id: "recipe-memory-undeclared",
+      required: false,
+    },
+  ]);
+  assert.equal(reserved.disposition, "denied");
+  const [ordinaryQuery] = await resolveContextRequests(
+    resolvedRecipe,
+    resolver,
+    [
+      {
+        ...scopedReceipts[0].request,
+        id: "ordinary-notes-query",
+        required: false,
+      },
+    ],
+  );
+  assert.equal(ordinaryQuery.disposition, "complete");
+  assert.doesNotMatch(ordinaryQuery.detail, /Reused retained exact result/);
   const lookup = await initializeContextLookup(
     createPlanningContextResolver({
       config: routingConfig,

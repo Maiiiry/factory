@@ -1,3 +1,7 @@
+import {
+  readPinnedWorkflowRecipe,
+  type WorkflowRecipeInput,
+} from "./workflow-recipes.js";
 import { assertDeclaredConditions } from "./adaptive-routing.js";
 import { assertGraphExpansions } from "./graph-expansion.js";
 import { workSettled } from "./scheduler.js";
@@ -398,7 +402,10 @@ function admitAdvancedAmendmentFormat(
     );
   assertDeclaredConditions(graph);
   assertGraphExpansions(graph);
-  if (graph.conditions?.length || state.schemaVersion === 9)
+  if (
+    (graph.conditions?.length || state.schemaVersion === 9) &&
+    state.schemaVersion !== 15
+  )
     state.schemaVersion = 13;
 }
 
@@ -726,6 +733,26 @@ export function applyPendingAmendment(
         args.state.pendingAmendment.phase === "backlog"
       )
         return false;
+      let workflowRecipe: WorkflowRecipeInput | undefined;
+      if (args.state.workflowRecipePin) {
+        try {
+          if (!args.contentStore)
+            throw new Error(
+              "Recipe amendment requires the admitted ContentStore",
+            );
+          workflowRecipe = await readPinnedWorkflowRecipe(
+            args.state.workflowRecipePin,
+            args.contentStore,
+          );
+        } catch (error) {
+          throw new StepFault(
+            decision(
+              "Pinned recipe content is unavailable; restore the exact retained recipe before amendment planning",
+            ),
+            { cause: error },
+          );
+        }
+      }
       const paid = paidModel(args.model, context);
       return withPlannerAdmission(
         args.state,
@@ -737,6 +764,7 @@ export function applyPendingAmendment(
         () =>
           advanceAmendment({
             ...rest,
+            workflowRecipe,
             model: {
               ...paid,
               // An answer that does not decode is a lost answer, not a refusal:
@@ -791,6 +819,7 @@ async function advanceAmendment(args: {
   body: string;
   model: PlanningModel;
   contentStore?: ContentStore;
+  workflowRecipe?: WorkflowRecipeInput;
   github: GitHubGateway;
   save: () => void;
   cancelled: () => boolean;
@@ -1076,6 +1105,10 @@ async function advanceAmendment(args: {
           prerequisites,
           localExecutables,
           { configuredConcurrency: state.capacity.concurrency },
+          undefined,
+          undefined,
+          state.planningRecovery?.contextLookup?.packet,
+          args.workflowRecipe,
         );
       }
       admitAdvancedAmendmentFormat(state, pending.graph!);
@@ -1102,6 +1135,8 @@ async function advanceAmendment(args: {
         localExecutables,
         { configuredConcurrency: state.capacity.concurrency },
         state.approvedPlaybookPin,
+        state.planningRecovery?.contextLookup?.packet,
+        args.workflowRecipe,
       );
       packet.amendment = {
         currentImplementationEvidence: amendmentImplementationEvidence({
@@ -1224,6 +1259,7 @@ async function advanceAmendment(args: {
       if (
         (state.schemaVersion === 11 ||
           state.schemaVersion === 13 ||
+          state.schemaVersion === 15 ||
           pending.graph!.conditions?.length ||
           pending.graph!.expansions?.length) &&
         args.github.projectionMutationAdmission !== "controller-checkpoint-v1"
@@ -1241,6 +1277,7 @@ async function advanceAmendment(args: {
         graph: pending.graph!,
         ...(state.schemaVersion === 11 ||
         state.schemaVersion === 13 ||
+        state.schemaVersion === 15 ||
         pending.graph!.conditions?.length ||
         pending.graph!.expansions?.length
           ? {
@@ -1297,11 +1334,13 @@ async function advanceAmendment(args: {
         pending.graph!.items.find((item) => item.id === reattempt),
       );
     state.graph = pending.graph!;
-    if (
+    if (state.workflowRecipePin) state.schemaVersion = 15;
+    else if (
       state.graph.conditions?.length ||
       state.conditionFacts ||
       state.workflowReflection ||
-      state.schemaVersion === 13
+      state.schemaVersion === 13 ||
+      state.schemaVersion === 15
     )
       state.schemaVersion = 13;
     else if (state.graph.expansions?.length) state.schemaVersion = 11;

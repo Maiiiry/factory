@@ -1,3 +1,9 @@
+import { StepFault, decision } from "../fault.js";
+import {
+  assertWorkflowRecipeAdmissionBinding,
+  readPinnedWorkflowRecipe,
+  type WorkflowRecipeAdmission,
+} from "../workflow-recipes.js";
 import { graphProjectionControl } from "../graph-projection-control.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -9,6 +15,7 @@ import {
 import type { FactoryConfig } from "../config.js";
 import type {
   ApprovedPlaybookAdmission,
+  ContentStore,
   ExecutionDriver,
   GitHubGateway,
 } from "../contracts.js";
@@ -37,6 +44,7 @@ export async function projectPreparedObjective(args: {
   path: string;
   diagnostics: DiagnosticEmitter;
   driver: ExecutionDriver;
+  contentStore: ContentStore;
   github: GitHubGateway;
   owner: LocalOwner;
   preparation: PreparationState;
@@ -65,6 +73,25 @@ export async function projectPreparedObjective(args: {
     throw new Error(
       "Planning must authenticate settlement before GitHub projection",
     );
+  if (preparation.workflowRecipePin) {
+    try {
+      const retained = await readPinnedWorkflowRecipe(
+        preparation.workflowRecipePin,
+        args.contentStore,
+      );
+      if (JSON.stringify(retained) !== JSON.stringify(plan.workflowRecipe))
+        throw new Error(
+          "Accepted recipe plan differs from its retained definition",
+        );
+    } catch (error) {
+      throw new StepFault(
+        decision(
+          "Restore the exact retained workflow recipe before projection; preserve the original pin and planning settlement",
+        ),
+        { cause: error },
+      );
+    }
+  }
   const baseSha = preparation.baseSha;
   preparation.coordinator.phase = "projection";
   preparation.coordinator.phaseStartedAt = new Date().toISOString();
@@ -79,7 +106,7 @@ export async function projectPreparedObjective(args: {
     );
   const graph = plan.graph;
   if (
-    [12, 14].includes(preparation.schemaVersion) &&
+    [12, 14, 16].includes(preparation.schemaVersion) &&
     github.projectionMutationAdmission !== "controller-checkpoint-v1"
   )
     throw new Error(
@@ -140,7 +167,7 @@ export async function projectPreparedObjective(args: {
       objectiveStep(preparation, "project", (context) =>
         github.projectGraph({
           graph,
-          ...([12, 14].includes(preparation.schemaVersion)
+          ...([12, 14, 16].includes(preparation.schemaVersion)
             ? {
                 expansionControl: graphProjectionControl(
                   preparation,
@@ -221,15 +248,46 @@ export function activateProjectedObjective(args: {
     plan.graphDigest,
     preparation.approvedPlaybookPin !== undefined,
   );
+  const workflowRecipeAdmission: WorkflowRecipeAdmission | undefined =
+    plan.workflowRecipe
+      ? {
+          schemaVersion: 1,
+          workflowRecipePin: structuredClone(plan.workflowRecipe.pin),
+          baseSha,
+          configDigest: installationConfigDigest,
+          sourcePacketDigest: preparation.sourcePacketDigest!,
+          graphDigest: plan.graphDigest,
+          packetDigest: plan.packetDigest,
+          reviewDigest: plan.reviewDigest,
+        }
+      : undefined;
+  if (workflowRecipeAdmission)
+    assertWorkflowRecipeAdmissionBinding(workflowRecipeAdmission, {
+      pin: preparation.workflowRecipePin!,
+      baseSha,
+      configDigest: installationConfigDigest,
+      sourcePacketDigest: preparation.sourcePacketDigest!,
+      graphDigest: plan.graphDigest,
+      packetDigest: plan.packetDigest,
+      reviewDigest: plan.reviewDigest,
+    });
   return {
+    ...(workflowRecipeAdmission
+      ? {
+          workflowRecipePin: structuredClone(preparation.workflowRecipePin!),
+          workflowRecipeAdmission,
+        }
+      : {}),
     schemaVersion:
-      preparation.schemaVersion === 14 || plan.schemaVersion === 6
-        ? 13
-        : preparation.schemaVersion === 12 || plan.schemaVersion === 5
-          ? 11
-          : preparation.schemaVersion === 10 || plan.schemaVersion === 4
-            ? 9
-            : 7,
+      preparation.schemaVersion === 16 || plan.schemaVersion === 7
+        ? 15
+        : preparation.schemaVersion === 14 || plan.schemaVersion === 6
+          ? 13
+          : preparation.schemaVersion === 12 || plan.schemaVersion === 5
+            ? 11
+            : preparation.schemaVersion === 10 || plan.schemaVersion === 4
+              ? 9
+              : 7,
     ...(preparation.graphProjectionIntents
       ? {
           graphProjectionIntents: structuredClone(

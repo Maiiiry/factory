@@ -103,6 +103,16 @@ export interface PlanningContextResolver {
 export function contextDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
+/** Recipe inputs carry frozen controller scopes; equal query text does not merge those facts. */
+export function contextRequestIdentity(request: ContextRequest): string {
+  return contextDigest([
+    request.collection,
+    request.operation,
+    request.selector,
+    request.query,
+    ...(request.id.startsWith("recipe-memory-") ? [request.id] : []),
+  ]);
+}
 export function contextResultBytes(
   result: Pick<ContextResult, "matches">,
 ): number {
@@ -332,15 +342,7 @@ export function assertContextFactsResolved(
   const latest = new Map<string, ContextResult>();
   for (const result of [...packet.automatic, ...packet.batches.flat()]) {
     if (result.request.required)
-      latest.set(
-        contextDigest([
-          result.request.collection,
-          result.request.operation,
-          result.request.selector,
-          result.request.query,
-        ]),
-        result,
-      );
+      latest.set(contextRequestIdentity(result.request), result);
   }
   const missing = [...latest.values()].filter(
     (result) => !resolvedContextResult(result),
@@ -467,18 +469,7 @@ export async function resolveContextRequests(
               (typeof m.provenance.validUntil === "string" &&
                 Date.parse(m.provenance.validUntil) > Date.now()),
           ) &&
-          contextDigest([
-            r.request.collection,
-            r.request.operation,
-            r.request.selector,
-            r.request.query,
-          ]) ===
-            contextDigest([
-              request.collection,
-              request.operation,
-              request.selector,
-              request.query,
-            ]),
+          contextRequestIdentity(r.request) === contextRequestIdentity(request),
       );
       result = prior
         ? {
@@ -755,13 +746,6 @@ export function assertHumanPlanningDependency(
       "Unavailable context requires an actual required unsuccessful lookup receipt before asking a human",
     );
   const results = [...packet.automatic, ...packet.batches.flat()];
-  const identity = (request: ContextRequest) =>
-    contextDigest([
-      request.collection,
-      request.operation,
-      request.selector,
-      request.query,
-    ]);
   for (const id of response.requestIds) {
     const matches = results.filter((result) => result.request.id === id);
     if (matches.length !== 1)
@@ -771,7 +755,11 @@ export function assertHumanPlanningDependency(
     const result = matches[0]!;
     const latest = [...results]
       .reverse()
-      .find((entry) => identity(entry.request) === identity(result.request));
+      .find(
+        (entry) =>
+          contextRequestIdentity(entry.request) ===
+          contextRequestIdentity(result.request),
+      );
     if (
       !result.request.required ||
       resolvedContextResult(result) ||

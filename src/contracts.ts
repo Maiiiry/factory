@@ -421,6 +421,8 @@ export function assertApprovedPlaybookPin(
 }
 
 export interface PlanningRequest<T> {
+  /** Pinned structural planning input; never source, command or effect authority. */
+  workflowRecipe?: import("./workflow-recipes.js").WorkflowRecipeInput;
   /** Authenticated role input; preserves source, command and effect authority. */
   adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** Retained controller-selected facts, separate from normative source authority. */
@@ -479,6 +481,8 @@ export interface PlanCommandAuthorization {
 }
 
 export interface PlanReviewRequest {
+  /** Exact pinned structural recipe independently reviewed with this graph. */
+  workflowRecipe?: import("./workflow-recipes.js").WorkflowRecipeInput;
   /** Authenticated role input; preserves source, command and effect authority. */
   adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** The exact context packet used by compilation, independently reviewed. */

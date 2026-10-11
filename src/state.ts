@@ -1,5 +1,9 @@
 import { assertWorkRoutingState } from "./runner/routing.js";
 import { assertWorkflowReflection } from "./workflow-reflection.js";
+import {
+  assertWorkflowRecipePin,
+  assertWorkflowRecipeAdmissionBinding,
+} from "./workflow-recipes.js";
 import { assertWorkItemScheduling } from "./scheduler.js";
 import { assertAdaptiveContextPacket } from "./adaptive-context.js";
 import { assertPlanningLookupRecord } from "./compiler/context.js";
@@ -209,6 +213,8 @@ export interface CoordinatorDisposition {
 
 /** Preparation shares the atomic state path; no executable graph is invented. */
 export interface PreparationState {
+  /** Exact immutable definition and resolved arguments retained before planning. */
+  workflowRecipePin?: import("./workflow-recipes.js").WorkflowRecipePin;
   /** Observational pointers; absence supplies no historical memory. */
   memoryBindings?: import("./repository-memory.js").RepositoryMemoryBinding[];
   graphProjectionIntents?: Record<
@@ -229,7 +235,7 @@ export interface PreparationState {
   /** Worker ceiling and scheduling resolved when the Objective started. */
   capacity: import("./config.js").Capacity;
   charges?: import("./repair-policy.js").RepairLedger["charges"];
-  schemaVersion: 8 | 10 | 12 | 14;
+  schemaVersion: 8 | 10 | 12 | 14 | 16;
   kind: "preparing";
   repository: string;
   objective: number;
@@ -270,7 +276,8 @@ export function isPreparationState(
     state?.schemaVersion === 8 ||
     state?.schemaVersion === 10 ||
     state?.schemaVersion === 12 ||
-    state?.schemaVersion === 14
+    state?.schemaVersion === 14 ||
+    state?.schemaVersion === 16
   );
 }
 
@@ -281,7 +288,8 @@ export function isExecutionState(
     state?.schemaVersion === 7 ||
     state?.schemaVersion === 9 ||
     state?.schemaVersion === 11 ||
-    state?.schemaVersion === 13
+    state?.schemaVersion === 13 ||
+    state?.schemaVersion === 15
   );
 }
 
@@ -320,6 +328,9 @@ export function setCoordinatorMode(
 }
 
 export interface FactoryState {
+  workflowRecipePin?: import("./workflow-recipes.js").WorkflowRecipePin;
+  /** Original admission fingerprints survive amendments and discovered children. */
+  workflowRecipeAdmission?: import("./workflow-recipes.js").WorkflowRecipeAdmission;
   conditionFacts?: Record<
     string,
     import("./runner/routing.js").WorkConditionSettlement
@@ -377,7 +388,7 @@ export interface FactoryState {
   prerequisitesDigest?: string;
   /** Immutable authenticated admission facts, bound to prerequisitesDigest. */
   prerequisites?: import("./contracts.js").PlanningPrerequisites;
-  schemaVersion: 7 | 9 | 11 | 13;
+  schemaVersion: 7 | 9 | 11 | 13 | 15;
   approvedPlaybookAdmission?: import("./contracts.js").ApprovedPlaybookAdmission;
   approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
   repository: string;
@@ -416,6 +427,67 @@ export interface FactoryState {
   /** Step repeat records for Work Items and the Objective (#515). */
   repeats?: Record<string, RepeatRecord>;
   wait?: Wait;
+}
+
+/** Pin shape is lifecycle-readable; runtime authenticates its retained bodies before use. */
+export function assertStateWorkflowRecipe(state: ContinuationState): void {
+  const pin = state.workflowRecipePin;
+  const preparation = isPreparationState(state);
+  const recipeFormat = preparation
+    ? state.schemaVersion === 16
+    : state.schemaVersion === 15;
+  if (preparation && Object.hasOwn(state, "workflowRecipeAdmission"))
+    throw new Error(
+      "Original recipe admission receipt belongs only to execution snapshots",
+    );
+  const admission = preparation ? undefined : state.workflowRecipeAdmission;
+  if (pin === undefined) {
+    if (
+      recipeFormat ||
+      admission !== undefined ||
+      (preparation &&
+        (state.plan?.schemaVersion === 7 ||
+          state.plan?.workflowRecipe !== undefined))
+    )
+      throw new Error("Recipe snapshot lacks its original pinned admission");
+    return;
+  }
+  if (!recipeFormat)
+    throw new Error(
+      "Pinned recipe requires preparation16 or execution15 snapshot semantics",
+    );
+  assertWorkflowRecipePin(pin);
+  if (pin.origin.kind === "repository" && pin.origin.baseSha !== state.baseSha)
+    throw new Error(
+      "Pinned repository recipe differs from its original admission base",
+    );
+  if (
+    typeof state.sourcePacketDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(state.sourcePacketDigest)
+  )
+    throw new Error("Pinned recipe lacks its immutable source packet binding");
+  if (preparation) {
+    if (
+      state.plan &&
+      (state.plan.schemaVersion !== 7 ||
+        JSON.stringify(state.plan.workflowRecipe?.pin) !== JSON.stringify(pin))
+    )
+      throw new Error("Preparation plan differs from its original recipe pin");
+    return;
+  }
+  if (!admission || !state.planGraphDigest)
+    throw new Error("Pinned recipe lacks its original graph admission");
+  assertWorkflowRecipeAdmissionBinding(admission, {
+    pin,
+    baseSha: state.baseSha,
+    configDigest: state.configDigest,
+    sourcePacketDigest: state.sourcePacketDigest!,
+    graphDigest: state.planGraphDigest,
+    // These are the retained original review fingerprints, not the current
+    // amended graph's review; creation authenticates them against the candidate.
+    packetDigest: admission.packetDigest,
+    reviewDigest: admission.reviewDigest,
+  });
 }
 
 /** Validate retained packet identities without requiring advisory bodies for lifecycle reads. */
@@ -774,7 +846,8 @@ export function parseFactoryState(
     (state.schemaVersion !== 7 &&
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
-      state.schemaVersion !== 13) ||
+      state.schemaVersion !== 13 &&
+      state.schemaVersion !== 15) ||
     state.repository !== repository ||
     state.objective !== objective
   )
@@ -790,7 +863,8 @@ export function parseFactoryState(
     if (
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
-      state.schemaVersion !== 13
+      state.schemaVersion !== 13 &&
+      state.schemaVersion !== 15
     )
       throw new Error("Adaptive context requires execution schema version 9");
     assertPlanningLookupRecord(lookup);
@@ -821,6 +895,7 @@ export function parseFactoryState(
   if (Object.hasOwn(state, "approvedPlaybookPin"))
     assertApprovedPlaybookPin(state.approvedPlaybookPin);
   sha(state.planGraphDigest, "planGraphDigest", 64);
+  assertStateWorkflowRecipe(state as unknown as FactoryState);
   assertAcceptedPlanningDecision(
     state.acceptedPlanningDecision,
     state.planGraphDigest as string,
@@ -865,7 +940,11 @@ export function parseFactoryState(
   assertExpansionState(state as unknown as FactoryState);
   assertAgentSessions(state as unknown as FactoryState);
   assertWorkRoutingState(state as unknown as FactoryState);
-  if (state.workflowReflection !== undefined && state.schemaVersion !== 13)
+  if (
+    state.workflowReflection !== undefined &&
+    state.schemaVersion !== 13 &&
+    state.schemaVersion !== 15
+  )
     throw new Error(
       "Workflow reflection requires execution snapshot version 13",
     );
@@ -879,7 +958,8 @@ export function parseFactoryState(
       if (
         state.schemaVersion !== 9 &&
         state.schemaVersion !== 11 &&
-        state.schemaVersion !== 13
+        state.schemaVersion !== 13 &&
+        state.schemaVersion !== 15
       )
         throw new Error("Discovery requires execution schema version 9");
       assertDiscoverySpecification(item.discovery);
@@ -968,7 +1048,8 @@ export function parseFactoryState(
     if (
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
-      state.schemaVersion !== 13
+      state.schemaVersion !== 13 &&
+      state.schemaVersion !== 15
     )
       throw new Error(
         "Discovery start admissions require execution schema version 9",
@@ -1015,7 +1096,10 @@ export function parseFactoryState(
     throw new Error(
       "Adaptive execution lacks its retained context or discovery semantics",
     );
-  if (state.schemaVersion === 13 && lookup === undefined)
+  if (
+    (state.schemaVersion === 13 || state.schemaVersion === 15) &&
+    lookup === undefined
+  )
     throw new Error(
       "Execution snapshot version 13 requires its original admitted planning context",
     );

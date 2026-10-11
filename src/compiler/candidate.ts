@@ -1,5 +1,10 @@
 import { assertDeclaredConditions } from "../adaptive-routing.js";
 import {
+  assertWorkflowRecipeGraph,
+  assertWorkflowRecipeContext,
+  type WorkflowRecipeInput,
+} from "../workflow-recipes.js";
+import {
   assertDiscoveryContextScope,
   assertContextFactsResolved,
   type PlanningContextPacket,
@@ -43,9 +48,10 @@ import { assertCoverageSources, coverageObligations } from "../qa.js";
 import { assertGraphExpansions } from "../graph-expansion.js";
 
 export interface PlanCandidate {
+  workflowRecipe?: WorkflowRecipeInput;
   contextLookup?: PlanningContextPacket;
   approvedPlaybookPin?: ApprovedPlaybookPin;
-  schemaVersion: 3 | 4 | 5 | 6;
+  schemaVersion: 3 | 4 | 5 | 6 | 7;
   prerequisites?: PlanningPrerequisites;
   localExecutables?: PlanningLocalExecutables;
   executionBounds?: PlanningExecutionBounds;
@@ -114,14 +120,19 @@ export function buildPlanCandidate(
     ...(review.failure ? { failure: review.failure } : {}),
   };
   return {
-    schemaVersion: graph.conditions?.length
-      ? 6
-      : graph.expansions?.length
-        ? 5
-        : packet.contextLookup ||
-            graph.items.some((item) => item.kind === "discovery")
-          ? 4
-          : 3,
+    ...(packet.workflowRecipe
+      ? { workflowRecipe: structuredClone(packet.workflowRecipe) }
+      : {}),
+    schemaVersion: packet.workflowRecipe
+      ? 7
+      : graph.conditions?.length
+        ? 6
+        : graph.expansions?.length
+          ? 5
+          : packet.contextLookup ||
+              graph.items.some((item) => item.kind === "discovery")
+            ? 4
+            : 3,
     ...(packet.contextLookup
       ? { contextLookup: structuredClone(packet.contextLookup) }
       : {}),
@@ -185,6 +196,20 @@ export function verifyPlanCandidate(
   allowPending = false,
   configuredConcurrency?: number,
 ): void {
+  if (candidate.workflowRecipe) {
+    assertWorkflowRecipeContext(
+      candidate.contextLookup,
+      candidate.workflowRecipe,
+    );
+    if (!candidate.contextLookup)
+      throw new Error("Pinned recipes require admitted adaptive context");
+    assertWorkflowRecipeGraph(candidate.graph, candidate.workflowRecipe);
+    if (
+      candidate.workflowRecipe.pin.origin.kind === "repository" &&
+      candidate.workflowRecipe.pin.origin.baseSha !== baseSha
+    )
+      throw new Error("Recipe origin differs from candidate base");
+  }
   assertObjectiveCriteria(body);
   if (candidate.contextLookup)
     assertContextFactsResolved(candidate.contextLookup);
@@ -218,6 +243,7 @@ export function verifyPlanCandidate(
     candidate.executionBounds,
     candidate.approvedPlaybookPin,
     candidate.contextLookup,
+    candidate.workflowRecipe,
   );
   if (
     (candidate.prerequisites &&
@@ -230,14 +256,16 @@ export function verifyPlanCandidate(
         JSON.stringify(candidate.localExecutables.finalCommands) !==
           JSON.stringify(expectedPacket.finalCommands))) ||
     candidate.schemaVersion !==
-      (candidate.graph.conditions?.length
-        ? 6
-        : candidate.graph.expansions?.length
-          ? 5
-          : candidate.contextLookup ||
-              candidate.graph.items.some((item) => item.kind === "discovery")
-            ? 4
-            : 3) ||
+      (candidate.workflowRecipe
+        ? 7
+        : candidate.graph.conditions?.length
+          ? 6
+          : candidate.graph.expansions?.length
+            ? 5
+            : candidate.contextLookup ||
+                candidate.graph.items.some((item) => item.kind === "discovery")
+              ? 4
+              : 3) ||
     candidate.objective !== objective ||
     candidate.baseSha !== baseSha ||
     candidate.bodyDigest !== digest(body) ||

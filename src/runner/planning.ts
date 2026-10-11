@@ -18,7 +18,11 @@ import {
   resolveCapacity,
   validateTarget,
 } from "../config.js";
-import type { GitHubGateway, PlanningModel } from "../contracts.js";
+import type {
+  ExecutionDriver,
+  GitHubGateway,
+  PlanningModel,
+} from "../contracts.js";
 import { DiagnosticEmitter, withDiagnosticSession } from "../diagnostics.js";
 import { executionProfileChoices } from "../execution-profiles.js";
 import { attachedFault } from "../fault.js";
@@ -35,6 +39,16 @@ import {
   saveState,
   statePath,
 } from "../state-store.js";
+import {
+  type WorkflowRecipeAdmissionContext,
+  type WorkflowRecipePin,
+  type WorkflowRecipeInput,
+  assertWorkflowRecipeAdmission,
+  objectiveWorkflowRecipeSelector,
+  resolveWorkflowRecipe,
+  retainWorkflowRecipe,
+  readPinnedWorkflowRecipe,
+} from "../workflow-recipes.js";
 import { shortPlanDigest } from "../status-summary.js";
 import {
   type ApplicationServices,
@@ -48,12 +62,121 @@ import {
   releaseMutationLock,
 } from "./ownership.js";
 
+/** Shared providerless preview facts; runtime additionally binds its declared driver. */
+export function workflowRecipeAdmissionContext(
+  config: FactoryConfig,
+  objectiveBody: string,
+  driver?: ExecutionDriver,
+): WorkflowRecipeAdmissionContext {
+  const enabled =
+    adaptiveWorkflowEnabled(objectiveBody) &&
+    config.planningContext?.enabled === true;
+  const semantic =
+    driver?.readonlyDiscovery === "selector-bound-read-only-v1" &&
+    !!driver.preflight;
+  return {
+    adaptiveEnabled: enabled,
+    selectors: config.planningContext?.selectors ?? [],
+    configuredConcurrency: resolveCapacity(config).concurrency,
+    executionProfileIds:
+      executionProfileChoices(config)?.profiles.map((profile) => profile.id) ??
+      [],
+    memoryEnabled:
+      config.planningContext?.enabled === true &&
+      config.planningContext.memory === true,
+    capabilities: [
+      {
+        id: "inventory-discovery",
+        status: "available",
+        detail: "Installed selector-bound inventory reader",
+      },
+      {
+        id: "semantic-discovery",
+        status: semantic ? "available" : driver ? "unavailable" : "unknown",
+        detail: semantic
+          ? "Declared selector-bound read-only driver; fresh preflight remains required"
+          : "Read-only discovery driver and preflight have not been verified",
+      },
+      {
+        id: "graph-expansion",
+        status: "available",
+        detail:
+          "Installed reviewed bounded expansion controller; projection admission remains required",
+      },
+      {
+        id: "graph-conditions",
+        status: "available",
+        detail: "Installed evidence-bound condition controller",
+      },
+      {
+        id: "repository-memory",
+        status:
+          config.planningContext?.enabled &&
+          config.planningContext.memory === true
+            ? "available"
+            : "unavailable",
+        detail: "Repository memory requires configured retrieval admission",
+      },
+    ],
+  };
+}
+
+async function preflightWorkflowRecipe(
+  contract: WorkflowRecipeInput["contract"],
+  objective: number,
+  baseSha: string,
+  driver: ExecutionDriver | undefined,
+  github: GitHubGateway,
+): Promise<void> {
+  const semanticStages = contract.stages.filter(
+    (stage) =>
+      stage.kind === "discovery" && stage.discovery?.mode === "semantic",
+  );
+  if (semanticStages.length) {
+    if (
+      driver?.readonlyDiscovery !== "selector-bound-read-only-v1" ||
+      !driver.preflight
+    )
+      throw new Error(
+        "Recipe semantic discovery lacks read-only driver preflight",
+      );
+    // This is a providerless capability probe, never an admitted execution graph.
+    await driver.preflight({
+      objective,
+      baseSha,
+      coverage: [],
+      items: semanticStages.map((stage) => ({
+        id: stage.id,
+        kind: "discovery",
+        title: stage.title,
+        goal: stage.goal,
+        nonGoals: stage.nonGoals,
+        dependencies: stage.dependencies,
+        discovery: stage.discovery,
+        acceptance: [],
+        ownedPaths: [],
+        citations: [],
+        validation: [],
+        brief: "",
+      })),
+    });
+  }
+  if (
+    contract.expansions.length &&
+    github.projectionMutationAdmission !== "controller-checkpoint-v1"
+  )
+    throw new Error(
+      "Recipe expansion requires checkpointed GitHub projection admission",
+    );
+}
+
 /** One controller-derived binding for the immutable preparation inputs. */
 function preparationSourceDigest(
   sources: PlanCandidate["sources"],
   prerequisites: PlanCandidate["prerequisites"],
   localExecutables: PlanCandidate["localExecutables"],
   approvedPlaybookPin?: PlanCandidate["approvedPlaybookPin"],
+  workflowRecipePin?: WorkflowRecipePin,
 ): string {
   const original = createHash("sha256")
     .update(
@@ -70,10 +193,16 @@ function preparationSourceDigest(
       ),
     )
     .digest("hex");
-  return approvedPlaybookPin === undefined
-    ? original
+  const advisory =
+    approvedPlaybookPin === undefined
+      ? original
+      : createHash("sha256")
+          .update(JSON.stringify([original, approvedPlaybookPin]))
+          .digest("hex");
+  return workflowRecipePin === undefined
+    ? advisory
     : createHash("sha256")
-        .update(JSON.stringify([original, approvedPlaybookPin]))
+        .update(JSON.stringify([advisory, workflowRecipePin]))
         .digest("hex");
 }
 
@@ -84,7 +213,7 @@ export async function planObjective(
   services: Pick<
     ApplicationServices,
     "planningModel" | "github" | "contentStore"
-  >,
+  > & { driver?: ExecutionDriver },
 ): Promise<PlanCandidate> {
   const digest = factoryConfigDigest(config);
   const emitter = new DiagnosticEmitter(
@@ -111,7 +240,7 @@ async function planObjectiveObserved(
   services: Pick<
     ApplicationServices,
     "planningModel" | "github" | "contentStore"
-  >,
+  > & { driver?: ExecutionDriver },
 ): Promise<PlanCandidate> {
   validateTarget(config.repository, config.checkout);
   checkRequiredEnvironment(config);
@@ -138,6 +267,33 @@ async function planObjectiveObserved(
       config.repository,
       advisory ? { version: advisory.version, digest: advisory.digest } : null,
     );
+    const selection = objectiveWorkflowRecipeSelector(issue.body);
+    let workflowRecipe: WorkflowRecipeInput | undefined;
+    if (selection) {
+      if (!config.planningContext?.enabled)
+        throw new Error("Recipe planning requires bounded adaptive context");
+      const resolution = resolveWorkflowRecipe({
+        selection,
+        checkout: config.checkout,
+        baseSha,
+        maxBytes: config.planningContext.bounds.maxBytes,
+      });
+      assertWorkflowRecipeAdmission(
+        resolution.contract,
+        workflowRecipeAdmissionContext(config, issue.body, services.driver),
+      );
+      await preflightWorkflowRecipe(
+        resolution.contract,
+        objective,
+        baseSha,
+        services.driver,
+        services.github,
+      );
+      workflowRecipe = await retainWorkflowRecipe(
+        resolution,
+        services.contentStore,
+      );
+    }
     const result = await compilePlan(
       objective,
       issue.body,
@@ -157,16 +313,19 @@ async function planObjectiveObserved(
           baseSha,
           sources: planningSources(issue.body, baseSha, config.checkout),
           contentStore: services.contentStore,
+          workflowRecipe,
         }),
         state: {
           autonomy: resolveAutonomy(config.autonomy),
           approvedPlaybookPin: planningModel.approvedPlaybookPin,
+          ...(workflowRecipe ? { workflowRecipePin: workflowRecipe.pin } : {}),
         },
         save: () => undefined,
       },
       await planningPrerequisites(config, services.github, objective, baseSha),
       preflightObjective(config, issue.body, baseSha),
       { configuredConcurrency: resolveCapacity(config).concurrency },
+      workflowRecipe,
     );
     diagnostics.emit({
       operation: "planning-preview",
@@ -312,6 +471,7 @@ export async function prepareObjective(args: {
   path: string;
   diagnostics: DiagnosticEmitter;
   planningModel: PlanningModel;
+  driver: ExecutionDriver;
   github: GitHubGateway;
   contentStore: ApplicationServices["contentStore"];
   owner: LocalOwner;
@@ -366,17 +526,62 @@ export async function prepareObjective(args: {
     config.repository,
     approvedPlaybookPin,
   );
+  const selection = objectiveWorkflowRecipeSelector(issue.body);
+  let workflowRecipe: WorkflowRecipeInput | undefined;
+  if (preparation?.workflowRecipePin) {
+    try {
+      workflowRecipe = await readPinnedWorkflowRecipe(
+        preparation.workflowRecipePin,
+        args.contentStore,
+      );
+    } catch {
+      preparation.coordinator.phase = "waiting";
+      preparation.coordinator.waitReason =
+        "Pinned workflow recipe is unavailable; restore its exact retained content before continuing";
+      saveState(path, preparation);
+      return preparation;
+    }
+  } else if (selection) {
+    if (preparation)
+      throw new Error(
+        "Retained preparation lacks the original workflow recipe pin; refuse it before replanning",
+      );
+    if (!adaptive || !config.planningContext?.enabled)
+      throw new Error(
+        "Workflow recipes require explicit adaptive workflow and bounded planning context",
+      );
+    const resolution = resolveWorkflowRecipe({
+      selection,
+      checkout: config.checkout,
+      baseSha,
+      maxBytes: config.planningContext.bounds.maxBytes,
+    });
+    assertWorkflowRecipeAdmission(
+      resolution.contract,
+      workflowRecipeAdmissionContext(config, issue.body, args.driver),
+    );
+    await preflightWorkflowRecipe(
+      resolution.contract,
+      objective,
+      baseSha,
+      args.driver,
+      github,
+    );
+    workflowRecipe = await retainWorkflowRecipe(resolution, args.contentStore);
+  }
   const sourcePacketDigest = preparationSourceDigest(
     planningSources(issue.body, baseSha, config.checkout),
     prerequisites,
     localExecutables,
     approvedPlaybookPin,
+    workflowRecipe?.pin,
   );
   if (!preparation) {
     preparation = {
       approvedPlaybookPin,
       sourcePacketDigest,
-      schemaVersion: adaptive ? 10 : 8,
+      schemaVersion: workflowRecipe ? 16 : adaptive ? 10 : 8,
+      ...(workflowRecipe ? { workflowRecipePin: workflowRecipe.pin } : {}),
       kind: "preparing",
       repository: config.repository,
       objective,
@@ -484,6 +689,7 @@ export async function prepareObjective(args: {
                       config.checkout,
                     ),
                     contentStore: args.contentStore,
+                    workflowRecipe,
                   }),
                   state: preparation!,
                   sessionState: preparation!,
@@ -495,6 +701,7 @@ export async function prepareObjective(args: {
                 prerequisites,
                 localExecutables,
                 { configuredConcurrency: capacity.concurrency },
+                workflowRecipe,
               ),
             true,
           );
@@ -509,7 +716,8 @@ export async function prepareObjective(args: {
       );
     }
   preparation.plan = plan;
-  if (plan.schemaVersion === 6) preparation.schemaVersion = 14;
+  if (plan.schemaVersion === 7) preparation.schemaVersion = 16;
+  else if (plan.schemaVersion === 6) preparation.schemaVersion = 14;
   else if (plan.schemaVersion === 5) preparation.schemaVersion = 12;
   else if (plan.graph.items.some((item) => item.kind === "discovery"))
     preparation.schemaVersion = 10;

@@ -1,3 +1,7 @@
+import {
+  assertWorkflowRecipeInput,
+  type WorkflowRecipeInput,
+} from "../workflow-recipes.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { adaptiveWorkflowEnabled } from "../adaptive-workflow.js";
@@ -17,6 +21,7 @@ import {
   type MemoryResult,
 } from "../repository-memory.js";
 import {
+  assertContextRequest,
   contextDigest,
   contextMatch,
   contextResultBytes,
@@ -46,8 +51,18 @@ export function createPlanningContextResolver(input: {
   sources: PlanningSource[];
   objectiveBody: string;
   contentStore: ContentStore;
+  workflowRecipe?: WorkflowRecipeInput;
 }): PlanningContextResolver | undefined {
-  const { config, objective, runId, baseSha, sources, contentStore } = input;
+  const {
+    config,
+    objective,
+    runId,
+    baseSha,
+    sources,
+    contentStore,
+    workflowRecipe,
+  } = input;
+  if (workflowRecipe) assertWorkflowRecipeInput(workflowRecipe);
   const enabled = adaptiveWorkflowEnabled(input.objectiveBody);
   const options = config.planningContext;
   if (!enabled) return undefined;
@@ -165,6 +180,42 @@ export function createPlanningContextResolver(input: {
           "Supply retained decision history for this Objective; original authority and current applicability remain explicit",
       })),
   );
+  const recipeRequests = new Map<
+    string,
+    { request: ContextRequest; scope: NonNullable<MemoryLookup["scope"]> }
+  >();
+  for (const declared of workflowRecipe?.contract.memoryInputs ?? []) {
+    if (
+      declared.selectors.some((path) => !admittedPath(path, options.selectors))
+    )
+      throw new Error("Recipe memory input exceeds admitted selector scope");
+    const request: ContextRequest = {
+      id: `recipe-memory-${declared.id}`,
+      operation: "search",
+      collection: "memory",
+      selector: "",
+      query: declared.query,
+      required: declared.required,
+      reason: `Pinned recipe ${workflowRecipe!.pin.id} version ${workflowRecipe!.pin.version} declares memory input ${declared.id}`,
+    };
+    assertContextRequest(request);
+    if (recipeRequests.has(request.id))
+      throw new Error("Recipe repeats a memory input identity");
+    recipeRequests.set(request.id, {
+      request,
+      scope: {
+        ...lookup.scope,
+        paths: [...declared.selectors],
+        kinds: [...declared.kinds],
+      },
+    });
+  }
+  // Required contract facts take the same finite allowance before optional retrieval.
+  automatic.unshift(
+    ...[...recipeRequests.values()]
+      .sort((a, b) => Number(b.request.required) - Number(a.request.required))
+      .map(({ request }) => request),
+  );
   const catalog: PlanningContextResolver["catalog"] = [
     {
       id: "repository",
@@ -247,6 +298,7 @@ export function createPlanningContextResolver(input: {
       treeSha,
       configDigest,
       sources,
+      ...(workflowRecipe ? { workflowRecipePin: workflowRecipe.pin } : {}),
       mandatoryDecisions: automatic
         .filter((request) => request.required)
         .map((request) => request.selector),
@@ -261,6 +313,23 @@ export function createPlanningContextResolver(input: {
         disposition: ContextResult["disposition"],
         detail: string,
       ): ContextResult => ({ request, disposition, matches: [], detail });
+      const recipeRequest = recipeRequests.get(request.id);
+      if (request.id.startsWith("recipe-memory-") && !recipeRequest)
+        return answer(
+          "denied",
+          "Recipe memory identity is not declared by the admitted pin",
+        );
+      if (
+        recipeRequest &&
+        contextDigest(recipeRequest.request) !== contextDigest(request)
+      )
+        return answer(
+          "denied",
+          "Recipe memory request differs from its pinned query and scope",
+        );
+      const selectedLookup = recipeRequest
+        ? { ...lookup, scope: recipeRequest.scope }
+        : lookup;
       if (request.collection === "pinned-sources") {
         const index = sources.findIndex(
           (_, i) => String(i) === request.selector,
@@ -411,13 +480,13 @@ export function createPlanningContextResolver(input: {
         request.operation === "read"
           ? [
               memory.read({
-                ...lookup,
+                ...selectedLookup,
                 id: request.selector,
                 maxBytes: remaining.maxBytes,
               }),
             ].filter((result): result is MemoryResult => result !== undefined)
           : memory.search({
-              ...lookup,
+              ...selectedLookup,
               query: request.query,
               limit: Math.min(16, remaining.maxResults),
               maxBytes: remaining.maxBytes,

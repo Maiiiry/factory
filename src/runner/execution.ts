@@ -1,3 +1,4 @@
+import { readPinnedWorkflowRecipe } from "../workflow-recipes.js";
 import {
   applyPendingGraphExpansion,
   authenticateExpansionInputs,
@@ -270,13 +271,6 @@ export async function runObjectivePass(
         "Objective issue is confirmed closed; operator direction required",
       );
     if (state) {
-      // Subprocesses recorded by an interrupted controller (for example a
-      // validation command) are ours: stop any survivor and clear the
-      // records, then repeat the step they belonged to.
-      if (state.coordinator?.processes?.length) {
-        await cancelRecordedSubprocesses(state);
-        saveState(path, state);
-      }
       if (
         !isExecutionState(state) ||
         state.repository !== config.repository ||
@@ -286,6 +280,31 @@ export async function runObjectivePass(
           // Cancel is refused once acceptance is sealed; the restored run reconciles.
           `Existing Objective state does not match this Factory installation; restore the configuration it started with${state.finalAcceptance ? ", then run it again" : `, or run \`factory cancel --objective ${objective}\``}`,
         );
+      }
+      if (state.workflowRecipePin)
+        await objectiveStep(state, "recipe-inputs", async () => {
+          try {
+            await readPinnedWorkflowRecipe(
+              state!.workflowRecipePin!,
+              contentStore,
+            );
+          } catch (error) {
+            throw attachFault(
+              new Error("Pinned workflow recipe content is unavailable", {
+                cause: error,
+              }),
+              decision(
+                "Restore the exact retained recipe definition and resolved contract before continuing; preserve the original pin and owned work",
+              ),
+            );
+          }
+        });
+      // Subprocesses recorded by an interrupted controller (for example a
+      // validation command) are ours: stop any survivor and clear the
+      // records, then repeat the step they belonged to.
+      if (state.coordinator?.processes?.length) {
+        await cancelRecordedSubprocesses(state);
+        saveState(path, state);
       }
       if (state.error)
         throw new Error(
@@ -377,6 +396,7 @@ export async function runObjectivePass(
         path,
         diagnostics,
         planningModel,
+        driver,
         contentStore,
         github,
         owner,
@@ -397,6 +417,7 @@ export async function runObjectivePass(
         path,
         diagnostics,
         driver,
+        contentStore,
         github,
         owner,
         preparation,
