@@ -1010,7 +1010,8 @@ export function validateConfig(value: unknown): FactoryConfig {
         value.githubManagement as FactoryConfig["githubManagement"]
       )?.projectStatus;
       if (
-        status?.projectId === project.projectId &&
+        status &&
+        status.projectId === project.projectId &&
         [project.metadataFieldId, project.orderFieldId].includes(status.fieldId)
       )
         throw new Error(
