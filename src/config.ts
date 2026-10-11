@@ -20,7 +20,10 @@ import {
   type ReviewArtifactSelector,
 } from "./review-artifacts.js";
 import { refuseUnknownFields } from "./unknown-fields.js";
-import { assertContextLookupBounds, type ContextLookupBounds } from "./compiler/context.js";
+import {
+  assertContextLookupBounds,
+  type ContextLookupBounds,
+} from "./compiler/context.js";
 
 export type CodexReasoningEffort =
   | "minimal"
@@ -637,16 +640,42 @@ export function validateConfig(value: unknown): FactoryConfig {
   if (value.planningContext !== undefined) {
     assertObject(value.planningContext, "planningContext");
     const context = value.planningContext;
-    assertOnlyKeys(context, ["enabled", "bounds", "selectors", "memory"], "planningContext");
+    assertOnlyKeys(
+      context,
+      ["enabled", "bounds", "selectors", "memory"],
+      "planningContext",
+    );
     if (context.enabled !== true)
-      throw new Error("planningContext.enabled must be true; omit the section to disable retrieval");
+      throw new Error(
+        "planningContext.enabled must be true; omit the section to disable retrieval",
+      );
     assertContextLookupBounds(context.bounds as ContextLookupBounds);
-    const selectors = assertUniqueStrings(context.selectors, "planningContext.selectors");
-    if (!selectors.length || selectors.length > 64 || selectors.some((selector) =>
-      selector !== selector.trim() || selector.startsWith("/") || selector.includes("\\") ||
-      selector.split("/").some((part, index, parts) => part === "." || part === ".." || (!part && index !== parts.length - 1)) ||
-      /[\u0000-\u001f\u007f*?\[\]{}]/.test(selector)))
-      throw new Error("planningContext.selectors requires 1–64 literal relative files or directory prefixes");
+    const selectors = assertUniqueStrings(
+      context.selectors,
+      "planningContext.selectors",
+    );
+    if (
+      !selectors.length ||
+      selectors.length > 64 ||
+      selectors.some(
+        (selector) =>
+          selector !== selector.trim() ||
+          selector.startsWith("/") ||
+          selector.includes("\\") ||
+          selector
+            .split("/")
+            .some(
+              (part, index, parts) =>
+                part === "." ||
+                part === ".." ||
+                (!part && index !== parts.length - 1),
+            ) ||
+          /[\u0000-\u001f\u007f*?\[\]{}]/.test(selector),
+      )
+    )
+      throw new Error(
+        "planningContext.selectors requires 1–64 literal relative files or directory prefixes",
+      );
     if (context.memory !== undefined && typeof context.memory !== "boolean")
       throw new Error("planningContext.memory must be a boolean");
   }

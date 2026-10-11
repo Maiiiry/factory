@@ -308,7 +308,9 @@ export function composePlanning(
 ): Pick<FactoryApplication, "planObjective" | "decidePlan" | "decide"> {
   validateTarget(config.repository, config.checkout);
   const services = {
-    contentStore: new LocalContentStore(join(stateRoot(config.repository), "content")),
+    contentStore: new LocalContentStore(
+      join(stateRoot(config.repository), "content"),
+    ),
     planningModel: composedPlanningModel(
       options.planningModel ?? composePlanningModel(config),
     ),
