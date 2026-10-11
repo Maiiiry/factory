@@ -78,7 +78,7 @@ For example, add `--harness claude-agent-sdk --worker-model MODEL --claude-max-t
 
 Claude worker credentials can also use `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR` or `CLAUDE_CONFIG_DIR`. Copilot supports `COPILOT_GITHUB_TOKEN`, `GITHUB_COPILOT_API_TOKEN`, `COPILOT_API_URL` and `COPILOT_PROVIDER_*`. Its local login must work without the system keychain. For a headless Claude service, bind `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` with `--credential-file`.
 
-Installing an optional SDK and authenticating its account does not qualify retained conversations. Claude retention is limited to planning; Claude implementation, result review and Objective review start fresh until their installed restart, workspace, permissions, accounting and disposal behavior is qualified.
+Installing an optional SDK and authenticating its account does not establish session settlement. Claude local planning, implementation and independent result/Objective reviews use adapter-owned private conversations, with current workspace, permissions and evidence rebound on every turn. Workers configured to load user settings stay fresh so isolation does not silently discard those settings.
 
 Claude's default tools are `Read`, `Edit`, `Write`, `Glob`, `Grep`; `--claude-tool` replaces them and `--claude-allow-tool` sets permissions. `--claude-permission` accepts `acceptEdits` (default) or `dontAsk`. No settings files load unless you add `--claude-setting-source user|project|local`; those settings and hooks are trusted local code. Copilot defaults to `view`, `create`, `edit`, `apply_patch`, `grep`, `glob`; `--copilot-tool` replaces that list. Keep `apply_patch` for models that need it to edit.
 
@@ -90,18 +90,18 @@ Codex tree-review commands inherit only PATH, private HOME and TMPDIR, LANG, LC_
 
 Factory can retain a planner from preparation through compilation, correction, diagnosis and graph amendment. Each follow-up is an explicit bounded turn; the native harness manages its internal agent loop and working context. Graph review starts fresh and independently. Workers and result/Objective reviewers use separate conversations, with current checkout, tools, permissions and evidence rebound on every turn.
 
-| Adapter           | Eligible retained roles                                                                                                |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Codex planning    | Planning, independent result review and Objective review.                                                              |
-| Claude planning   | Planning only, using adapter-owned private storage. Result and Objective review stay fresh pending live qualification. |
-| Codex worker      | Implementation.                                                                                                        |
-| Claude worker     | Fresh; retained implementation is disabled pending live qualification.                                                 |
-| Copilot worker    | Fresh; retained continuation is disabled pending live qualification.                                                   |
-| Managed execution | Fresh across attempts.                                                                                                 |
+| Adapter           | Eligible retained roles                                                                        |
+| ----------------- | ---------------------------------------------------------------------------------------------- |
+| Codex planning    | Planning, independent result review and Objective review.                                      |
+| Claude planning   | Planning, independent result review and Objective review, using adapter-owned private storage. |
+| Codex worker      | Implementation.                                                                                |
+| Claude worker     | Implementation when user settings are not requested.                                           |
+| Copilot worker    | Fresh; retained continuation is disabled pending live qualification.                           |
+| Managed execution | Fresh across attempts.                                                                         |
 
 Copilot continuation is implemented but remains disabled until native account access, restart, current-checkout rebinding and accounting behavior are qualified.
 
-Claude's other role paths are implemented but unqualified. A planning qualification does not establish worker or review retention. Their existing native receipts and disposal paths remain intact; disabled retention never clears active or unknown work or grants a fresh attempt.
+Claude follow-ups require the same authenticated native identity, privately owned transcript, current model/permission selection and settled preceding turn. Cumulative native counters are converted to new-turn per-model/category and cost deltas; missing or reset categories remain unknown. Reviewers retain their own independent conversation and read-only current evidence, never the worker's conversation or write permissions. Managed execution stays fresh across attempts. Missing or disabled retention never clears active or unknown work or grants a fresh attempt.
 
 Codex defaults to exec. `--planning-transport app-server` at setup, or setting `planning.codex.transport` to `"app-server"` in the configuration before starting an Objective, selects the app-server transport for tool-free compilation, graph review and diagnosis. Tree result and final Objective reviews remain explicitly on exec with their exact-candidate offline permission profile; SDK workers are unchanged. This is selected routing, never a fallback after an ambiguous dispatch. The [upstream app-server documentation](https://learn.chatgpt.com/docs/app-server) labels the command experimental and unsupported for production workloads. Opt-in does not establish improved latency or live qualification.
 

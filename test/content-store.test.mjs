@@ -11,6 +11,8 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -175,6 +177,53 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const store = new LocalContentStore(join(state, "content"));
   const source = readFileSync(join(checkout, "api.md"));
   const sourceRef = store.putBytes(source, { mediaType: "text/markdown" });
+  const retainedSourcePath = join(
+    state,
+    "content",
+    sourceRef.digest.slice(0, 2),
+    sourceRef.digest,
+  );
+  const retainedSourceIdentity = statSync(retainedSourcePath).ino;
+  assert.deepEqual(
+    store.putBytes(source, { mediaType: sourceRef.mediaType }),
+    sourceRef,
+  );
+  assert.equal(statSync(retainedSourcePath).ino, retainedSourceIdentity);
+  assert.deepEqual(store.readBytes(sourceRef), source);
+  chmodSync(retainedSourcePath, 0o644);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /owned private regular file/,
+    );
+  } finally {
+    chmodSync(retainedSourcePath, 0o600);
+  }
+  const changedSource = Buffer.from(source);
+  changedSource[0] ^= 1;
+  writeFileSync(retainedSourcePath, changedSource);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /digest verification/,
+    );
+  } finally {
+    writeFileSync(retainedSourcePath, source);
+  }
+  rmSync(retainedSourcePath);
+  symlinkSync(join(checkout, "api.md"), retainedSourcePath);
+  try {
+    assert.throws(
+      () => store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      /regular file|symlink/,
+    );
+  } finally {
+    rmSync(retainedSourcePath);
+    assert.deepEqual(
+      store.putBytes(source, { mediaType: sourceRef.mediaType }),
+      sourceRef,
+    );
+  }
   const memory = new LocalRepositoryMemory(state, "fixture/memory", store);
   const record = {
     schemaVersion: 1,
@@ -860,9 +909,22 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   // the same batch I/O used by full archive publication and verification.
   const opaque = Buffer.alloc(1024 * 1024, 0xff);
   opaque.set([0xff, 0x00, 0x0a, 0x80]);
-  const opaqueRef = store.putBytes(opaque, {
+  const opaqueRef = await store.put(Readable.toWeb(Readable.from([opaque])), {
     mediaType: "application/octet-stream",
   });
+  const opaquePath = join(
+    state,
+    "content",
+    opaqueRef.digest.slice(0, 2),
+    opaqueRef.digest,
+  );
+  const opaqueIdentity = statSync(opaquePath).ino;
+  assert.deepEqual(
+    store.putBytes(opaque, { mediaType: opaqueRef.mediaType }),
+    opaqueRef,
+  );
+  assert.equal(statSync(opaquePath).ino, opaqueIdentity);
+  assert.deepEqual(store.readBytes(opaqueRef), opaque);
   const batchObjects = join(root, "batch-objects.git");
   execFileSync(
     "git",
@@ -1321,6 +1383,71 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.deepEqual(
     multiWitnessArchive.queueOwnerLineage.originalClaim,
     secondLineage.originalClaim,
+  );
+  const priorWitnessArchive = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    { objective: 2, claimId: claim.id, runId: claimInitial.runId },
+  );
+  for (const [actual, original, initialOriginal, foreignRefs] of [
+    [
+      priorWitnessArchive.queueOwnerLineage,
+      lineage,
+      initialBytes,
+      [secondLineage.initialSnapshot, secondTerminalFile.ref],
+    ],
+    [
+      multiWitnessArchive.queueOwnerLineage,
+      secondLineage,
+      secondInitialBytes,
+      [lineage.initialSnapshot, terminalFile.ref],
+    ],
+  ]) {
+    assert.ok(actual);
+    assert.deepEqual(actual.checkpoints, original.checkpoints);
+    assert.deepEqual(actual.bodies, original.bodies);
+    assert.deepEqual(
+      actual.bodies.map(({ ref }) => ref),
+      [
+        original.checkpoints.before.manifest,
+        original.checkpoints.claimed.manifest,
+        original.checkpoints.initial.manifest,
+        original.originalClaim,
+        original.initialSnapshot,
+      ],
+    );
+    for (const { ref, bytes } of actual.bodies) {
+      assert.equal(bytes.byteLength, ref.bytes);
+      assert.equal(
+        createHash("sha256").update(bytes).digest("hex"),
+        ref.digest,
+      );
+      assert.equal(ref.mediaType, "application/json");
+      assert.equal(
+        foreignRefs.some((foreign) => foreign.digest === ref.digest),
+        false,
+      );
+    }
+    assert.deepEqual(
+      Buffer.from(
+        actual.bodies.find(
+          ({ ref }) => ref.digest === original.initialSnapshot.digest,
+        ).bytes,
+      ),
+      initialOriginal,
+    );
+  }
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    async () => {
+      const cold = await inspectRecoveryCheckpoint(config);
+      const warm = await inspectRecoveryCheckpoint(config);
+      assert.equal(cold.commitSha, multiWitnessInspection.commitSha);
+      assert.equal(warm.commitSha, cold.commitSha);
+      assert.deepEqual(cold.capacity, multiWitnessInspection.capacity);
+      assert.deepEqual(warm.capacity, cold.capacity);
+    },
+    { queueControlVerification: true },
   );
   await assert.rejects(
     readVerifiedRecoveryCheckpoint(config, undefined, {

@@ -9,7 +9,6 @@ import {
   rmSync,
 } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
-import { Readable } from "node:stream";
 import {
   type AccountingSeal,
   assertAccountingSealBinding,
@@ -901,14 +900,11 @@ function privateBytes(path: string, root: string): Buffer {
   return readFileSync(path);
 }
 async function retainBytes(
-  store: ContentStore,
+  store: LocalContentStore,
   bytes: Uint8Array,
   mediaType = "application/json",
 ): Promise<ContentRef> {
-  return store.put(
-    Readable.toWeb(Readable.from([bytes])) as ReadableStream<Uint8Array>,
-    { mediaType },
-  );
+  return store.putBytes(bytes, { mediaType });
 }
 
 /** Capture only authenticated original roots; installations, owners and native homes are excluded. */
