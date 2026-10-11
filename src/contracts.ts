@@ -49,6 +49,12 @@ export interface WorkItem {
   kind?: "work" | "qa" | "aggregate" | "discovery";
   /** Bound read-only observation; never coding or publication authority. */
   discovery?: import("./discovery.js").DiscoverySpecification;
+  /** Declared dependency observations, selected by exact role and typed fields. */
+  discoveryInputs?: {
+    producerItemId: string;
+    role: string;
+    fields: ("path" | "mode" | "blobSha" | "contentRef" | "classification")[];
+  }[];
   /** Hierarchy only; every required child also has an explicit dependency edge. */
   children?: string[];
   executionProfile?: { id: string; reason: string };
