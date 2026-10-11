@@ -3,9 +3,9 @@ import {
   existsSync,
   lstatSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
-  readdirSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +19,7 @@ import {
 } from "./accounting.js";
 import type { FactoryConfig } from "./config.js";
 import { stateRoot } from "./config.js";
+import { LocalContentStore } from "./content/local.js";
 import type {
   CapturedAssetSet,
   ContentRef,
@@ -27,26 +28,25 @@ import type {
   ExecutionResult,
   HarnessRequest,
 } from "./contracts.js";
-import { LocalContentStore } from "./content/local.js";
 import {
   assertDiscoveryOutputManifest,
-  parseDiscoveryBody,
   type DiscoveryOutputManifest,
+  parseDiscoveryBody,
 } from "./discovery.js";
-import { decodeRepositoryMemoryManifest } from "./repository-memory.js";
 import {
   assertRejectedCollectionReceipt,
   authenticateRejectedCollectionReceipt,
   type RejectedCollectionReceipt,
 } from "./execution/local.js";
-import type { RepositoryMemoryBinding } from "./repository-memory.js";
+import { pinnedGit, pinnedGitEnvironment, subprocessAsync } from "./process.js";
 import type {
   RecoveryCheckpointClosure,
   RecoveryCheckpointFile,
 } from "./recovery-checkpoint.js";
-import { pinnedGit, pinnedGitEnvironment, subprocessAsync } from "./process.js";
-import { parsePortableContinuation } from "./state-store.js";
+import type { RepositoryMemoryBinding } from "./repository-memory.js";
+import { decodeRepositoryMemoryManifest } from "./repository-memory.js";
 import { isPreparationState, type WorkState } from "./state.js";
+import { parsePortableContinuation } from "./state-store.js";
 import type { ValidationEvidence } from "./validation-evidence.js";
 import type { WorkflowRecipePin } from "./workflow-recipes.js";
 
@@ -883,6 +883,13 @@ export async function buildRecoveryCheckpointClosure(input: {
     files.push(...proposals.files);
     for (const ref of proposals.contentRefs) refs.set(refKey(ref), ref);
     gaps.push(...(proposals.gaps as RecoveryClosureGap[]));
+    const { projectQueuePersistenceClosure } = await import(
+      "./project-queue-state.js"
+    );
+    const queueHistory = projectQueuePersistenceClosure(config, root);
+    files.push(...queueHistory.files);
+    for (const ref of queueHistory.contentRefs) refs.set(refKey(ref), ref);
+    gaps.push(...(queueHistory.gaps as RecoveryClosureGap[]));
     for (const entry of proposals.gitObjects ?? [])
       objects.set(`commit:${entry.commitSha}`, {
         sha: entry.commitSha,

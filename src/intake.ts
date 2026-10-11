@@ -1,518 +1,669 @@
-import { createHash } from "node:crypto";
-import {
-  closeSync,
-  fsyncSync,
-  openSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { checkRequiredEnvironment } from "./repair-policy.js";
-import { requiredProviderCredentials } from "./provider-credentials.js";
-import {
-  factoryConfigDigest,
-  stateRoot,
-  type FactoryConfig,
-} from "./config.js";
-import type { GitHubGateway, IntakeIssuePage } from "./contracts.js";
 import * as time from "./clock.js";
 import { objectiveComplete } from "./completion.js";
-import { attachedFault } from "./fault.js";
-import { planningPrerequisites } from "./objective-prerequisites.js";
+import {
+  type FactoryConfig,
+  factoryAuthorityDigest,
+  factoryConfigDigest,
+  stateRoot,
+} from "./config.js";
+import type { GitHubGateway } from "./contracts.js";
 import {
   type ControlRequest,
   ForegroundControllerError,
   requestControl,
   serveControl,
 } from "./coordinator-control.js";
+import { NativeStackDelivery } from "./delivery/native-stack.js";
+import { attachedFault } from "./fault.js";
+import { RealGitHubGateway } from "./github.js";
+import { planningPrerequisites } from "./objective-prerequisites.js";
 import { fetchHead, git, gitAsync } from "./process.js";
 import {
+  completeQueueOperation,
+  createQueueOperation,
+  observeProjectQueue,
+  parseQueueMetadata,
+  performQueueEffect,
+  type QueueMetadata,
+  type QueueMode,
+  type QueueOperation,
+  queueDigest,
+  readQueueHistory,
+  requireProjectQueueEffects,
+  type VerifiedQueueObservation,
+} from "./project-queue-state.js";
+import {
+  awaitCheckpointAdmission,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import { checkRequiredEnvironment } from "./repair-policy.js";
+import {
   type ApplicationServices,
-  runObjective,
   CoordinatorHandoff,
+  runObjective,
 } from "./runner.js";
+import { type ContinuationState, isExecutionState } from "./state.js";
 import {
   acquireInstallationLock,
   readContinuation,
   releaseControllerLock,
   retargetControllerLock,
-  saveState,
-  statePath,
 } from "./state-store.js";
-import {
-  isExecutionState,
-  isPreparationState,
-  setCoordinatorMode,
-} from "./state.js";
-import type { ContinuationState } from "./state.js";
 
-/**
- * The queue and its service switch. Pending order is derived from `objectives`, never copied
- * into a second queue. `watch` is set by `factory setup --background`, which is the consent to
- * run the service; a queue without it is only a list waiting for that setup.
- */
+/** A fresh in-memory Project view; never persisted or restored as a queue. */
 export interface IntakeAuthorization {
+  queueProtocol: "project-queue-v1";
   version: 1;
+  authority: "github-project";
+  complete: boolean;
   repository: string;
   configDigest: string;
-  /** Objectives the operator queued, in order; empty for a watch-only service. */
   objectives: number[];
   watch?: true;
   bodyDigests: Record<string, string>;
-  /** Frozen first-dispatch deadlines; null retains an admission without an elapsed cap. */
-  objectiveDeadlines?: Record<string, string | null>;
   dequeued: number[];
-  mode: "running" | "paused" | "draining";
+  mode: QueueMode;
+  legacyLocalQueueIgnored?: true;
   observation?: {
     at: string;
     reasons: Record<string, string>;
     error?: string;
-    /** The Objective that stopped the queue for a human decision. */
     needsDecision?: number;
     idleReason?: "awaiting-approved-work" | "waiting-for-eligible-work";
     unapproved?: number[];
   };
 }
-const DRAINING_REFUSAL =
-  "The queue is draining; it cannot take new work. `factory queue resume` reopens it";
-/** How often the service looks at GitHub for queued work. */
 export const DEFAULT_QUEUE_POLL_SECONDS = 30;
 export const queuePollSeconds = (config: FactoryConfig): number =>
   config.queue?.pollSeconds ?? DEFAULT_QUEUE_POLL_SECONDS;
-const digest = (body: string) =>
-  createHash("sha256").update(body).digest("hex");
-const intakePath = (config: FactoryConfig) =>
-  join(stateRoot(config.repository), "intake.json");
-function saveIntake(config: FactoryConfig, value: IntakeAuthorization): void {
-  const path = intakePath(config);
-  mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.tmp`;
-  const fd = openSync(temporary, "wx", 0o600);
-  try {
-    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temporary, path);
-  const directory = openSync(stateRoot(config.repository), "r");
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
-}
-/**
- * The queue record. A record written under another configuration is refused
- * unless `anyConfiguration` is set, which only reads (`factory queue list`).
- */
-export function readIntake(
+const defaultGateway = (config: FactoryConfig): GitHubGateway =>
+  new RealGitHubGateway(
+    config.repository,
+    new NativeStackDelivery(config.repository),
+  );
+function view(
   config: FactoryConfig,
-  { anyConfiguration = false } = {},
-): IntakeAuthorization | undefined {
-  const path = intakePath(config);
-  if (!existsSync(path)) return;
-  const invalid = (reason: string, queued = false): never => {
-    const remove = `rm ${/^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`}`;
-    const setup = `factory setup --background${requiredProviderCredentials(
-      config,
-    )
-      .map((name) => ` --credential-file ${name}=ABSOLUTE_PRIVATE_FILE`)
-      .join("")}`;
-    throw new Error(
-      `The queue record ${path} cannot be used (${reason}). ${
-        queued
-          ? `Run \`factory queue list\` to see what it holds before deleting it, because deleting drops the queue order; then delete it with \`${remove}\`, run \`${setup}\` and \`factory queue add N\` to start a new queue`
-          : `It is from an earlier build; delete it with \`${remove}\`, then run \`${setup}\` and \`factory queue add N\` to start a new queue`
-      }`,
-    );
+  observed?: VerifiedQueueObservation,
+  error?: unknown,
+): IntakeAuthorization {
+  const entries = observed?.entries ?? [];
+  return {
+    version: 1,
+    queueProtocol: "project-queue-v1",
+    authority: "github-project",
+    complete: !!observed,
+    repository: config.repository,
+    configDigest: factoryConfigDigest(config),
+    objectives: entries.map((entry) => entry.objective),
+    bodyDigests: Object.fromEntries(
+      entries.map((entry) => [entry.objective, entry.bodyDigest]),
+    ),
+    dequeued: entries
+      .filter((entry) => entry.state === "withdrawn")
+      .map((entry) => entry.objective),
+    mode: observed?.control.mode ?? "paused",
+    ...(observed?.control.watch ? { watch: true } : {}),
+    ...(existsSync(join(stateRoot(config.repository), "intake.json"))
+      ? { legacyLocalQueueIgnored: true }
+      : {}),
+    observation: {
+      at: observed?.snapshot.observedAt ?? new Date().toISOString(),
+      reasons: {},
+      ...(error ? { error: String(error) } : {}),
+      ...(observed
+        ? {
+            unapproved: observed.snapshot.cards
+              .filter((card) => card.metadata === null)
+              .map((card) => card.objective),
+          }
+        : {}),
+    },
   };
-  let value: IntakeAuthorization;
-  try {
-    value = JSON.parse(readFileSync(path, "utf8")) as IntakeAuthorization;
-  } catch {
-    return invalid("not valid JSON");
-  }
-  if (
-    value.version !== 1 ||
-    value.repository !== config.repository ||
-    !["running", "paused", "draining"].includes(value.mode) ||
-    !Array.isArray(value.dequeued)
-  )
-    invalid("it does not match this installation");
-  if (!anyConfiguration && value.configDigest !== factoryConfigDigest(config))
-    invalid("it was written under another configuration", true);
-  for (const key of Object.keys(value))
-    if (
-      ![
-        "version",
-        "repository",
-        "configDigest",
-        "objectives",
-        "watch",
-        "bodyDigests",
-        "objectiveDeadlines",
-        "dequeued",
-        "mode",
-        "observation",
-      ].includes(key)
-    )
-      invalid(`unsupported field ${key}`);
-  if (value.watch !== undefined && value.watch !== true)
-    invalid("invalid service switch");
-  try {
-    validateObjectives(value.objectives);
-  } catch {
-    invalid("invalid Objective list");
-  }
-  if (!value.objectives.length && !value.watch)
-    invalid("an empty queue exists only with the background service");
-  for (const objective of value.objectives)
-    if (!/^[a-f0-9]{64}$/.test(value.bodyDigests[objective] ?? ""))
-      invalid(`Objective #${objective} has no issue body binding`);
-  if (value.dequeued.some((id) => !value.objectives.includes(id)))
-    invalid("a removed Objective is not in the queue");
-  if (value.objectiveDeadlines !== undefined) {
-    if (
-      value.objectiveDeadlines === null ||
-      typeof value.objectiveDeadlines !== "object" ||
-      Array.isArray(value.objectiveDeadlines)
-    )
-      invalid("invalid Objective deadlines");
-    for (const [id, deadline] of Object.entries(value.objectiveDeadlines))
-      if (
-        !/^[1-9]\d*$/.test(id) ||
-        !value.objectives.includes(Number(id)) ||
-        (deadline !== null &&
-          (typeof deadline !== "string" ||
-            !Number.isFinite(Date.parse(deadline))))
-      )
-        invalid(`invalid deadline binding for Objective #${id}`);
-  }
-  return value;
 }
-/** Under the installation lock, retain elapsed authority before the first dispatch. */
-function objectiveDeadline(
+/** Missing receipts hold execution; legacy file bytes are never parsed. */
+export async function readIntake(
   config: FactoryConfig,
-  record: IntakeAuthorization,
-  objective: number,
-  state: ContinuationState | undefined,
-): string | undefined {
-  const recorded = record.objectiveDeadlines?.[objective];
-  const retained = state?.coordinator?.deadlineAt;
-  if (state && recorded !== undefined && recorded !== (retained ?? null))
-    throw new Error(
-      `Objective #${objective} queue deadline differs from its retained continuation`,
+  options: { anyConfiguration?: boolean; github?: GitHubGateway } = {},
+): Promise<IntakeAuthorization | undefined> {
+  if (!config.queue?.project) return;
+  try {
+    return view(
+      config,
+      await observeProjectQueue(
+        config,
+        options.github ?? defaultGateway(config),
+      ),
     );
-  let deadline = recorded;
-  if (deadline === undefined) {
-    deadline = state
-      ? (retained ?? null)
-      : config.queue?.objectiveDeadlineSeconds === undefined
-        ? null
-        : new Date(
-            Date.now() + config.queue.objectiveDeadlineSeconds * 1_000,
-          ).toISOString();
-    record.objectiveDeadlines ??= {};
-    record.objectiveDeadlines[objective] = deadline;
-    saveIntake(config, record);
+  } catch (error) {
+    return view(config, undefined, error);
   }
-  if (!state && deadline !== null && Date.parse(deadline) <= Date.now())
-    throw new Error(
-      `Objective #${objective} queue deadline elapsed before its first start; the recorded deadline cannot be renewed`,
-    );
-  return deadline ?? undefined;
+}
+function terminal(state: ContinuationState | undefined): boolean {
+  return (
+    !!state &&
+    (!!state.cancelledAt ||
+      (isExecutionState(state) && objectiveComplete(state)))
+  );
+}
+export async function intakeSettled(config: FactoryConfig): Promise<boolean> {
+  if (
+    config.queue?.project &&
+    (await readQueueHistory(config)).some(
+      (record) => record.kind === "project-queue-owner" && !record.settled,
+    )
+  )
+    return false;
+  const directory = join(stateRoot(config.repository), "objectives");
+  return (
+    existsSync(directory)
+      ? readdirSync(directory)
+          .filter((name) => /^\d+$/.test(name))
+          .map((name) => readContinuation(config.repository, Number(name)))
+          .filter(Boolean)
+      : []
+  ).every(terminal);
 }
 function validateObjectives(objectives: number[]): void {
   if (
     !Array.isArray(objectives) ||
+    !objectives.length ||
     objectives.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
     new Set(objectives).size !== objectives.length
   )
-    throw new Error("The queue takes distinct positive Objective numbers");
+    throw new Error("queue add requires distinct positive Objective numbers");
 }
-function continuations(config: FactoryConfig): ContinuationState[] {
-  const path = join(stateRoot(config.repository), "objectives");
-  return existsSync(path)
-    ? readdirSync(path)
-        .filter((name) => /^\d+$/.test(name))
-        .map((name) => readContinuation(config.repository, Number(name))!)
-        .filter(Boolean)
-    : [];
-}
-function terminal(state: ContinuationState): boolean {
-  return (
-    !!state.cancelledAt || (isExecutionState(state) && objectiveComplete(state))
+function scoped<T>(config: FactoryConfig, task: () => Promise<T>): Promise<T> {
+  return withRecoveryCheckpointScope(
+    { config, buildClosure: () => buildRecoveryCheckpointClosure({ config }) },
+    task,
   );
 }
-/** Under the installation lock, sync dormant queued snapshots; the active controller owns its state. */
-function syncQueuedCoordinators(
+async function locked<T>(
   config: FactoryConfig,
-  record: IntakeAuthorization,
-  activeObjective?: number,
-): void {
-  for (const objective of record.objectives) {
-    if (objective === activeObjective || record.dequeued.includes(objective))
-      continue;
-    const current = readContinuation(config.repository, objective);
-    if (!current?.coordinator || terminal(current)) continue;
-    setCoordinatorMode(current, record.mode);
-    saveState(statePath(config.repository, objective), current);
+  task: () => Promise<T>,
+): Promise<T> {
+  mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
+  const lock = acquireInstallationLock(config.repository);
+  try {
+    return await scoped(config, task);
+  } finally {
+    releaseControllerLock(
+      join(stateRoot(config.repository), "controller.lock"),
+      lock,
+    );
   }
 }
-export function intakeSettled(config: FactoryConfig): boolean {
-  return continuations(config).every(terminal);
+async function mutationSnapshot(config: FactoryConfig, github: GitHubGateway) {
+  const binding = requireProjectQueueEffects(config);
+  if (!github.projectQueueRead)
+    throw new Error("GitHub gateway cannot read Project queue metadata");
+  await awaitCheckpointAdmission(config.repository, "explicit");
+  const snapshot = await github.projectQueueRead(binding);
+  const history = await readQueueHistory(config);
+  if (
+    history.some(
+      (record) =>
+        record.kind === "project-queue-operation" && !record.completed,
+    )
+  )
+    throw new Error(
+      "A previous Project queue operation remains partial or unknown; no mutation replay is allowed",
+    );
+  return { snapshot, history };
 }
-/** Authorize the issues' current bodies; the queue runs an Objective only while its body matches. */
-async function authorizedBodies(
+/** Authenticate the owner's protocol before sending any admission-changing action. */
+async function projectControlRequest(
+  config: FactoryConfig,
+  operation: "enqueue" | "watch" | "pause" | "resume" | "drain" | "dequeue",
+  input?: Record<string, unknown>,
+) {
+  const observed = await requestControl(config.repository, {
+    objective: 0,
+    action: "status",
+  });
+  if (!observed.handled) return observed;
+  if (
+    !observed.result ||
+    typeof observed.result !== "object" ||
+    !("queueProtocol" in observed.result) ||
+    observed.result.queueProtocol !== "project-queue-v1"
+  ) {
+    if (operation === "pause" || operation === "drain")
+      return requestControl(config.repository, {
+        objective: 0,
+        action: operation,
+      });
+    throw new Error(
+      "The existing service uses the retired local queue protocol; hand it off through factory supervisor stop, then set up the Project-bound installation. No admission was sent to that owner",
+    );
+  }
+  return requestControl(config.repository, {
+    objective: 0,
+    action: "project-queue",
+    input: {
+      ...input,
+      operation,
+      protocol: "project-queue-v1",
+      authorityDigest: factoryAuthorityDigest(config),
+    },
+  });
+}
+async function writeControl(
+  config: FactoryConfig,
+  github: GitHubGateway,
+  mode: QueueMode,
+  watch?: boolean,
+  approval: QueueOperation["approval"] = { kind: "queue-command" },
+): Promise<void> {
+  const { snapshot, history } = await mutationSnapshot(config, github);
+  const previous =
+    snapshot.control.metadata === null
+      ? undefined
+      : parseQueueMetadata(snapshot.control.metadata);
+  if (previous && previous.kind !== "control")
+    throw new Error("Bound Project control metadata is invalid");
+  if (previous) await observeProjectQueue(config, github, "explicit-operation");
+  const watching =
+    watch ?? (previous?.kind === "control" ? previous.watch : false);
+  if (
+    previous?.kind === "control" &&
+    previous.mode === mode &&
+    previous.watch === watching &&
+    history.some(
+      (record) =>
+        record.id === previous.receiptId &&
+        record.authorityDigest === factoryAuthorityDigest(config),
+    )
+  )
+    return;
+  if (
+    !previous &&
+    history.some(
+      (record) =>
+        record.kind === "project-queue-operation" && record.scope === "control",
+    )
+  )
+    throw new Error(
+      "Project control was cleared after an earlier receipt; supported reconciliation is required",
+    );
+  const operation = createQueueOperation(config, {
+    action: "control",
+    scope: "control",
+    previousReceiptId: previous?.receiptId ?? null,
+    approval,
+  });
+  operation.metadata = JSON.stringify({
+    schemaVersion: 1,
+    kind: "control",
+    receiptId: operation.id,
+    mode,
+    watch: watching,
+  } satisfies QueueMetadata);
+  await performQueueEffect(config, github, operation, {
+    action: "set-metadata",
+    itemId: snapshot.control.itemId,
+    metadata: operation.metadata,
+  });
+  await completeQueueOperation(config, operation);
+}
+export interface EnqueueOptions {
+  expectedBodyDigests?: Record<string, string>;
+}
+export interface ProjectPublicationProvenance {
+  kind: "proposal";
+  proposalId: string;
+  approvalDigest: string;
+  bodyDigest?: string;
+}
+async function enqueueOwned(
   config: FactoryConfig,
   github: GitHubGateway,
   objectives: number[],
-): Promise<Record<string, string>> {
+  options: EnqueueOptions = {},
+): Promise<IntakeAuthorization> {
   validateObjectives(objectives);
-  if (!objectives.length)
-    throw new Error("queue add needs at least one Objective number");
   checkRequiredEnvironment(config);
-  const bodyDigests: Record<string, string> = {};
-  for (const objective of objectives)
-    bodyDigests[objective] = digest((await github.objective(objective)).body);
-  return bodyDigests;
+  const initialized = await mutationSnapshot(config, github);
+  if (initialized.snapshot.control.metadata === null)
+    await writeControl(config, github, "running");
+  else {
+    const previousControl = parseQueueMetadata(
+      initialized.snapshot.control.metadata,
+    );
+    if (previousControl.kind !== "control")
+      throw new Error("Invalid Project queue control role");
+    await writeControl(
+      config,
+      github,
+      previousControl.mode,
+      previousControl.watch,
+    );
+  }
+  for (const objective of objectives) {
+    const observed = await observeProjectQueue(
+      config,
+      github,
+      "explicit-operation",
+    );
+    if (observed.control.mode === "draining")
+      throw new Error(
+        "The queue is draining; use `factory queue resume` before adding work",
+      );
+    const issue = await github.objective(objective);
+    if (!issue.nodeId || issue.state !== "open")
+      throw new Error(
+        `Objective #${objective} must be an authenticated open Issue with its exact node identity`,
+      );
+    const bodyDigest = queueDigest(issue.body);
+    if (
+      options.expectedBodyDigests &&
+      options.expectedBodyDigests[objective] !== bodyDigest
+    )
+      throw new Error(
+        `Objective #${objective} changed after reviewed publication; exact approved contents are required`,
+      );
+    const previous = observed.entries.find(
+      (entry) => entry.objective === objective,
+    );
+    if (
+      previous?.state === "queued" &&
+      previous.bodyDigest === bodyDigest &&
+      previous.authorityDigest === factoryAuthorityDigest(config)
+    )
+      continue;
+    const existing = readContinuation(config.repository, objective);
+    if (existing && !terminal(existing) && previous?.bodyDigest !== bodyDigest)
+      throw new Error(
+        "Unfinished approved contents cannot be replaced by requeueing; use supported recovery",
+      );
+    if (
+      observed.history.some(
+        (record) =>
+          record.kind === "project-queue-owner" &&
+          record.objective === objective &&
+          !record.settled,
+      )
+    )
+      throw new Error(
+        "Objective has an unresolved or foreign owner; admission changes are held",
+      );
+    const order =
+      previous?.order ??
+      Math.max(0, ...observed.entries.map((entry) => entry.order)) + 1;
+    if (!Number.isSafeInteger(order))
+      throw new Error("Project order exhausted its exact integer range");
+    const operation = createQueueOperation(config, {
+      action: "admit",
+      scope: issue.nodeId,
+      previousReceiptId: previous?.receiptId ?? null,
+      approval: { kind: "queue-command" },
+      objective,
+      issueNodeId: issue.nodeId,
+      bodyDigest,
+      order,
+    });
+    operation.metadata = JSON.stringify({
+      schemaVersion: 1,
+      kind: "admission",
+      admissionId: randomUUID(),
+      receiptId: operation.id,
+      state: "queued",
+    } satisfies QueueMetadata);
+    const ensured = await performQueueEffect(config, github, operation, {
+      action: "ensure-card",
+      issueNodeId: issue.nodeId,
+    });
+    await performQueueEffect(config, github, operation, {
+      action: "set-order",
+      itemId: ensured.itemId,
+      order,
+    });
+    await performQueueEffect(config, github, operation, {
+      action: "set-metadata",
+      itemId: ensured.itemId,
+      metadata: operation.metadata,
+    });
+    await completeQueueOperation(config, operation);
+  }
+  return (await readIntake(config, { github }))!;
 }
-/**
- * The queue with these Objectives added: new ones go last, one already queued keeps its place
- * and takes the freshly authorized body, one removed earlier is queued again.
- */
-function queued(
-  config: FactoryConfig,
-  objectives: number[],
-  bodyDigests: Record<string, string>,
-  previous?: IntakeAuthorization,
-): IntakeAuthorization {
-  return {
-    version: 1,
-    repository: config.repository,
-    configDigest: factoryConfigDigest(config),
-    objectives: [
-      ...(previous?.objectives ?? []),
-      ...objectives.filter((id) => !previous?.objectives.includes(id)),
-    ],
-    bodyDigests: { ...previous?.bodyDigests, ...bodyDigests },
-    ...(previous?.objectiveDeadlines
-      ? { objectiveDeadlines: { ...previous.objectiveDeadlines } }
-      : {}),
-    dequeued: (previous?.dequeued ?? []).filter(
-      (id) => !objectives.includes(id),
-    ),
-    mode: previous?.mode ?? "running",
-    ...(previous?.watch ? { watch: true as const } : {}),
-  };
-}
-/** `queue add`: handled by the service when it owns the installation, else under the ordinary lock. */
 export async function enqueueIntake(
   config: FactoryConfig,
   github: GitHubGateway,
   objectives: number[],
+  options: EnqueueOptions = {},
 ): Promise<IntakeAuthorization> {
-  const reply = await requestControl(config.repository, {
-    objective: 0,
-    action: "enqueue",
-    input: { objectives },
+  const reply = await projectControlRequest(config, "enqueue", {
+    objectives,
+    ...options,
   });
   if (reply.handled) return reply.result as IntakeAuthorization;
-  mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
-  const lockPath = join(stateRoot(config.repository), "controller.lock");
-  const lock = acquireInstallationLock(config.repository);
-  try {
-    const bodyDigests = await authorizedBodies(config, github, objectives);
-    const value = queued(config, objectives, bodyDigests, readIntake(config));
-    saveIntake(config, value);
-    return value;
-  } finally {
-    releaseControllerLock(lockPath, lock);
-  }
+  return locked(config, () =>
+    enqueueOwned(config, github, objectives, options),
+  );
 }
-/** Mark the queue as served by the background service: what `factory setup --background` does. */
+export async function ensureProjectObjective(
+  config: FactoryConfig,
+  github: GitHubGateway,
+  objective: number,
+  provenance?: ProjectPublicationProvenance,
+): Promise<void> {
+  const reply = await projectControlRequest(config, "enqueue", {
+    roadmapOnly: true,
+    objectives: [objective],
+    provenance,
+  });
+  if (reply.handled) return;
+  await locked(config, () =>
+    ensureProjectObjectiveOwned(config, github, objective, provenance),
+  );
+}
+async function ensureProjectObjectiveOwned(
+  config: FactoryConfig,
+  github: GitHubGateway,
+  objective: number,
+  provenance?: ProjectPublicationProvenance,
+): Promise<void> {
+  await mutationSnapshot(config, github);
+  const issue = await github.objective(objective);
+  if (!issue.nodeId)
+    throw new Error(
+      "Project publication requires authenticated Issue identity",
+    );
+  const bodyDigest = queueDigest(issue.body);
+  if (provenance?.bodyDigest && provenance.bodyDigest !== bodyDigest)
+    throw new Error(
+      "Published contents changed before Project card publication",
+    );
+  const operation = createQueueOperation(config, {
+    action: "roadmap",
+    scope: `roadmap:${issue.nodeId}`,
+    previousReceiptId: null,
+    approval: provenance
+      ? {
+          kind: "proposal",
+          proposalId: provenance.proposalId,
+          approvalDigest: provenance.approvalDigest,
+        }
+      : { kind: "queue-command" },
+    objective,
+    issueNodeId: issue.nodeId,
+    bodyDigest,
+  });
+  await performQueueEffect(config, github, operation, {
+    action: "ensure-card",
+    issueNodeId: issue.nodeId,
+  });
+  await completeQueueOperation(config, operation);
+}
 export async function watchIntake(
   config: FactoryConfig,
+  github: GitHubGateway = defaultGateway(config),
 ): Promise<IntakeAuthorization> {
-  const reply = await requestControl(config.repository, {
-    objective: 0,
-    action: "watch",
-  });
+  const reply = await projectControlRequest(config, "watch");
   if (reply.handled) return reply.result as IntakeAuthorization;
-  mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
-  const path = join(stateRoot(config.repository), "controller.lock");
-  const lock = acquireInstallationLock(config.repository);
-  try {
-    const value = watchRecord(config, readIntake(config));
-    saveIntake(config, value);
-    return value;
-  } finally {
-    releaseControllerLock(path, lock);
-  }
+  return locked(config, async () => {
+    const { snapshot } = await mutationSnapshot(config, github);
+    const previous =
+      snapshot.control.metadata === null
+        ? undefined
+        : parseQueueMetadata(snapshot.control.metadata);
+    await writeControl(
+      config,
+      github,
+      previous?.kind === "control" ? previous.mode : "running",
+      true,
+      { kind: "background-setup" },
+    );
+    return view(config, await observeProjectQueue(config, github));
+  });
 }
-function watchRecord(
+async function applyControl(
   config: FactoryConfig,
-  previous?: IntakeAuthorization,
-): IntakeAuthorization {
-  return {
-    version: 1,
-    repository: config.repository,
-    configDigest: factoryConfigDigest(config),
-    objectives: [],
-    bodyDigests: {},
-    dequeued: [],
-    mode: "running",
-    ...previous,
-    watch: true,
-  };
-}
-
-/** Conditional page receipts are transient observations. A restart performs fresh authenticated reads. */
-export class IntakeObservation {
-  private pages = new Map<number, IntakeIssuePage>();
-  constructor(private readonly github: GitHubGateway) {}
-  async scan(): Promise<
-    Map<number, { labels: string[]; state: "open" | "closed" }>
-  > {
-    if (!this.github.intakePage)
+  github: GitHubGateway,
+  action: string,
+  objective?: number,
+): Promise<IntakeAuthorization> {
+  const observed = await observeProjectQueue(
+    config,
+    github,
+    "explicit-operation",
+  );
+  if (action === "dequeue") {
+    const entry = observed.entries.find(
+      (candidate) =>
+        candidate.objective === objective && candidate.state === "queued",
+    );
+    if (!entry) throw new Error(`Objective #${objective} is not admitted`);
+    const state = readContinuation(config.repository, entry.objective);
+    if (
+      (state && !terminal(state)) ||
+      observed.history.some(
+        (record) =>
+          record.kind === "project-queue-owner" &&
+          record.objective === entry.objective &&
+          !record.settled,
+      )
+    )
       throw new Error(
-        "GitHub gateway does not support conditional intake observations",
+        `Objective #${objective} has unfinished owned work; use supported cancellation before removal`,
       );
-    const issues = new Map<
-      number,
-      { labels: string[]; state: "open" | "closed" }
-    >();
-    for (let page = 1; ; page++) {
-      const cached = this.pages.get(page);
-      let observed = await this.github.intakePage(page, cached?.etag);
-      if (observed.status === 304) {
-        if (cached?.data) observed = cached;
-        else observed = await this.github.intakePage(page);
-      }
-      if (observed.status !== 200 || !Array.isArray(observed.data))
-        throw new Error("Conditional intake observation has no usable page");
-      this.pages.set(page, observed);
-      for (const issue of observed.data)
-        if (issue.number > 0) issues.set(issue.number, issue);
-      if (observed.data.length < 100) {
-        for (const key of this.pages.keys())
-          if (key > page) this.pages.delete(key);
-        return issues;
-      }
-    }
-  }
+    const operation = createQueueOperation(config, {
+      action: "withdraw",
+      scope: entry.issueNodeId,
+      previousReceiptId: entry.receiptId,
+      approval: { kind: "queue-command" },
+      objective: entry.objective,
+      issueNodeId: entry.issueNodeId,
+      bodyDigest: entry.bodyDigest,
+      order: entry.order,
+    });
+    operation.metadata = JSON.stringify({
+      schemaVersion: 1,
+      kind: "admission",
+      admissionId: entry.admissionId,
+      receiptId: operation.id,
+      state: "withdrawn",
+    } satisfies QueueMetadata);
+    await performQueueEffect(config, github, operation, {
+      action: "set-metadata",
+      itemId: entry.itemId,
+      metadata: operation.metadata,
+    });
+    await completeQueueOperation(config, operation);
+  } else if (["pause", "resume", "drain", "handoff"].includes(action))
+    await writeControl(
+      config,
+      github,
+      action === "pause"
+        ? "paused"
+        : action === "resume"
+          ? "running"
+          : "draining",
+    );
+  else if (action !== "status" && action !== "sync")
+    throw new Error("Unsupported queue action");
+  return view(config, await observeProjectQueue(config, github));
 }
-
 export async function intakeControl(
   config: FactoryConfig,
-  action: "status" | "pause" | "resume" | "drain" | "dequeue",
+  action: "status" | "sync" | "pause" | "resume" | "drain" | "dequeue",
   objective?: number,
+  github: GitHubGateway = defaultGateway(config),
 ): Promise<unknown> {
+  if (action === "sync") return readIntake(config, { github });
   let reply: Awaited<ReturnType<typeof requestControl>>;
   try {
-    reply = await requestControl(config.repository, {
-      objective: 0,
-      action,
-      input: objective ? { objective } : undefined,
-    });
+    reply =
+      action === "status"
+        ? await requestControl(config.repository, {
+            objective: 0,
+            action: "status",
+          })
+        : await projectControlRequest(
+            config,
+            action,
+            objective ? { objective } : undefined,
+          );
   } catch (error) {
-    // A foreground run answers only for its Objective, but the queue can still be read.
     if (action !== "status" || !(error instanceof ForegroundControllerError))
       throw error;
     return {
-      ...(readIntake(config, { anyConfiguration: true }) ?? {
-        objectives: [],
-        dequeued: [],
-      }),
+      ...(await readIntake(config, { github })),
       activeObjective: error.objective,
     };
   }
-  if (reply.handled) return reply.result;
-  mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
-  const path = join(stateRoot(config.repository), "controller.lock"),
-    lock = acquireInstallationLock(config.repository);
-  try {
-    const record = readIntake(config, {
-      anyConfiguration: action === "status",
-    });
-    if (!record) {
-      if (action === "status") return { objectives: [], dequeued: [] };
-      throw new Error(
-        "Nothing is queued; add Objectives with `factory queue add N`",
-      );
-    }
-    applyControl(config, record, action, objective);
-    if (["pause", "resume", "drain"].includes(action))
-      syncQueuedCoordinators(config, record);
-    return record;
-  } finally {
-    releaseControllerLock(path, lock);
+  if (reply.handled) {
+    if (
+      action === "status" &&
+      (!reply.result ||
+        typeof reply.result !== "object" ||
+        !("queueProtocol" in reply.result) ||
+        reply.result.queueProtocol !== "project-queue-v1")
+    )
+      return { ...(await readIntake(config, { github })), legacyOwner: true };
+    return reply.result;
   }
+  if (action === "status") return readIntake(config, { github });
+  return locked(config, () => applyControl(config, github, action, objective));
 }
-function applyControl(
-  config: FactoryConfig,
-  record: IntakeAuthorization,
-  action: string,
-  objective?: number,
-): void {
-  if (action === "dequeue") {
-    if (!objective || !record.objectives.includes(objective))
-      throw new Error(`Objective #${objective} is not in the queue`);
-    const state = readContinuation(config.repository, objective);
-    if (state && !terminal(state))
-      throw new Error(
-        `Objective #${objective} is running and cannot be removed; cancel it with \`factory cancel --objective ${objective}\``,
-      );
-    if (!record.dequeued.includes(objective)) record.dequeued.push(objective);
-  } else if (action === "pause") record.mode = "paused";
-  else if (action === "resume") record.mode = "running";
-  else if (action === "drain" || action === "handoff") record.mode = "draining";
-  else if (action !== "status") throw new Error("Unsupported queue action");
-  if (action !== "status") saveIntake(config, record);
-}
-
-/** Restore only the unchanged, settled idle watch after supported artifact handoff. */
-export function resumeWatcherAfterUpgrade(
+export async function resumeWatcherAfterUpgrade(
   config: FactoryConfig,
   expected: IntakeAuthorization,
-): boolean {
-  const path = join(stateRoot(config.repository), "controller.lock");
-  const lock = acquireInstallationLock(config.repository);
-  try {
-    const current = readIntake(config);
-    const binding = (record: IntakeAuthorization) => {
-      const { mode: _mode, observation: _observation, ...value } = record;
-      return JSON.stringify(value);
-    };
+): Promise<boolean> {
+  return locked(config, async () => {
+    const github = defaultGateway(config);
+    const current = await readIntake(config, { github });
     if (
-      !current?.watch ||
+      !current?.complete ||
+      !current.watch ||
       !expected.watch ||
       expected.mode !== "running" ||
       !["draining", "running"].includes(current.mode) ||
-      binding(current) !== binding(expected) ||
-      !intakeSettled(config)
+      current.configDigest !== expected.configDigest ||
+      JSON.stringify(current.objectives) !==
+        JSON.stringify(expected.objectives) ||
+      JSON.stringify(current.bodyDigests) !==
+        JSON.stringify(expected.bodyDigests) ||
+      JSON.stringify(current.dequeued) !== JSON.stringify(expected.dequeued) ||
+      !(await intakeSettled(config))
     )
       return false;
-    // A queue that is already running was never drained: the unit had failed
-    // and no owner was there to drain it.
-    if (current.mode === "draining") applyControl(config, current, "resume");
+    if (current.mode === "draining")
+      await applyControl(config, github, "resume");
     return true;
-  } finally {
-    releaseControllerLock(path, lock);
-  }
+  });
 }
-
 async function resolveBase(
   config: FactoryConfig,
   github: GitHubGateway,
   predecessors: number[],
   objective: number,
-): Promise<string> {
+): Promise<void> {
   const head = await fetchHead(config.checkout, await github.defaultBranch());
   await planningPrerequisites(config, github, objective, head, predecessors);
   if (git(config.checkout, "status", "--porcelain"))
@@ -524,35 +675,31 @@ async function resolveBase(
     throw new Error(
       "Compilation checkout diverges from authenticated default head",
     );
-  return head;
 }
-
-/** One installation owner, finite explicit authority, existing per-Objective continuations. */
-export async function runIntake(
+export function runIntake(
   config: FactoryConfig,
   services: ApplicationServices,
 ): Promise<IntakeAuthorization> {
-  const initial = readIntake(config);
-  if (!initial)
-    throw new Error(
-      "Nothing is queued; add Objectives with `factory queue add N`",
-    );
-  const record: IntakeAuthorization = initial;
-  const lockPath = join(stateRoot(config.repository), "controller.lock");
-  const lock = acquireInstallationLock(config.repository);
-  const observations = new IntakeObservation(services.github);
+  return scoped(config, () => runIntakeOwned(config, services));
+}
+async function runIntakeOwned(
+  config: FactoryConfig,
+  services: ApplicationServices,
+): Promise<IntakeAuthorization> {
+  requireProjectQueueEffects(config);
+  let record = view(config, await observeProjectQueue(config, services.github));
+  const lockPath = join(stateRoot(config.repository), "controller.lock"),
+    lock = acquireInstallationLock(config.repository);
   let server: Awaited<ReturnType<typeof serveControl>> | undefined;
   let activeObjective: number | undefined;
   let objectiveControl:
     | ((request: ControlRequest) => Promise<unknown>)
     | undefined;
   let handingOff = false;
+  let localMode: QueueMode | undefined;
   let wake: (() => void) | undefined;
-  /**
-   * When GitHub may answer again after a transient fault with a time (a
-   * rate limit): the next observation waits until then (#641).
-   */
   let heldUntil = 0;
+  let controlTail: Promise<unknown> = Promise.resolve();
   const holdFor = (error: unknown) => {
     const fault = attachedFault(error);
     const at =
@@ -560,277 +707,290 @@ export async function runIntake(
         ? Date.parse(fault.retryAt)
         : Number.NaN;
     if (Number.isFinite(at)) heldUntil = Math.max(heldUntil, at);
-    return fault?.kind === "transient";
   };
   const onHandoff = () => {
     handingOff = true;
-    record.mode = "draining";
-    saveIntake(config, record);
+    localMode = "draining";
+    if (activeObjective && objectiveControl)
+      void objectiveControl({
+        objective: activeObjective,
+        action: "handoff",
+      }).catch(() => undefined);
     wake?.();
   };
-  const closing = () => handingOff || record.mode === "draining";
-  const handle = async (request: ControlRequest): Promise<unknown> => {
-    if (request.objective === 0 && request.action === "status")
-      return { ...record, activeObjective: activeObjective ?? null };
-    if (
-      request.objective === 0 &&
-      ["enqueue", "watch"].includes(request.action)
-    ) {
-      if (closing()) throw new Error(DRAINING_REFUSAL);
-      if (request.action === "enqueue") {
-        // Authorized outside the loop, applied in one step: the loop sees the new Objectives next pass.
-        const objectives = request.input?.objectives as number[];
-        const bodyDigests = await authorizedBodies(
-          config,
-          services.github,
-          objectives,
+  const handleOwned = async (request: ControlRequest): Promise<unknown> => {
+    if (request.action === "project-queue") {
+      const operation = request.input?.operation;
+      if (
+        request.objective !== 0 ||
+        request.input?.protocol !== "project-queue-v1" ||
+        request.input?.authorityDigest !== factoryAuthorityDigest(config) ||
+        typeof operation !== "string" ||
+        !["enqueue", "watch", "pause", "resume", "drain", "dequeue"].includes(
+          operation,
+        )
+      )
+        throw new Error(
+          "Project queue control protocol or authority binding differs",
         );
-        if (closing()) throw new Error(DRAINING_REFUSAL);
-        Object.assign(record, queued(config, objectives, bodyDigests, record));
-      } else Object.assign(record, watchRecord(config, record));
-      saveIntake(config, record);
-      wake?.();
-      return record;
-    }
+      request = { ...request, action: operation as ControlRequest["action"] };
+    } else if (
+      request.objective === 0 &&
+      ["enqueue", "watch", "resume", "dequeue"].includes(request.action)
+    )
+      throw new Error(
+        "Queue mutations require the Project queue protocol; upgrade the caller before admission",
+      );
     if (request.objective !== 0) {
       if (request.objective === activeObjective && objectiveControl)
         return objectiveControl(request);
-      const preparing = readContinuation(config.repository, request.objective);
+      const state = readContinuation(config.repository, request.objective);
       if (
         request.action === "status" &&
-        preparing?.objective === request.objective &&
+        state &&
         record.objectives.includes(request.objective)
       )
-        return preparing.coordinator;
-      if (
-        !isPreparationState(preparing) ||
-        preparing.objective !== request.objective ||
-        !record.objectives.includes(request.objective)
-      )
-        throw new Error(
-          `Objective #${request.objective} is not the one the service is running; \`factory queue list\` shows what is`,
-        );
-      if (request.action === "status") return preparing.coordinator;
-      if (request.action === "cancel") {
-        preparing.cancelRequested = true;
-        setCoordinatorMode(preparing, "paused");
-        preparing.coordinator.waitReason =
-          "Planning cancellation requested; submitted outcomes remain preserved";
-        saveState(statePath(config.repository, preparing.objective), preparing);
-        record.mode = "paused";
-        saveIntake(config, record);
-        wake?.();
-        return "requested";
-      }
-      if (!["pause", "resume", "drain", "handoff"].includes(request.action))
-        throw new Error(
-          "Preparation supports status, pause, resume, drain, handoff and cancellation",
-        );
+        return state.coordinator;
+      throw new Error(
+        "Only the current owned Objective supports lifecycle control; inspect retained state",
+      );
     }
-    applyControl(
-      config,
-      record,
-      request.action,
-      Number(request.input?.objective) || undefined,
-    );
-    if (request.action === "handoff") handingOff = true;
-    if (
-      activeObjective &&
-      objectiveControl &&
-      ["pause", "resume", "drain", "handoff"].includes(request.action)
-    )
-      await objectiveControl({
-        objective: activeObjective,
-        action: request.action,
+    if (request.action === "status") {
+      record =
+        (await readIntake(config, { github: services.github })) ??
+        view(config, undefined, "Project binding missing");
+      return {
+        ...record,
+        activeObjective: activeObjective ?? null,
+        ...(localMode ? { localMode } : {}),
+      };
+    }
+    if (["pause", "drain", "handoff"].includes(request.action)) {
+      localMode = request.action === "pause" ? "paused" : "draining";
+      if (request.action === "handoff") handingOff = true;
+      if (activeObjective && objectiveControl)
+        await objectiveControl({
+          objective: activeObjective,
+          action: request.action,
+        });
+      wake?.();
+    }
+    if (request.action === "enqueue") {
+      if (handingOff || localMode === "draining")
+        throw new Error("The local service is draining");
+      const ids = request.input?.objectives as number[];
+      if (request.input?.roadmapOnly) {
+        validateObjectives(ids);
+        for (const id of ids)
+          await ensureProjectObjectiveOwned(
+            config,
+            services.github,
+            id,
+            request.input?.provenance as
+              | ProjectPublicationProvenance
+              | undefined,
+          );
+        record = view(
+          config,
+          await observeProjectQueue(config, services.github),
+        );
+      } else
+        record = await enqueueOwned(config, services.github, ids, {
+          expectedBodyDigests: request.input?.expectedBodyDigests as
+            | Record<string, string>
+            | undefined,
+        });
+    } else if (request.action === "watch") {
+      const observed = await observeProjectQueue(config, services.github);
+      await writeControl(config, services.github, observed.control.mode, true, {
+        kind: "background-setup",
       });
-    if (["pause", "resume", "drain", "handoff"].includes(request.action))
-      syncQueuedCoordinators(config, record, activeObjective);
+      record = view(config, await observeProjectQueue(config, services.github));
+    } else {
+      try {
+        record = await applyControl(
+          config,
+          services.github,
+          request.action,
+          Number(request.input?.objective) || undefined,
+        );
+      } catch (error) {
+        if (["pause", "drain", "handoff"].includes(request.action))
+          return {
+            ...record,
+            complete: false,
+            localMode,
+            observation: {
+              at: new Date().toISOString(),
+              reasons: {},
+              error: `Local cessation requested; Project control remains unsynchronized: ${String(error)}`,
+            },
+          };
+        throw error;
+      }
+      if (request.action === "resume") {
+        localMode = undefined;
+        if (activeObjective && objectiveControl)
+          await objectiveControl({
+            objective: activeObjective,
+            action: "resume",
+          });
+      }
+    }
     wake?.();
     return { ...record, activeObjective: activeObjective ?? null };
   };
-  const serve = async () => {
-    server = await serveControl(config.repository, lock, handle);
-  };
-  const closeServer = async () => {
-    if (server) {
-      await new Promise<void>((resolve) => server!.close(() => resolve()));
-      server = undefined;
-    }
+  const handle = (request: ControlRequest): Promise<unknown> => {
+    const result = controlTail.then(() => handleOwned(request));
+    controlTail = result.catch(() => undefined);
+    return result;
   };
   process.on("SIGTERM", onHandoff);
   try {
     retargetControllerLock(lockPath, lock, 0);
-    await serve();
+    server = await serveControl(config.repository, lock, handle);
     for (;;) {
-      if (handingOff || record.mode === "draining") return record;
-      // Unfinished queued Objectives come first, one at a time in queue
-      // order: foreground runs of different Objectives can each stop
-      // unfinished and be queued later (#824). One the queue does not hold
-      // stays with `factory run`.
-      const current = record.objectives
-        .map((id) => readContinuation(config.repository, id))
-        .find((state) => state && !terminal(state));
-      const reasons: Record<string, string> = {};
-      let selected = current?.objective;
-      if (record.mode === "running" && !selected) {
-        const remaining = record.objectives.filter(
-          (id) =>
-            !record.dequeued.includes(id) &&
-            !readContinuation(config.repository, id),
-        );
-        if (!remaining.length && !record.watch) return record;
-        try {
-          const scanned = await observations.scan();
-          for (const id of remaining) {
-            try {
-              const issue = await services.github.objective(id);
-              if (issue.state !== "open") {
-                reasons[id] = "Issue is closed";
-                continue;
-              }
-              if (digest(issue.body) !== record.bodyDigests[id]) {
-                reasons[id] = "Issue body changed after authorization";
-                continue;
-              }
+      if (handingOff || localMode === "draining")
+        return { ...record, mode: "draining" };
+      let observed: VerifiedQueueObservation | undefined;
+      try {
+        observed = await observeProjectQueue(config, services.github);
+        record = view(config, observed);
+      } catch (error) {
+        holdFor(error);
+        record = view(config, undefined, error);
+      }
+      if (record.complete && record.mode === "draining") return record;
+      if (observed && record.mode === "running" && localMode !== "paused") {
+        const reasons: Record<string, string> = {};
+        let selected: number | undefined;
+        for (const entry of observed.entries.filter(
+          (entry) => entry.state === "queued",
+        )) {
+          const state = readContinuation(config.repository, entry.objective);
+          if (terminal(state)) continue;
+          const card = observed.snapshot.cards.find(
+            (candidate) => candidate.objective === entry.objective,
+          )!;
+          if (
+            card.state !== "open" ||
+            queueDigest(card.body) !== entry.bodyDigest
+          ) {
+            reasons[entry.objective] =
+              "Issue is closed or its approved contents changed";
+            continue;
+          }
+          if (state?.error || state?.cancelRequested) {
+            reasons[entry.objective] =
+              "Retained failure/cancellation requires supported recovery";
+            break;
+          }
+          try {
+            if (!state) {
               if (!services.github.objectiveDependencies)
-                throw new Error("GitHub dependency observation unavailable");
-              const predecessors =
-                await services.github.objectiveDependencies(id);
-              const missing = predecessors.find((before) => {
-                const state = readContinuation(config.repository, before);
+                throw new Error("Native dependency observation unavailable");
+              const predecessors = await services.github.objectiveDependencies(
+                entry.objective,
+              );
+              const missing = predecessors.find((id) => {
+                const before = readContinuation(config.repository, id);
                 return (
-                  !isExecutionState(state) ||
-                  !objectiveComplete(state) ||
-                  !state.finalAcceptance
+                  !isExecutionState(before) ||
+                  !objectiveComplete(before) ||
+                  !before.finalAcceptance
                 );
               });
               if (missing) {
-                reasons[id] =
+                reasons[entry.objective] =
                   `Predecessor #${missing} has no accepted evidence`;
                 continue;
               }
-              await resolveBase(config, services.github, predecessors, id);
-              selected = id;
-              break;
-            } catch (error) {
-              holdFor(error);
-              reasons[id] =
-                `Observation or baseline unavailable: ${String(error)}`;
+              await resolveBase(
+                config,
+                services.github,
+                predecessors,
+                entry.objective,
+              );
             }
+            selected = entry.objective;
+            break;
+          } catch (error) {
+            holdFor(error);
+            reasons[entry.objective] = String(error);
           }
-          record.observation = {
-            at: new Date().toISOString(),
-            reasons,
-            ...(record.watch
-              ? {
-                  unapproved: [...scanned.keys()].filter(
-                    (id) => !record.objectives.includes(id),
-                  ),
-                  ...(!selected
-                    ? {
-                        idleReason: remaining.length
-                          ? ("waiting-for-eligible-work" as const)
-                          : ("awaiting-approved-work" as const),
-                      }
-                    : {}),
-                }
-              : {}),
-          };
-        } catch (error) {
-          holdFor(error);
-          record.observation = {
-            at: new Date().toISOString(),
-            reasons,
-            error: String(error),
-          };
         }
-        saveIntake(config, record);
-      }
-      if (selected && record.mode === "running") {
-        let unavailable = false;
-        activeObjective = selected;
-        retargetControllerLock(lockPath, lock, selected);
-        try {
-          const state = readContinuation(config.repository, selected);
-          if (state?.error || state?.cancelRequested)
-            throw new Error(
-              "Current Objective is failed or cancelling; explicit supported recovery is required",
-            );
-          if (!state || isPreparationState(state)) {
-            const issue = await services.github
-              .objective(selected)
-              .catch((error: unknown) => {
-                // GitHub cannot answer yet (a rate limit, an outage): nothing
-                // has started, so observe again when it may, not pause (#641).
-                if (!holdFor(error)) throw error;
-                record.observation = {
-                  at: new Date().toISOString(),
-                  reasons,
-                  error: String(error),
-                };
-                saveIntake(config, record);
-                return undefined;
-              });
-            if (!issue) unavailable = true;
-            else if (
-              issue.state !== "open" ||
-              digest(issue.body) !== record.bodyDigests[selected]
-            )
-              throw new Error("Selected Objective changed before compilation");
-          }
-          if (record.mode !== "running" || handingOff) continue;
-          if (!unavailable) {
-            const deadlineAt = objectiveDeadline(
-              config,
-              record,
-              selected,
-              state,
-            );
+        record.observation = {
+          at: new Date().toISOString(),
+          reasons,
+          ...(!selected
+            ? {
+                idleReason: record.objectives.length
+                  ? "waiting-for-eligible-work"
+                  : "awaiting-approved-work",
+              }
+            : {}),
+        };
+        if (selected) {
+          activeObjective = selected;
+          retargetControllerLock(lockPath, lock, selected);
+          try {
+            if (handingOff || localMode) continue;
             const result = await runObjective(config, selected, services, {
-              ...(deadlineAt ? { deadlineAt } : {}),
               ownerLock: lock,
               observeControl: (handler) => {
                 objectiveControl = handler;
               },
             });
             if (!terminal(result)) {
-              // The queue stops on a human decision; status names the command, then `factory queue resume`.
-              record.mode = "paused";
+              localMode = "paused";
               record.observation = {
                 at: new Date().toISOString(),
                 reasons,
                 needsDecision: selected,
-                error: `Objective #${selected} needs a human decision: ${result.coordinator?.waitReason ?? "inspect its status"}`,
+                error:
+                  result.coordinator?.waitReason ??
+                  "Inspect retained Objective status",
               };
-              saveIntake(config, record);
-              return record;
+              try {
+                await applyControl(config, services.github, "pause");
+              } catch {
+                /* Local stop retains remote uncertainty. */
+              }
+              return { ...record, mode: "paused" };
             }
+          } catch (error) {
+            if (error instanceof CoordinatorHandoff) {
+              handingOff = true;
+              return { ...record, mode: "draining" };
+            }
+            localMode = "paused";
+            record.observation = {
+              at: new Date().toISOString(),
+              reasons,
+              error: String(error),
+            };
+            try {
+              await applyControl(config, services.github, "pause");
+            } catch {
+              /* No replay or fallback authority. */
+            }
+            return { ...record, mode: "paused" };
+          } finally {
+            objectiveControl = undefined;
+            activeObjective = undefined;
+            retargetControllerLock(lockPath, lock, 0);
           }
-        } catch (error) {
-          if (record.mode !== "running" || handingOff) {
-            if (String(record.mode) === "draining" || handingOff) return record;
-            continue;
-          }
-          if (error instanceof CoordinatorHandoff) {
-            handingOff = true;
-            return record;
-          }
-          record.mode = "paused";
-          record.observation = {
-            at: new Date().toISOString(),
-            reasons,
-            error: String(error),
-          };
-          saveIntake(config, record);
-          // Unknown/failed work remains in its existing snapshot; no automatic repeat.
-          return record;
-        } finally {
-          objectiveControl = undefined;
-          activeObjective = undefined;
-          retargetControllerLock(lockPath, lock, 0);
+          continue;
         }
-        // Unavailable: wait below for GitHub, as an idle observation does.
-        if (!unavailable) continue;
+        if (
+          !record.watch &&
+          observed.entries.every(
+            (entry) =>
+              entry.state === "withdrawn" ||
+              terminal(readContinuation(config.repository, entry.objective)),
+          )
+        )
+          return record;
       }
       await pauseObservation(
         queuePollSeconds(config) * 1000,
@@ -842,17 +1002,16 @@ export async function runIntake(
     }
   } finally {
     process.off("SIGTERM", onHandoff);
-    await closeServer();
-    releaseControllerLock(lockPath, lock);
+    await controlTail;
+    try {
+      if (server)
+        await new Promise<void>((resolve) => server!.close(() => resolve()));
+    } finally {
+      releaseControllerLock(lockPath, lock);
+    }
   }
 }
-
-/**
- * The pause between observations: one poll, or until GitHub may answer again,
- * whichever is later. A timer ends on whole real milliseconds, which can fall
- * short of the hold on the logical clock; the pause ends only once the clock
- * has passed the hold, or when the registered wake is called (#817).
- */
+/** Waking observation never creates dispatch authority. */
 export async function pauseObservation(
   pollMs: number,
   heldUntil: number,

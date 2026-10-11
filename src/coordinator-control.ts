@@ -28,7 +28,8 @@ export interface ControlRequest {
     | "propose-amendment"
     | "dequeue"
     | "enqueue"
-    | "watch";
+    | "watch"
+    | "project-queue";
   input?: Record<string, unknown>;
 }
 /**
