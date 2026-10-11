@@ -839,6 +839,129 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     /digest verification/,
   );
   writeFileSync(contextPath, contextBytes);
+  // Two attributable observations retain one actual Git source body. Optional
+  // accounting includes their summaries, provenance and selection descriptors.
+  const memoryStore = new LocalContentStore(
+    join(stateRoot(expandedState.repository), "content"),
+  );
+  const memory = new LocalRepositoryMemory(
+    stateRoot(expandedState.repository),
+    expandedState.repository,
+    memoryStore,
+  );
+  const observedRef = memoryStore.putBytes(Buffer.from(sources[1].content), {
+    mediaType: "text/plain",
+  });
+  const observations = ["first-source-read", "second-source-read"].map(
+    (identity) =>
+      memory.retain({
+        schemaVersion: 1,
+        repository: expandedState.repository,
+        visibility: "repository",
+        kind: "observation",
+        producer: {
+          objective: producer.objective,
+          runId: producer.runId,
+          identity,
+          itemId: "join",
+          status: "observed",
+        },
+        createdAt: new Date().toISOString(),
+        authority: "observation",
+        summary: "Shared migration notes observed from the pinned source.",
+        bodies: [
+          {
+            role: "migration-notes",
+            ref: observedRef,
+            availability: "retained",
+          },
+        ],
+        sources: [
+          {
+            identity: "repository:notes.txt",
+            path: "notes.txt",
+            commitSha: baseSha,
+            treeSha: git("rev-parse", "HEAD^{tree}"),
+            complete: true,
+            ref: observedRef,
+          },
+        ],
+        bindings: {
+          treeSha: git("rev-parse", "HEAD^{tree}"),
+          environment: { configDigest: expandedState.configDigest },
+        },
+        validity: { state: "current", conditions: [] },
+        supersedes: [],
+      }),
+  );
+  assert.notEqual(observations[0].id, observations[1].id);
+  const advisoryState = structuredClone(expandedState);
+  const allowance = 65536;
+  advisoryState.planningRecovery.contextLookup.packet.bounds.maxBytes =
+    allowance;
+  const advisoryInput = {
+    ...contextInput,
+    state: advisoryState,
+    role: "diagnosis",
+    item: materialized.graph.items.find((item) => item.id === "join"),
+    sources: [],
+    required: {},
+    requiredSelections: [],
+  };
+  const advisory = await buildAdaptiveContext(advisoryInput);
+  const observationMatches = advisory.payload.memory.filter((match) =>
+    observations.some((binding) => binding.id === match.binding.id),
+  );
+  assert.equal(observationMatches.length, 2);
+  assert.ok(
+    observationMatches.every((match) => match.disposition === "current"),
+  );
+  const observedBodies = advisory.payload.memory
+    .flatMap((match) => match.content)
+    .filter((body) => body.ref.digest === observedRef.digest);
+  assert.deepEqual(
+    observedBodies
+      .filter((body) => body.text !== undefined)
+      .map((body) => body.text),
+    [sources[1].content],
+  );
+  assert.match(observationMatches[1].content[0].reuse, /^memory:/);
+  const serializedCost = advisory.payload.memory.reduce(
+    (total, match) =>
+      total +
+      Buffer.byteLength(
+        JSON.stringify({
+          match,
+          selection: advisory.packet.selections.find(
+            (selection) => selection.id === `memory:${match.binding.id}`,
+          ),
+        }),
+      ),
+    0,
+  );
+  assert.ok(serializedCost <= allowance);
+  assert.ok(serializedCost > observedRef.bytes);
+  const boundedState = structuredClone(expandedState);
+  boundedState.planningRecovery.contextLookup.packet.bounds.maxBytes =
+    observedRef.bytes + 1;
+  const bounded = await buildAdaptiveContext({
+    ...advisoryInput,
+    state: boundedState,
+    role: "expansion",
+  });
+  assert.deepEqual(bounded.payload.memory, []);
+  for (const observation of observations) {
+    assert.ok(
+      bounded.packet.unavailable.includes(
+        `Optional memory ${observation.id} deferred by serialized byte allowance`,
+      ),
+    );
+    const selection = bounded.packet.selections.find(
+      (selection) => selection.id === `memory:${observation.id}`,
+    );
+    assert.equal(selection.disposition, "incomplete");
+    assert.deepEqual(selection.refs, []);
+  }
   writeFileSync(
     join(checkout, "src", "helper.ts"),
     "Working copy changed after materialization\n",
