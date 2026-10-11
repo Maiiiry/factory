@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   createReadStream,
@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
+import { linuxProcessIdentity } from "../dist/process.js";
 import { analyzeInteractions } from "../dist/analysis.js";
 import { captureAssetSets } from "../dist/media.js";
 import {
@@ -62,7 +63,16 @@ import {
 } from "../dist/runner/routing.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
 import { objectiveCandidate } from "../dist/qa.js";
-import { factoryConfigDigest, stateRoot } from "../dist/config.js";
+import {
+  factoryAuthorityDigest,
+  factoryConfigDigest,
+  stateRoot,
+} from "../dist/config.js";
+import {
+  authenticateQueueOwnerReferences,
+  bindProjectQueueRun,
+  parseQueueRecord,
+} from "../dist/project-queue-state.js";
 import {
   decidePlaybook,
   learningDigest,
@@ -838,6 +848,180 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     firstCheckpoint.lastAcknowledged.commitSha,
   );
   assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  // This same real private Git workflow retains a claim, its first canonical
+  // snapshot, and terminal cancellation originals. No adapter response or
+  // admission receipt is invented: dispatch settlement authenticates those
+  // separately, while this case exercises the literal lineage/restore boundary.
+  const claimDirectory = join(state, "project-queue-history");
+  mkdirSync(claimDirectory, { mode: 0o700 });
+  const claim = {
+    schemaVersion: 1,
+    kind: "project-queue-owner",
+    id: randomUUID(),
+    repository,
+    authorityDigest: factoryAuthorityDigest(config),
+    admissionId: randomUUID(),
+    receiptId: randomUUID(),
+    objective: 2,
+    bodyDigest: cancelled.objectiveBodyDigest,
+    ownerTokenDigest: learningDigest("original-owner"),
+    at: new Date().toISOString(),
+    deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  const claimPath = join(claimDirectory, `${claim.id}.json`);
+  const writeClaim = () =>
+    writeFileSync(claimPath, `${JSON.stringify(claim)}\n`, { mode: 0o600 });
+  writeClaim();
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const claimInitial = {
+    ...structuredClone(cancelled),
+    objective: 2,
+    runId: randomUUID(),
+    coordinator: {
+      mode: "paused",
+      phase: "planning",
+      phaseStartedAt: new Date().toISOString(),
+      deadlineAt: claim.deadlineAt,
+    },
+  };
+  delete claimInitial.cancelledAt;
+  saveState(statePath(repository, 2), claimInitial);
+  const initialBytes = readFileSync(statePath(repository, 2));
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const claimTerminal = {
+    ...structuredClone(claimInitial),
+    cancelRequested: true,
+    cancelledAt: new Date().toISOString(),
+  };
+  saveState(statePath(repository, 2), claimTerminal);
+  const terminalBytes = readFileSync(statePath(repository, 2));
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const lineageArchive = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    { objective: 2, claimId: claim.id, runId: claimInitial.runId },
+  );
+  const lineage = lineageArchive.queueOwnerLineage;
+  assert.ok(lineage);
+  for (const original of lineage.bodies)
+    assert.deepEqual(
+      store.putBytes(original.bytes, { mediaType: "application/json" }),
+      original.ref,
+    );
+  assert.deepEqual(store.readBytes(lineage.initialSnapshot), initialBytes);
+  const terminalRef = store.putBytes(terminalBytes, {
+    mediaType: "application/json",
+  });
+  claim.settled = {
+    at: new Date().toISOString(),
+    runId: claimInitial.runId,
+    disposition: "quiescent",
+    cancellation: {
+      schemaVersion: 1,
+      originalClaim: lineage.originalClaim,
+      initialSnapshot: lineage.initialSnapshot,
+      cancelledSnapshot: terminalRef,
+      configDigest: claimInitial.configDigest,
+      owner: {
+        pid: process.pid,
+        startTime: linuxProcessIdentity(process.pid).startTime,
+        tokenDigest: learningDigest("cancelling-owner"),
+      },
+      lineage: { kind: "verified-first-run", checkpoints: lineage.checkpoints },
+    },
+  };
+  await authenticateQueueOwnerReferences(claim, (reference) =>
+    store.readBytes(reference),
+  );
+  const unrelated = structuredClone(claim);
+  unrelated.settled.runId = randomUUID();
+  await assert.rejects(
+    authenticateQueueOwnerReferences(unrelated, (reference) =>
+      store.readBytes(reference),
+    ),
+    /original run/,
+  );
+  const uncertain = structuredClone(claimTerminal);
+  uncertain.coordinator.processes = [
+    { pid: process.pid, startTime: "unsettled-owned-process" },
+  ];
+  const uncertainProof = structuredClone(claim);
+  uncertainProof.settled.cancellation.cancelledSnapshot = store.putBytes(
+    Buffer.from(JSON.stringify(uncertain)),
+    { mediaType: "application/json" },
+  );
+  await assert.rejects(
+    authenticateQueueOwnerReferences(uncertainProof, (reference) =>
+      store.readBytes(reference),
+    ),
+    /quiescent/,
+  );
+  await assert.rejects(
+    readVerifiedRecoveryCheckpoint(config, undefined, {
+      objective: 2,
+      claimId: claim.id,
+      runId: randomUUID(),
+    }),
+    /replaced/,
+  );
+  writeClaim();
+  const queueCheckpoint = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(queueCheckpoint.status, "acknowledged");
+  const queueArchive = await readVerifiedRecoveryCheckpoint(config);
+  const queueFile = queueArchive.manifest.files.find(
+    (file) => file.path === `project-queue-history/${claim.id}.json`,
+  );
+  assert.ok(queueFile);
+  const queueOriginalBytes = await queueArchive.readVerifiedBlob(queueFile.ref);
+  const archivedClaim = parseQueueRecord(
+    queueOriginalBytes,
+    repository,
+    claim.id,
+  );
+  await authenticateQueueOwnerReferences(
+    archivedClaim,
+    queueArchive.readVerifiedBlob,
+  );
+  // The producer path freezes its literal first snapshot exactly once.
+  const boundClaim = {
+    ...claim,
+    id: randomUUID(),
+    objective: 3,
+    ownerTokenDigest: learningDigest("new-owner"),
+  };
+  delete boundClaim.settled;
+  const boundInitial = {
+    ...structuredClone(claimInitial),
+    objective: 3,
+    runId: randomUUID(),
+  };
+  saveState(statePath(repository, 3), boundInitial);
+  bindProjectQueueRun(config, boundClaim, "new-owner", boundInitial);
+  const bindingOriginal = structuredClone(boundClaim.runBinding);
+  boundInitial.coordinator.phase = "idle";
+  saveState(statePath(repository, 3), boundInitial);
+  bindProjectQueueRun(config, boundClaim, "new-owner", boundInitial);
+  assert.deepEqual(boundClaim.runBinding, bindingOriginal);
+  assert.throws(
+    () =>
+      bindProjectQueueRun(config, boundClaim, "new-owner", {
+        ...boundInitial,
+        runId: randomUUID(),
+      }),
+    /cannot change/,
+  );
   new LocalRepositoryMemory(state, repository).retain({
     ...record,
     createdAt: new Date().toISOString(),
@@ -1079,6 +1263,23 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   );
   for (const original of accountingOriginals)
     assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
+  assert.deepEqual(readFileSync(claimPath), Buffer.from(queueOriginalBytes));
+  const restoredClaim = parseQueueRecord(
+    readFileSync(claimPath),
+    repository,
+    claim.id,
+  );
+  await authenticateQueueOwnerReferences(restoredClaim, (reference) =>
+    store.readBytes(reference),
+  );
+  assert.deepEqual(
+    store.readBytes(restoredClaim.settled.cancellation.initialSnapshot),
+    initialBytes,
+  );
+  assert.deepEqual(
+    store.readBytes(restoredClaim.settled.cancellation.cancelledSnapshot),
+    terminalBytes,
+  );
   assert.equal(existsSync(join(state, "captures")), false);
   assert.equal(existsSync(join(state, "harness")), false);
   assert.equal(
