@@ -100,6 +100,10 @@ export function derivePrerequisiteGuidance(
         ? "absent"
         : "unknown";
   const held = mode !== "running";
+  const terminal =
+    Boolean(state?.cancelledAt) ||
+    view.state === "complete" ||
+    view.state === "cancelled";
   const binding = {
     repository: state?.repository ?? view.repository ?? "",
     objective: view.objective,
@@ -113,6 +117,7 @@ export function derivePrerequisiteGuidance(
       : null,
   };
   const add = (raw: Omit<PrerequisiteGuidanceEntry, "id">) => {
+    if (terminal && raw.kind !== "unknown-effect") return;
     // Redact recursively before deriving stable identities; no source body is copied.
     const clean = JSON.parse(
       JSON.stringify(raw, (_key, value) =>
@@ -295,9 +300,17 @@ export function derivePrerequisiteGuidance(
               reason: `Use the configured ${authentication.provider} login; then inspect current status before continuing`,
             },
           }
-        : view.nextAction
-          ? { nextAction: view.nextAction }
-          : {}),
+        : {
+            nextAction:
+              scope === "objective"
+                ? (view.nextAction ?? observe)
+                : fix && !held && owner !== "unknown"
+                  ? {
+                      command: `factory retry --objective ${view.objective} --item ${scope}`,
+                      reason: `Resolve this retained prerequisite before retrying its exact step${owner === "absent" ? `; then factory run --objective ${view.objective}` : ""}; existing attempts and limits remain binding`,
+                    }
+                  : continuation,
+          }),
       ...(names.length
         ? {
             secretNames: names,
