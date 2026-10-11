@@ -16,7 +16,11 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
-import { LocalRepositoryMemory } from "../dist/repository-memory.js";
+import {
+  LocalRepositoryMemory,
+  retainPlanningSourceMemory,
+} from "../dist/repository-memory.js";
+import { stateRoot } from "../dist/config.js";
 import {
   authenticateDiscoveryOutput,
   discoverRepository,
@@ -546,6 +550,19 @@ test("memory source admission precedes same-Objective relevance and binary bodie
     [permitted.id],
   );
   assert.equal(memory.read({ ...lookup, id: mixed.id }), undefined);
+  assert.equal(
+    memory.metadata({ ...lookup, excludeIds: [permitted.id] }).entries.length,
+    0,
+  );
+  assert.equal(
+    memory.read({ ...lookup, excludeIds: [permitted.id], id: permitted.id }),
+    undefined,
+  );
+  assert.equal(
+    memory.search({ ...lookup, excludeIds: [permitted.id], query: "orchard" })
+      .length,
+    0,
+  );
   assert.deepEqual(
     memory
       .search({ ...lookup, query: "orchard" })
@@ -593,4 +610,42 @@ test("memory source admission precedes same-Objective relevance and binary bodie
     /exact binary bytes retained; text lookup unavailable/,
   );
   assert.deepEqual(store.readBytes(result.record.bodies[0].ref), opaque);
+  const supplied = readFileSync(join(checkout, "src", "main.txt"), "utf8");
+  const baseSha = git("rev-parse", "HEAD");
+  rmSync(checkout, { recursive: true });
+  const references = retainPlanningSourceMemory({
+    repository: "fixture/supplied-reference",
+    objective: 1,
+    runId: baseSha,
+    baseSha,
+    treeSha,
+    configDigest: "a".repeat(64),
+    sources: [
+      { path: "OBJECTIVE", content: "Omit the Objective body" },
+      { path: "src/main.txt", content: supplied },
+    ],
+  });
+  assert.equal(references.length, 1);
+  const referenceMemory = new LocalRepositoryMemory(
+    stateRoot("fixture/supplied-reference"),
+    "fixture/supplied-reference",
+  );
+  const reference = referenceMemory.read({
+    access: {
+      repository: "fixture/supplied-reference",
+      visibility: ["private"],
+    },
+    scope: { objective: 1, paths: ["src/main.txt"] },
+    id: references[0].id,
+    applicability: {
+      treeSha,
+      paths: { "src/main.txt": allowed.ref.digest },
+      environment: { configDigest: "a".repeat(64) },
+      sources: { "src/main.txt#": { version: allowed.ref.digest } },
+    },
+  });
+  assert.equal(reference.disposition, "current");
+  assert.equal(reference.content[0].text, supplied);
+  assert.equal(reference.record.sources[0].commitSha, baseSha);
+  assert.equal(reference.record.sources[0].treeSha, treeSha);
 });
