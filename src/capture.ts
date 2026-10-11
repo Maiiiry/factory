@@ -140,6 +140,26 @@ export interface InteractionMetadata {
     reportedStatus?: "completed" | "failed" | "cancelled" | "in_progress";
     explicitFailure?: true;
   };
+  /** SDK items are operations exposed by the adapter, not additional native calls. */
+  sdkOperation?: {
+    source: "codex-sdk";
+    itemId: string;
+    kind: "command_execution" | "mcp_tool_call";
+    event: "item.started" | "item.updated" | "item.completed";
+    status: "in_progress" | "completed" | "failed";
+  };
+  /** An image-bearing native output; no inference about rendering or billed image tokens. */
+  nativeImageOutput?: {
+    source: "owned-codex-rollout";
+    callId: string | null;
+    recordedAt: string | null;
+    images: number;
+    inlineEncodedImages: number;
+    imageReferences: number;
+    unknownEncodingImages: number;
+    serializedImageBytes: number;
+    serializedImageDigest: string;
+  };
   /** Each descendant remains a separate accounting scope, bound to the invoking parent. */
   nativeOwnership?: { rootSessionId: string; parentSessionId: string };
   nativeDescendant?: {

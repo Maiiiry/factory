@@ -187,6 +187,155 @@ function summarizeTools(activity: ReturnType<typeof summarizeNativeTools>) {
   };
 }
 
+/** Exposed SDK item identities only: never parse shell text for nested commands. */
+function summarizeSdkOperations(records: InteractionMetadata[]) {
+  const items = new Map<
+    string,
+    NonNullable<InteractionMetadata["sdkOperation"]>
+  >();
+  const conflicts = new Set<string>();
+  for (const record of records) {
+    const item = record.sdkOperation;
+    if (
+      !item ||
+      item.source !== "codex-sdk" ||
+      typeof item.itemId !== "string" ||
+      !/^[a-zA-Z0-9_-]{1,256}$/.test(item.itemId) ||
+      !["command_execution", "mcp_tool_call"].includes(item.kind) ||
+      !["item.started", "item.updated", "item.completed"].includes(
+        item.event,
+      ) ||
+      !["in_progress", "completed", "failed"].includes(item.status)
+    )
+      continue;
+    const key = JSON.stringify([record.providerSessionId ?? null, item.itemId]);
+    const previous = items.get(key);
+    if (
+      previous &&
+      (previous.kind !== item.kind ||
+        (previous.event === "item.completed" &&
+          (item.event !== previous.event || item.status !== previous.status)))
+    ) {
+      conflicts.add(key);
+      continue;
+    }
+    items.set(key, {
+      source: "codex-sdk",
+      itemId: item.itemId,
+      kind: item.kind,
+      event: item.event,
+      status: item.status,
+    });
+  }
+  const selected = [...items]
+    .filter(([key]) => !conflicts.has(key))
+    .map(([, item]) => item);
+  return {
+    source: "codex-sdk-items" as const,
+    observedItems: selected.length || items.size ? selected.length : null,
+    completedItems: items.size
+      ? selected.filter((item) => item.event === "item.completed").length
+      : null,
+    conflictingIdentities: conflicts.size,
+    byKind: ["command_execution", "mcp_tool_call"].map((kind) => ({
+      kind,
+      observedItems: items.size
+        ? selected.filter((item) => item.kind === kind).length
+        : null,
+    })),
+    coverage: items.size
+      ? ("observed-items-only" as const)
+      : ("unavailable" as const),
+    relationToNativeCalls: "separate-view-never-add" as const,
+    nestedShellCommands: "unavailable" as const,
+  };
+}
+
+function summarizeImageOutputs(
+  records: InteractionMetadata[],
+  activity: ReturnType<typeof summarizeNativeTools>,
+) {
+  const outputs = new Map<
+    string,
+    NonNullable<InteractionMetadata["nativeImageOutput"]>
+  >();
+  const conflicts = new Set<string>();
+  for (const record of records) {
+    const image = record.nativeImageOutput;
+    if (
+      !image ||
+      record.visible?.contextSnapshot ||
+      image.source !== "owned-codex-rollout" ||
+      !image.callId ||
+      !/^[a-zA-Z0-9_-]{1,256}$/.test(image.callId) ||
+      !/^[a-f0-9]{64}$/.test(image.serializedImageDigest) ||
+      ![
+        image.images,
+        image.inlineEncodedImages,
+        image.imageReferences,
+        image.unknownEncodingImages,
+        image.serializedImageBytes,
+      ].every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      image.images < 1 ||
+      image.inlineEncodedImages +
+        image.imageReferences +
+        image.unknownEncodingImages !==
+        image.images
+    )
+      continue;
+    const key = JSON.stringify([
+      record.providerSessionId ?? null,
+      image.callId,
+    ]);
+    const selected = {
+      source: "owned-codex-rollout" as const,
+      callId: image.callId,
+      recordedAt:
+        typeof image.recordedAt === "string" &&
+        Number.isFinite(Date.parse(image.recordedAt))
+          ? new Date(image.recordedAt).toISOString()
+          : null,
+      images: image.images,
+      inlineEncodedImages: image.inlineEncodedImages,
+      imageReferences: image.imageReferences,
+      unknownEncodingImages: image.unknownEncodingImages,
+      serializedImageBytes: image.serializedImageBytes,
+      serializedImageDigest: image.serializedImageDigest,
+    };
+    const previous = outputs.get(key);
+    if (previous && !isDeepStrictEqual(previous, selected)) conflicts.add(key);
+    else outputs.set(key, selected);
+  }
+  const selected = [...outputs]
+    .filter(([key]) => !conflicts.has(key))
+    .map(([key, image]) => {
+      const call = activity.calls.find(
+        (call) => JSON.stringify([call.sessionId, call.callId]) === key,
+      );
+      return {
+        ...image,
+        sessionId: call?.sessionId ?? null,
+        matchedNativeCall: Boolean(call),
+        tool: call?.name ?? null,
+      };
+    });
+  const timed = selected
+    .filter((image) => image.matchedNativeCall && image.recordedAt !== null)
+    .sort((a, b) => a.recordedAt!.localeCompare(b.recordedAt!));
+  return {
+    source: "owned-native-image-outputs" as const,
+    observedOutputs: selected.length || outputs.size ? selected.length : null,
+    firstMatchingToolOutputAt: timed[0]?.recordedAt ?? null,
+    firstRenderedImageAt: null,
+    billedImageTokens: null,
+    conflictingIdentities: conflicts.size,
+    coverage: outputs.size
+      ? ("observed-outputs-only" as const)
+      : ("unavailable" as const),
+    observations: selected,
+  };
+}
+
 function summarizeNative(
   records: InteractionMetadata[],
   options: AnalysisOptions,
@@ -693,6 +842,8 @@ function summarizeInvocation(
     ),
     native: summarizeNative(records, options, nativeToolActivity),
     nativeToolActivity,
+    sdkOperations: summarizeSdkOperations(records),
+    imageOutputs: summarizeImageOutputs(records, nativeToolActivity),
     boundaryObservations: records
       .filter((record) => record.boundary)
       .map((record) => ({
@@ -1251,6 +1402,7 @@ export function analyzeInteractions(
       "Capture may be disabled, redacted, truncated or incomplete. Default analysis never loads content. Explicit native-tool content analysis reads only complete authenticated tool payloads to recover legacy call IDs/timestamps; it returns no arguments, paths or error text and never reconstructs historical decisions.",
       "Native tool counts deduplicate call IDs within each invocation and exclude SDK callbacks and replacement snapshots. Output observation proves returned transport, not nested command success. Response boundaries count observed tool-call rounds, not all upstream requests. Call-to-output durations use recorded native timestamps, never capture-write time, and can overlap. Nested command/process counts and repeated reads/validation remain unavailable without explicit structured facts.",
       "Native tool counts cover correlated model-visible calls only. SDK items, nested processes, model responses, parent invocations and child scopes are not extra calls; outputs never prove command success. Child accounting remains separate because parent inclusion is unknown. Reported child status is not resource cessation or acceptance.",
+      "SDK operation summaries deduplicate exposed item identities and remain separate from native wrapper calls. Image observations identify serialized image-bearing tool output, not file identity, first rendering, billed image tokens or successful inspection; absent image metadata is unavailable rather than zero.",
       "Controller observations are filtered by repository/Objective/run/item/attempt only; invocation/model filters do not imply ownership of shared validation or delivery. Related invocation keys express shared recorded scope, not causation.",
     ],
   };

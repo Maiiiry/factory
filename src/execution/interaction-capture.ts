@@ -188,6 +188,14 @@ export function codexCaptureEvent(
   ) {
     const item = event.item;
     base.providerMessageId = item.id;
+    if (item.type === "command_execution" || item.type === "mcp_tool_call")
+      base.sdkOperation = {
+        source: "codex-sdk",
+        itemId: item.id,
+        kind: item.type,
+        event: event.type,
+        status: item.status,
+      };
     if (item.type === "agent_message")
       record(
         {

@@ -29,7 +29,10 @@ import {
 import { packageManagerUpdate } from "./package-manager-update.js";
 import type { PhaseAdmission } from "./phase-admission.js";
 import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
-import { environmentValidationIndices } from "./qa.js";
+import {
+  environmentValidationIndices,
+  reusableEnvironmentValidationIndices,
+} from "./qa.js";
 import { preflightItemEnvironment } from "./qa-execution.js";
 import {
   retainedFailedResultContext,
@@ -199,6 +202,10 @@ export async function runWorker(
         ? {
             environmentReadiness: {
               validationIndices: readinessIndices,
+              reusableValidationIndices: reusableEnvironmentValidationIndices(
+                state.graph,
+                item.id,
+              ),
               acceptedBaseSha: state.baseSha,
               lfsMembers: validationLfsMembersForItem(
                 state,

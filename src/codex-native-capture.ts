@@ -193,6 +193,56 @@ export interface OwnedRolloutBudget {
   remainingBytes: number;
   remainingEvents: number;
 }
+
+/** Only explicit image blocks in tool output; text, shell arguments and URLs are never exported. */
+export function nativeImageOutputObservation(
+  payload: Record<string, unknown>,
+  rowTimestamp?: unknown,
+): CaptureEvent["nativeImageOutput"] {
+  if (!Array.isArray(payload.output)) return;
+  const imageItems = payload.output.filter((item: unknown) => {
+    if (!item || typeof item !== "object") return false;
+    return ["input_image", "image"].includes(
+      String((item as Record<string, unknown>).type),
+    );
+  }) as Record<string, unknown>[];
+  if (!imageItems.length) return;
+  const serializedImages = JSON.stringify(imageItems);
+  const inlineEncodedImages = imageItems.filter(
+    (item) =>
+      (typeof item.image_url === "string" &&
+        item.image_url.startsWith("data:")) ||
+      (item.type === "image" &&
+        typeof item.data === "string" &&
+        item.data.length > 0),
+  ).length;
+  const imageReferences = imageItems.filter(
+    (item) =>
+      typeof item.image_url === "string" &&
+      item.image_url.length > 0 &&
+      !item.image_url.startsWith("data:") &&
+      !(
+        item.type === "image" &&
+        typeof item.data === "string" &&
+        item.data.length > 0
+      ),
+  ).length;
+  return {
+    source: "owned-codex-rollout",
+    callId: identifier(payload.call_id),
+    recordedAt:
+      nativeToolObservation(payload, rowTimestamp)?.recordedAt ?? null,
+    images: imageItems.length,
+    inlineEncodedImages,
+    imageReferences,
+    unknownEncodingImages:
+      imageItems.length - inlineEncodedImages - imageReferences,
+    serializedImageBytes: Buffer.byteLength(serializedImages),
+    serializedImageDigest: createHash("sha256")
+      .update(serializedImages)
+      .digest("hex"),
+  };
+}
 export interface OwnedChild {
   id: string;
   model?: string;
@@ -483,6 +533,14 @@ export function captureOwnedRollout(
           digest: createHash("sha256").update(serialized).digest("hex"),
           contextSnapshot,
         },
+        ...(!contextSnapshot && event === "codex.native-tool-output"
+          ? {
+              nativeImageOutput: nativeImageOutputObservation(
+                payload,
+                rowTimestamp,
+              ),
+            }
+          : {}),
       },
       () => payload,
     );

@@ -80,6 +80,7 @@ import { DEFAULT_PROVIDER_TURN_IDLE_TIMEOUT_MS } from "../provider-turn.js";
 import { assertPinnedNpmScripts, validateCheckout } from "../validation.js";
 import type { ValidationEvidence } from "../validation-evidence.js";
 import { workspacePackageAdditions } from "../workspace-membership.js";
+import { workerReadinessReceipt } from "../worker-readiness.js";
 import { stoppedFault } from "./attempt.js";
 import { assertDurableValue } from "./checkpoint.js";
 import { executionFault } from "./fault.js";
@@ -1232,7 +1233,31 @@ export class LocalExecutionDriver implements ExecutionDriver {
       );
       const workerRequest = { ...request };
       if (!admittedSession) delete workerRequest.session;
+      const workerReadiness = environmentReadiness
+        ? workerReadinessReceipt({
+            request,
+            workerIdentity: identity,
+            worktree,
+            validationRoot: join(
+              this.workRoot,
+              "environment-preflight",
+              identity,
+            ),
+            evidence: environmentReadiness,
+          })
+        : undefined;
+      context?.observeReadinessOffer?.({
+        workerIdentity: identity,
+        status: workerReadiness?.commands.some((entry) => entry.reusable)
+          ? "bound-current"
+          : "ineligible",
+        eligibleCommandCount:
+          workerReadiness?.commands.filter((entry) => entry.reusable).length ??
+          0,
+        ...(workerReadiness && { receiptDigest: workerReadiness.digest }),
+      });
       const handle = await harness.start({
+        ...(workerReadiness && { workerReadiness }),
         ...(admittedSession && { session: admittedSession }),
         ...(request.captureContext &&
           this.captureSettings && {

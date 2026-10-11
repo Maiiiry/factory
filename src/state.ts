@@ -45,6 +45,7 @@ import {
   assertCompletedCoverage,
   assertCoverageShape,
   environmentValidationIndices,
+  reusableEnvironmentValidationIndices,
   objectiveCandidate,
   objectivePreparationCommands,
 } from "./qa.js";
@@ -1263,6 +1264,11 @@ export function parseFactoryState(
           if (
             JSON.stringify(selected.validationIndices) !==
               JSON.stringify(expectedIndices) ||
+            (selected.reusableValidationIndices !== undefined &&
+              JSON.stringify(selected.reusableValidationIndices) !==
+                JSON.stringify(
+                  reusableEnvironmentValidationIndices(attemptGraph, id),
+                )) ||
             selected.acceptedBaseSha !== state.baseSha ||
             JSON.stringify(attemptedItem.validation) !==
               JSON.stringify(acceptedItem.validation)

@@ -30,6 +30,10 @@ import {
   ProviderTurnTimeoutError,
 } from "../provider-turn.js";
 import { fixedPackageScripts } from "../validation.js";
+import {
+  currentWorkerReadiness,
+  workerReadinessInstructions,
+} from "../worker-readiness.js";
 
 export function privateProgress(path: string, event: unknown): void {
   const fd = openSync(
@@ -211,10 +215,22 @@ export function renderWorkItemPrompt(request: HarnessRequest) {
   const environmentInstructions = request.environment?.instructions
     ? `\n\nInstallation-owned profile instructions, subordinate to Factory worker constraints and the approved Work Item; no additional tools, paths, permissions or publication authority:\n${request.environment.instructions}`
     : "";
+  const readiness = currentWorkerReadiness(request);
+  const reusable = new Set(
+    readiness?.commands
+      .filter((entry) => entry.reusable)
+      .map((entry) => entry.validationIndex),
+  );
+  const postEditValidation = request.item.validation.filter(
+    (_, index) => !reusable.has(index),
+  );
   const validationInstructions = request.item.validation.length
-    ? `\n\nAuthoritative validation: run every exact command below in the checkout before finishing; fix failures within owned paths. For format failures, use the repository's formatter on changed files. If a command needs an unavailable service, tool or input, report the exact command and reason. Factory runs these commands independently after your turn; do not claim its checks passed. Committed LFS pointers alone do not make acceptance impossible: Factory verifies applicable selected required-LFS pointers and restores selected content-store bytes before exact-result validation. Complete owned deliverables, keep selected inputs read-only, and report real implementation conflicts or missing required inputs. Do not hydrate unowned destinations or configure LFS filters. Preserve each command's literal meaning, provenance and source:\n${request.item.validation
+    ? `\n\nAuthoritative post-edit validation: run every exact required command below in the checkout before finishing; fix failures within owned paths. For format failures, use the repository's formatter on changed files. If a command needs an unavailable service, tool or input, report the exact command and reason. Factory runs these commands independently after your turn; do not claim its checks passed. Committed LFS pointers alone do not make acceptance impossible: Factory verifies applicable selected required-LFS pointers and restores selected content-store bytes before exact-result validation. Complete owned deliverables, keep selected inputs read-only, and report real implementation conflicts or missing required inputs. Do not hydrate unowned destinations or configure LFS filters. Preserve each command's literal meaning, provenance and source:\n${postEditValidation
         .map((check) => JSON.stringify(check))
         .join("\n")}`
+    : "";
+  const readinessInstructions = readiness
+    ? workerReadinessInstructions(readiness)
     : "";
   const scriptNames = fixedPackageScripts(
     request.item.validation.map((check) => check.command),
@@ -254,7 +270,10 @@ export function renderWorkItemPrompt(request: HarnessRequest) {
     ["evidence", sourceInstructions],
     [
       "instructions",
-      validationInstructions + scriptInstructions + mediaInstructions,
+      validationInstructions +
+        readinessInstructions +
+        scriptInstructions +
+        mediaInstructions,
     ],
     ["evidence", inputInstructions],
     ["instructions", environmentInstructions],
