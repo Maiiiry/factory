@@ -51,6 +51,9 @@ import {
   authenticateDiscoveryOutput,
   classifyDiscoveryOutput,
   assertDiscoverySpecification,
+  assertDiscoveryOutputManifest,
+  assertDiscoveryBody,
+  discoverySpecificationDigest,
 } from "../discovery.js";
 import {
   attachedFault,
@@ -316,6 +319,30 @@ export class CodexHarness implements AgentHarness {
    * unrecorded start of it spawned is stopped first (#585).
    */
   async start(request: HarnessRequest): Promise<HarnessHandle> {
+    if ((request.item.kind === "discovery") !== Boolean(request.discovery))
+      throw new Error(
+        "Codex discovery requires its explicit read-only execution input",
+      );
+    if (request.discovery) {
+      assertDiscoverySpecification(request.item.discovery);
+      assertDiscoveryOutputManifest(request.discovery.manifest);
+      assertDiscoveryBody(request.discovery.body);
+      const { manifest, body } = request.discovery;
+      if (
+        request.item.discovery.mode !== "semantic" ||
+        manifest.status !== "complete" ||
+        manifest.producer.itemId !== request.item.id ||
+        manifest.specificationDigest !==
+          discoverySpecificationDigest(request.item.discovery) ||
+        manifest.body.bytes !== Buffer.byteLength(JSON.stringify(body)) ||
+        manifest.body.digest !==
+          createHash("sha256").update(JSON.stringify(body)).digest("hex")
+      )
+        throw new Error(
+          "Codex discovery input differs from its bound inventory",
+        );
+      await verifyDiscoveryExport(request.worktree, body.entries);
+    }
     if (
       request.discovery &&
       (request.session ||
@@ -532,6 +559,40 @@ async function verifyBoundInput(path: string, ref: ContentRef): Promise<void> {
   }
   if (bytes !== ref.bytes || hash.digest("hex") !== ref.digest)
     throw workFault("Bound asset input differs from its captured digest");
+}
+
+async function verifyDiscoveryExport(
+  worktree: string,
+  entries: { path: string; content: ContentRef }[],
+): Promise<void> {
+  if (
+    !existsSync(worktree) ||
+    !lstatSync(worktree).isDirectory() ||
+    realpathSync(worktree) !== resolve(worktree)
+  )
+    throw workFault("Discovery export is missing or redirected");
+  const expected = new Set(entries.map((entry) => entry.path));
+  const inspect = (directory: string, relative = ""): void => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory, name);
+      const shown = relative ? `${relative}/${name}` : name;
+      const stat = lstatSync(path);
+      if (name === ".git")
+        throw workFault("Discovery export contains Git metadata");
+      if (stat.isDirectory()) inspect(path, shown);
+      else if (!stat.isFile() || !expected.has(shown))
+        throw workFault(
+          "Read-only discovery export contains an unexpected source or link",
+        );
+    }
+  };
+  inspect(worktree);
+  for (const entry of entries) {
+    const path = resolve(worktree, entry.path);
+    if (!path.startsWith(`${resolve(worktree)}${sep}`))
+      throw workFault("Discovery export escapes its selected source scope");
+    await verifyBoundInput(path, entry.content);
+  }
 }
 
 function assertDurableHandle(handle: HarnessHandle): void {
@@ -929,6 +990,7 @@ export function checkpointWorkerSession(
 }
 
 export class LocalExecutionDriver implements ExecutionDriver {
+  readonly readonlyDiscovery = "selector-bound-read-only-v1" as const;
   readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly freshCheckoutReadiness = true as const;
   readonly retainedFailedResultContext = true as const;
@@ -1649,25 +1711,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
           manifest: active.request.discovery.manifest,
           store: this.contentStore,
         });
-        const expected = new Set(original.entries.map((entry) => entry.path));
-        const inspect = (directory: string, relative = ""): void => {
-          for (const name of readdirSync(directory)) {
-            const path = join(directory, name);
-            const shown = relative ? `${relative}/${name}` : name;
-            const stat = lstatSync(path);
-            if (stat.isDirectory()) inspect(path, shown);
-            else if (!stat.isFile() || !expected.has(shown))
-              throw workFault(
-                "Read-only discovery export contains an unexpected source or link",
-              );
-          }
-        };
-        inspect(active.worktree);
-        for (const entry of original.entries)
-          await verifyBoundInput(
-            join(active.worktree, entry.path),
-            entry.content,
-          );
+        await verifyDiscoveryExport(active.worktree, original.entries);
         const manifest = await classifyDiscoveryOutput({
           checkout: this.checkout,
           specification: active.request.item.discovery!,

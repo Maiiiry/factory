@@ -81,7 +81,7 @@ export type DiscoveryOutputField = (typeof DISCOVERY_OUTPUT_FIELDS)[number];
 export function selectDiscoveryOutputFields(
   body: DiscoveryBody,
   fields: readonly DiscoveryOutputField[],
-): unknown[] {
+): Record<string, unknown>[] {
   if (
     !fields.length ||
     new Set(fields).size !== fields.length ||
