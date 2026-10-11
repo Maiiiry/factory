@@ -170,6 +170,8 @@ export interface MemoryLookup {
   access: MemoryAccess;
   excludeIds?: string[];
   suppliedSources?: { path: string; heading?: string; digest: string }[];
+  /** Automatic context omits machine source snapshots for an already supplied selection. */
+  excludeSuppliedSourceHistory?: boolean;
   /** Exact complete bodies already authenticated in the current role packet. */
   suppliedBodyDigests?: string[];
   scope?: {
@@ -180,6 +182,7 @@ export interface MemoryLookup {
   };
   applicability?: MemoryApplicability;
   limit: number;
+  /** Bound unique authenticated body bytes; callers separately bound rendered metadata. */
   maxBytes?: number;
 }
 
@@ -880,7 +883,7 @@ export class LocalRepositoryMemory {
   private result(
     entry: ReturnType<LocalRepositoryMemory["manifest"]>,
     applicability: MemoryApplicability | undefined,
-    budget: { bytes: number },
+    budget: { bytes: number; bodies?: Map<string, Uint8Array> },
     superseded = false,
   ): MemoryResult {
     const { binding, record } = entry;
@@ -956,7 +959,10 @@ export class LocalRepositoryMemory {
         continue;
       }
       try {
-        const bytes = this.store.readBytes(body.ref);
+        const bytes =
+          budget.bodies?.get(body.ref.digest) ?? this.store.readBytes(body.ref);
+        if (bytes.length !== body.ref.bytes)
+          throw new Error("Retained body size differs");
         let decoded: string;
         try {
           decoded = new TextDecoder("utf-8", {
@@ -972,14 +978,16 @@ export class LocalRepositoryMemory {
           disposition = "unavailable";
           continue;
         }
-        if (bytes.length > budget.bytes) {
+        const cost = budget.bodies?.has(body.ref.digest) ? 0 : bytes.length;
+        if (cost > budget.bytes) {
           gaps.push(
             `${body.role}: complete body exceeds remaining byte allowance`,
           );
           if (disposition !== "unavailable") disposition = "incomplete";
           continue;
         }
-        budget.bytes -= bytes.length;
+        budget.bytes -= cost;
+        budget.bodies?.set(body.ref.digest, bytes);
         content.push({
           role: body.role,
           ref: body.ref,
@@ -1036,6 +1044,11 @@ export class LocalRepositoryMemory {
       (!Array.isArray(lookup.excludeIds) || !lookup.excludeIds.every(isHash))
     )
       throw new Error("Invalid excluded memory identity");
+    if (
+      lookup.excludeSuppliedSourceHistory !== undefined &&
+      typeof lookup.excludeSuppliedSourceHistory !== "boolean"
+    )
+      throw new Error("Invalid automatic source history selection");
     if (lookup.suppliedSources !== undefined) {
       if (!Array.isArray(lookup.suppliedSources))
         throw new Error("Invalid supplied memory sources");
@@ -1086,6 +1099,25 @@ export class LocalRepositoryMemory {
                 source.ref?.digest === supplied.digest &&
                 entry.record.bodies[0]?.ref?.digest === supplied.digest,
             ),
+          )
+        ) &&
+        !(
+          lookup.excludeSuppliedSourceHistory &&
+          entry.record.kind === "reference" &&
+          entry.record.authority === "observation" &&
+          entry.record.producer.status === "observed-supplied-source" &&
+          entry.record.bodies.length === 1 &&
+          entry.record.bodies[0]?.role === "supplied-source-selection" &&
+          entry.record.bodies[0]?.availability === "retained" &&
+          entry.record.bodies[0]?.ref !== undefined &&
+          entry.record.sources.length === 1 &&
+          entry.record.sources[0]?.ref?.digest ===
+            entry.record.bodies[0]?.ref?.digest &&
+          (lookup.suppliedSources ?? []).some(
+            (supplied) =>
+              entry.record.sources[0]?.path === supplied.path &&
+              memorySourceHeading(entry.record.sources[0]?.heading) ===
+                memorySourceHeading(supplied.heading),
           )
         ) &&
         this.accessible(lookup.access, entry.record) &&
@@ -1264,7 +1296,10 @@ export class LocalRepositoryMemory {
     const superseded = new Set(
       retained.entries.flatMap((entry) => entry.record.supersedes),
     );
-    const budget = { bytes: lookup.maxBytes ?? 262_144 };
+    const budget = {
+      bytes: lookup.maxBytes ?? 262_144,
+      bodies: new Map<string, Uint8Array>(),
+    };
     const entries = retained.entries
       .sort((left, right) =>
         right.record.createdAt.localeCompare(left.record.createdAt),
@@ -1346,7 +1381,10 @@ export class LocalRepositoryMemory {
     const superseded = new Set(
       retained.entries.flatMap((entry) => entry.record.supersedes),
     );
-    const budget = { bytes: lookup.maxBytes ?? 262_144 };
+    const budget = {
+      bytes: lookup.maxBytes ?? 262_144,
+      bodies: new Map<string, Uint8Array>(),
+    };
     return selected.map((entry) =>
       this.result(
         entry,
