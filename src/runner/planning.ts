@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { releaseAgentSessions } from "../agent-session.js";
+import { adaptiveWorkflowEnabled } from "../adaptive-workflow.js";
 import {
   bindPlanningPlaybook,
   compilePlan,
@@ -151,6 +152,7 @@ async function planObjectiveObserved(
         contextResolver: createPlanningContextResolver({
           config,
           objective,
+          objectiveBody: issue.body,
           runId: planningScopeId,
           baseSha,
           sources: planningSources(issue.body, baseSha, config.checkout),
@@ -335,6 +337,11 @@ export async function prepareObjective(args: {
     reportRunStatus,
   } = args;
   let { preparation } = args;
+  const adaptive = adaptiveWorkflowEnabled(issue.body);
+  if (adaptive && !config.planningContext?.enabled)
+    throw new Error(
+      "Adaptive workflow is enabled for this Objective; admit planningContext bounds and selectors in configuration before planning",
+    );
   let planningModel = args.planningModel;
   // A new plan starts from the default branch as origin has it now; the
   // checkout's own refs are only as new as its last fetch. A preparation
@@ -369,7 +376,7 @@ export async function prepareObjective(args: {
     preparation = {
       approvedPlaybookPin,
       sourcePacketDigest,
-      schemaVersion: config.planningContext?.enabled ? 10 : 8,
+      schemaVersion: adaptive ? 10 : 8,
       kind: "preparing",
       repository: config.repository,
       objective,
@@ -468,6 +475,7 @@ export async function prepareObjective(args: {
                   contextResolver: createPlanningContextResolver({
                     config,
                     objective,
+                    objectiveBody: issue.body,
                     runId: preparation!.runId,
                     baseSha,
                     sources: planningSources(

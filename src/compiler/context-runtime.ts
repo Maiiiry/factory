@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { adaptiveWorkflowEnabled } from "../adaptive-workflow.js";
 import {
   factoryConfigDigest,
   stateRoot,
@@ -6,7 +8,7 @@ import {
 } from "../config.js";
 import type { ContentStore } from "../contracts.js";
 import { retainLearningMemory } from "../learning.js";
-import { pinnedGit } from "../process.js";
+import { pinnedGit, pinnedGitEnvironment } from "../process.js";
 import {
   LocalRepositoryMemory,
   type MemoryApplicability,
@@ -41,11 +43,17 @@ export function createPlanningContextResolver(input: {
   runId: string;
   baseSha: string;
   sources: PlanningSource[];
+  objectiveBody: string;
   contentStore: ContentStore;
 }): PlanningContextResolver | undefined {
   const { config, objective, runId, baseSha, sources, contentStore } = input;
+  const enabled = adaptiveWorkflowEnabled(input.objectiveBody);
   const options = config.planningContext;
-  if (!options?.enabled) return undefined;
+  if (!enabled) return undefined;
+  if (!options?.enabled)
+    throw new Error(
+      "Adaptive workflow is enabled for this Objective; admit planningContext bounds and selectors in configuration before planning",
+    );
   const preparationStarted = Date.now();
   const treeSha = pinnedGit(config.checkout, "rev-parse", `${baseSha}^{tree}`);
   const configDigest = factoryConfigDigest(config);
@@ -74,7 +82,7 @@ export function createPlanningContextResolver(input: {
     },
     applicability,
     scope: { objective, paths: options.selectors },
-    limit: Math.min(256, Math.max(0, options.bounds.maxResults - 1)),
+    limit: 64,
     maxBytes: options.bounds.maxBytes,
   };
   let memory: LocalRepositoryMemory | undefined;
@@ -122,17 +130,6 @@ export function createPlanningContextResolver(input: {
         },
       ]
     : [];
-  if (metadata && !metadata.complete)
-    automatic[0] = {
-      id: "automatic-incomplete-memory-inventory",
-      operation: "inventory",
-      collection: "memory",
-      selector: "",
-      query: "",
-      required: true,
-      reason:
-        "An incomplete eligible manifest inventory cannot establish that all current Objective decisions are supplied",
-    };
   automatic.unshift(
     ...(metadata?.entries ?? [])
       .filter(
@@ -148,9 +145,9 @@ export function createPlanningContextResolver(input: {
         collection: "memory",
         selector: binding.id,
         query: "",
-        required: true,
+        required: false,
         reason:
-          "Supply retained current human decision for this Objective before graph compilation",
+          "Supply retained decision history for this Objective; original authority and current applicability remain explicit",
       })),
   );
   const catalog: PlanningContextResolver["catalog"] = [
@@ -163,14 +160,11 @@ export function createPlanningContextResolver(input: {
     },
     {
       id: "pinned-sources",
-      selectors: sources
-        .slice(0, options.bounds.maxResults)
-        .map((_, index) => String(index)),
+      selectors: sources.slice(0, 65).map((_, index) => String(index)),
       operations: ["read"],
       freshness:
         "Indexed exact required Sources already supplied in the planning packet; indices retain pinned path and heading",
-      completeness:
-        sources.length <= options.bounds.maxResults ? "complete" : "incomplete",
+      completeness: sources.length <= 65 ? "complete" : "incomplete",
     },
   ];
   if (options.memory)
@@ -288,6 +282,42 @@ export function createPlanningContextResolver(input: {
           (source) =>
             source.path === request.selector && source.heading === undefined,
         );
+        let blobSha: string | undefined;
+        if (request.operation === "read" && source) {
+          try {
+            const entry = execFileSync(
+              "git",
+              [
+                "-C",
+                config.checkout,
+                "ls-tree",
+                "-z",
+                baseSha,
+                "--",
+                source.path,
+              ],
+              {
+                env: pinnedGitEnvironment(),
+                timeout: Math.max(1, remaining.deadlineAt - Date.now()),
+                maxBuffer: 8192,
+                stdio: ["ignore", "pipe", "pipe"],
+              },
+            ).toString("utf8");
+            blobSha = /^(?:100644|100755) blob ([a-f0-9]{40,64})\t/.exec(
+              entry,
+            )?.[1];
+            if (!blobSha)
+              return answer(
+                "unavailable",
+                "Selected pinned source is not a regular immutable Git blob; symlink targets are not traversed",
+              );
+          } catch {
+            return answer(
+              "unavailable",
+              "Selected pinned source metadata is unavailable within the remaining read/time allowance",
+            );
+          }
+        }
         const result =
           request.operation === "read" && source
             ? bound(
@@ -296,7 +326,7 @@ export function createPlanningContextResolver(input: {
                   contextMatch(
                     `git:${baseSha}:${source.path}`,
                     source.content,
-                    { baseSha, path: source.path, complete: true },
+                    { baseSha, path: source.path, blobSha, complete: true },
                   ),
                 ],
                 remaining,
