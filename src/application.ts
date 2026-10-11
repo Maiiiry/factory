@@ -46,8 +46,8 @@ import { RealGitHubGateway } from "./github.js";
 import {
   enqueueIntake,
   ensureProjectObjective,
-  intakeControl,
   type IntakeAuthorization,
+  intakeControl,
   runIntake,
   watchIntake,
 } from "./intake.js";
@@ -55,6 +55,11 @@ import {
   executionCredential,
   resolveProviderCredential,
 } from "./provider-credentials.js";
+import {
+  withRecoveryCheckpointOperation,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import {
   type ApplicationServices,
   cancelObjective,
@@ -71,11 +76,6 @@ import {
   selectAssetSet,
 } from "./runner.js";
 import type { ContinuationState, PreparationState } from "./state.js";
-import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
-import {
-  synchronizeRecoveryCheckpoint,
-  withRecoveryCheckpointScope,
-} from "./recovery-checkpoint.js";
 
 /** Bind existing operations to their configured archive without changing lifecycle authority. */
 function checkpointOperations(config: FactoryConfig) {
@@ -90,22 +90,7 @@ function checkpointOperations(config: FactoryConfig) {
   return {
     local: <T>(task: () => T): T => withRecoveryCheckpointScope(input, task),
     async: <T>(task: () => Promise<T>): Promise<T> =>
-      withRecoveryCheckpointScope(input, async () => {
-        let result: T;
-        try {
-          result = await task();
-        } catch (error) {
-          // Retain the original lifecycle error; sync failure remains in durability status.
-          try {
-            await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
-          } catch {
-            // The journal retains sync failure; do not replace the lifecycle error.
-          }
-          throw error;
-        }
-        await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
-        return result;
-      }),
+      withRecoveryCheckpointOperation(input, task),
   };
 }
 

@@ -20,22 +20,22 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  type FactoryConfig,
   factoryAuthorityDigest,
   factoryConfigDigest,
   stateRoot,
-  type FactoryConfig,
 } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
 import type { ContentRef } from "./contracts.js";
 import { attachFault, decision } from "./fault.js";
 import {
+  linuxProcessIdentity,
   pinnedGitCommand,
   pinnedGitEnvironment,
   releaseGuard,
   subprocessAsync,
   takeGuard,
   UnsettledSubprocessError,
-  linuxProcessIdentity,
 } from "./process.js";
 import type { ControllerLock } from "./state-store.js";
 
@@ -279,6 +279,11 @@ export function isCheckpointAdmissionFailure(
 const scopes = new AsyncLocalStorage<{
   config: FactoryConfig;
   buildClosure: () => Promise<RecoveryCheckpointClosure>;
+  operation?: {
+    completion?: string;
+    activeChildren: number;
+    closed: boolean;
+  };
 }>();
 export function hasPrivateCheckpointScope(): boolean {
   const scope = scopes.getStore();
@@ -936,6 +941,7 @@ export function markCheckpointDirty(
   if (!scope) return;
   if (scope.config.repository !== repository)
     throw new Error("Checkpoint scope repository differs from mutation");
+  if (scope.operation) delete scope.operation.completion;
   const options = settings(scope.config);
   if (!options) return;
   if (
@@ -985,6 +991,89 @@ export function withRecoveryCheckpointScope<T>(
     return task();
   }
   return scopes.run(input, task);
+}
+/** A producer completes durability before returning; an explicit forwarding caller may reuse it. */
+export function withRecoveryCheckpointOperation<T>(
+  input: {
+    config: FactoryConfig;
+    buildClosure: () => Promise<RecoveryCheckpointClosure>;
+  },
+  task: () => Promise<T>,
+  options: {
+    /** Only a caller forwarding the terminal result without later durable work may opt in. */
+    forwardCompletedBarrier?: boolean;
+  } = {},
+): Promise<T> {
+  return withRecoveryCheckpointScope(input, () => {
+    const scope = scopes.getStore();
+    if (!scope) throw new Error("Checkpoint operation has no admitted scope");
+    const parent = scope.operation?.closed ? undefined : scope.operation;
+    if (parent) {
+      delete parent.completion;
+      parent.activeChildren++;
+    }
+    const operation: NonNullable<typeof scope.operation> = {
+      activeChildren: 0,
+      closed: false,
+    };
+    // A fingerprint is an in-process completion witness, never a cached archive
+    // or a newer acknowledgement manufactured from an older manifest.
+    const fingerprint = () => {
+      const persistence = settings(input.config);
+      if (!persistence)
+        return `local-only:${factoryConfigDigest(input.config)}`;
+      const record = journal(input.config, persistence);
+      if (
+        record.sequence !== record.acknowledgedSequence ||
+        !record.lastAcknowledged ||
+        record.hold ||
+        record.error ||
+        record.changed.length ||
+        record.retentionGaps?.length ||
+        (record.attempts.at(-1) &&
+          record.attempts.at(-1)?.status !== "acknowledged")
+      )
+        return undefined;
+      return `${factoryConfigDigest(input.config)}:${canonical(record)}`;
+    };
+    return scopes.run({ ...scope, operation }, async () => {
+      let completion: string | undefined;
+      try {
+        let result: T;
+        try {
+          result = await task();
+        } catch (error) {
+          // Preserve the lifecycle error; the journal retains any sync failure.
+          try {
+            await synchronizeRecoveryCheckpoint(input.config, {
+              reason: "explicit",
+            });
+          } catch {
+            // Durability status retains the failure alongside the original error.
+          }
+          throw error;
+        }
+        if (
+          !options.forwardCompletedBarrier ||
+          operation.activeChildren !== 0 ||
+          !operation.completion ||
+          operation.completion !== fingerprint()
+        )
+          await synchronizeRecoveryCheckpoint(input.config, {
+            reason: "explicit",
+          });
+        completion = fingerprint();
+        return result;
+      } finally {
+        operation.closed = true;
+        if (parent) {
+          parent.activeChildren--;
+          if (!parent.closed && parent.activeChildren === 0)
+            parent.completion = completion;
+        }
+      }
+    });
+  });
 }
 export async function awaitCheckpointAdmission(
   repository: string | undefined,

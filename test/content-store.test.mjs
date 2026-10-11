@@ -97,6 +97,7 @@ import {
   readRecoveryCheckpointBodies,
   writeRecoveryCheckpointBodies,
   synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointOperation,
   withRecoveryCheckpointScope,
 } from "../dist/recovery-checkpoint.js";
 import { buildMemoryLearningClosure } from "../dist/repository-memory-transfer.js";
@@ -899,6 +900,49 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     firstCheckpoint.lastAcknowledged.commitSha,
   );
   assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  // The CLI's forwarding scope reuses the actual producer's completed Git
+  // barrier. A later atomic snapshot save invalidates that exact completion.
+  let operationClosureBuilds = 0;
+  const operationInput = {
+    config,
+    buildClosure: () => {
+      operationClosureBuilds++;
+      return buildClosure();
+    },
+  };
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    () =>
+      withRecoveryCheckpointOperation(operationInput, async () =>
+        gitPersistenceStatus(config),
+      ),
+    { forwardCompletedBarrier: true },
+  );
+  assert.equal(operationClosureBuilds, 1);
+  assert.equal(
+    gitPersistenceStatus(config).lastAcknowledged.commitSha,
+    unchangedCheckpoint.lastAcknowledged.commitSha,
+  );
+  operationClosureBuilds = 0;
+  const beforeLaterSave = gitPersistenceStatus(config).lastAcknowledged;
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    async () => {
+      await withRecoveryCheckpointOperation(operationInput, async () =>
+        gitPersistenceStatus(config),
+      );
+      saveState(statePath(repository, 1), cancelled);
+    },
+    { forwardCompletedBarrier: true },
+  );
+  assert.equal(operationClosureBuilds, 2);
+  const afterLaterSave = gitPersistenceStatus(config).lastAcknowledged;
+  assert.equal(afterLaterSave.sequence > beforeLaterSave.sequence, true);
+  assert.notEqual(afterLaterSave.commitSha, beforeLaterSave.commitSha);
+  assert.deepEqual(
+    readContinuation(repository, 1).planningRecovery,
+    cancelled.planningRecovery,
+  );
   // Exercise the actual retention producer and adapter admission seam with a
   // literal storage-contract payload. This is no provider call, dispatch receipt
   // or semantic acceptance: the real store, saved owner and private Git ACK are
