@@ -5,6 +5,7 @@ import type {
   WorkGraph,
 } from "../contracts.js";
 import type { FactoryConfig } from "../config.js";
+import { buildAdaptiveContext } from "../adaptive-context.js";
 import {
   authenticateDiscoveryOutput,
   type DiscoveryBody,
@@ -403,6 +404,35 @@ export async function applyPendingGraphExpansion(
         );
         if (inputPacketRef.digest !== result.digest)
           throw held("Materialization packet content identity differs");
+        await buildAdaptiveContext({
+          state,
+          role: "expansion",
+          item: state.graph.items.find(
+            (item) => item.id === envelope.input.producerItemId,
+          ),
+          baseSha: result.inputPacket.manifest.source.commitSha,
+          checkout: config.checkout,
+          store: contentStore,
+          config,
+          required: {
+            envelopeId: envelope.id,
+            materializationDigest: result.digest,
+            inputPacketRef,
+            childIds: result.childIds,
+            interpretation:
+              "The complete authenticated discovery and reviewed work shape reside in the retained materialization input packet. Advisory memory cannot change its deterministic batches or grant ownership.",
+          },
+          requiredSelections: [
+            {
+              id: `expansion:${result.digest}`,
+              kind: "discovery",
+              disposition: "current",
+              required: true,
+              refs: [inputPacketRef],
+            },
+          ],
+          save,
+        });
         if (state.pendingAmendment)
           throw held(
             "A reviewed amendment now owns the next graph transition; expansion was not submitted",

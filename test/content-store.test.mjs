@@ -28,7 +28,18 @@ import {
 import { selectedDiscoveryInputs } from "../dist/runner/discovery.js";
 import { linearDeliveryUnits } from "../dist/delivery/plan.js";
 import { materializeGraphExpansion } from "../dist/graph-expansion.js";
-import { readyItems, validateAndOrderGraph } from "../dist/scheduler.js";
+import { graphDigest } from "../dist/graph-amendments.js";
+import {
+  authenticateAdaptiveContextPacket,
+  buildAdaptiveContext,
+} from "../dist/adaptive-context.js";
+import {
+  pendingItemBlocker,
+  rankPending,
+  readyItems,
+  schedulingObservations,
+  validateAndOrderGraph,
+} from "../dist/scheduler.js";
 import {
   aggregateAcceptance,
   assertCompletedCoverage,
@@ -537,6 +548,57 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
   const children = materialized.childIds.map((id) =>
     materialized.graph.items.find((item) => item.id === id),
   );
+  const scheduled = structuredClone(materialized.graph);
+  const schedulingWork = {
+    ...waiting,
+    ...Object.fromEntries(
+      children.map((item) => [item.id, { status: "pending" }]),
+    ),
+  };
+  const unknownTiming = schedulingObservations(scheduled, schedulingWork);
+  assert.equal(
+    unknownTiming.get(children[0].id).rankingBasis,
+    "remaining-stages",
+  );
+  assert.equal(unknownTiming.get(children[0].id).estimatedCriticalPathMs, null);
+  assert.equal(unknownTiming.get(children[0].id).queueMs, null);
+  for (const item of scheduled.items)
+    item.scheduling = {
+      estimatedDurationMs: item.id === children[0].id ? 20 : 10,
+      reason: "The first literal batch contains two modules rather than one.",
+    };
+  const ranked = rankPending(scheduled, schedulingWork);
+  assert.ok(
+    ranked.indexOf(scheduled.items.find((item) => item.id === "integration")) <
+      ranked.indexOf(
+        scheduled.items.find((item) => item.id === children[0].id),
+      ),
+  );
+  assert.deepEqual(
+    ranked
+      .filter((item) => materialized.childIds.includes(item.id))
+      .map((item) => item.id),
+    materialized.childIds,
+  );
+  assert.equal(
+    schedulingObservations(scheduled, schedulingWork).get(children[0].id)
+      .rankingBasis,
+    "declared-duration",
+  );
+  const scheduledChildren = scheduled.items.filter((item) =>
+    materialized.childIds.includes(item.id),
+  );
+  for (const item of scheduledChildren) item.resources = ["migration-check"];
+  assert.equal(
+    pendingItemBlocker(
+      scheduled,
+      schedulingWork,
+      scheduledChildren[1],
+      new Set([scheduledChildren[0].id]),
+      new Set([envelope.id]),
+    ).kind,
+    "resource",
+  );
   assert.deepEqual(
     children.map((item) => item.ownedPaths),
     [["src/api.ts", "src/helper.ts"], ["src/ui/view.ts"]],
@@ -597,6 +659,309 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     Buffer.from(JSON.stringify(materialized.inputPacket)),
     { mediaType: "application/json" },
   );
+  // Expansion receipt scope reduces each worker's input to its complete batch,
+  // while the original ordinary consumer still receives the full inventory.
+  const expandedState = {
+    repository: "fixture/adaptive-discovery",
+    objective: producer.objective,
+    runId: producer.runId,
+    configDigest: "a".repeat(64),
+    baseSha,
+    planGraphDigest: graphDigest(graph),
+    graph: materialized.graph,
+    work: { ...state.work, ...waiting },
+    expansionHistory: [
+      {
+        schemaVersion: 1,
+        id: `${envelope.id}-${materialized.digest}`,
+        envelopeId: envelope.id,
+        parentGraphDigest: graphDigest(graph),
+        graphDigest: graphDigest(materialized.graph),
+        envelopeDigest: materialized.envelopeDigest,
+        materializationDigest: materialized.digest,
+        inputPacketRef: packetRef,
+        childIds: materialized.childIds,
+        acceptedAt: new Date().toISOString(),
+      },
+    ],
+  };
+  expandedState.work.inventory = state.work.inventory;
+  for (const child of children) {
+    const input = await selectedDiscoveryInputs({
+      state: expandedState,
+      item: child,
+      checkout,
+      store,
+    });
+    assert.deepEqual(
+      input[0].entries.map((entry) => entry.path),
+      child.ownedPaths,
+    );
+    assert.deepEqual(input[0].selectionScope.paths, child.ownedPaths);
+    assert.equal(input[0].selectionScope.complete, true);
+    for (const entry of input[0].entries)
+      assert.deepEqual(
+        Buffer.from(entry.contentBody.bytes, "base64"),
+        execFileSync("git", [
+          "-C",
+          checkout,
+          "show",
+          `${baseSha}:${entry.path}`,
+        ]),
+      );
+  }
+  const sources = ["src/api.ts", "notes.txt"].map((path) => ({
+    path,
+    content: execFileSync(
+      "git",
+      ["-C", checkout, "show", `${baseSha}:${path}`],
+      { encoding: "utf8" },
+    ),
+  }));
+  retainPlanningSourceMemory({
+    repository: expandedState.repository,
+    objective: producer.objective,
+    runId: producer.runId,
+    baseSha,
+    treeSha: git("rev-parse", "HEAD^{tree}"),
+    configDigest: expandedState.configDigest,
+    sources,
+  });
+  expandedState.planningRecovery = {
+    contextLookup: {
+      packet: {
+        schemaVersion: 1,
+        binding: "b".repeat(64),
+        bounds: {
+          maxRounds: 1,
+          maxRequestsPerRound: 1,
+          maxResults: 8,
+          maxBytes: 1,
+          maxElapsedMs: 30000,
+          maxProviderCalls: 1,
+        },
+        catalog: ["repository", "memory"].map((id) => ({
+          id,
+          selectors: ["src/", "notes.txt"],
+          operations: ["read"],
+          freshness: "Pinned source",
+          completeness: "complete",
+        })),
+        automatic: [],
+        batches: [],
+      },
+    },
+  };
+  const selectedBatch = await selectedDiscoveryInputs({
+    state: expandedState,
+    item: children[0],
+    checkout,
+    store,
+  });
+  const interfaceRef = store.putBytes(Buffer.from(sources[1].content), {
+    mediaType: "text/plain",
+  });
+  const required = {
+    discoveryInputs: selectedBatch,
+    sharedInterface: { path: "notes.txt", content: sources[1].content },
+  };
+  const contextInput = {
+    state: expandedState,
+    role: "dispatch",
+    item: children[0],
+    baseSha,
+    checkout,
+    store,
+    sources,
+    required,
+    requiredSelections: [
+      {
+        id: "migration-inventory",
+        kind: "discovery",
+        disposition: "current",
+        required: true,
+        refs: body.entries
+          .filter((entry) => children[0].ownedPaths.includes(entry.path))
+          .map((entry) => entry.content),
+      },
+      {
+        id: "migration-interface",
+        kind: "interface",
+        disposition: "current",
+        required: true,
+        refs: [interfaceRef],
+      },
+    ],
+    save: () => undefined,
+  };
+  const context = await buildAdaptiveContext(contextInput);
+  assert.deepEqual(context.payload.required, required);
+  assert.ok(Buffer.byteLength(JSON.stringify(required)) > 1);
+  assert.equal(
+    context.packet.selections.filter(
+      (selection) => selection.kind === "supplied",
+    ).length,
+    sources.length,
+  );
+  // Already supplied source bodies are excluded before optional byte accounting.
+  assert.deepEqual(context.payload.memory, []);
+  assert.deepEqual(context.packet.unavailable, []);
+  const restartedStore = new LocalContentStore(join(root, "content"));
+  const restartedContext = await buildAdaptiveContext({
+    ...contextInput,
+    state: JSON.parse(JSON.stringify(expandedState)),
+    store: restartedStore,
+    save: () => assert.fail("Exact retained context should be reused"),
+  });
+  assert.equal(restartedContext.packet.id, context.packet.id);
+  assert.deepEqual(
+    await authenticateAdaptiveContextPacket(
+      restartedStore,
+      restartedContext.packet,
+    ),
+    context.payload,
+  );
+  const contextPath = join(
+    root,
+    "content",
+    context.packet.contentRef.digest.slice(0, 2),
+    context.packet.contentRef.digest,
+  );
+  const contextBytes = readFileSync(contextPath);
+  rmSync(contextPath);
+  await assert.rejects(
+    authenticateAdaptiveContextPacket(restartedStore, context.packet),
+    /ENOENT|unavailable|missing/,
+  );
+  writeFileSync(contextPath, "corrupt role context");
+  await assert.rejects(
+    authenticateAdaptiveContextPacket(restartedStore, context.packet),
+    /digest verification/,
+  );
+  writeFileSync(contextPath, contextBytes);
+  // Two attributable observations retain one actual Git source body. Optional
+  // accounting includes their summaries, provenance and selection descriptors.
+  const memoryStore = new LocalContentStore(
+    join(stateRoot(expandedState.repository), "content"),
+  );
+  const memory = new LocalRepositoryMemory(
+    stateRoot(expandedState.repository),
+    expandedState.repository,
+    memoryStore,
+  );
+  const observedRef = memoryStore.putBytes(Buffer.from(sources[1].content), {
+    mediaType: "text/plain",
+  });
+  const observations = ["first-source-read", "second-source-read"].map(
+    (identity) =>
+      memory.retain({
+        schemaVersion: 1,
+        repository: expandedState.repository,
+        visibility: "repository",
+        kind: "observation",
+        producer: {
+          objective: producer.objective,
+          runId: producer.runId,
+          identity,
+          itemId: "join",
+          status: "observed",
+        },
+        createdAt: new Date().toISOString(),
+        authority: "observation",
+        summary: "Shared migration notes observed from the pinned source.",
+        bodies: [
+          {
+            role: "migration-notes",
+            ref: observedRef,
+            availability: "retained",
+          },
+        ],
+        sources: [
+          {
+            identity: "repository:notes.txt",
+            path: "notes.txt",
+            commitSha: baseSha,
+            treeSha: git("rev-parse", "HEAD^{tree}"),
+            complete: true,
+            ref: observedRef,
+          },
+        ],
+        bindings: {
+          treeSha: git("rev-parse", "HEAD^{tree}"),
+          environment: { configDigest: expandedState.configDigest },
+        },
+        validity: { state: "current", conditions: [] },
+        supersedes: [],
+      }),
+  );
+  assert.notEqual(observations[0].id, observations[1].id);
+  const advisoryState = structuredClone(expandedState);
+  const allowance = 65536;
+  advisoryState.planningRecovery.contextLookup.packet.bounds.maxBytes =
+    allowance;
+  const advisoryInput = {
+    ...contextInput,
+    state: advisoryState,
+    role: "diagnosis",
+    item: materialized.graph.items.find((item) => item.id === "join"),
+    sources: [],
+    required: {},
+    requiredSelections: [],
+  };
+  const advisory = await buildAdaptiveContext(advisoryInput);
+  const observationMatches = advisory.payload.memory.filter((match) =>
+    observations.some((binding) => binding.id === match.binding.id),
+  );
+  assert.equal(observationMatches.length, 2);
+  assert.ok(
+    observationMatches.every((match) => match.disposition === "current"),
+  );
+  const observedBodies = advisory.payload.memory
+    .flatMap((match) => match.content)
+    .filter((body) => body.ref.digest === observedRef.digest);
+  assert.deepEqual(
+    observedBodies
+      .filter((body) => body.text !== undefined)
+      .map((body) => body.text),
+    [sources[1].content],
+  );
+  assert.match(observationMatches[1].content[0].reuse, /^memory:/);
+  const serializedCost = advisory.payload.memory.reduce(
+    (total, match) =>
+      total +
+      Buffer.byteLength(
+        JSON.stringify({
+          match,
+          selection: advisory.packet.selections.find(
+            (selection) => selection.id === `memory:${match.binding.id}`,
+          ),
+        }),
+      ),
+    0,
+  );
+  assert.ok(serializedCost <= allowance);
+  assert.ok(serializedCost > observedRef.bytes);
+  const boundedState = structuredClone(expandedState);
+  boundedState.planningRecovery.contextLookup.packet.bounds.maxBytes =
+    observedRef.bytes + 1;
+  const bounded = await buildAdaptiveContext({
+    ...advisoryInput,
+    state: boundedState,
+    role: "expansion",
+  });
+  assert.deepEqual(bounded.payload.memory, []);
+  for (const observation of observations) {
+    assert.ok(
+      bounded.packet.unavailable.includes(
+        `Optional memory ${observation.id} deferred by serialized byte allowance`,
+      ),
+    );
+    const selection = bounded.packet.selections.find(
+      (selection) => selection.id === `memory:${observation.id}`,
+    );
+    assert.equal(selection.disposition, "incomplete");
+    assert.deepEqual(selection.refs, []);
+  }
   writeFileSync(
     join(checkout, "src", "helper.ts"),
     "Working copy changed after materialization\n",

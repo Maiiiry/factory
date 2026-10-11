@@ -5,6 +5,12 @@
 
 import { isDeepStrictEqual } from "node:util";
 import { agentSessionContinuation } from "./agent-session.js";
+import {
+  buildAdaptiveContext,
+  retainedAdaptiveDispatchContext,
+} from "./adaptive-context.js";
+import { adaptiveWorkflowEnabled } from "./adaptive-workflow.js";
+import { createHash } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
 import type {
   ContentStore,
@@ -14,7 +20,7 @@ import type {
 } from "./contracts.js";
 import type { DiagnosticEmitter } from "./diagnostics.js";
 import { workerContext } from "./execution/checkpoint.js";
-import { cancelledFault } from "./fault.js";
+import { cancelledFault, decision, StepFault } from "./fault.js";
 import {
   assertGraphRevisions,
   graphDigest,
@@ -24,6 +30,7 @@ import { executeItem } from "./item-steps.js";
 import { selectedInputsForItem, validationLfsMembersForItem } from "./media.js";
 import {
   objectiveKnowledgeView,
+  completeObjectiveKnowledge,
   publishObjectiveKnowledge,
 } from "./objective-knowledge.js";
 import { packageManagerUpdate } from "./package-manager-update.js";
@@ -40,7 +47,11 @@ import {
 } from "./repair-policy.js";
 import type { FactoryState } from "./state.js";
 import { workspacePackageAdditions } from "./workspace-membership.js";
-import { selectedDiscoveryInputs } from "./runner/discovery.js";
+import {
+  discoveryContextBodies,
+  discoveryContextSelections,
+  selectedDiscoveryInputs,
+} from "./runner/discovery.js";
 
 interface ItemWorker {
   state: FactoryState;
@@ -87,6 +98,11 @@ export function workerAttemptItem(
   )
     throw new Error("Worker planned peer context differs from accepted graph");
   const attempted = attemptItem(item, state.work[item.id]?.recovery);
+  if (knowledge && "adaptiveContext" in knowledge)
+    return {
+      ...attempted,
+      brief: `${attempted.brief}\n\nController selected role context (original source, ownership and acceptance authority remains in the Work Item):\n${JSON.stringify(knowledge.adaptiveContext)}`,
+    };
   const context = {
     objective: state.objective,
     acceptedGraphDigest: graphDigest(state.graph),
@@ -128,7 +144,49 @@ export async function runWorker(
   },
 ): Promise<ExecutionResult> {
   const { state, item, phases, baseSha } = args;
+  const disableChildAgents =
+    Boolean(state.planningRecovery?.contextLookup?.packet) ||
+    adaptiveWorkflowEnabled(args.objectiveBody ?? "");
   const work = state.work[item.id]!;
+  if (disableChildAgents && work.execution && !work.adaptiveContextId)
+    throw new StepFault(
+      decision(
+        "The retained adaptive worker lacks its original dispatch packet. Preserve its ownership and reconcile or cancel through the supported lifecycle before continuation.",
+        "No replacement context, attempt, provider call or worker cancellation was admitted.",
+      ),
+    );
+  if (disableChildAgents && args.driver.childAgents !== "disabled")
+    throw new Error(
+      "Worker driver cannot enforce the adaptive native child-agent prohibition; no provider call was made",
+    );
+  const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
+  if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
+    throw new StepFault(
+      decision(
+        "Adaptive dispatch lacks its recorded exact attempt and execution base. Restore the admitted binding through supported recovery before continuing.",
+        "The original ownership and accounting remain unchanged; no new dispatch context was selected.",
+      ),
+    );
+  let context: Awaited<ReturnType<typeof retainedAdaptiveDispatchContext>>;
+  if (adaptive) {
+    try {
+      context = await retainedAdaptiveDispatchContext({
+        state,
+        item,
+        baseSha,
+        store: args.store,
+        sources: item.inputSources,
+      });
+    } catch (error) {
+      throw new StepFault(
+        decision(
+          "The original dispatch context cannot be authenticated. Restore its exact retained bytes and binding, or use supported reconciliation or cancellation before continuing.",
+          "The original packet pointer, worker handle, attempt and accounting are preserved; no live context was reselected.",
+        ),
+        { cause: error },
+      );
+    }
+  }
   const retained = work.recovery?.correction
     ? retainedFailedResultContext(work.recovery.history?.at(-1))
     : undefined;
@@ -153,20 +211,72 @@ export async function runWorker(
   // A reattached worker keeps the coding slot it holds while it runs remotely.
   if (work.phaseReservation !== "coding")
     await phases.reserve(item.id, "coding");
-  const attemptedItem = workerAttemptItem(state, item, baseSha, {
-    knowledge: objectiveKnowledgeView(
-      state,
-      item,
-      args.config.checkout,
-      baseSha,
-    ),
-    discoveryInputs: await selectedDiscoveryInputs({
+  let discoveryInputs: Awaited<ReturnType<typeof selectedDiscoveryInputs>> = [];
+  if (!context) {
+    discoveryInputs = await selectedDiscoveryInputs({
       state,
       item,
       checkout: args.config.checkout,
       store: args.store,
-    }),
-  });
+    });
+    const discoverySelections = discoveryContextSelections(discoveryInputs);
+    const discoveryBodies = discoveryContextBodies(discoveryInputs);
+    const knowledge = adaptive
+      ? await completeObjectiveKnowledge({
+          state,
+          item,
+          checkout: args.config.checkout,
+          baseSha,
+          store: args.store,
+          suppliedDigests: [
+            ...discoveryBodies.map((body) => body.ref.digest),
+            ...(item.inputSources ?? []).map((source) =>
+              createHash("sha256").update(source.content).digest("hex"),
+            ),
+          ],
+        })
+      : undefined;
+    context = await buildAdaptiveContext({
+      state,
+      role: "dispatch",
+      item,
+      baseSha,
+      checkout: args.config.checkout,
+      store: args.store,
+      config: args.config,
+      sources: item.inputSources,
+      suppliedBodies: [
+        ...discoveryBodies,
+        ...(knowledge?.suppliedBodies ?? []),
+      ],
+      required: { knowledge: knowledge?.view ?? {}, discoveryInputs },
+      requiredSelections: [
+        ...discoverySelections,
+        ...(knowledge?.selections ?? []),
+      ],
+      save: args.save,
+    });
+  }
+  if (context && work.adaptiveContextId !== context.packet.id) {
+    work.adaptiveContextId = context.packet.id;
+    args.save();
+  }
+  const attemptedItem = workerAttemptItem(
+    state,
+    item,
+    baseSha,
+    context
+      ? { adaptiveContext: context.payload }
+      : {
+          knowledge: objectiveKnowledgeView(
+            state,
+            item,
+            args.config.checkout,
+            baseSha,
+          ),
+          discoveryInputs,
+        },
+  );
   const session = args.driver.sessionCapabilities?.resumeRoles.includes(
     "implementation",
   )
@@ -189,6 +299,8 @@ export async function runWorker(
     diagnostics: args.diagnostics,
     ...(session ? { session } : {}),
     request: (attemptId) => ({
+      ...(context ? { adaptiveContext: context.packet } : {}),
+      ...(disableChildAgents ? { childAgents: "disabled" as const } : {}),
       ...(session
         ? {
             session: {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -143,7 +143,14 @@ export interface MemoryLookup {
   access: MemoryAccess;
   excludeIds?: string[];
   suppliedSources?: { path: string; heading?: string; digest: string }[];
-  scope?: { objective?: number; paths?: string[]; kinds?: MemoryKind[] };
+  /** Exact complete bodies already authenticated in the current role packet. */
+  suppliedBodyDigests?: string[];
+  scope?: {
+    objective?: number;
+    paths?: string[];
+    kinds?: MemoryKind[];
+    itemIds?: string[];
+  };
   applicability?: MemoryApplicability;
   limit: number;
   maxBytes?: number;
@@ -494,6 +501,7 @@ export class LocalRepositoryMemory {
   private readonly records: string;
   private readonly store: LocalContentStore;
   private retainedIdentities?: Map<string, RepositoryMemoryBinding>;
+  private readonly observedBodies = new Map<string, Buffer>();
   catalogStatus: "ready" | "unavailable" = "unavailable";
   constructor(
     root: string,
@@ -508,6 +516,25 @@ export class LocalRepositoryMemory {
     privateDirectory(this.directory);
     privateDirectory(this.records);
     this.store = store ?? new LocalContentStore(join(root, "content"));
+  }
+  /** Reuse already authenticated exact supplied bytes within this lookup instance. */
+  suppliedContent(bytes: Uint8Array): void {
+    const body = Buffer.from(bytes);
+    this.observedBodies.set(
+      createHash("sha256").update(body).digest("hex"),
+      body,
+    );
+  }
+  private observedBody(ref: ContentRef): Buffer {
+    const existing = this.observedBodies.get(ref.digest);
+    if (existing) {
+      if (existing.length !== ref.bytes)
+        throw new Error("Supplied memory body size differs");
+      return existing;
+    }
+    const bytes = this.store.readBytes(ref);
+    this.observedBodies.set(ref.digest, bytes);
+    return bytes;
   }
   retain(record: RepositoryMemoryRecord): RepositoryMemoryBinding {
     assertRepositoryMemoryRecord(record);
@@ -644,7 +671,7 @@ export class LocalRepositoryMemory {
       )
         continue;
       try {
-        const bytes = this.store.readBytes(body.ref);
+        const bytes = this.observedBody(body.ref);
         const decoded = new TextDecoder("utf-8", {
           fatal: true,
           ignoreBOM: true,
@@ -845,7 +872,7 @@ export class LocalRepositoryMemory {
         if (disposition !== "unavailable") disposition = "incomplete";
       } else {
         try {
-          this.store.readBytes(source.ref);
+          this.observedBody(source.ref);
         } catch {
           gaps.push(
             `source ${source.identity}: referenced bytes unavailable or corrupt`,
@@ -882,6 +909,13 @@ export class LocalRepositoryMemory {
         if (source.heading !== undefined) text(source.heading);
       }
     }
+    if (
+      lookup.suppliedBodyDigests !== undefined &&
+      (!Array.isArray(lookup.suppliedBodyDigests) ||
+        !lookup.suppliedBodyDigests.every(isHash))
+    )
+      throw new Error("Invalid supplied memory body digests");
+    if (lookup.scope?.itemIds !== undefined) strings(lookup.scope.itemIds);
     if (lookup.access.repository !== this.repository)
       return { entries: [], unavailable: [] };
     if (
@@ -896,6 +930,13 @@ export class LocalRepositoryMemory {
     retained.entries = retained.entries.filter(
       (entry) =>
         !excluded.has(entry.binding.id) &&
+        !(
+          entry.record.bodies.length &&
+          entry.record.bodies.every(
+            (body) =>
+              body.ref && lookup.suppliedBodyDigests?.includes(body.ref.digest),
+          )
+        ) &&
         !(
           entry.record.kind === "reference" &&
           entry.record.bodies.length === 1 &&
@@ -921,6 +962,13 @@ export class LocalRepositoryMemory {
     const scope = lookup.scope;
     if (!scope) return true;
     if (scope.kinds && !scope.kinds.includes(record.kind)) return false;
+    if (
+      scope.itemIds &&
+      record.producer.objective === scope.objective &&
+      record.producer.itemId !== undefined &&
+      !scope.itemIds.includes(record.producer.itemId)
+    )
+      return false;
     // Relevance never grants source authority, including on a successor of the
     // same Objective. Admit every retained repository body before returning it.
     const admitted = (path: string) =>
@@ -1029,7 +1077,10 @@ export class LocalRepositoryMemory {
     return true;
   }
   /** Eligible manifest metadata only; no supporting body is opened for relevance selection. */
-  metadata(lookup: MemoryLookup): {
+  metadata(
+    lookup: MemoryLookup,
+    query?: string,
+  ): {
     entries: {
       binding: RepositoryMemoryBinding;
       record: RepositoryMemoryRecord;
@@ -1038,6 +1089,21 @@ export class LocalRepositoryMemory {
     unavailable: string[];
   } {
     const retained = this.eligible(lookup);
+    // Metadata relevance never opens retained bodies and never broadens eligibility.
+    const words = query
+      ?.match(/[\p{L}\p{N}_-]+/gu)
+      ?.slice(0, 32)
+      .map((word) => word.toLowerCase());
+    if (words?.length)
+      retained.entries = retained.entries.filter((entry) => {
+        const metadata = JSON.stringify({
+          summary: entry.record.summary,
+          producer: entry.record.producer,
+          sources: entry.record.sources,
+          bindings: entry.record.bindings,
+        }).toLowerCase();
+        return words.some((word) => metadata.includes(word));
+      });
     return {
       entries: retained.entries
         .sort((left, right) =>

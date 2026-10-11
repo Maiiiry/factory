@@ -243,6 +243,7 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
   }
 
   readonly capabilities = {
+    childAgents: "disabled",
     protocolVersion: 1,
     worktree: "factory-owned-read-write",
     head: "preserve",

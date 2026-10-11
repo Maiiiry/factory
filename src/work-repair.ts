@@ -5,7 +5,24 @@ import {
   withPlannerAdmission,
 } from "./compiler/planning.js";
 import { planningGraphView } from "./compiler/sources.js";
-import type { PlanningModel, PlanningRequest, WorkItem } from "./contracts.js";
+import type {
+  ContentStore,
+  ContentRef,
+  PlanningModel,
+  PlanningRequest,
+  WorkItem,
+} from "./contracts.js";
+import {
+  authenticateAdaptiveContextPacket,
+  buildAdaptiveContext,
+} from "./adaptive-context.js";
+import { completeObjectiveKnowledge } from "./objective-knowledge.js";
+import {
+  discoveryContextBodies,
+  discoveryContextSelections,
+  selectedDiscoveryInputs,
+  type SelectedDiscoveryInput,
+} from "./runner/discovery.js";
 import {
   CONTROLLER_CAPABILITIES_DIGEST,
   installedControllerCapabilities,
@@ -41,7 +58,7 @@ import {
   SemanticAcceptanceFailure,
   semanticValidationDigest,
 } from "./semantic-refusal.js";
-import type { FactoryState } from "./state.js";
+import { assertWorkAdaptiveContext, type FactoryState } from "./state.js";
 import { clearRepeats, type StepClock, StepPaused, step } from "./step.js";
 
 /** The exact collected candidate exists, but settled local validation failed: a wrong result. */
@@ -1220,6 +1237,8 @@ export async function diagnoseWorkRepair(args: {
   sources?: { path: string; content: string; heading?: string }[];
   /** The target checkout: the failed result's files are read from it. */
   checkout?: string;
+  /** Existing retained-content seam for adaptive diagnosis context. */
+  contentStore?: ContentStore;
   /** The run's cancel signal: ends the diagnose step's wait or try. */
   signal?: AbortSignal;
   /** The run's pause signal: ends the diagnose step's wait; it resumes later. */
@@ -1323,8 +1342,6 @@ export async function diagnoseWorkRepair(args: {
               submitted: false,
             };
             const invocation = work.recovery!.diagnosisInvocation;
-            invocation.submitted = true;
-            save();
             const invalidDiagnosis = (
               detail: string,
               response: unknown,
@@ -1362,6 +1379,118 @@ export async function diagnoseWorkRepair(args: {
                 }),
               },
             });
+            if (state.planningRecovery?.contextLookup?.packet) {
+              if (!args.checkout || !args.contentStore)
+                throw new StepFault({
+                  kind: "decision",
+                  evidence: [],
+                  question:
+                    "Adaptive diagnosis requires its admitted checkout and retained content store; preserve the current failure and restore those inputs before diagnosis",
+                });
+              assertWorkAdaptiveContext(state, item.id, work);
+              const dispatchPacket = work.adaptiveContextId
+                ? state.adaptiveContexts?.[work.adaptiveContextId]
+                : undefined;
+              const dispatch = dispatchPacket
+                ? await authenticateAdaptiveContextPacket(
+                    args.contentStore,
+                    dispatchPacket,
+                  )
+                : undefined;
+              // QA and preparation failures legitimately have no coding dispatch.
+              // Select their declared inputs now without inventing old consumption.
+              const baseSha = work.changeRef ?? work.baseSha ?? state.baseSha;
+              const discovered = dispatch
+                ? undefined
+                : await selectedDiscoveryInputs({
+                    state,
+                    item,
+                    checkout: args.checkout,
+                    store: args.contentStore,
+                  });
+              const discoveryBodies = discovered
+                ? discoveryContextBodies(discovered)
+                : [];
+              const knowledge = dispatch
+                ? undefined
+                : await completeObjectiveKnowledge({
+                    state,
+                    item,
+                    checkout: args.checkout,
+                    baseSha,
+                    store: args.contentStore,
+                    suppliedDigests: [
+                      ...discoveryBodies.map((body) => body.ref.digest),
+                      ...request.sources.map((source) =>
+                        createHash("sha256")
+                          .update(source.content)
+                          .digest("hex"),
+                      ),
+                    ],
+                  });
+              const retainedInputs = dispatch?.required as
+                | {
+                    discoveryInputs?: SelectedDiscoveryInput[];
+                    knowledge?: {
+                      bodies?: { ref: ContentRef; bytes: string }[];
+                    };
+                  }
+                | undefined;
+              const selected = await buildAdaptiveContext({
+                state,
+                role: "diagnosis",
+                item,
+                baseSha,
+                checkout: args.checkout,
+                store: args.contentStore,
+                sources: request.sources,
+                required: {
+                  failureEvent: failure.event,
+                  suppliedCaseDigest: inputDigest(evidence),
+                  failingAttemptInputs: dispatch?.required ?? {
+                    discoveryInputs: discovered ?? [],
+                    knowledge: knowledge?.view ?? {},
+                  },
+                  ...(dispatch
+                    ? { failingAttemptDelegation: dispatch.delegation }
+                    : {}),
+                  inputOrigin: dispatch
+                    ? "retained-dispatch"
+                    : "diagnosis-selection",
+                  interpretation:
+                    "The complete failing case and authorized sources are already supplied by this diagnosis request; this binding reuses those bytes without repeating them.",
+                },
+                requiredSelections: dispatchPacket
+                  ? dispatchPacket.selections.filter(
+                      (selection) =>
+                        selection.required &&
+                        selection.kind !== "decision" &&
+                        selection.kind !== "supplied",
+                    )
+                  : [
+                      ...discoveryContextSelections(discovered ?? []),
+                      ...(knowledge?.selections ?? []),
+                    ],
+                suppliedBodies: dispatch
+                  ? [
+                      ...discoveryContextBodies(
+                        retainedInputs?.discoveryInputs ?? [],
+                      ),
+                      ...(retainedInputs?.knowledge?.bodies ?? []).map(
+                        (body) => ({
+                          ref: body.ref,
+                          bytes: Buffer.from(body.bytes, "base64"),
+                        }),
+                      ),
+                    ]
+                  : [...discoveryBodies, ...(knowledge?.suppliedBodies ?? [])],
+                save,
+              });
+              if (selected) {
+                request.adaptiveContext = selected.packet;
+                request.objective += `\n${selected.evidence.content}`;
+              }
+            }
             const requestDigest = createHash("sha256")
               .update(JSON.stringify(request))
               .digest("hex");
@@ -1373,6 +1502,9 @@ export async function diagnoseWorkRepair(args: {
                   "The retained diagnosis request differs from current evidence; preserve the original submission rather than replaying it",
               });
             invocation.requestDigest = requestDigest;
+            // Local evidence authentication can fail without any submitted effect.
+            // Freeze the complete request before dispatch, never before hydration.
+            invocation.submitted = true;
             save();
             const response = (invocation.response ??
               (await generatePlannerStructured<DiagnosisAnswer>(

@@ -309,8 +309,10 @@ export async function runQaItem(args: {
         }
         await args.phases?.reserve(item.id, "validation");
         if (retainPausedWait()) return undefined;
-        await preflightItemEnvironment({ ...args, baseSha: commit });
-        if (retainPausedWait()) return undefined;
+        // This read-only proof has no implementation turn to preflight. Its
+        // complete declared sequence includes setup and probes in the actual
+        // fresh validator checkout; preparation in another checkout cannot
+        // transfer ignored runtime files or substitute for these receipts.
         return validateWorkItem(
           args.config.checkout,
           join(args.root, "validation", item.id),

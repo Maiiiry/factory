@@ -225,6 +225,18 @@ export function compilerWire(
     requiredLfsRoles: { type: "array", items: text },
   });
   if (request.contextLookup) {
+    itemSchema.properties!.scheduling = {
+      description:
+        "Optional advisory duration for one useful batch, including preparation, validation and review. Null means unknown; an estimate grants no capacity or deadline authority.",
+      anyOf: [
+        strict({
+          estimatedDurationMs: { type: "string", pattern: "^[1-9][0-9]*$" },
+          reason: { ...text, minLength: 1 },
+        }),
+        { type: "null" },
+      ],
+    };
+    itemSchema.required!.push("scheduling");
     itemSchema.properties!.discoveryInputs = {
       type: "array",
       items: strict({
@@ -705,6 +717,26 @@ export function compilerWire(
             }
           }
           delete item.newPackages;
+          if (request.contextLookup) {
+            if (item.scheduling === null) delete item.scheduling;
+            else {
+              const scheduling = object(item.scheduling, "scheduling");
+              keys(scheduling, ["estimatedDurationMs", "reason"], "scheduling");
+              if (
+                typeof scheduling.estimatedDurationMs !== "string" ||
+                !/^[1-9][0-9]*$/.test(scheduling.estimatedDurationMs) ||
+                !Number.isSafeInteger(Number(scheduling.estimatedDurationMs)) ||
+                String(Number(scheduling.estimatedDurationMs)) !==
+                  scheduling.estimatedDurationMs
+              )
+                throw new PlannerChoiceError(
+                  "Advisory duration must be a positive safe integer or null when unknown",
+                );
+              scheduling.estimatedDurationMs = Number(
+                scheduling.estimatedDurationMs,
+              );
+            }
+          }
           if (!Array.isArray(item.sourceAssets))
             throw new Error("Planner sourceAssets must be an array");
           for (const rawAsset of item.sourceAssets) {

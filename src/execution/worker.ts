@@ -155,7 +155,19 @@ export async function runCodexWorker(
   });
   let invocationStarted = false;
   try {
-    const codex = new Codex({ env: home.env });
+    if (request.childAgents !== undefined && request.childAgents !== "disabled")
+      throw new Error("Unsupported native child-agent execution policy");
+    const codex = new Codex({
+      env: home.env,
+      ...(request.childAgents === "disabled" && {
+        // CLI overrides take precedence over repository configuration on both
+        // new and resumed turns. V2 must not supersede the ordinary flag.
+        config: {
+          agents: { enabled: false },
+          features: { multi_agent: false, multi_agent_v2: false },
+        },
+      }),
+    });
     const options = {
       workingDirectory: request.worktree,
       approvalPolicy: "never" as const,

@@ -26,10 +26,18 @@ import {
   graphDigest,
 } from "../dist/graph-amendments.js";
 import {
+  completeObjectiveKnowledge,
   objectiveKnowledgeView,
   publishObjectiveKnowledge,
   reviewObjectiveKnowledge,
 } from "../dist/objective-knowledge.js";
+import {
+  buildAdaptiveContext,
+  authenticateAdaptiveContextPacket,
+} from "../dist/adaptive-context.js";
+import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
+import { initializeContextLookup } from "../dist/compiler/context.js";
+import { stateRoot, validateConfig } from "../dist/config.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
 import { materializeGraphExpansion } from "../dist/graph-expansion.js";
 import { authenticateExpansionInputs } from "../dist/runner/expansion.js";
@@ -496,6 +504,332 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       state.repository,
       1,
     );
+    {
+      // Freeze complete selected role inputs through the ordinary atomic snapshot.
+      // Optional retrieval bounds never trim the required settled interface body.
+      git(
+        checkout,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/target.git",
+      );
+      const selection = { model: "unused-local-check", reasoningEffort: "low" };
+      const config = validateConfig({
+        schemaVersion: 1,
+        repository: loaded.repository,
+        checkout,
+        planning: {
+          kind: "codex-sdk",
+          planner: selection,
+          reviewer: selection,
+        },
+        execution: {
+          kind: "local",
+          concurrency: 1,
+          harness: { kind: "codex-sdk", ...selection },
+        },
+        delivery: { kind: "regular" },
+        policy: { network: "off", allowedSecretNames: [] },
+        planningContext: {
+          enabled: true,
+          memory: false,
+          selectors: ["README.md"],
+          bounds: {
+            maxRounds: 1,
+            maxRequestsPerRound: 1,
+            maxResults: 1,
+            maxBytes: 1,
+            maxElapsedMs: 5000,
+            maxProviderCalls: 1,
+          },
+        },
+      });
+      const adaptive = structuredClone(loaded);
+      adaptive.schemaVersion = 9;
+      const source = {
+        path: "README.md",
+        content: git(checkout, "show", `${adaptive.baseSha}:README.md`),
+      };
+      const resolver = createPlanningContextResolver({
+        config,
+        objective: adaptive.objective,
+        runId: adaptive.runId,
+        baseSha: adaptive.baseSha,
+        sources: [source],
+        objectiveBody: "## Adaptive workflow\nenabled\n",
+        contentStore: store,
+      });
+      adaptive.planningRecovery = {
+        phase: "ready",
+        history: [],
+        contextLookup: await initializeContextLookup(resolver),
+      };
+      adaptive.work.api = {
+        status: "running",
+        step: "execute",
+        attempt: "api-role-attempt",
+        baseSha: result.changeRef,
+        executionBaseSha: result.changeRef,
+        graphRevisionDigest: graphDigest(adaptive.graph),
+      };
+      const knowledge = await completeObjectiveKnowledge({
+        state: adaptive,
+        item: consumer,
+        checkout,
+        baseSha: result.changeRef,
+        store,
+      });
+      const rolePath = join(root, "private-state", "role-context.json");
+      let initialRoleSaves = 0;
+      const saveRole = () => {
+        initialRoleSaves++;
+        const id = adaptive.work.api.adaptiveContextId;
+        assert.ok(adaptive.adaptiveContexts[id]);
+        saveState(rolePath, adaptive);
+      };
+      const selected = await buildAdaptiveContext({
+        state: adaptive,
+        role: "dispatch",
+        item: consumer,
+        baseSha: result.changeRef,
+        checkout,
+        store,
+        config,
+        sources: [source],
+        required: { sources: [source], knowledge: knowledge.view },
+        requiredSelections: knowledge.selections,
+        save: saveRole,
+      });
+      assert.equal(initialRoleSaves, 1);
+      const roleSnapshot = readFileSync(rolePath, "utf8");
+      const roleReload = parseFactoryState(
+        JSON.parse(roleSnapshot),
+        adaptive.repository,
+        adaptive.objective,
+      );
+      assert.deepEqual(
+        roleReload.adaptiveContexts[selected.packet.id],
+        selected.packet,
+      );
+      assert.equal(roleReload.work.api.adaptiveContextId, selected.packet.id);
+      assert.deepEqual(
+        await authenticateAdaptiveContextPacket(
+          store,
+          roleReload.adaptiveContexts[selected.packet.id],
+        ),
+        selected.payload,
+      );
+      assert.ok(
+        selected.packet.selections.some(
+          (entry) => entry.kind === "interface" && entry.required,
+        ),
+      );
+      const supplied = JSON.stringify(selected.payload.required);
+      assert.ok(
+        supplied.includes(
+          Buffer.from('{"timestamp":"UTC"}\n').toString("base64"),
+        ),
+      );
+      assert.ok(supplied.includes(source.content.replaceAll("\n", "\\n")));
+      // A real peer finishes after dispatch. Its newly published advisory facts
+      // change live selection without changing this attempt's admitted input.
+      const peerCheckout = join(root, "peer-target");
+      git(
+        checkout,
+        "worktree",
+        "add",
+        "--detach",
+        peerCheckout,
+        result.changeRef,
+      );
+      writeFileSync(join(peerCheckout, "ui.json"), '{"format":"UTC"}\n');
+      writeFileSync(
+        join(peerCheckout, ".factory-handoff.json"),
+        JSON.stringify({
+          notes: [
+            {
+              kind: "pitfall",
+              summary: "Peer UI requires the timestamp format",
+              paths: ["ui.json"],
+              consumers: ["api"],
+            },
+          ],
+        }),
+      );
+      const peerResult = await collectWorktreeResult(
+        checkout,
+        peerCheckout,
+        {
+          item: peer,
+          baseSha: result.changeRef,
+          attemptId: "ui-role-attempt",
+        },
+        store,
+        {},
+      );
+      roleReload.work.ui = {
+        status: "done",
+        attempt: "ui-role-attempt",
+        changeRef: peerResult.changeRef,
+        treeSha: peerResult.treeSha,
+      };
+      await publishObjectiveKnowledge(roleReload, peer, peerResult, store);
+      const changedKnowledge = await completeObjectiveKnowledge({
+        state: roleReload,
+        item: consumer,
+        checkout,
+        baseSha: result.changeRef,
+        store,
+      });
+      assert.notDeepEqual(changedKnowledge.view, knowledge.view);
+      assert.ok(
+        JSON.stringify(changedKnowledge.view).includes("Peer UI requires"),
+      );
+      saveState(rolePath, roleReload);
+      const peerSnapshot = readFileSync(rolePath, "utf8");
+      let restartSaves = 0;
+      const resumeDispatch = (
+        state,
+        overrides = {},
+        save = () => {
+          restartSaves++;
+          saveState(rolePath, state);
+        },
+      ) =>
+        buildAdaptiveContext({
+          state,
+          role: "dispatch",
+          item: consumer,
+          baseSha: result.changeRef,
+          checkout,
+          store,
+          config,
+          sources: [source],
+          required: { sources: [source], knowledge: changedKnowledge.view },
+          requiredSelections: changedKnowledge.selections,
+          save,
+          ...overrides,
+        });
+      const reused = await resumeDispatch(roleReload);
+      assert.equal(reused.packet.id, selected.packet.id);
+      assert.deepEqual(reused.payload, selected.payload);
+      assert.equal(roleReload.work.api.adaptiveContextId, selected.packet.id);
+      assert.equal(restartSaves, 0);
+      assert.equal(readFileSync(rolePath, "utf8"), peerSnapshot);
+      // A unique older pre-pointer checkpoint restores the original identity
+      // through one ordinary atomic save, without rebuilding its payload.
+      const prePointer = structuredClone(roleReload);
+      delete prePointer.work.api.adaptiveContextId;
+      saveState(rolePath, prePointer);
+      const recovered = await resumeDispatch(prePointer);
+      assert.equal(recovered.packet.id, selected.packet.id);
+      assert.deepEqual(recovered.payload, selected.payload);
+      assert.equal(restartSaves, 1);
+      assert.equal(
+        parseFactoryState(
+          JSON.parse(readFileSync(rolePath, "utf8")),
+          adaptive.repository,
+          adaptive.objective,
+        ).work.api.adaptiveContextId,
+        selected.packet.id,
+      );
+      assert.equal(readFileSync(rolePath, "utf8"), peerSnapshot);
+      const changedOwner = structuredClone(roleReload);
+      changedOwner.work.api.attempt = "foreign-attempt";
+      assert.throws(
+        () => saveState(rolePath, changedOwner),
+        /selected adaptive context differs/,
+      );
+      await assert.rejects(
+        () => resumeDispatch(changedOwner),
+        /admitted attempt/,
+      );
+      await assert.rejects(
+        () => resumeDispatch(roleReload, { baseSha: adaptive.baseSha }),
+        /admitted attempt/,
+      );
+      await assert.rejects(
+        () =>
+          resumeDispatch(roleReload, {
+            sources: [
+              { ...source, content: `${source.content}\nChanged source` },
+            ],
+          }),
+        /complete supplied Source bytes/,
+      );
+      assert.equal(restartSaves, 1);
+      assert.equal(readFileSync(rolePath, "utf8"), peerSnapshot);
+      // Historical stopped local ownership is preserved; no provider is launched.
+      const stoppedWorktree = join(
+        stateRoot(adaptive.repository),
+        "worktrees",
+        "api-role-attempt",
+      );
+      mkdirSync(join(stateRoot(adaptive.repository), "worktrees"), {
+        recursive: true,
+      });
+      git(
+        checkout,
+        "worktree",
+        "add",
+        "--detach",
+        stoppedWorktree,
+        result.changeRef,
+      );
+      const owned = structuredClone(roleReload);
+      owned.work.api.execution = {
+        provider: "local",
+        identity: owned.work.api.attempt,
+        data: {
+          worktree: stoppedWorktree,
+          stopped: "Historical local start ceased",
+        },
+      };
+      const legacyOwned = structuredClone(owned);
+      delete legacyOwned.work.api.adaptiveContextId;
+      delete legacyOwned.adaptiveContexts;
+      saveState(rolePath, legacyOwned);
+      const legacySnapshot = readFileSync(rolePath, "utf8");
+      const legacyBefore = structuredClone(legacyOwned);
+      await assert.rejects(
+        () => resumeDispatch(legacyOwned),
+        /lacks its original dispatch packet/,
+      );
+      assert.deepEqual(legacyOwned, legacyBefore);
+      assert.equal(restartSaves, 1);
+      assert.equal(readFileSync(rolePath, "utf8"), legacySnapshot);
+      saveState(rolePath, owned);
+      const ownedSnapshot = readFileSync(rolePath, "utf8");
+      const ownedBefore = structuredClone(owned);
+      rmSync(
+        join(
+          root,
+          "private-content",
+          selected.packet.contentRef.digest.slice(0, 2),
+          selected.packet.contentRef.digest,
+        ),
+      );
+      // Historical ownership remains inspectable; another call cannot use missing bytes.
+      assert.equal(
+        parseFactoryState(
+          JSON.parse(ownedSnapshot),
+          adaptive.repository,
+          adaptive.objective,
+        ).work.api.attempt,
+        "api-role-attempt",
+      );
+      await assert.rejects(
+        () => authenticateAdaptiveContextPacket(store, selected.packet),
+        /missing/,
+      );
+      await assert.rejects(() => resumeDispatch(owned), /missing/);
+      assert.deepEqual(owned, ownedBefore);
+      assert.equal(owned.work.api.execution.identity, "api-role-attempt");
+      assert.equal(owned.work.api.adaptiveContextId, selected.packet.id);
+      assert.equal(restartSaves, 1);
+      assert.equal(readFileSync(rolePath, "utf8"), ownedSnapshot);
+    }
     {
       // Reuse this real Git/ContentStore and atomic snapshot workflow for expansion:
       // the checkpoint records possible submission, not an invented GitHub response.

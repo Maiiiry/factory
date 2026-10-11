@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  readAdaptiveContextBytes,
+  type AdaptiveContextSelection,
+} from "./adaptive-context.js";
 import type {
   ContentRef,
   ContentStore,
@@ -28,6 +32,20 @@ export interface ObjectiveKnowledgeRecord {
   recordRef: ContentRef;
   notes: WorkHandoffNote[];
   sources: { path: string; ref: ContentRef }[];
+}
+interface KnowledgeViewEntry {
+  producerItem: string;
+  producerAttempt: string;
+  producerGraphDigest: string;
+  producerCommitSha: string;
+  producerTreeSha: string;
+  recordRef: ContentRef;
+  relationship: string;
+  producerDisposition: string;
+  authority: string;
+  kind: WorkHandoffNote["kind"];
+  summary: string;
+  sources: { path: string; ref?: ContentRef; availability: string }[];
 }
 
 const digest = (bytes: Uint8Array | string) =>
@@ -278,7 +296,7 @@ export function objectiveKnowledgeView(
   checkout: string,
   baseSha: string,
   options?: { includeOwnClaims?: true; objectiveReview?: true },
-): object {
+) {
   const ancestors = new Set<string>();
   const visit = (id: string) => {
     if (ancestors.has(id)) return;
@@ -288,7 +306,7 @@ export function objectiveKnowledgeView(
       visit(dependency);
   };
   for (const dependency of item.dependencies) visit(dependency);
-  const selected: object[] = [];
+  const selected: KnowledgeViewEntry[] = [];
   for (const peer of state.graph.items) {
     const work = state.work[peer.id];
     const ownClaim = options?.includeOwnClaims && peer.id === item.id;
@@ -390,6 +408,91 @@ export function objectiveKnowledgeView(
     entries: selected,
     interpretation:
       "Summaries remain advisory, including interface claims. Only current-bytes authenticates identical referenced file bytes in this checkout; it does not authenticate the claim or transfer prior validation/acceptance. Changed or unavailable sources are historical investigation leads. Own requirements, pinned inputs and human decisions remain authoritative.",
+  };
+}
+
+/** Full selected source bytes accompany settled interfaces; claims never become proof. */
+export async function completeObjectiveKnowledge(input: {
+  state: FactoryState;
+  item: WorkItem;
+  checkout: string;
+  baseSha: string;
+  store: ContentStore;
+  review?: "result" | "objective";
+  suppliedDigests?: string[];
+}): Promise<{
+  view: object;
+  selections: AdaptiveContextSelection[];
+  suppliedBodies: { ref: ContentRef; bytes: Uint8Array }[];
+}> {
+  const view = objectiveKnowledgeView(
+    input.state,
+    input.item,
+    input.checkout,
+    input.baseSha,
+    input.review === "objective"
+      ? { objectiveReview: true }
+      : input.review === "result"
+        ? { includeOwnClaims: true }
+        : undefined,
+  );
+  const bodies = new Map<
+    string,
+    { ref: ContentRef; encoding: "base64"; bytes: string }
+  >();
+  const selections: AdaptiveContextSelection[] = [];
+  for (const entry of view.entries) {
+    await input.store.verify(entry.recordRef);
+    const refs: ContentRef[] = [entry.recordRef];
+    for (const source of entry.sources) {
+      if (!source.ref) {
+        if (
+          entry.relationship === "settled-dependency" &&
+          entry.kind === "interface"
+        )
+          throw new Error(
+            "Required settled interface lacks its complete bound source body",
+          );
+        continue;
+      }
+      refs.push(source.ref);
+      if (
+        bodies.has(source.ref.digest) ||
+        input.suppliedDigests?.includes(source.ref.digest)
+      )
+        continue;
+      const bytes = await readAdaptiveContextBytes(input.store, source.ref);
+      bodies.set(source.ref.digest, {
+        ref: source.ref,
+        encoding: "base64",
+        bytes: bytes.toString("base64"),
+      });
+    }
+    selections.push({
+      id: `interface:${entry.producerItem}:${entry.producerAttempt}:${digest(JSON.stringify(entry))}`,
+      kind: "interface",
+      disposition: entry.sources.every(
+        (source) => source.availability === "current-bytes",
+      )
+        ? "current"
+        : "historical",
+      required:
+        entry.relationship === "settled-dependency" &&
+        entry.kind === "interface",
+      refs,
+    });
+  }
+  return {
+    suppliedBodies: [...bodies.values()].map((body) => ({
+      ref: body.ref,
+      bytes: Buffer.from(body.bytes, "base64"),
+    })),
+    view: {
+      ...view,
+      bodies: [...bodies.values()],
+      suppliedBodyDigests: input.suppliedDigests ?? [],
+    },
+    selections,
   };
 }
 

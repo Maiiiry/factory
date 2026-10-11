@@ -37,7 +37,11 @@ import { currentProcessSignal } from "../process.js";
 import { runQaItem } from "../qa-execution.js";
 import { runDiscoveryItem } from "../runner/discovery.js";
 import { phaseAdmission } from "../phase-admission.js";
-import { readyItems } from "../scheduler.js";
+import {
+  pendingItemBlocker,
+  readyItems,
+  schedulingObservations,
+} from "../scheduler.js";
 import { expansionBlocksItem } from "../expansion-readiness.js";
 import type { FactoryState } from "../state.js";
 import {
@@ -733,6 +737,7 @@ export async function runRegularGraph(args: {
             state,
             item,
             model: args.planningModel,
+            contentStore,
             diagnostics: args.diagnostics,
             sources: planningSources(
               args.objectiveBody,
@@ -818,23 +823,25 @@ export async function runRegularGraph(args: {
       },
     });
     const slots = graph.items.length;
-    let workerSlots = phases.availableSlots(reported);
+    phases.availableSlots(reported);
+    let admittedCoding = 0;
+    const owned = new Set([
+      ...active.keys(),
+      ...graph.items
+        .filter((item) =>
+          ["waiting", "published"].includes(state.work[item.id]!.status),
+        )
+        .map((item) => item.id),
+    ]);
+    const facts = schedulingObservations(graph, state.work);
+    const capacityBlocked = new Map<string, { kind: string; detail: string }>();
     const ready =
       args.paused?.() || args.amendmentPending?.()
         ? []
         : readyItems(
             graph,
             state.work,
-            new Set([
-              ...active.keys(),
-              ...graph.items
-                .filter((item) =>
-                  ["waiting", "published"].includes(
-                    state.work[item.id]!.status,
-                  ),
-                )
-                .map((item) => item.id),
-            ]),
+            owned,
             slots,
             args.resolvedExpansionIds,
           ).filter((item) => {
@@ -844,19 +851,16 @@ export async function runRegularGraph(args: {
               (item.kind === "discovery" &&
                 item.discovery?.mode === "inventory")
                 ? undefined
-                : (phases.reason(item.id, "coding") ??
-                  (workerSlots <= 0
-                    ? reported === "unknown"
-                      ? "operator coding ceiling; provider capacity unknown"
-                      : "driver or operator coding capacity"
-                    : undefined));
+                : (phases.blocker(item.id, "coding") ??
+                  phases.slotBlocker(reported, admittedCoding));
             if (blocked) {
+              capacityBlocked.set(item.id, blocked);
               setWait(
                 state,
                 { item: item.id },
                 {
                   kind: "capacity",
-                  detail: blocked,
+                  detail: blocked.detail,
                 },
               );
               return false;
@@ -870,9 +874,42 @@ export async function runRegularGraph(args: {
                 item.discovery?.mode === "inventory"
               )
             )
-              workerSlots--;
+              admittedCoding++;
             return true;
           });
+    const selected = new Set(ready.map((item) => item.id));
+    for (const item of graph.items.filter(
+      (candidate) => state.work[candidate.id]?.status === "pending",
+    )) {
+      const held = args.paused?.() || args.amendmentPending?.();
+      const blocker = held
+        ? {
+            kind: "operator",
+            detail:
+              "Objective is paused or awaits its admitted graph transition",
+          }
+        : selected.has(item.id)
+          ? undefined
+          : (capacityBlocked.get(item.id) ??
+            pendingItemBlocker(
+              graph,
+              state.work,
+              item,
+              new Set([...owned, ...selected]),
+              args.resolvedExpansionIds,
+            ) ?? {
+              kind: "ordering",
+              detail: "Awaiting the next fitting scheduling opportunity",
+            });
+      args.diagnostics?.scheduling({
+        runId: state.runId,
+        itemId: item.id,
+        facts: facts.get(item.id)!,
+        blocker,
+        providerAvailableSlots: reported,
+        codingReservations: phases.codingCount(),
+      });
+    }
     if (ready.length) await args.reconcile?.();
     for (const item of ready) {
       if (stopped()) throw await cancelRun();

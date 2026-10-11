@@ -8,6 +8,25 @@ import { assertDiscoverySpecification } from "./discovery.js";
 import { expansionBlocksItem } from "./expansion-readiness.js";
 import type { WorkState } from "./state.js";
 
+/** Admission and restored snapshots share the same optional advisory hint shape. */
+export function assertWorkItemScheduling(value?: unknown): void {
+  if (value === undefined) return;
+  const hint = value as Record<string, unknown>;
+  if (
+    !hint ||
+    typeof hint !== "object" ||
+    Array.isArray(hint) ||
+    Object.keys(hint).sort().join() !== "estimatedDurationMs,reason" ||
+    !Number.isSafeInteger(hint.estimatedDurationMs) ||
+    Number(hint.estimatedDurationMs) <= 0 ||
+    typeof hint.reason !== "string" ||
+    !hint.reason.trim()
+  )
+    throw new Error(
+      "Work Item scheduling requires a positive advisory duration and reason",
+    );
+}
+
 /** Native item types must hold before proof, path, scheduler or review consumers. */
 export function assertWorkItemFields(
   value: unknown,
@@ -79,6 +98,7 @@ export function assertWorkItemFields(
     throw new Error("Work Item minimumAssetSets must be a nonnegative integer");
   if (item.priority !== undefined && !Number.isSafeInteger(item.priority))
     throw new Error("Work Item priority must be an integer");
+  assertWorkItemScheduling(item.scheduling);
   if (
     item.sourceAssets !== undefined &&
     (!Array.isArray(item.sourceAssets) ||
@@ -323,16 +343,12 @@ export function readyItems(
     if (admitted.length >= slots) break;
     if (
       work[item.id]?.status !== "pending" ||
-      expansionBlocksItem(graph, item.id, resolvedExpansionIds) ||
-      !item.dependencies.every((id) => work[id]?.status === "done")
-    )
-      continue;
-    if (
-      [...active, ...admitted.map((candidate) => candidate.id)].some((id) =>
-        itemsConflict(
-          item,
-          graph.items.find((candidate) => candidate.id === id)!,
-        ),
+      pendingItemBlocker(
+        graph,
+        work,
+        item,
+        new Set([...active, ...admitted.map((candidate) => candidate.id)]),
+        resolvedExpansionIds,
       )
     )
       continue;
@@ -341,21 +357,187 @@ export function readyItems(
   return admitted;
 }
 
-/** Rank only after the caller establishes dependencies/ownership eligibility. Completion gets the next opportunity. */
+export interface SchedulingBlocker {
+  kind: "dependency" | "ownership" | "resource" | "expansion" | "operator";
+  detail: string;
+  blockedBy?: string;
+}
+
+/** Current graph/state facts only. Hierarchy and old observations grant no admission. */
+export function pendingItemBlocker(
+  graph: WorkGraph,
+  work: Record<string, WorkState>,
+  item: WorkItem,
+  active: ReadonlySet<string>,
+  resolvedExpansionIds?: ReadonlySet<string>,
+  dependencyReady: (id: string) => boolean = (id) =>
+    work[id]?.status === "done",
+): SchedulingBlocker | undefined {
+  const wait = work[item.id]?.wait;
+  if (wait && ["decision", "prerequisite"].includes(wait.kind))
+    return { kind: "operator", detail: wait.detail };
+  if (expansionBlocksItem(graph, item.id, resolvedExpansionIds))
+    return {
+      kind: "expansion",
+      detail: "Required discovery expansion is not authenticated and settled",
+    };
+  const dependency = item.dependencies.find((id) => !dependencyReady(id));
+  if (dependency) {
+    const held = work[dependency]?.wait;
+    return {
+      kind:
+        held && ["decision", "prerequisite"].includes(held.kind)
+          ? "operator"
+          : "dependency",
+      blockedBy: dependency,
+      detail:
+        held && ["decision", "prerequisite"].includes(held.kind)
+          ? `Dependency ${dependency} awaits its operator prerequisite`
+          : `Dependency ${dependency} has not completed acceptance`,
+    };
+  }
+  for (const id of active) {
+    if (id === item.id) continue;
+    const other = graph.items.find((candidate) => candidate.id === id);
+    if (!other || !itemsConflict(item, other)) continue;
+    const ownership = item.ownedPaths.some((a) =>
+      other.ownedPaths.some((b) => pathsOverlap(a, b)),
+    );
+    return {
+      kind: ownership ? "ownership" : "resource",
+      blockedBy: id,
+      detail: ownership
+        ? `Literal ownership is held by ${id}`
+        : `Declared shared resource is held by ${id}`,
+    };
+  }
+  return undefined;
+}
+
+/** Remaining DAG stages are a proxy; absent duration estimates remain unknown. */
+export function criticalPathValues(
+  graph: WorkGraph,
+  work: Record<string, WorkState>,
+) {
+  const successors = new Map<string, WorkItem[]>();
+  for (const item of graph.items)
+    for (const dependency of item.dependencies)
+      successors.set(dependency, [...(successors.get(dependency) ?? []), item]);
+  const values = new Map<
+    string,
+    { remainingStages: number; estimatedDurationMs: number | null }
+  >();
+  const visiting = new Set<string>();
+  const visit = (
+    item: WorkItem,
+  ): { remainingStages: number; estimatedDurationMs: number | null } => {
+    const previous = values.get(item.id);
+    if (previous) return previous;
+    if (visiting.has(item.id))
+      throw new Error("Scheduling graph contains a dependency cycle");
+    visiting.add(item.id);
+    const children = (successors.get(item.id) ?? [])
+      .filter((child) => work[child.id]?.status !== "done")
+      .map(visit);
+    const remainingStages =
+      work[item.id]?.status === "done"
+        ? 0
+        : 1 + Math.max(0, ...children.map((child) => child.remainingStages));
+    const estimate = item.scheduling?.estimatedDurationMs;
+    const duration =
+      work[item.id]?.status === "done"
+        ? 0
+        : estimate === undefined ||
+            children.some((child) => child.estimatedDurationMs === null)
+          ? null
+          : estimate +
+            Math.max(0, ...children.map((child) => child.estimatedDurationMs!));
+    const estimatedDurationMs =
+      duration !== null && !Number.isSafeInteger(duration) ? null : duration;
+    const result = { remainingStages, estimatedDurationMs };
+    visiting.delete(item.id);
+    values.set(item.id, result);
+    return result;
+  };
+  for (const item of graph.items) visit(item);
+  return values;
+}
+
+export function schedulingObservations(
+  graph: WorkGraph,
+  work: Record<string, WorkState>,
+  now = Date.now(),
+) {
+  const values = criticalPathValues(graph, work);
+  const rankingBasis = graph.items
+    .filter((item) => work[item.id]?.status !== "done")
+    .every((item) => values.get(item.id)!.estimatedDurationMs !== null)
+    ? "declared-duration"
+    : "remaining-stages";
+  return new Map(
+    graph.items.map((item) => {
+      const current = work[item.id];
+      const start =
+        current?.startedAt === undefined
+          ? undefined
+          : Date.parse(current.startedAt);
+      const end =
+        current?.completedAt === undefined
+          ? undefined
+          : Date.parse(current.completedAt);
+      const elapsedToCompletionMs =
+        start !== undefined &&
+        end !== undefined &&
+        Number.isFinite(start) &&
+        Number.isFinite(end) &&
+        end >= start
+          ? end - start
+          : null;
+      return [
+        item.id,
+        {
+          rankingBasis,
+          remainingCriticalPathStages: values.get(item.id)!.remainingStages,
+          estimatedCriticalPathMs: values.get(item.id)!.estimatedDurationMs,
+          elapsedSinceStartMs:
+            start !== undefined &&
+            Number.isFinite(start) &&
+            now >= start &&
+            end === undefined
+              ? now - start
+              : null,
+          elapsedToCompletionMs,
+          queueMs: null,
+          deliveryHeadReplacements: current?.replacedHeads?.length ?? 0,
+          ownedPathCount: item.ownedPaths.length,
+        },
+      ] as const;
+    }),
+  );
+}
+export type SchedulingObservation =
+  ReturnType<typeof schedulingObservations> extends Map<string, infer Value>
+    ? Value
+    : never;
+
+/** Completion and explicit priority win; one common basis keeps ranking transitive. */
 export function rankPending(
   graph: WorkGraph,
   work: Record<string, WorkState>,
 ): WorkItem[] {
-  const prerequisite = (id: string): boolean =>
-    graph.items.some(
-      (item) =>
-        work[item.id]?.status !== "done" && item.dependencies.includes(id),
-    );
+  const values = criticalPathValues(graph, work);
+  const estimatesComplete = graph.items
+    .filter((item) => work[item.id]?.status !== "done")
+    .every((item) => values.get(item.id)!.estimatedDurationMs !== null);
   return [...graph.items].sort(
     (a, b) =>
       Number(b.kind === "qa" || b.kind === "aggregate") -
         Number(a.kind === "qa" || a.kind === "aggregate") ||
       (b.priority ?? 0) - (a.priority ?? 0) ||
-      Number(prerequisite(b.id)) - Number(prerequisite(a.id)),
+      (estimatesComplete
+        ? values.get(b.id)!.estimatedDurationMs! -
+          values.get(a.id)!.estimatedDurationMs!
+        : values.get(b.id)!.remainingStages -
+          values.get(a.id)!.remainingStages),
   );
 }

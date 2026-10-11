@@ -1,6 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { buildAdaptiveContext } from "../adaptive-context.js";
 import { agentSessionContinuation } from "../agent-session.js";
-import { reviewObjectiveKnowledge } from "../objective-knowledge.js";
+import {
+  completeObjectiveKnowledge,
+  reviewObjectiveKnowledge,
+} from "../objective-knowledge.js";
 import { join } from "node:path";
 import {
   finalObjectiveCommands,
@@ -36,6 +40,11 @@ import {
 import { workspacePackageAdditions } from "../workspace-membership.js";
 import type { ObjectiveStep } from "./ownership.js";
 import { authenticateObjectiveInputs } from "./expansion.js";
+import {
+  discoveryContextBodies,
+  discoveryContextSelections,
+  objectiveDiscoveryInputs,
+} from "./discovery.js";
 
 /** Heads others push during final validation that Factory follows before asking. */
 const FOLLOWED_HEAD_LIMIT = 3;
@@ -338,6 +347,53 @@ export async function finalizeObjective(args: {
     // invalid one are both asked again (the invalid one with its
     // validation error) until the bound makes it a decision. A criterion
     // the operator must judge comes back as the pending final acceptance.
+    const finalSources = planningSources(
+      issue.body,
+      state.baseSha,
+      config.checkout,
+    );
+    let adaptive: Awaited<ReturnType<typeof buildAdaptiveContext>>;
+    if (state.planningRecovery?.contextLookup?.packet) {
+      const discoveryInputs = await objectiveDiscoveryInputs({
+        state,
+        checkout: config.checkout,
+        store: contentStore,
+      });
+      const discoveryBodies = discoveryContextBodies(discoveryInputs);
+      const discoverySelections = discoveryContextSelections(discoveryInputs);
+      const knowledge = await completeObjectiveKnowledge({
+        state,
+        item: {
+          ...state.graph.items[0]!,
+          id: "objective-review",
+          dependencies: state.graph.items.map((peer) => peer.id),
+          ownedPaths: [],
+        },
+        checkout: config.checkout,
+        baseSha: candidateCommitSha,
+        store: contentStore,
+        review: "objective",
+        suppliedDigests: [
+          ...discoveryBodies.map((body) => body.ref.digest),
+          ...finalSources.map((source) =>
+            createHash("sha256").update(source.content).digest("hex"),
+          ),
+        ],
+      });
+      adaptive = await buildAdaptiveContext({
+        state,
+        role: "objective-review",
+        baseSha: candidateCommitSha,
+        checkout: config.checkout,
+        store: contentStore,
+        config,
+        sources: finalSources,
+        suppliedBodies: [...discoveryBodies, ...knowledge.suppliedBodies],
+        required: { knowledge: knowledge.view, discoveryInputs },
+        requiredSelections: [...discoverySelections, ...knowledge.selections],
+        save: () => save(state),
+      });
+    }
     const reviewFinal = () =>
       objectiveStep(
         state,
@@ -360,20 +416,19 @@ export async function finalizeObjective(args: {
               commit: candidateCommitSha,
               evidence: acceptanceEvidence,
               contentStore,
+              ...(adaptive ? { adaptiveContext: adaptive.packet } : {}),
               criteria: objectiveCriteria(issue.body),
-              sources: planningSources(
-                issue.body,
-                state.baseSha,
-                config.checkout,
-              ),
+              sources: finalSources,
               evidenceSources: [
                 ...objectiveEvidence.evidence,
-                ...reviewObjectiveKnowledge(
-                  state,
-                  undefined,
-                  config.checkout,
-                  candidateCommitSha,
-                ),
+                ...(adaptive
+                  ? [adaptive.evidence]
+                  : reviewObjectiveKnowledge(
+                      state,
+                      undefined,
+                      config.checkout,
+                      candidateCommitSha,
+                    )),
                 ...(hydrationReceipt
                   ? [
                       {

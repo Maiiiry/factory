@@ -8,6 +8,7 @@ import { clearWait, setWait } from "./step.js";
  * admit it (the configuration declares no or too large a reservation).
  */
 interface Blocked {
+  kind: "concurrency" | "host-resource" | "completion";
   detail: string;
   fix?: string;
 }
@@ -65,6 +66,26 @@ export function phaseAdmission(
       ),
     );
   };
+  const slotBlocker = (
+    reported: number | "unknown",
+    admitted = 0,
+  ): { kind: "provider" | "concurrency"; detail: string } | undefined => {
+    if (capacity.concurrency - codingCount() - admitted <= 0)
+      return {
+        kind: "concurrency",
+        detail:
+          reported === "unknown"
+            ? "Operator/host coding ceiling; provider capacity unknown"
+            : "Operator/host coding concurrency ceiling",
+      };
+    if (reported !== "unknown" && reported - admitted <= 0)
+      return {
+        kind: "provider",
+        detail:
+          "Remaining reported provider slots are exhausted or allocated in this pass",
+      };
+    return undefined;
+  };
   const blocker = (id: string, phase: ResourcePhase): Blocked | undefined => {
     const reservations = Object.entries(state.work)
       .map(
@@ -86,7 +107,7 @@ export function phaseAdmission(
       reservations.filter(([, work]) => work.phaseReservation === phase)
         .length >= ceiling
     )
-      return { detail: `${phase} concurrency ceiling` };
+      return { kind: "concurrency", detail: `${phase} concurrency ceiling` };
     const declaration = capacity.scheduling?.phases?.[phase];
     for (const resource of ["cpu", "memoryMiB"] as const) {
       const limit = capacity.scheduling?.[resource];
@@ -94,11 +115,13 @@ export function phaseAdmission(
       const requested = declaration?.[resource];
       if (requested === undefined)
         return {
+          kind: "host-resource",
           detail: `unknown ${phase} ${resource} reservation`,
           fix: `Declare capacity.scheduling.phases.${phase}.${resource} in the configuration`,
         };
       if (requested > limit)
         return {
+          kind: "host-resource",
           detail: `${phase} ${resource} reservation exceeds ceiling`,
           fix: `Lower capacity.scheduling.phases.${phase}.${resource} to at most capacity.scheduling.${resource}`,
         };
@@ -108,12 +131,14 @@ export function phaseAdmission(
           capacity.scheduling?.phases?.[work.phaseReservation!]?.[resource];
         if (amount === undefined)
           return {
+            kind: "host-resource",
             detail: `unknown active ${resource} reservation`,
             fix: `Declare capacity.scheduling.phases.${work.phaseReservation}.${resource} in the configuration`,
           };
         total += amount;
       }
-      if (total > limit) return { detail: `${resource} ceiling` };
+      if (total > limit)
+        return { kind: "host-resource", detail: `${resource} ceiling` };
     }
     // A ready completion phase receives the next fitting grant. It never waits behind new coding.
     if (
@@ -125,7 +150,7 @@ export function phaseAdmission(
           work.requestedPhase !== "coding",
       )
     )
-      return { detail: "completion phase waiting" };
+      return { kind: "completion", detail: "completion phase waiting" };
     return undefined;
   };
   const reason = (id: string, phase: ResourcePhase): string | undefined =>
@@ -177,6 +202,15 @@ export function phaseAdmission(
     save();
     notify();
   };
-  return { reason, reserve, release, changed, codingCount, availableSlots };
+  return {
+    reason,
+    blocker,
+    slotBlocker,
+    reserve,
+    release,
+    changed,
+    codingCount,
+    availableSlots,
+  };
 }
 export type PhaseAdmission = ReturnType<typeof phaseAdmission>;
