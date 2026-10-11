@@ -21,6 +21,10 @@ import {
 } from "./review-artifacts.js";
 import { refuseUnknownFields } from "./unknown-fields.js";
 import {
+  assertGitPersistenceConfig,
+  type GitPersistenceConfig,
+} from "./recovery-checkpoint.js";
+import {
   assertContextLookupBounds,
   type ContextLookupBounds,
 } from "./compiler/context.js";
@@ -231,6 +235,8 @@ export function hostSchedulingDefaults(host: HostFacts): {
 }
 
 export interface FactoryConfig {
+  /** Explicit Git destination and payload scope; omission is local-only retention. */
+  gitPersistence?: GitPersistenceConfig;
   /** Explicit bounded retrieval admission; omission retains the static planner. */
   planningContext?: {
     enabled: true;
@@ -633,10 +639,13 @@ export function validateConfig(value: unknown): FactoryConfig {
       "githubManagement",
       "reviewArtifacts",
       "planningContext",
+      "gitPersistence",
     ],
     "configuration",
   );
   assertReviewArtifactSelectors(value.reviewArtifacts);
+  if (value.gitPersistence !== undefined)
+    assertGitPersistenceConfig(value.gitPersistence);
   if (value.planningContext !== undefined) {
     assertObject(value.planningContext, "planningContext");
     const context = value.planningContext;

@@ -53,6 +53,12 @@ import {
 } from "./status-summary.js";
 import { checkIntakeServiceState, supervise } from "./supervision.js";
 import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
+import {
+  gitPersistenceStatus,
+  synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 
 /** Whether a live controller owns this Objective; null when a lock is unreadable. */
 function controllerActive(
@@ -93,6 +99,8 @@ function help(): void {
       "      Collect terminal experience, propose a compact playbook, then explicitly approve its exact draft before advisory use",
       "  recipe --file ABSOLUTE_OBJECTIVE",
       "      Preview a pinned workflow recipe against the current checkout without model calls or admission",
+      "  persistence status | sync",
+      "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
       "  run --objective N [--deadline ISO_TIMESTAMP]",
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
       "  queue add N [N ...] | list | remove N | pause | resume | drain",
@@ -281,9 +289,17 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
       };
     }
   }
-  const document = { service, queue, ...current };
+  const document = {
+    service,
+    queue,
+    ...current,
+    durability: gitPersistenceStatus(config),
+  };
   if (json) console.log(JSON.stringify(document));
-  else for (const line of renderServiceStatus(document)) console.log(line);
+  else {
+    for (const line of renderServiceStatus(document)) console.log(line);
+    console.log(`Durability: ${JSON.stringify(document.durability)}`);
+  }
 }
 type ServiceStatus = Parameters<typeof renderServiceStatus>[0];
 
@@ -320,7 +336,7 @@ async function decideCommand(
   );
 }
 
-async function main(): Promise<void> {
+async function dispatchMain(): Promise<void> {
   const [, , command, ...args] = process.argv;
   if (!command || command === "help" || command === "--help") return help();
   assertKnownFlags(command, args);
@@ -336,6 +352,18 @@ async function main(): Promise<void> {
   if (command === "dream") return runDreamCommand(readConfig(path), args, path);
   if (command === "recipe")
     return runWorkflowRecipePreview(readConfig(path), args);
+  if (command === "persistence") {
+    const [action, ...rest] = queueWords(args);
+    if (rest.length || (action !== "status" && action !== "sync"))
+      throw new Error("Use factory persistence status | sync");
+    const config = readConfig(path);
+    const result =
+      action === "status"
+        ? gitPersistenceStatus(config)
+        : await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (command === "queue") return queueCommand(args, path);
   if (command === "supervisor") return supervisorCommand(args, path);
   if (command === "status" && option(args, "objective") === undefined)
@@ -566,17 +594,20 @@ function statusDocument(
       document.nextAction.command,
       configuration,
     );
-  return { document, secrets };
+  return {
+    document: { ...document, durability: gitPersistenceStatus(config) },
+    secrets,
+  };
 }
 
 function statusLines(
   document: ReturnType<typeof statusDocument>["document"],
   secrets: string[],
 ): string[] {
-  return renderStatusText(
-    document,
-    option(process.argv.slice(3), "config"),
-  ).map((line) => redactDiagnosticDetail(line, secrets));
+  return [
+    ...renderStatusText(document, option(process.argv.slice(3), "config")),
+    `Durability: ${JSON.stringify(document.durability)}`,
+  ].map((line) => redactDiagnosticDetail(line, secrets));
 }
 
 /** Print how a run ended and set the documented exit code. */
@@ -601,6 +632,51 @@ function reportRun(
         );
   console.log(outcome.message);
   process.exitCode = outcome.code;
+}
+
+async function main(): Promise<void> {
+  const [, , command, ...args] = process.argv;
+  const mutating = new Set([
+    "propose",
+    "dream",
+    "run",
+    "queue",
+    "decide",
+    "retry",
+    "repair",
+    "select",
+    "propose-amendment",
+    "pause",
+    "drain",
+    "resume",
+    "cancel",
+  ]);
+  if (!command || !mutating.has(command)) return dispatchMain();
+  assertKnownFlags(command, args);
+  const config = readConfig(option(args, "config") ?? configPath());
+  await withRecoveryCheckpointScope(
+    {
+      config,
+      buildClosure: () =>
+        buildRecoveryCheckpointClosure({
+          config,
+          scope: config.gitPersistence?.scope ?? "private-history",
+        }),
+    },
+    async () => {
+      try {
+        await dispatchMain();
+      } catch (error) {
+        try {
+          await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+        } catch {
+          // The durability journal retains this failure alongside the original error.
+        }
+        throw error;
+      }
+      await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+    },
+  );
 }
 
 main().catch((error: unknown) => {

@@ -333,7 +333,7 @@ For an approved migration or cross-cutting fix whose file inventory is unknown, 
 
 Integration waits for authenticated expansion and every required child. A complete empty inventory creates no children and still requires the original acceptance proof. Partial or unreadable inputs, unknown semantic classifications and exhausted expansion bounds remain visible stops; scope changes use the existing amendment or human-decision paths. One immutable input materializes each envelope; changing that input requires an explicit successor or revalidation. Restarts retain the same child identities and input packets, and uncertain GitHub writes are reconciled without being submitted again.
 
-Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. Portable Git-backed memory recovery is tracked separately; see [workflow recipes](#workflow-recipes) for reusable pinned shapes.
+Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. See [Git checkpoints](#git-checkpoints) for durable memory and history, and [workflow recipes](#workflow-recipes) for reusable pinned shapes.
 
 Adaptive workers automatically receive the relevant retained memory, verified human decisions, settled interface bodies and selected discovery entries for their batch. Role packets are retained before calls and authenticated on restart. Required source and acceptance inputs remain complete even when the advisory-memory allowance is exhausted; optional historical material stays an attributed lead. Already supplied content is reused rather than copied or requested again. Native session compaction remains the harness's responsibility.
 
@@ -678,7 +678,7 @@ factory dream --show --config /private/factory.json
 
 Use the actual path and next commands printed by Dream; drafts default to the repository's private state `learning/proposals/` directory. Review consolidated entries, source links, dated summaries and contradictions before approval. Merge or retire redundant guidance to fit the budget while preserving original episodes and sources. After editing, recompute the file digest; approval or rejection applies only to those exact bytes. `--preview` retains and displays the bounded selection checkpoint without a model call. `--show` reads the current approved playbook and any unresolved Dream submissions without a model call. A submission with no authenticated native terminal receipt remains unknown and prevents a new Dream pass; repeating the command does not resolve the old submission or replenish its allowance.
 
-Only an approved compact version enters subsequent Objective planning and review inputs. Each Objective pins its version: later approval cannot change an active run. Learning is advisory, never command authority, permission or acceptance evidence, and it cannot override pinned Sources or limits. Episodes, exact proposals/reviewed drafts, decisions, revisions, provider receipts and selection checkpoints remain private attributable originals. Their complete reference closure is available for persistence; a catalog entry alone cannot restore an approval. Current storage is local and does not claim remote Git durability. They may be sent only to the already configured provider when Dream is authorized; review source-derived private text before sharing it.
+Only an approved compact version enters subsequent Objective planning and review inputs. Each Objective pins its version: later approval cannot change an active run. Learning is advisory, never command authority, permission or acceptance evidence, and it cannot override pinned Sources or limits. Episodes, exact proposals/reviewed drafts, decisions, revisions, provider receipts and selection checkpoints remain private attributable originals. Their complete reference closure is available for persistence; a catalog entry alone cannot restore an approval. Without an explicit Git checkpoint configuration, storage is local only. A complete verified private checkpoint retains these originals; see [Git checkpoints](#git-checkpoints). They may be sent only to the already configured provider when Dream is authorized; review source-derived private text before sharing it.
 
 ## GitHub progress check-ins
 
@@ -734,3 +734,38 @@ An optional `githubManagement.projectStatus` can update the Objective's existing
 ```
 
 The Project must belong to the target repository owner, its field must be named Status and be single-select, and every option must exist. The accepted option must differ from all others. The Objective must already have one nonarchived Project card; Factory never adds/deletes cards or touches other fields. The explicit opt-in makes this field Factory-managed, so concurrent human edits may be overwritten. Unknown update outcomes hold only this field permanently; one later read remains an observation, not mutation confirmation or permission to retry. `factory status` reports Project tracking failures separately from app acceptance. Accepted Project status follows actual accepted Objective closure.
+
+## Git checkpoints
+
+Factory keeps its working files outside the target checkout. Configure a Git archive explicitly if those records must survive loss of the machine. Git is the remote durable medium; SQLite/search and local ContentStore files are rebuildable replicas. A successful local save, content digest or GitHub progress comment does not acknowledge a remote backup. Without this configuration, status reports local-only retention.
+
+Add `gitPersistence` to the private Factory configuration. Choose a destination whose visibility permits every included body. A special branch in a public repository does not make its contents private. `private-history` requires a private destination; GitHub visibility is checked before publication. Credentials, native conversation homes, locks, sockets, services and installed packages are excluded. Do not put credentials in the remote URL.
+
+```json
+{
+  "gitPersistence": {
+    "remote": "https://github.com/YOUR_ACCOUNT/YOUR_PRIVATE_ARCHIVE.git",
+    "ref": "refs/heads/factory-history",
+    "visibility": "private",
+    "scope": "private-history",
+    "maxBytes": 16777216,
+    "maxFiles": 4096,
+    "timeoutMs": 120000,
+    "coalesceMs": 30000
+  }
+}
+```
+
+This is an explicit archive binding, not permission to create another repository or widen source disclosure. `repository-knowledge` exports only eligible repository-visible memory, excluding private continuation and learning originals; publication to a public destination also requires verified public source visibility. Neither scope exports ambient credentials or the native harness home. The byte/file bounds govern the materialized checkpoint, and timeout/coalescing bounds govern synchronization. They grant no extra model, retry, concurrency or spending allowance. Archive history is append-only; deduplicating bodies does not bound accumulated Git history, and Factory does not automatically delete it.
+
+```sh
+factory persistence status --config /private/factory.json
+factory persistence sync --config /private/factory.json
+factory status --objective N --json --config /private/factory.json
+```
+
+Status distinguishes pending local changes, the attempted publication, failure or uncertainty, and the last independently fetched and verified Git checkpoint. The unsynced window identifies locally retained changes after that acknowledgement. Synchronization verifies actual required bodies, including exact memory bindings, learning approval originals and retained source/result identities. Missing legacy material remains an explicit gap; a pointer cannot replace it. Imported memory preserves original timestamps, provenance, supersession and unapproved status. Rebuilt search supplies no new acceptance or authority.
+
+With `private-history`, critical external actions wait for the saved intent and charged allowance to be durably acknowledged. A `repository-knowledge` archive protects eligible memory only; execution still has local continuation storage. Ordinary settled writes can coalesce within the configured interval. A lost publication response retains its attempted base and candidate; reconciliation reads that exact revision rather than blindly pushing again. Conflicts stop publication without force push, reset or silently replacing another writer's history.
+
+Checkpoints preserve historical controller/provider owner receipts and unknown effects. Fetching them on another machine grants no foreign-process resume, watch consent, service activation, acceptance or replay. Fresh-host operational restoration is a separate supported recovery operation; do not copy old lock files, edit snapshots or start from a new state root to evade an unresolved owner. Archived queue observations are historical; restoring a checkpoint does not enqueue work or activate a service.
