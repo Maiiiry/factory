@@ -34,7 +34,11 @@ import {
   stateRoot,
 } from "./config.js";
 import { objectiveComplete } from "./completion.js";
-import { requestControl } from "./coordinator-control.js";
+import {
+  type ControllerReadiness,
+  ControllerReadinessPendingError,
+  requestControl,
+} from "./coordinator-control.js";
 import { isExecutionState } from "./state.js";
 import { command, linuxProcessIdentity } from "./process.js";
 import {
@@ -43,6 +47,8 @@ import {
   continuationConfigurationMatches,
   readContinuation,
   readControllerOwner,
+  liveControllerOwner,
+  installationLockPath,
 } from "./state-store.js";
 
 interface ServiceBinding {
@@ -520,31 +526,115 @@ export async function handoffService(
 /** A stopped service whose run exited 2 is waiting for a human decision, not failed. */
 function awaitsDecision(name: string): boolean {
   return (
-    inspect("is-active", name) !== "active" &&
+    !["active", "activating"].includes(inspect("is-active", name) ?? "") &&
     inspect("show", name, "--property=ExecMainStatus", "--value") === "2"
   );
 }
+export type ServiceReadiness =
+  | "starting"
+  | "owned-ready"
+  | "needs-decision"
+  | "stopped"
+  | "failed";
+
+function serviceProcess(name: string) {
+  const active = inspect("is-active", name);
+  const pid = Number(inspect("show", name, "--property=MainPID", "--value"));
+  const identity =
+    Number.isSafeInteger(pid) && pid > 0
+      ? linuxProcessIdentity(pid)
+      : undefined;
+  if (
+    ["active", "activating"].includes(active ?? "") &&
+    (!identity || identity.state === "Z")
+  )
+    throw new Error(
+      "Service process identity is unavailable; preserve startup and inspect the unit",
+    );
+  return { active, pid, identity };
+}
+
+async function observeServiceReadiness(
+  config: FactoryConfig,
+  name: string,
+  deadlineAt: number,
+): Promise<ServiceReadiness> {
+  const service = serviceProcess(name);
+  if (!["active", "activating"].includes(service.active ?? "")) {
+    if (awaitsDecision(name)) return "needs-decision";
+    if (service.active === "failed") return "failed";
+    if (service.active === "inactive") return "stopped";
+    throw new Error(
+      "Service startup state is unavailable; inspect the exact unit",
+    );
+  }
+  const owner = liveControllerOwner(installationLockPath(config.repository));
+  if (!owner) return "starting";
+  if (
+    owner.pid !== service.pid ||
+    !owner.intake ||
+    owner.startTime !== service.identity?.startTime
+  )
+    throw new Error(
+      "Service has a different live controller owner; preserve ownership and inspect it",
+    );
+  let reply: Awaited<ReturnType<typeof requestControl>> | undefined;
+  try {
+    reply = await requestControl(
+      config.repository,
+      {
+        objective: 0,
+        action: "readiness",
+      },
+      { deadlineAt },
+    );
+  } catch (error) {
+    if (!(error instanceof ControllerReadinessPendingError)) throw error;
+  }
+  const current = serviceProcess(name);
+  const currentOwner = liveControllerOwner(
+    installationLockPath(config.repository),
+  );
+  if (
+    !["active", "activating"].includes(current.active ?? "") ||
+    current.pid !== service.pid ||
+    current.identity?.startTime !== service.identity?.startTime ||
+    !currentOwner ||
+    currentOwner.token !== owner.token ||
+    currentOwner.pid !== owner.pid ||
+    currentOwner.startTime !== owner.startTime ||
+    !currentOwner.intake
+  )
+    throw new Error(
+      "Service ownership changed during its readiness handshake; inspect retained state",
+    );
+  if (!reply?.handled) return "starting";
+  const ready = reply.result as ControllerReadiness;
+  if (
+    !ready.owner.intake ||
+    ready.owner.pid !== current.pid ||
+    ready.owner.startTime !== current.identity?.startTime
+  )
+    throw new Error("Service readiness does not match its exact MainPID");
+  return "owned-ready";
+}
+
 async function verifyServiceOwner(
   config: FactoryConfig,
   name: string,
-): Promise<"owner" | "needs-decision"> {
+): Promise<"owned-ready" | "starting" | "needs-decision"> {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    const owner = readControllerOwner(
-      join(stateRoot(config.repository), "controller.lock"),
-    );
-    const pid = Number(inspect("show", name, "--property=MainPID", "--value"));
-    if (owner?.pid === pid && owner.intake && hasOwner(config)) {
-      const reply = await requestControl(config.repository, {
-        objective: 0,
-        action: "status",
-      });
-      if (reply.handled) return "owner";
-    }
-    if (awaitsDecision(name)) return "needs-decision";
-    if (inspect("is-active", name) === "failed") break;
-    await pause(100);
+    const readiness = await observeServiceReadiness(config, name, deadline);
+    if (readiness === "owned-ready" || readiness === "needs-decision")
+      return readiness;
+    if (readiness !== "starting") break;
+    if (Date.now() >= deadline) return "starting";
+    await pause(Math.min(100, Math.max(0, deadline - Date.now())));
   }
+  const readiness = await observeServiceReadiness(config, name, deadline);
+  if (readiness === "starting" || readiness === "needs-decision")
+    return readiness;
   throw new Error(
     `Service has not established its exact coordinator owner. The service log has the reason (a package that refuses the retained state says so there): \`journalctl --user -u ${name} -n 50 --no-pager\`. Inspect \`factory status\` and retained evidence, which are untouched`,
   );
@@ -569,10 +659,31 @@ export async function supervise(
   const config = readConfig(configPath);
   const path = unitPath(config),
     name = serviceName(config.repository);
-  if (action === "status") {
+  if (action === "status" || action === "check") {
     const registered = existsSync(path);
+    const host = supervisorHost();
+    const health = inspectBinding(config, registered);
+    let readiness: ServiceReadiness | "unavailable" | "held" = "unavailable";
+    let readinessDetail: string | undefined;
+    if (
+      registered &&
+      host.supported &&
+      health.bindingHealth.status === "usable"
+    ) {
+      try {
+        readiness = await observeServiceReadiness(
+          config,
+          name,
+          Date.now() + 15_000,
+        );
+      } catch {
+        readiness = "held";
+        readinessDetail =
+          "Exact service ownership could not be verified; inspect the unit and retained owner";
+      }
+    }
     return {
-      ...supervisorHost(),
+      ...host,
       unit: name,
       registered,
       active: inspect("is-active", name),
@@ -580,7 +691,9 @@ export async function supervise(
       ...(registered && awaitsDecision(name)
         ? { waitingFor: "human-decision" }
         : {}),
-      ...inspectBinding(config, registered),
+      ...health,
+      readiness,
+      ...(readinessDetail ? { readinessDetail } : {}),
     };
   }
   requireHost();
@@ -650,6 +763,8 @@ export async function supervise(
     const outcome = await verifyServiceOwner(config, name);
     return {
       active: inspect("is-active", name),
+      startRequested: true,
+      readiness: outcome,
       ...(outcome === "needs-decision" ? { waitingFor: "human-decision" } : {}),
     };
   }
@@ -681,7 +796,13 @@ export async function supervise(
       if (restart) {
         systemctl("start", name);
         try {
-          await verifyServiceOwner(config, name);
+          const readiness = await verifyServiceOwner(config, name);
+          return {
+            artifact: candidate.cli,
+            restarted: true,
+            readiness,
+            startRequested: true,
+          };
         } catch (error) {
           throw new Error(
             `${(error as Error).message}. The unit now runs ${candidate.cli}; to return to the previous package, which restarts the service, run \`${supervisorCommand("upgrade", configPath, { cli: value.cli })}\``,

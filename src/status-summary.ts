@@ -1460,6 +1460,8 @@ export interface ServiceStatusDocument {
     active?: string;
     enabled?: string;
     waitingFor?: string;
+    readiness?: string;
+    readinessDetail?: string;
     bindingHealth?: { diagnostics: { message: string; action: string }[] };
   };
   queue: {
@@ -1484,11 +1486,19 @@ export function renderServiceStatus(document: ServiceStatusDocument): string[] {
     lines.push("Service: not set up; `factory setup --background` sets it up");
   else {
     lines.push(
-      `Service: ${service.active ?? "unknown"}, ${service.enabled ?? "unknown"}${service.unit ? ` (${service.unit})` : ""}`,
+      `Service: ${service.active ?? "unknown"}, ${service.enabled ?? "unknown"}${service.readiness ? `, local readiness ${service.readiness}` : ""}${service.unit ? ` (${service.unit})` : ""}`,
     );
     for (const problem of service.bindingHealth?.diagnostics ?? [])
       lines.push(`  ${problem.message} ${problem.action}`);
-    if (
+    if (service.readiness === "starting")
+      lines.push(
+        "  Startup pending; `factory supervisor check` reports local owner readiness. Preserve the running service and retained state.",
+      );
+    else if (service.readiness === "held")
+      lines.push(
+        `  ${service.readinessDetail ?? "Local ownership is unverified"}; inspect the unit and retained state.`,
+      );
+    else if (
       service.waitingFor === "human-decision" &&
       !document.currentObjective &&
       !document.currentObjectiveError
