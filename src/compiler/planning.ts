@@ -1,3 +1,4 @@
+import { admitNativeReturn } from "./native-return.js";
 import { hasPrivateCheckpointScope } from "../recovery-checkpoint.js";
 import { assertDeclaredConditions } from "../adaptive-routing.js";
 import {
@@ -208,8 +209,11 @@ export async function generatePlannerStructured<T>(
           "Reconciled native planning output lacks its original literal return and durable receipt owner; preserve the settled session without fresh replay",
         ),
       );
-    if (result.nativeReturn)
-      await request.invocation?.retainNativeReturn?.(result.nativeReturn);
+    await admitNativeReturn(
+      request.invocation?.retainNativeReturn?.bind(request.invocation),
+      result.nativeReturn,
+      session.scope.repository,
+    );
     if (
       result.response === undefined ||
       result.session.currentTurn?.terminal !== "completed"

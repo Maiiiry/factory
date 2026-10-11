@@ -7,6 +7,7 @@ import { COMPILER_READINESS_GUIDANCE } from "../compiler-wire.js";
 import type {
   ApprovedPlaybookPin,
   ContentRef,
+  ContentStore,
   ExecutionProfileChoices,
   ModelInvocationContext,
   ModelInvocationObservation,
@@ -112,6 +113,44 @@ export interface PlanningRecoveryRecord {
     correction: string;
     review?: PlanningReviewRecord;
   }[];
+}
+
+/** Retain the current owned native original and complete its existing admission. */
+export async function retainPlanningNativeReturn(
+  args: {
+    record: PlanningRecoveryRecord;
+    invocationId: string;
+    phase: ModelInvocationPhase;
+    repository: string;
+    store: ContentStore;
+    save: () => void;
+  },
+  receipt: Parameters<
+    NonNullable<ModelInvocationContext["retainNativeReturn"]>
+  >[0],
+): Promise<"admission-complete"> {
+  const owner = args.record.invocations?.find(
+    (entry) => entry.id === args.invocationId && entry.phase === args.phase,
+  );
+  if (!owner || args.record.invocation?.id !== args.invocationId)
+    throw new Error("Native planning return has a superseded invocation owner");
+  const bytes = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 1,
+      invocationId: args.invocationId,
+      phase: args.phase,
+      ...receipt,
+    }),
+  );
+  const ref = await args.store.put(
+    Readable.toWeb(Readable.from([bytes])) as ReadableStream<Uint8Array>,
+    { mediaType: "application/json" },
+  );
+  owner.nativeReturns ??= [];
+  owner.nativeReturns.push(ref);
+  args.save();
+  await awaitCheckpointAdmission(args.repository, "explicit");
+  return "admission-complete";
 }
 
 class PlanningReviewBindingError extends Error {}
@@ -349,41 +388,25 @@ async function compilePlanAdmitted(
     ...(context.sessionState &&
     [17, 18, 19, 20].includes(context.sessionState.schemaVersion)
       ? {
-          retainNativeReturn: async (
-            receipt: Parameters<
-              NonNullable<ModelInvocationContext["retainNativeReturn"]>
-            >[0],
-          ) => {
-            const owner = record.invocations?.find(
-              (entry) => entry.id === id && entry.phase === phase,
-            );
-            if (!owner || record.invocation?.id !== id)
-              throw new Error(
-                "Native planning return has a superseded invocation owner",
-              );
-            const repository = context.sessionState!.repository;
-            const store =
-              context.contextResolver?.contentStore ??
-              new LocalContentStore(join(stateRoot(repository), "content"));
-            const bytes = Buffer.from(
-              JSON.stringify({
-                schemaVersion: 1,
+          retainNativeReturn: (receipt) =>
+            retainPlanningNativeReturn(
+              {
+                record,
                 invocationId: id,
                 phase,
-                ...receipt,
-              }),
-            );
-            const ref = await store.put(
-              Readable.toWeb(
-                Readable.from([bytes]),
-              ) as ReadableStream<Uint8Array>,
-              { mediaType: "application/json" },
-            );
-            owner.nativeReturns ??= [];
-            owner.nativeReturns.push(ref);
-            save();
-            await awaitCheckpointAdmission(repository, "explicit");
-          },
+                repository: context.sessionState!.repository,
+                store:
+                  context.contextResolver?.contentStore ??
+                  new LocalContentStore(
+                    join(
+                      stateRoot(context.sessionState!.repository),
+                      "content",
+                    ),
+                  ),
+                save,
+              },
+              receipt,
+            ),
         }
       : {}),
   });

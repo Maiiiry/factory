@@ -273,7 +273,7 @@ export type ModelInvocationObserver = ((
 export interface ModelInvocationContext {
   /** Awaited controller admission after recording each native attempt, before submission; absent on cached decode. */
   beforeProviderAttempt?: () => void | Promise<void>;
-  /** Exact native return retained by the controller before its last local copy is released. */
+  /** Exact native return retained before release. Confirm admission only after its durable checkpoint succeeds; void callers retain adapter admission. */
   retainNativeReturn?(receipt: {
     response: string;
     representation: "literal-agent-text" | "sdk-structured-value";
@@ -282,7 +282,7 @@ export interface ModelInvocationContext {
     providerSessionId?: string;
     terminal: "completed" | "failed" | "interrupted";
     usage?: ModelInvocationUsage;
-  }): Promise<void>;
+  }): Promise<"admission-complete"> | Promise<void>;
   invocationId: string;
   phase: ModelInvocationPhase;
   ordinal: number;
