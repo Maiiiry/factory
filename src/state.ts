@@ -1694,6 +1694,15 @@ export function parseFactoryState(
       if (execution.data !== undefined) {
         const active = record(execution.data, `work.${id}.execution.data`);
         if (
+          active.rejectedCollection !== undefined &&
+          (state.schemaVersion !== 17 ||
+            !["local", "openai-agents", "claude-managed-agents"].includes(
+              String(execution.provider),
+            ) ||
+            active.result !== undefined)
+        )
+          throw new Error("Invalid rejected collection disposition");
+        if (
           active.admissionBlockedAt !== undefined &&
           (state.schemaVersion !== 17 ||
             execution.provider !== "local" ||
