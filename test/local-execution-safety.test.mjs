@@ -703,21 +703,41 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         const originalGraph = graphDigest(reflected.graph);
         const originalCharges = structuredClone(reflected.charges);
         let reflectionSaves = 0;
-        const reflect = () => reflectWorkflow({
-          state: reflected, event: { kind: "completion", itemId: "schema" },
-          store, save: () => { reflectionSaves++; saveState(reflectedPath, reflected); },
-        });
+        const reflect = () =>
+          reflectWorkflow({
+            state: reflected,
+            event: { kind: "completion", itemId: "schema" },
+            store,
+            save: () => {
+              reflectionSaves++;
+              saveState(reflectedPath, reflected);
+            },
+          });
         const reflection = await reflect();
         assert.equal(reflection.action.kind, "existing-critical-path");
         assert.ok(reflection.action.eligibleItemIds.includes("api"));
         assert.equal(reflection.baseline.currentProofs, 0);
-        assert.ok(workflowStageObligations(reflected).every((proof) => proof.disposition === "missing"));
+        assert.ok(
+          workflowStageObligations(reflected).every(
+            (proof) => proof.disposition === "missing",
+          ),
+        );
         const retainedBody = await readWorkflowReflection(store, reflection);
-        assert.equal(retainedBody.observations.items.find((entry) => entry.id === "schema").changeRef, result.changeRef);
+        assert.equal(
+          retainedBody.observations.items.find((entry) => entry.id === "schema")
+            .changeRef,
+          result.changeRef,
+        );
         assert.equal(retainedBody.previousRecord, null);
         const reflectionSnapshot = readFileSync(reflectedPath, "utf8");
-        const reflectionReload = parseFactoryState(JSON.parse(reflectionSnapshot), reflected.repository, reflected.objective);
-        assert.deepEqual(reflectionReload.workflowReflection.records, [reflection]);
+        const reflectionReload = parseFactoryState(
+          JSON.parse(reflectionSnapshot),
+          reflected.repository,
+          reflected.objective,
+        );
+        assert.deepEqual(reflectionReload.workflowReflection.records, [
+          reflection,
+        ]);
         assert.equal((await reflect()).id, reflection.id);
         assert.equal(reflectionSaves, 1);
         assert.equal(readFileSync(reflectedPath, "utf8"), reflectionSnapshot);
@@ -726,15 +746,26 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         assert.deepEqual(reflected.charges, originalCharges);
         reflected.work.ui = structuredClone(roleReload.work.ui);
         const reassessed = await reflectWorkflow({
-          state: reflected, event: { kind: "completion", itemId: "ui" }, store,
-          save: () => { reflectionSaves++; saveState(reflectedPath, reflected); },
+          state: reflected,
+          event: { kind: "completion", itemId: "ui" },
+          store,
+          save: () => {
+            reflectionSaves++;
+            saveState(reflectedPath, reflected);
+          },
         });
         assert.equal(reassessed.assessment.outcome, "useful-progress");
         assert.equal(reassessed.assessment.completedItemDelta, 1);
         assert.equal(reassessed.assessment.currentProofDelta, 0);
-        const reassessmentBody = await readWorkflowReflection(store, reassessed);
+        const reassessmentBody = await readWorkflowReflection(
+          store,
+          reassessed,
+        );
         assert.deepEqual(reassessmentBody.previousRecord, reflection);
-        assert.deepEqual(await readWorkflowReflection(store, reassessmentBody.previousRecord), retainedBody);
+        assert.deepEqual(
+          await readWorkflowReflection(store, reassessmentBody.previousRecord),
+          retainedBody,
+        );
         assert.equal(reflectionSaves, 2);
       }
       saveState(rolePath, roleReload);
@@ -1739,21 +1770,54 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       },
     };
     planner.checkpoint(intent);
-    const unknownTurnSnapshot = readContinuation(preparation.repository, preparation.objective);
-    const unknownTurnDocument = continuationStatusDocument(unknownTurnSnapshot,
-      preparation.repository, preparation.objective, "regular", [pinnedBody], undefined, false);
+    const unknownTurnSnapshot = readContinuation(
+      preparation.repository,
+      preparation.objective,
+    );
+    const unknownTurnDocument = continuationStatusDocument(
+      unknownTurnSnapshot,
+      preparation.repository,
+      preparation.objective,
+      "regular",
+      [pinnedBody],
+      undefined,
+      false,
+    );
     const guidance = unknownTurnDocument.prerequisiteGuidance;
-    const unknownTurn = guidance.entries.find((entry) => entry.kind === "unknown-effect" && entry.scope.startsWith("session:"));
+    const unknownTurn = guidance.entries.find(
+      (entry) =>
+        entry.kind === "unknown-effect" && entry.scope.startsWith("session:"),
+    );
     assert.equal(unknownTurn.owner, "controller");
-    assert.equal(unknownTurn.nextAction.command, `factory status --objective ${preparation.objective}`);
+    assert.equal(
+      unknownTurn.nextAction.command,
+      `factory status --objective ${preparation.objective}`,
+    );
     assert.equal(unknownTurnDocument.phase, "waiting");
     assert.equal(guidance.control.owner, "absent");
     assert.equal(guidance.binding.runId, preparation.runId);
     assert.equal(guidance.binding.configDigest, preparation.configDigest);
-    assert.ok(Object.isFrozen(guidance) && Object.isFrozen(guidance.entries) && Object.isFrozen(unknownTurn));
-    assert.equal(JSON.stringify(unknownTurnDocument).includes(pinnedBody), false);
-    assert.equal(continuationStatusDocument(unknownTurnSnapshot, preparation.repository,
-      preparation.objective, "regular", [pinnedBody], undefined, false).prerequisiteGuidance.digest, guidance.digest);
+    assert.ok(
+      Object.isFrozen(guidance) &&
+        Object.isFrozen(guidance.entries) &&
+        Object.isFrozen(unknownTurn),
+    );
+    assert.equal(
+      JSON.stringify(unknownTurnDocument).includes(pinnedBody),
+      false,
+    );
+    assert.equal(
+      continuationStatusDocument(
+        unknownTurnSnapshot,
+        preparation.repository,
+        preparation.objective,
+        "regular",
+        [pinnedBody],
+        undefined,
+        false,
+      ).prerequisiteGuidance.digest,
+      guidance.digest,
+    );
     await assert.rejects(
       () =>
         releaseAgentSessions(
@@ -1819,9 +1883,21 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       preparation.repository,
       preparation.objective,
     );
-    assert.equal(continuationStatusDocument(resumedPreparation, preparation.repository,
-      preparation.objective, "regular", [pinnedBody], undefined, false).prerequisiteGuidance.entries.some(
-        (entry) => entry.kind === "unknown-effect" && entry.scope.startsWith("session:")), false);
+    assert.equal(
+      continuationStatusDocument(
+        resumedPreparation,
+        preparation.repository,
+        preparation.objective,
+        "regular",
+        [pinnedBody],
+        undefined,
+        false,
+      ).prerequisiteGuidance.entries.some(
+        (entry) =>
+          entry.kind === "unknown-effect" && entry.scope.startsWith("session:"),
+      ),
+      false,
+    );
     const activated = {
       ...structuredClone(loaded),
       objectiveBodyDigest: preparation.objectiveBodyDigest,
