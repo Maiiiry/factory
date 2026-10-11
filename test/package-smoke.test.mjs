@@ -101,6 +101,9 @@ test("packed Factory installs offline and runs its CLI and bundled scanner", () 
       "skills/director/SKILL.md",
       "skills/setup/SKILL.md",
       "docs/USER-GUIDE.md",
+      "assets/recipes/repository-migration.json",
+      "assets/recipes/api-feature.json",
+      "assets/recipes/bounded-audit.json",
       "THIRD_PARTY_NOTICES.md",
     ]) {
       assert.ok(
@@ -290,6 +293,43 @@ assert.throws(() => assertPinnedNpmScripts(checkout, rawBase, rawChanged, [boots
     const installedConfig = JSON.parse(readFileSync(config, "utf8"));
     assert.equal(installedConfig.repository, "example/package-smoke");
     assert.equal(installedConfig.checkout, checkout);
+    const recipeConfig = join(root, "recipe-config.json");
+    writeFileSync(
+      recipeConfig,
+      JSON.stringify({
+        ...installedConfig,
+        planningContext: {
+          enabled: true,
+          selectors: ["app.mjs"],
+          bounds: {
+            maxRounds: 4,
+            maxRequestsPerRound: 8,
+            maxResults: 64,
+            maxBytes: 262144,
+            maxElapsedMs: 30000,
+            maxProviderCalls: 8,
+          },
+        },
+      }),
+    );
+    const recipeObjective = join(root, "recipe-objective.md");
+    writeFileSync(
+      recipeObjective,
+      '## Adaptive workflow\n\nenabled\n\n## Workflow recipe\n\n```json\n{"selector":"plugin:repository-migration","arguments":{"selectors":["app.mjs"],"maxChildren":2}}\n```\n',
+    );
+    const recipePreview = JSON.parse(
+      run("recipe", "--file", recipeObjective, "--config", recipeConfig),
+    );
+    assert.equal(recipePreview.admission, "preview-only");
+    assert.equal(recipePreview.status, "ready");
+    assert.equal(recipePreview.origin.kind, "plugin");
+    assert.equal(recipePreview.baseSha, git("rev-parse", "HEAD").trim());
+    assert.equal(recipePreview.estimates.dynamicItems.maximum, 2);
+    assert.equal(recipePreview.estimates.cost, "unknown");
+    assert.equal(
+      existsSync(join(environment.XDG_STATE_HOME, "clockgrove-factory")),
+      false,
+    );
     const nativeAnalysis = JSON.parse(
       run(
         "diagnostics",

@@ -1,4 +1,14 @@
 export { observeModelInvocation } from "./compiler/observation.js";
+export {
+  objectiveWorkflowRecipeSelector,
+  resolveWorkflowRecipe,
+  previewWorkflowRecipe,
+  retainWorkflowRecipe,
+  readPinnedWorkflowRecipe,
+  type WorkflowRecipeInput,
+  type WorkflowRecipePin,
+  type WorkflowRecipePreview,
+} from "./workflow-recipes.js";
 
 export {
   bindPlanningPlaybook,

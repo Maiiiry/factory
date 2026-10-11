@@ -36,6 +36,8 @@ const commandFlags: Record<string, string[]> = {
   propose: ["source", "output", "file", "approve", "enqueue"],
   dream: [
     "budget-bytes",
+    "input-budget-bytes",
+    "preview",
     "file",
     "approve",
     "reject",
@@ -43,6 +45,7 @@ const commandFlags: Record<string, string[]> = {
     "record",
     "objective",
   ],
+  recipe: ["file"],
   run: ["objective", "deadline"],
   queue: [],
   supervisor: ["cli", "disable", "service-credential"],
@@ -89,6 +92,7 @@ export const booleanFlags = new Set([
   "rereview",
   "show",
   "record",
+  "preview",
 ]);
 const removedFlags = ["source", "authority", "admission", "abandon"];
 /** Flags dropped when running a command became its own consent. */

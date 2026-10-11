@@ -52,6 +52,7 @@ import {
   renderStatusText,
 } from "./status-summary.js";
 import { checkIntakeServiceState, supervise } from "./supervision.js";
+import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
 
 /** Whether a live controller owns this Objective; null when a lock is unreadable. */
 function controllerActive(
@@ -87,9 +88,11 @@ function help(): void {
       "  propose --source DOC#HEADING [--output ABSOLUTE_NEW_FILE]",
       "  propose --file ABSOLUTE_FILE --approve SHA256 [--enqueue]",
       "      Draft and review Objectives, then explicitly approve their exact file before issue creation",
-      "  dream [--budget-bytes N] | --show | --record --objective N",
+      "  dream [--input-budget-bytes N] [--budget-bytes N] [--preview] | --show | --record --objective N",
       "  dream --file ABSOLUTE_DRAFT --approve|--reject SHA256",
       "      Collect terminal experience, propose a compact playbook, then explicitly approve its exact draft before advisory use",
+      "  recipe --file ABSOLUTE_OBJECTIVE",
+      "      Preview a pinned workflow recipe against the current checkout without model calls or admission",
       "  run --objective N [--deadline ISO_TIMESTAMP]",
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
       "  queue add N [N ...] | list | remove N | pause | resume | drain",
@@ -331,6 +334,8 @@ async function main(): Promise<void> {
   if (command === "propose")
     return runProposeCommand(readConfig(path), args, path);
   if (command === "dream") return runDreamCommand(readConfig(path), args, path);
+  if (command === "recipe")
+    return runWorkflowRecipePreview(readConfig(path), args);
   if (command === "queue") return queueCommand(args, path);
   if (command === "supervisor") return supervisorCommand(args, path);
   if (command === "status" && option(args, "objective") === undefined)

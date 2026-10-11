@@ -631,13 +631,43 @@ sha256sum /private/existing-dir/objectives.json
 factory propose --file /private/existing-dir/objectives.json --approve REVIEWED_SHA256 --enqueue --config /private/factory.json
 ```
 
+## Workflow recipes
+
+A recipe selects a reusable workflow shape without changing the Objective's requirements, commands or permissions. Enable the adaptive workflow and configure its planning selectors and lookup bounds first. Declare one recipe in the Objective:
+
+````markdown
+## Workflow recipe
+
+```json
+{
+  "selector": "plugin:repository-migration",
+  "arguments": {
+    "selectors": ["src/"],
+    "maxFilesPerChild": 12,
+    "maxChildren": 8
+  }
+}
+```
+````
+
+Repository recipes are regular Git files at `.factory/recipes/<id>.json`. An unqualified selector prefers the repository definition; `repository:` and `plugin:` choose their namespace explicitly. An invalid repository definition fails instead of silently selecting the packaged recipe. Typed arguments resolve selectors, stages and finite expansion limits; they are never shell interpolation or command authority.
+
+Preview the declaration against the current checkout before admission:
+
+```sh
+factory recipe --file /private/objective.md --config /private/factory.json
+```
+
+Preview reports the exact local base and definition, resolved arguments, stages, memory inputs, expansion ceilings and missing prerequisites. It makes no model call, publishes nothing and admits no work. Unverified adapter prerequisites remain explicit. Task totals, duration, calls and cost remain unknown where discovery or execution has not occurred. Actual admission resolves the declaration at the fetched Objective base, verifies capabilities and pins both original definition and resolved bytes. Restart authenticates that pin; later recipe edits affect only new admissions.
+
 ## Learning and Dream
 
-Learning episodes retain terminal Objective history privately and append-only. Collect an episode explicitly without a model call; nonterminal, unsettled or unknown work is refused. `dream` makes one bounded proposal pass through the configured provider, producing an editable private draft outside the target checkout. Its default active playbook budget is 16 KiB; later proposals retain the existing budget unless you specify `--budget-bytes N`. Dream does not approve its own proposal or start an Objective.
+Learning episodes retain terminal Objective history privately and append-only. Collect an episode explicitly without a model call; nonterminal, unsettled or unknown work is refused. `dream` makes one bounded proposal pass through the configured provider, producing an editable private draft outside the target checkout. Its default active playbook budget is 16 KiB; later proposals retain the existing budget unless you specify `--budget-bytes N`. Dream does not approve its own proposal or start an Objective. Input selection has its own byte allowance: `--input-budget-bytes N` overrides the admitted retrieval allowance for this consolidation, separately from the active playbook budget. Shared retrieval selects bounded new or relevant settled episodes; complete prior guidance and its attribution remain required. Included and deferred records, complete input bytes and their digests are retained before submission.
 
 ```sh
 factory dream --record --objective N --config /private/factory.json
-factory dream --config /private/factory.json
+factory dream --preview --input-budget-bytes 262144 --config /private/factory.json
+factory dream --input-budget-bytes 262144 --config /private/factory.json
 # Review/edit the printed draft path, then hash the exact bytes you reviewed
 sha256sum /private/learning/proposals/ID.draft.json
 factory dream --file /private/learning/proposals/ID.draft.json --approve REVIEWED_SHA256 --config /private/factory.json
@@ -646,9 +676,9 @@ factory dream --file /private/learning/proposals/ID.draft.json --reject REVIEWED
 factory dream --show --config /private/factory.json
 ```
 
-Use the actual path and next commands printed by Dream; drafts default to the repository's private state `learning/proposals/` directory. Review consolidated entries, source links, dated summaries and contradictions before approval. Merge or retire redundant guidance to fit the budget while preserving original episodes and sources. After editing, recompute the file digest; approval or rejection applies only to those exact bytes. `--show` reads the current approved playbook without a model call.
+Use the actual path and next commands printed by Dream; drafts default to the repository's private state `learning/proposals/` directory. Review consolidated entries, source links, dated summaries and contradictions before approval. Merge or retire redundant guidance to fit the budget while preserving original episodes and sources. After editing, recompute the file digest; approval or rejection applies only to those exact bytes. `--preview` retains and displays the bounded selection checkpoint without a model call. `--show` reads the current approved playbook and any unresolved Dream submissions without a model call. A submission with no authenticated native terminal receipt remains unknown and prevents a new Dream pass; repeating the command does not resolve the old submission or replenish its allowance.
 
-Only an approved compact version enters subsequent Objective planning and review inputs. Each Objective pins its version: later approval cannot change an active run. Learning is advisory, never command authority, permission or acceptance evidence, and it cannot override pinned Sources or limits. Episodes and drafts stay private locally and may be sent only to the already configured provider when Dream is authorized; review source-derived private text before sharing it.
+Only an approved compact version enters subsequent Objective planning and review inputs. Each Objective pins its version: later approval cannot change an active run. Learning is advisory, never command authority, permission or acceptance evidence, and it cannot override pinned Sources or limits. Episodes, exact proposals/reviewed drafts, decisions, revisions, provider receipts and selection checkpoints remain private attributable originals. Their complete reference closure is available for persistence; a catalog entry alone cannot restore an approval. Current storage is local and does not claim remote Git durability. They may be sent only to the already configured provider when Dream is authorized; review source-derived private text before sharing it.
 
 ## GitHub progress check-ins
 
