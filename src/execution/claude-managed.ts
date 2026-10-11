@@ -132,6 +132,7 @@ const interrupted = (detail: string): ExecutionObservation => ({
 
 /** Provider semantics are implemented here; live proof remains the separate #259 qualification. */
 export class ClaudeManagedExecutionDriver implements ExecutionDriver {
+  readonly childAgents = "disabled" as const;
   private readonly client: ClaudeManagedClient;
   constructor(
     private readonly args: {

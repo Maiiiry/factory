@@ -182,6 +182,7 @@ interface Active {
   artifact?: { id: string; digest: string; bytes: number; turnId: string };
 }
 export class OpenAIManagedExecutionDriver implements ExecutionDriver {
+  readonly childAgents = "disabled" as const;
   private client: OpenAIManagedTransport;
   constructor(
     private args: {

@@ -130,6 +130,7 @@ export class GitHubCopilotSdkHarness implements AgentHarness {
   // fresh until native account, installed restart and workspace binding qualify it.
   readonly sessionCapabilities = undefined;
   readonly capabilities = {
+    childAgents: "disabled",
     protocolVersion: 1,
     worktree: "factory-owned-read-write",
     head: "preserve",

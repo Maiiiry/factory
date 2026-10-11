@@ -174,6 +174,7 @@ export class CodexHarness implements AgentHarness {
   readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly sessionAdapter = "codex";
   readonly capabilities = {
+    childAgents: "disabled",
     protocolVersion: 1,
     worktree: "factory-owned-read-write",
     head: "preserve",
@@ -237,6 +238,7 @@ export class CodexHarness implements AgentHarness {
           network: this.network,
           allowedSecretNames: [...this.allowedSecretNames].sort(),
           executionBinding: request.item.executionBinding,
+          ...(request.childAgents && { childAgents: request.childAgents }),
         }),
       )
       .digest("hex");
@@ -990,6 +992,7 @@ export function checkpointWorkerSession(
 }
 
 export class LocalExecutionDriver implements ExecutionDriver {
+  readonly childAgents = "disabled" as const;
   readonly readonlyDiscovery = "selector-bound-read-only-v1" as const;
   readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly freshCheckoutReadiness = true as const;
@@ -1183,6 +1186,14 @@ export class LocalExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionHandle> {
     const harness = this.resolveHarness(request.item);
+    if (
+      request.childAgents !== undefined &&
+      (request.childAgents !== "disabled" ||
+        harness.capabilities.childAgents !== "disabled")
+    )
+      throw new Error(
+        "Assigned execution adapter cannot enforce the requested native child-agent prohibition; no provider call was made",
+      );
     this.assertDiscoveryCapability(request.item, harness);
     if (request.item.kind === "discovery") {
       if (
@@ -1429,6 +1440,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
         ...(workerReadiness && { receiptDigest: workerReadiness.digest }),
       });
       const handle = await harness.start({
+        ...(request.childAgents && { childAgents: request.childAgents }),
         ...(request.discovery &&
           discoveryBody && {
             discovery: {
