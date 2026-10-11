@@ -245,10 +245,12 @@ export function createApplication(
     if (
       services.planningModel.providerAttemptAdmission !==
         "controller-checkpoint-v1" ||
-      services.driver.effectAdmission !== "controller-checkpoint-v1"
+      services.driver.effectAdmission !== "controller-checkpoint-v1" ||
+      services.github.effectAdmission !== "controller-checkpoint-v1" ||
+      services.delivery.effectAdmission !== "controller-checkpoint-v1"
     )
       throw new Error(
-        "Git-backed continuation requires planning and execution adapters that enforce checkpoint admission",
+        "Git-backed continuation requires planning, execution, GitHub and delivery adapters that enforce checkpoint admission",
       );
   }
   const checkpoint = checkpointOperations(config);
@@ -258,8 +260,15 @@ export function createApplication(
         enqueueIntake(config, services.github, objectives),
       ),
     runIntake: () => checkpoint.async(() => runIntake(config, services)),
-    planObjective: (objective) =>
-      checkpoint.async(() => planObjective(config, objective, services)),
+    planObjective: (objective) => {
+      if (config.gitPersistence?.scope === "private-history")
+        return Promise.reject(
+          new Error(
+            "Use runObjective for Git-backed planning; transient plan previews have no continuation journal",
+          ),
+        );
+      return checkpoint.async(() => planObjective(config, objective, services));
+    },
     decidePlan: (objective, input) =>
       checkpoint.async(() => decidePlan(config, objective, services, input)),
     decide: (objective, input) =>
@@ -393,8 +402,15 @@ export function composePlanning(
     throw new Error("Git-backed planning requires checkpoint admission");
   const checkpoint = checkpointOperations(config);
   return {
-    planObjective: (objective) =>
-      checkpoint.async(() => planObjective(config, objective, services)),
+    planObjective: (objective) => {
+      if (config.gitPersistence?.scope === "private-history")
+        return Promise.reject(
+          new Error(
+            "Use runObjective for Git-backed planning; transient plan previews have no continuation journal",
+          ),
+        );
+      return checkpoint.async(() => planObjective(config, objective, services));
+    },
     decidePlan: (objective, input) =>
       checkpoint.async(() => decidePlan(config, objective, services, input)),
     decide: (objective, input) =>
