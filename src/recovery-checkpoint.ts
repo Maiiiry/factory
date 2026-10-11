@@ -9,6 +9,7 @@ import {
   fsyncSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   realpathSync,
@@ -16,6 +17,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   factoryAuthorityDigest,
@@ -988,6 +990,7 @@ function git(
   options: GitPersistenceConfig,
   args: string[],
   input?: Uint8Array | string,
+  cwd?: string,
 ): Buffer {
   return execFileSync(
     "git",
@@ -1001,6 +1004,7 @@ function git(
     ],
     {
       env: pinnedGitEnvironment(),
+      cwd,
       input,
       timeout: options.timeoutMs,
       maxBuffer: options.maxBytes + 65536,
@@ -1355,6 +1359,129 @@ function closureIdentity(value: RecoveryCheckpointClosure): string {
     gaps: ordered(value.gaps),
   });
 }
+// A transport batch bounds framing and argv overhead; archive admission limits
+// and every body's exact identity still apply to the complete collection.
+const BODY_BATCH_SIZE = 64;
+function assertBodyBounds(
+  refs: readonly ContentRef[],
+  options: GitPersistenceConfig,
+): void {
+  for (const ref of refs) assertRef(ref);
+  if (
+    refs.length > options.maxFiles ||
+    new Set(refs.map((ref) => ref.digest)).size !== refs.length ||
+    refs.reduce((sum, ref) => sum + ref.bytes, 0) > options.maxBytes
+  )
+    throw new Error("Checkpoint body batch exceeds admitted bounds");
+}
+export function readRecoveryCheckpointBodies(
+  directory: string,
+  options: GitPersistenceConfig,
+  entries: readonly { ref: ContentRef; oid: string }[],
+): Map<string, Buffer> {
+  assertBodyBounds(
+    entries.map(({ ref }) => ref),
+    options,
+  );
+  const bodies = new Map<string, Buffer>();
+  for (let offset = 0; offset < entries.length; offset += BODY_BATCH_SIZE) {
+    const batch = entries.slice(offset, offset + BODY_BATCH_SIZE);
+    if (batch.some(({ oid }) => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)))
+      throw new Error("Checkpoint body Git identity is invalid");
+    const output = git(
+      directory,
+      options,
+      ["cat-file", "--batch"],
+      batch.map(({ oid }) => `${oid}\n`).join(""),
+    );
+    let cursor = 0;
+    for (const { ref, oid } of batch) {
+      const end = output.indexOf(10, cursor);
+      const expected = `${oid} blob ${ref.bytes}`;
+      if (
+        end === -1 ||
+        !output.subarray(cursor, end).equals(Buffer.from(expected))
+      )
+        throw new Error("Checkpoint body batch identity, type or size differs");
+      cursor = end + 1;
+      const bytes = output.subarray(cursor, cursor + ref.bytes);
+      cursor += ref.bytes;
+      if (
+        bytes.length !== ref.bytes ||
+        output[cursor] !== 10 ||
+        hash(bytes) !== ref.digest
+      )
+        throw new Error(
+          "Fetched checkpoint body failed exact digest verification",
+        );
+      cursor++;
+      bodies.set(ref.digest, bytes);
+    }
+    if (cursor !== output.length)
+      throw new Error("Checkpoint body batch contains extra bytes");
+  }
+  return bodies;
+}
+export function writeRecoveryCheckpointBodies(
+  directory: string,
+  options: GitPersistenceConfig,
+  bodies: readonly { ref: ContentRef; bytes: Uint8Array }[],
+): { ref: ContentRef; oid: string }[] {
+  assertBodyBounds(
+    bodies.map(({ ref }) => ref),
+    options,
+  );
+  if (!bodies.length) return [];
+  const temporary = mkdtempSync(join(tmpdir(), "factory-checkpoint-bodies-"));
+  const entries: { ref: ContentRef; oid: string }[] = [];
+  try {
+    for (let offset = 0; offset < bodies.length; offset += BODY_BATCH_SIZE) {
+      const batch = bodies.slice(offset, offset + BODY_BATCH_SIZE);
+      const files = batch.map(({ ref, bytes }) => {
+        if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+          throw new Error("Checkpoint write body differs from exact reference");
+        const path = join(temporary, ref.digest);
+        writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
+        return path;
+      });
+      const output = git(
+        resolve(directory),
+        options,
+        [
+          "hash-object",
+          "--no-filters",
+          "-w",
+          "--",
+          ...batch.map(({ ref }) => ref.digest),
+        ],
+        undefined,
+        temporary,
+      ).toString("utf8");
+      const oids = output.split("\n");
+      if (oids.pop() !== "" || oids.length !== batch.length)
+        throw new Error("Checkpoint written Git identities are incomplete");
+      for (let index = 0; index < batch.length; index++) {
+        const oid = oids[index]!;
+        const { ref, bytes } = batch[index]!;
+        if (
+          !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid) ||
+          createHash(oid.length === 40 ? "sha1" : "sha256")
+            .update(`blob ${bytes.length}\0`)
+            .update(bytes)
+            .digest("hex") !== oid
+        )
+          throw new Error(
+            "Checkpoint written Git identity differs from exact bytes",
+          );
+        entries.push({ ref, oid });
+        rmSync(files[index]!);
+      }
+    }
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+  return entries;
+}
 export function recoveryCheckpointClosureDigest(
   closure: RecoveryCheckpointClosure,
 ): string {
@@ -1385,6 +1512,7 @@ function readArchive(
       "Checkpoint manifest does not retain canonical exact bytes",
     );
   const refs = allRefs(manifest);
+  const objectIds = new Map<string, string>();
   const names = git(directory, options, [
     "ls-tree",
     "-rz",
@@ -1396,10 +1524,16 @@ function readArchive(
     .filter(Boolean)
     .map((line) => {
       const tab = line.indexOf("\t");
-      const [mode, type] = line.slice(0, tab).split(" ");
-      if (mode !== "100644" || type !== "blob")
+      const [mode, type, oid] = line.slice(0, tab).split(" ");
+      if (
+        mode !== "100644" ||
+        type !== "blob" ||
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid!)
+      )
         throw new Error("Archive contains nonregular payload entries");
-      return line.slice(tab + 1);
+      const path = line.slice(tab + 1);
+      objectIds.set(path, oid!);
+      return path;
     })
     .sort();
   const expected = [
@@ -1408,18 +1542,11 @@ function readArchive(
   ].sort();
   if (canonical(names) !== canonical(expected))
     throw new Error("Archive contains unexpected or missing bytes");
-  const blobs = new Map<string, Buffer>();
-  for (const ref of refs) {
-    const bytes = git(directory, options, [
-      "show",
-      `${commitSha}:blobs/${ref.digest}`,
-    ]);
-    if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
-      throw new Error(
-        "Fetched checkpoint body failed exact digest verification",
-      );
-    blobs.set(ref.digest, bytes);
-  }
+  const blobs = readRecoveryCheckpointBodies(
+    directory,
+    options,
+    refs.map((ref) => ({ ref, oid: objectIds.get(`blobs/${ref.digest}`)! })),
+  );
   return {
     manifest,
     blobs,
@@ -2311,12 +2438,7 @@ async function publishCheckpoint(
     )
       .toString("utf8")
       .trim();
-    const blobEntries = blobs.map(({ ref, bytes }) => ({
-      ref,
-      oid: git(p.git, options, ["hash-object", "-w", "--stdin"], bytes)
-        .toString("utf8")
-        .trim(),
-    }));
+    const blobEntries = writeRecoveryCheckpointBodies(p.git, options, blobs);
     const blobsTree = git(
       p.git,
       options,
