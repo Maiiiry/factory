@@ -317,6 +317,8 @@ export interface FactoryState {
   /** Charged failure events (see repair-policy.ts). */
   charges?: import("./repair-policy.js").RepairLedger["charges"];
   backlogDiscoveries?: import("./graph-amendments.js").AmendmentProposal[];
+  /** Start admissions charged before discovery effects; survives replacement WorkState. */
+  discoveryAttemptCounts?: Record<string, number>;
   graphRevisions?: import("./graph-amendments.js").GraphRevision[];
   pendingAmendment?: import("./graph-amendments.js").PendingAmendment;
   /** Superseded known rejections retain their original proposal and evidence. */
@@ -827,6 +829,43 @@ export function parseFactoryState(
       )
     )
       throw new Error(`${id}.validation is invalid`);
+  }
+  if (state.discoveryAttemptCounts !== undefined) {
+    if (state.schemaVersion !== 9)
+      throw new Error(
+        "Discovery start admissions require execution schema version 9",
+      );
+    const counts = record(
+      state.discoveryAttemptCounts,
+      "discoveryAttemptCounts",
+    );
+    const revisions =
+      (state.graphRevisions as FactoryState["graphRevisions"]) ?? [];
+    for (const [id, count] of Object.entries(counts)) {
+      // Accepted revisions retain historical identities; counters are never dropped
+      // merely because a graph no longer selects their discovery item.
+      const admitted =
+        (graph.items as WorkGraph["items"]).find(
+          (item) => item.id === id && item.kind === "discovery",
+        ) ??
+        [...revisions]
+          .reverse()
+          .flatMap((revision) => revision.graph.items)
+          .find((item) => item.id === id && item.kind === "discovery");
+      if (!admitted?.discovery)
+        throw new Error(
+          `Discovery start admissions name an unadmitted item ${id}`,
+        );
+      assertDiscoverySpecification(admitted.discovery);
+      if (
+        !Number.isSafeInteger(count) ||
+        Number(count) < 0 ||
+        Number(count) > admitted.discovery.allowance.maxAttempts
+      )
+        throw new Error(
+          `Discovery start admissions exceed the recorded allowance for ${id}`,
+        );
+    }
   }
   if (
     state.schemaVersion === 9 &&
