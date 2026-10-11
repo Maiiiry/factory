@@ -429,17 +429,18 @@ export function createPlanningContextResolver(input: {
         );
       if (!results.length)
         return answer(
-          metadata.complete ? "no-match" : "incomplete",
-          metadata.complete
-            ? "No retained match in the admitted eligible memory scope"
-            : "Eligible manifest inventory is incomplete; absence remains unknown",
+          metadata.unavailable.length ? "incomplete" : "no-match",
+          metadata.unavailable.length
+            ? "Retained manifest integrity or availability gaps leave scoped absence unknown"
+            : "No retained match in the admitted eligible memory scope",
         );
       const disposition: ContextResult["disposition"] = results.some(
         (result) => result.disposition === "unavailable",
       )
         ? "unavailable"
         : results.some((result) => result.disposition === "incomplete") ||
-            (request.operation === "search" && !metadata.complete) ||
+            (request.operation === "search" &&
+              metadata.unavailable.length > 0) ||
             (request.operation === "search" &&
               results.length === Math.min(16, remaining.maxResults))
           ? "incomplete"
