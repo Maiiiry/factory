@@ -1807,6 +1807,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
     this.active.delete(handle.identity);
     if (
       collected ||
+      active.request.discovery ||
       !existsSync(join(active.worktree, ".factory-discovery.json"))
     )
       await this.removeExecutionDirectory(active.worktree);
