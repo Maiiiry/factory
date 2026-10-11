@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ContentRef, ContentStore } from "./contracts.js";
+import { judgedAsWork } from "./fault.js";
 import { ownsPath, validOwnershipPath } from "./ownership.js";
 import { pinnedGit, pinnedGitRaw } from "./process.js";
 
@@ -58,6 +59,116 @@ export interface DiscoveryOutputManifest {
   selectedEntries: number;
   body: ContentRef;
   disposition: "observation" | "advisory";
+}
+
+export interface DiscoveryExecutionInput {
+  manifest: DiscoveryOutputManifest;
+}
+export interface DiscoveryHarnessInput extends DiscoveryExecutionInput {
+  body: DiscoveryBody;
+}
+
+export const DISCOVERY_OUTPUT_FIELDS = [
+  "path",
+  "mode",
+  "blobSha",
+  "contentRef",
+  "classification",
+] as const;
+export type DiscoveryOutputField = (typeof DISCOVERY_OUTPUT_FIELDS)[number];
+
+/** Explicit field selection keeps provenance and completeness with every selected row. */
+export function selectDiscoveryOutputFields(
+  body: DiscoveryBody,
+  fields: readonly DiscoveryOutputField[],
+): unknown[] {
+  if (
+    !fields.length ||
+    new Set(fields).size !== fields.length ||
+    fields.some((field) => !DISCOVERY_OUTPUT_FIELDS.includes(field))
+  )
+    throw new Error(
+      "Discovery input must select supported distinct declared fields",
+    );
+  return body.entries.map((entry) =>
+    Object.fromEntries(
+      fields.map((field) => [
+        field,
+        field === "contentRef" ? entry.content : (entry[field] ?? null),
+      ]),
+    ),
+  );
+}
+
+export function assertDiscoveryOutputManifest(
+  value: unknown,
+): asserts value is DiscoveryOutputManifest {
+  const manifest = object(value, "Discovery manifest");
+  keys(
+    manifest,
+    [
+      "schemaVersion",
+      "producer",
+      "role",
+      "schema",
+      "specificationDigest",
+      "source",
+      "status",
+      "selectedEntries",
+      "body",
+      "disposition",
+    ],
+    "Discovery manifest",
+  );
+  const producer = object(manifest.producer, "Discovery producer");
+  keys(
+    producer,
+    ["objective", "runId", "itemId", "attemptId"],
+    "Discovery producer",
+  );
+  const source = object(manifest.source, "Discovery source");
+  keys(source, ["commitSha", "treeSha", "selectors"], "Discovery source");
+  const body = object(manifest.body, "Discovery content reference");
+  keys(body, ["digest", "bytes", "mediaType"], "Discovery content reference");
+  if (
+    manifest.schemaVersion !== 1 ||
+    manifest.schema !== "factory.repository-inventory/v1" ||
+    typeof manifest.role !== "string" ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(manifest.role) ||
+    typeof manifest.specificationDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(manifest.specificationDigest) ||
+    typeof producer.objective !== "number" ||
+    !Number.isSafeInteger(producer.objective) ||
+    producer.objective <= 0 ||
+    [producer.runId, producer.itemId, producer.attemptId].some(
+      (id) => typeof id !== "string" || !id.trim(),
+    ) ||
+    [source.commitSha, source.treeSha].some(
+      (sha) => typeof sha !== "string" || !/^[0-9a-f]{40,64}$/.test(sha),
+    ) ||
+    !Array.isArray(source.selectors) ||
+    !source.selectors.length ||
+    source.selectors.some(
+      (path) => typeof path !== "string" || !validOwnershipPath(path),
+    ) ||
+    typeof manifest.selectedEntries !== "number" ||
+    !Number.isSafeInteger(manifest.selectedEntries) ||
+    manifest.selectedEntries < 0 ||
+    !["complete", "partial", "unreadable", "truncated", "failed"].includes(
+      String(manifest.status),
+    ) ||
+    (manifest.disposition !== "observation" &&
+      manifest.disposition !== "advisory") ||
+    body.mediaType !== "application/json" ||
+    typeof body.digest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(body.digest) ||
+    typeof body.bytes !== "number" ||
+    !Number.isSafeInteger(body.bytes) ||
+    body.bytes <= 0
+  )
+    throw new Error(
+      "Discovery output manifest has invalid source, identity or completeness bindings",
+    );
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -167,24 +278,92 @@ async function put(
   );
 }
 
+export function assertDiscoveryBody(
+  value: unknown,
+): asserts value is DiscoveryBody {
+  const body = object(value, "Discovery body");
+  keys(body, ["schema", "entries", "failures", "semantic"], "Discovery body");
+  if (
+    body.schema !== "factory.repository-inventory/v1" ||
+    !Array.isArray(body.entries) ||
+    !Array.isArray(body.failures)
+  )
+    throw new Error("Discovery body has an unsupported schema");
+  const paths = new Set<string>();
+  for (const value of body.entries) {
+    const entry = object(value, "Discovery entry");
+    keys(
+      entry,
+      ["path", "mode", "blobSha", "content", "classification"],
+      "Discovery entry",
+    );
+    const ref = object(entry.content, "Discovery source reference");
+    keys(ref, ["digest", "bytes", "mediaType"], "Discovery source reference");
+    if (
+      typeof entry.path !== "string" ||
+      !entry.path ||
+      entry.path
+        .split("/")
+        .some((part) => !part || part === "." || part === "..") ||
+      paths.has(entry.path) ||
+      !["100644", "100755", "120000"].includes(String(entry.mode)) ||
+      typeof entry.blobSha !== "string" ||
+      !/^[0-9a-f]{40,64}$/.test(entry.blobSha) ||
+      ref.mediaType !== "application/octet-stream" ||
+      typeof ref.digest !== "string" ||
+      !/^[0-9a-f]{64}$/.test(ref.digest) ||
+      typeof ref.bytes !== "number" ||
+      !Number.isSafeInteger(ref.bytes) ||
+      ref.bytes < 0 ||
+      (entry.classification !== undefined &&
+        (typeof entry.classification !== "string" ||
+          !entry.classification.trim()))
+    )
+      throw new Error("Discovery entry has invalid source identity or content");
+    paths.add(entry.path);
+  }
+  for (const value of body.failures) {
+    const failure = object(value, "Discovery failure");
+    keys(failure, ["path", "status", "detail"], "Discovery failure");
+    if (
+      typeof failure.path !== "string" ||
+      !failure.path ||
+      paths.has(failure.path) ||
+      !["partial", "unreadable", "truncated", "failed"].includes(
+        String(failure.status),
+      ) ||
+      typeof failure.detail !== "string" ||
+      !failure.detail
+    )
+      throw new Error("Discovery failure has invalid completeness");
+    paths.add(failure.path);
+  }
+  if (body.semantic !== undefined) {
+    const semantic = object(body.semantic, "Semantic discovery");
+    keys(semantic, ["status", "detail"], "Semantic discovery");
+    if (
+      !["complete", "partial", "failed"].includes(String(semantic.status)) ||
+      typeof semantic.detail !== "string"
+    )
+      throw new Error("Semantic discovery has invalid completeness");
+  }
+}
+
+export function parseDiscoveryBody(bytes: Uint8Array): DiscoveryBody {
+  const body = JSON.parse(
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+  );
+  assertDiscoveryBody(body);
+  return body;
+}
+
 export async function readDiscoveryBody(
   store: ContentStore,
   ref: ContentRef,
 ): Promise<DiscoveryBody> {
   await store.verify(ref);
   const bytes = await new Response(await store.open(ref)).arrayBuffer();
-  const body = JSON.parse(
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-  );
-  const value = object(body, "Discovery body");
-  keys(value, ["schema", "entries", "failures", "semantic"], "Discovery body");
-  if (
-    value.schema !== "factory.repository-inventory/v1" ||
-    !Array.isArray(value.entries) ||
-    !Array.isArray(value.failures)
-  )
-    throw new Error("Discovery body has an unsupported schema");
-  return body as DiscoveryBody;
+  return parseDiscoveryBody(new Uint8Array(bytes));
 }
 
 /** Reads immutable Git objects only; complete bodies remain outside target Git. */
@@ -304,6 +483,7 @@ export async function authenticateDiscoveryOutput(args: {
   store: ContentStore;
 }): Promise<DiscoveryBody> {
   const { manifest, specification: spec } = args;
+  assertDiscoveryOutputManifest(manifest);
   if (
     manifest.schemaVersion !== 1 ||
     manifest.schema !== spec.schema ||
@@ -345,6 +525,21 @@ export async function authenticateDiscoveryOutput(args: {
           !entry.classification.trim()))
     )
       throw new Error("Discovery entry is duplicate, unobserved or mismatched");
+    const ref = object(entry.content, "Discovery source reference");
+    keys(ref, ["digest", "bytes", "mediaType"], "Discovery source reference");
+    const size = Number(pinnedGit(args.checkout, "cat-file", "-s", source.oid));
+    if (
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      size > spec.allowance.maxBytes - bytes ||
+      ref.bytes !== size ||
+      ref.mediaType !== "application/octet-stream" ||
+      typeof ref.digest !== "string" ||
+      !/^[0-9a-f]{64}$/.test(ref.digest)
+    )
+      throw new Error(
+        "Discovery source body exceeds its allowance or has an invalid reference",
+      );
     const actual = pinnedGitRaw(args.checkout, "cat-file", "blob", source.oid);
     if (
       entry.content.bytes !== actual.length ||
@@ -450,46 +645,52 @@ export async function classifyDiscoveryOutput(args: {
     throw new Error(
       "Semantic discovery requires a complete bound source inventory",
     );
-  if (Buffer.byteLength(args.response) > args.specification.allowance.maxBytes)
-    throw new Error(
-      "Semantic discovery response exceeds its declared byte allowance",
-    );
-  const parsed = object(JSON.parse(args.response), "Semantic response");
-  keys(parsed, ["status", "entries", "detail"], "Semantic response");
-  if (
-    !["complete", "partial", "failed"].includes(String(parsed.status)) ||
-    typeof parsed.detail !== "string" ||
-    !Array.isArray(parsed.entries)
-  )
-    throw new Error("Semantic discovery response is malformed");
-  const seen = new Set<string>();
-  for (const value of parsed.entries) {
-    const entry = object(value, "Semantic classification");
-    keys(entry, ["path", "classification"], "Semantic classification");
-    const observed = body.entries.find((source) => source.path === entry.path);
+  judgedAsWork(() => {
     if (
-      !observed ||
-      seen.has(observed.path) ||
-      typeof entry.classification !== "string" ||
-      !entry.classification.trim()
+      Buffer.byteLength(args.response) > args.specification.allowance.maxBytes
     )
       throw new Error(
-        "Semantic discovery cites an unobserved, duplicate or invalid path",
+        "Semantic discovery response exceeds its declared byte allowance",
       );
-    seen.add(observed.path);
-    observed.classification = entry.classification;
-  }
-  if (parsed.status === "complete" && seen.size !== body.entries.length)
-    throw new Error(
-      "Semantic discovery claims completeness while omitting observed paths",
-    );
-  body.semantic = {
-    status: parsed.status as "complete" | "partial" | "failed",
-    detail: parsed.detail,
-  };
+    const parsed = object(JSON.parse(args.response), "Semantic response");
+    keys(parsed, ["status", "entries", "detail"], "Semantic response");
+    if (
+      !["complete", "partial", "failed"].includes(String(parsed.status)) ||
+      typeof parsed.detail !== "string" ||
+      !Array.isArray(parsed.entries)
+    )
+      throw new Error("Semantic discovery response is malformed");
+    const seen = new Set<string>();
+    for (const value of parsed.entries) {
+      const entry = object(value, "Semantic classification");
+      keys(entry, ["path", "classification"], "Semantic classification");
+      const observed = body.entries.find(
+        (source) => source.path === entry.path,
+      );
+      if (
+        !observed ||
+        seen.has(observed.path) ||
+        typeof entry.classification !== "string" ||
+        !entry.classification.trim()
+      )
+        throw new Error(
+          "Semantic discovery cites an unobserved, duplicate or invalid path",
+        );
+      seen.add(observed.path);
+      observed.classification = entry.classification;
+    }
+    if (parsed.status === "complete" && seen.size !== body.entries.length)
+      throw new Error(
+        "Semantic discovery claims completeness while omitting observed paths",
+      );
+    body.semantic = {
+      status: parsed.status as "complete" | "partial" | "failed",
+      detail: parsed.detail,
+    };
+  });
   const manifest: DiscoveryOutputManifest = {
     ...structuredClone(args.manifest),
-    status: body.semantic.status,
+    status: body.semantic!.status,
     disposition: "advisory",
     body: await put(
       args.store,
