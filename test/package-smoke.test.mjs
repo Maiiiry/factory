@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -317,6 +318,9 @@ assert.throws(() => assertPinnedNpmScripts(checkout, rawBase, rawChanged, [boots
       recipeObjective,
       '## Adaptive workflow\n\nenabled\n\n## Workflow recipe\n\n```json\n{"selector":"plugin:repository-migration","arguments":{"selectors":["app.mjs"],"maxChildren":2}}\n```\n',
     );
+    const stateFilesBeforePreview = readdirSync(environment.XDG_STATE_HOME, {
+      recursive: true,
+    }).sort();
     const recipePreview = JSON.parse(
       run("recipe", "--file", recipeObjective, "--config", recipeConfig),
     );
@@ -326,9 +330,9 @@ assert.throws(() => assertPinnedNpmScripts(checkout, rawBase, rawChanged, [boots
     assert.equal(recipePreview.baseSha, git("rev-parse", "HEAD").trim());
     assert.equal(recipePreview.estimates.dynamicItems.maximum, 2);
     assert.equal(recipePreview.estimates.cost, "unknown");
-    assert.equal(
-      existsSync(join(environment.XDG_STATE_HOME, "clockgrove-factory")),
-      false,
+    assert.deepEqual(
+      readdirSync(environment.XDG_STATE_HOME, { recursive: true }).sort(),
+      stateFilesBeforePreview,
     );
     const nativeAnalysis = JSON.parse(
       run(
