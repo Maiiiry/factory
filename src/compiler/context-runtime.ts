@@ -1,3 +1,8 @@
+import type { ContinuationState } from "../state.js";
+import {
+  assertRestoredContinuationReady,
+  continuationConfigurationMatches,
+} from "../state-store.js";
 import {
   assertWorkflowRecipeInput,
   type WorkflowRecipeInput,
@@ -52,6 +57,7 @@ export function createPlanningContextResolver(input: {
   objectiveBody: string;
   contentStore: ContentStore;
   workflowRecipe?: WorkflowRecipeInput;
+  continuation?: ContinuationState;
 }): PlanningContextResolver | undefined {
   const {
     config,
@@ -72,7 +78,16 @@ export function createPlanningContextResolver(input: {
     );
   const preparationStarted = Date.now();
   const treeSha = pinnedGit(config.checkout, "rev-parse", `${baseSha}^{tree}`);
-  const configDigest = factoryConfigDigest(config);
+  if (input.continuation?.restoration) {
+    assertRestoredContinuationReady(input.continuation, config);
+    if (!continuationConfigurationMatches(input.continuation, config))
+      throw new Error(
+        "Planning context original configuration binding is unavailable",
+      );
+  }
+  const configDigest = input.continuation?.restoration
+    ? input.continuation.configDigest
+    : factoryConfigDigest(config);
   const applicability: MemoryApplicability = {
     treeSha,
     paths: Object.fromEntries(

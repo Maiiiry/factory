@@ -21,6 +21,7 @@ import type {
   AssetSelectionDecision,
   AuthenticationRequest,
   CapturedAssetSet,
+  ContentRef,
   ExecutionHandle,
   NamedCheckEvidence,
   NativeStackLayer,
@@ -215,6 +216,7 @@ export interface CoordinatorDisposition {
 
 /** Preparation shares the atomic state path; no executable graph is invented. */
 export interface PreparationState {
+  restoration?: ContinuationRestoration;
   /** Exact immutable definition and resolved arguments retained before planning. */
   workflowRecipePin?: import("./workflow-recipes.js").WorkflowRecipePin;
   /** Observational pointers; absence supplies no historical memory. */
@@ -237,7 +239,7 @@ export interface PreparationState {
   /** Worker ceiling and scheduling resolved when the Objective started. */
   capacity: import("./config.js").Capacity;
   charges?: import("./repair-policy.js").RepairLedger["charges"];
-  schemaVersion: 8 | 10 | 12 | 14 | 16 | 18;
+  schemaVersion: 8 | 10 | 12 | 14 | 16 | 18 | 20;
   kind: "preparing";
   repository: string;
   objective: number;
@@ -280,7 +282,8 @@ export function isPreparationState(
     state?.schemaVersion === 12 ||
     state?.schemaVersion === 14 ||
     state?.schemaVersion === 16 ||
-    state?.schemaVersion === 18
+    state?.schemaVersion === 18 ||
+    state?.schemaVersion === 20
   );
 }
 
@@ -293,7 +296,8 @@ export function isExecutionState(
     state?.schemaVersion === 11 ||
     state?.schemaVersion === 13 ||
     state?.schemaVersion === 15 ||
-    state?.schemaVersion === 17
+    state?.schemaVersion === 17 ||
+    state?.schemaVersion === 19
   );
 }
 
@@ -349,6 +353,7 @@ export function observedStackNumber(
       : undefined;
 }
 export interface FactoryState {
+  restoration?: ContinuationRestoration;
   workflowRecipePin?: import("./workflow-recipes.js").WorkflowRecipePin;
   /** Original admission fingerprints survive amendments and discovered children. */
   workflowRecipeAdmission?: import("./workflow-recipes.js").WorkflowRecipeAdmission;
@@ -409,7 +414,7 @@ export interface FactoryState {
   prerequisitesDigest?: string;
   /** Immutable authenticated admission facts, bound to prerequisitesDigest. */
   prerequisites?: import("./contracts.js").PlanningPrerequisites;
-  schemaVersion: 7 | 9 | 11 | 13 | 15 | 17;
+  schemaVersion: 7 | 9 | 11 | 13 | 15 | 17 | 19;
   approvedPlaybookAdmission?: import("./contracts.js").ApprovedPlaybookAdmission;
   approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
   repository: string;
@@ -467,9 +472,9 @@ export function assertStateWorkflowRecipe(state: ContinuationState): void {
   const preparation = isPreparationState(state);
   const recipeFormat = preparation
     ? state.schemaVersion === 16 ||
-      (state.schemaVersion === 18 && pin !== undefined)
+      ([18, 20].includes(Number(state.schemaVersion)) && pin !== undefined)
     : state.schemaVersion === 15 ||
-      (state.schemaVersion === 17 && pin !== undefined);
+      ([17, 19].includes(Number(state.schemaVersion)) && pin !== undefined);
   if (preparation && Object.hasOwn(state, "workflowRecipeAdmission"))
     throw new Error(
       "Original recipe admission receipt belongs only to execution snapshots",
@@ -876,13 +881,14 @@ export function parseFactoryState(
 ): FactoryState {
   const state = record(value, "state");
   assertCoordinator(state.coordinator);
+  assertContinuationRestoration(state as unknown as ContinuationState);
   if (
     (state.schemaVersion !== 7 &&
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
       state.schemaVersion !== 15 &&
-      state.schemaVersion !== 17) ||
+      ![17, 19].includes(Number(state.schemaVersion))) ||
     state.repository !== repository ||
     state.objective !== objective
   )
@@ -900,7 +906,7 @@ export function parseFactoryState(
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
       state.schemaVersion !== 15 &&
-      state.schemaVersion !== 17
+      ![17, 19].includes(Number(state.schemaVersion))
     )
       throw new Error("Adaptive context requires execution schema version 9");
     assertPlanningLookupRecord(lookup);
@@ -980,7 +986,7 @@ export function parseFactoryState(
     state.workflowReflection !== undefined &&
     state.schemaVersion !== 13 &&
     state.schemaVersion !== 15 &&
-    state.schemaVersion !== 17
+    ![17, 19].includes(Number(state.schemaVersion))
   )
     throw new Error(
       "Workflow reflection requires execution snapshot version 13",
@@ -997,7 +1003,7 @@ export function parseFactoryState(
         state.schemaVersion !== 11 &&
         state.schemaVersion !== 13 &&
         state.schemaVersion !== 15 &&
-        state.schemaVersion !== 17
+        ![17, 19].includes(Number(state.schemaVersion))
       )
         throw new Error("Discovery requires execution schema version 9");
       assertDiscoverySpecification(item.discovery);
@@ -1088,7 +1094,7 @@ export function parseFactoryState(
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
       state.schemaVersion !== 15 &&
-      state.schemaVersion !== 17
+      ![17, 19].includes(Number(state.schemaVersion))
     )
       throw new Error(
         "Discovery start admissions require execution schema version 9",
@@ -1139,7 +1145,7 @@ export function parseFactoryState(
   if (
     (state.schemaVersion === 13 ||
       state.schemaVersion === 15 ||
-      (state.schemaVersion === 17 &&
+      ([17, 19].includes(Number(state.schemaVersion)) &&
         (state.workflowRecipePin !== undefined ||
           state.conditionFacts !== undefined ||
           state.workflowReflection !== undefined ||
@@ -1271,7 +1277,7 @@ export function parseFactoryState(
       throw new Error(`Work Item ${id} closedPullRequest must be an integer`);
     if (
       item.branchUpdateAdmission !== undefined &&
-      (state.schemaVersion !== 17 ||
+      (![17, 19].includes(Number(state.schemaVersion)) ||
         item.branchUpdateFrom === undefined ||
         !["blocked", "submitted"].includes(String(item.branchUpdateAdmission)))
     )
@@ -1695,7 +1701,7 @@ export function parseFactoryState(
         const active = record(execution.data, `work.${id}.execution.data`);
         if (
           active.rejectedCollection !== undefined &&
-          (state.schemaVersion !== 17 ||
+          (![17, 19].includes(Number(state.schemaVersion)) ||
             !["local", "openai-agents", "claude-managed-agents"].includes(
               String(execution.provider),
             ) ||
@@ -1704,7 +1710,7 @@ export function parseFactoryState(
           throw new Error("Invalid rejected collection disposition");
         if (
           active.admissionBlockedAt !== undefined &&
-          (state.schemaVersion !== 17 ||
+          (![17, 19].includes(Number(state.schemaVersion)) ||
             execution.provider !== "local" ||
             active.phase !== "prepared" ||
             Number.isNaN(
@@ -1719,7 +1725,7 @@ export function parseFactoryState(
           throw new Error("Invalid local checkpoint admission disposition");
         if (active.checkpointAdmission !== undefined) {
           if (
-            state.schemaVersion !== 17 ||
+            ![17, 19].includes(Number(state.schemaVersion)) ||
             !["openai-agents", "claude-managed-agents"].includes(
               String(execution.provider),
             )
@@ -1958,7 +1964,7 @@ export function parseFactoryState(
           throw new Error("Native stack identity is invalid");
         continue;
       }
-      if (state.schemaVersion !== 17)
+      if (![17, 19].includes(Number(state.schemaVersion)))
         throw new Error(
           "Native stack creation requires checkpoint reader capability",
         );
@@ -2029,7 +2035,7 @@ export function parseFactoryState(
         throw new Error("Pending native merge identity is invalid");
       sha(merge.expectedHeadSha, "Pending native merge head");
       if (merge.request !== undefined) {
-        if (state.schemaVersion !== 17)
+        if (![17, 19].includes(Number(state.schemaVersion)))
           throw new Error(
             "Native merge intent requires checkpoint reader capability",
           );
@@ -2196,4 +2202,130 @@ export function parseFactoryState(
   // Portable metadata decoding precedes verified content hydration.
   assertFinalAcceptance(validated, { verifyAccountingBodies: false });
   return validated;
+}
+
+/** Verified installation provenance, never replacement execution authority. */
+export interface ContinuationRestoration {
+  schemaVersion: 1;
+  checkpoint: { commitSha: string; payloadDigest: string };
+  archive: ContentRef;
+  original: {
+    snapshot: ContentRef;
+    configDigest: string;
+    schemaVersion: number;
+  };
+  source?: {
+    authorityDigest: string;
+    configDigest: string;
+    checkout: string;
+    stateRoot: string;
+  };
+  installation: {
+    identity: string;
+    configDigest: string;
+    authorityDigest: string;
+    checkout: string;
+    stateRoot: string;
+  };
+  status: "held" | "reconciled";
+  reason: string;
+}
+export function assertContinuationRestoration(state: ContinuationState): void {
+  const value = state.restoration;
+  if (!value) {
+    if (state.schemaVersion === 19 || state.schemaVersion === 20)
+      throw new Error(
+        "Restored continuation requires its original checkpoint provenance",
+      );
+    return;
+  }
+  if (state.schemaVersion !== 19 && state.schemaVersion !== 20)
+    throw new Error("Restoration requires execution19 or preparation20");
+  const exact = (value: unknown, keys: string[]): Record<string, unknown> => {
+    const object = record(value, "restoration");
+    if (Object.keys(object).some((key) => !keys.includes(key)))
+      throw new Error("Unknown restoration provenance field");
+    return object;
+  };
+  exact(value, [
+    "schemaVersion",
+    "checkpoint",
+    "archive",
+    "original",
+    "source",
+    "installation",
+    "status",
+    "reason",
+  ]);
+  const hash = (value: unknown, label: string) => sha(value, label, 64);
+  const archive = exact(value.archive, ["digest", "bytes", "mediaType"]);
+  if (
+    archive.digest !== value.checkpoint.payloadDigest ||
+    !Number.isSafeInteger(archive.bytes) ||
+    Number(archive.bytes) < 0 ||
+    archive.mediaType !== "application/json"
+  )
+    throw new Error("Restoration archive differs from its exact checkpoint");
+  const checkpoint = exact(value.checkpoint, ["commitSha", "payloadDigest"]);
+  sha(checkpoint.commitSha, "restoration checkpoint");
+  hash(checkpoint.payloadDigest, "restoration payload");
+  const original = exact(value.original, [
+    "snapshot",
+    "configDigest",
+    "schemaVersion",
+  ]);
+  hash(original.configDigest, "restoration original configuration");
+  if (
+    original.configDigest !== state.configDigest ||
+    !Number.isSafeInteger(original.schemaVersion) ||
+    Number(original.schemaVersion) < 7
+  )
+    throw new Error(
+      "Restoration original differs from its frozen configuration",
+    );
+  const snapshot = exact(original.snapshot, ["digest", "bytes", "mediaType"]);
+  hash(snapshot.digest, "restoration original snapshot");
+  if (
+    !Number.isSafeInteger(snapshot.bytes) ||
+    Number(snapshot.bytes) < 0 ||
+    snapshot.mediaType !== "application/json"
+  )
+    throw new Error("Invalid restoration original snapshot reference");
+  const layout = (value: unknown, source: boolean) => {
+    const object = exact(
+      value,
+      source
+        ? ["authorityDigest", "configDigest", "checkout", "stateRoot"]
+        : [
+            "identity",
+            "authorityDigest",
+            "configDigest",
+            "checkout",
+            "stateRoot",
+          ],
+    );
+    hash(object.authorityDigest, "restoration authority");
+    hash(object.configDigest, "restoration configuration");
+    if (!source) string(object.identity, "restoration installation identity");
+    for (const key of ["checkout", "stateRoot"])
+      if (
+        typeof object[key] !== "string" ||
+        !(object[key] as string).startsWith("/")
+      )
+        throw new Error(
+          "Restoration layout must retain exact absolute host paths",
+        );
+  };
+  if (value.source) layout(value.source, true);
+  layout(value.installation, false);
+  if (
+    value.schemaVersion !== 1 ||
+    !["held", "reconciled"].includes(value.status) ||
+    !value.reason?.trim()
+  )
+    throw new Error("Invalid restoration disposition");
+  if (value.status === "reconciled" && !value.source)
+    throw new Error(
+      "A legacy checkpoint without original authority cannot be rebound",
+    );
 }

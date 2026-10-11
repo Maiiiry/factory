@@ -251,7 +251,7 @@ export function assertGraphRevisions(state: FactoryState): void {
       ...(original.reviewRejectedNativeReturns ?? []),
     ]) {
       if (
-        state.schemaVersion !== 17 ||
+        ![17, 19].includes(state.schemaVersion) ||
         !ref ||
         Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
         !/^[a-f0-9]{64}$/.test(ref.digest) ||
@@ -437,7 +437,7 @@ function admitAdvancedAmendmentFormat(
   if (
     (graph.conditions?.length || state.schemaVersion === 9) &&
     state.schemaVersion !== 15 &&
-    state.schemaVersion !== 17
+    ![17, 19].includes(state.schemaVersion)
   )
     state.schemaVersion = 13;
 }
@@ -857,7 +857,7 @@ function amendmentNativeHooks(
   ModelInvocationContext,
   "beforeProviderAttempt" | "retainNativeReturn"
 > {
-  if (args.state.schemaVersion !== 17) return {};
+  if (![17, 19].includes(args.state.schemaVersion)) return {};
   return {
     beforeProviderAttempt: () =>
       awaitCheckpointAdmission(args.state.repository, "before-effect"),
@@ -1349,7 +1349,7 @@ async function advanceAmendment(args: {
         (state.schemaVersion === 11 ||
           state.schemaVersion === 13 ||
           state.schemaVersion === 15 ||
-          state.schemaVersion === 17 ||
+          [17, 19].includes(state.schemaVersion) ||
           pending.graph!.conditions?.length ||
           pending.graph!.expansions?.length) &&
         args.github.projectionMutationAdmission !== "controller-checkpoint-v1"
@@ -1368,7 +1368,7 @@ async function advanceAmendment(args: {
         ...(state.schemaVersion === 11 ||
         state.schemaVersion === 13 ||
         state.schemaVersion === 15 ||
-        state.schemaVersion === 17 ||
+        [17, 19].includes(state.schemaVersion) ||
         pending.graph!.conditions?.length ||
         pending.graph!.expansions?.length
           ? {
@@ -1436,7 +1436,7 @@ async function advanceAmendment(args: {
         pending.graph!.items.find((item) => item.id === reattempt),
       );
     state.graph = pending.graph!;
-    if (state.schemaVersion === 17) {
+    if ([17, 19].includes(state.schemaVersion)) {
       /* Keep the checkpoint reader fence. */
     } else if (state.workflowRecipePin) state.schemaVersion = 15;
     else if (

@@ -39,6 +39,7 @@ import {
   type RejectedCollectionReceipt,
 } from "./execution/local.js";
 import { pinnedGit, pinnedGitEnvironment, subprocessAsync } from "./process.js";
+import { assertRecoveryCheckpointManifest } from "./recovery-checkpoint.js";
 import type {
   RecoveryCheckpointClosure,
   RecoveryCheckpointFile,
@@ -63,7 +64,20 @@ export interface RecoveryClosureGap {
 }
 interface BodyRoot {
   ref: ContentRef;
-  kind: "discovery" | "expansion" | "memory" | "accounting";
+  kind:
+    | "discovery"
+    | "expansion"
+    | "memory"
+    | "accounting"
+    | "restoration-original"
+    | "restoration-archive";
+  identity?: {
+    repository: string;
+    objective?: number;
+    runId?: string;
+    configDigest?: string;
+    schemaVersion?: number;
+  };
   binding?: RepositoryMemoryBinding;
   accounting?: AccountingSeal;
 }
@@ -203,6 +217,27 @@ function continuationReferences(value: unknown): ContinuationReferences & {
       throw new Error("Recovery checkpoint has an invalid Git object identity");
     objects.set(`${kind}:${sha}`, { sha, kind, role });
   };
+  if (state.restoration) {
+    const receipt = state.restoration;
+    add(receipt.original.snapshot);
+    add(receipt.archive);
+    roots.push({
+      ref: receipt.original.snapshot,
+      kind: "restoration-original",
+      identity: {
+        repository: state.repository,
+        objective: state.objective,
+        runId: state.runId,
+        configDigest: state.configDigest,
+        schemaVersion: receipt.original.schemaVersion,
+      },
+    });
+    roots.push({
+      ref: receipt.archive,
+      kind: "restoration-archive",
+      identity: { repository: state.repository },
+    });
+  }
   const recipe = (pin: WorkflowRecipePin | undefined) => {
     if (!pin) return;
     add(pin.definitionRef);
@@ -663,6 +698,10 @@ export function describeMemoryBodyReferences(
 async function verifyDescription(
   description: ContinuationReferences & { roots: BodyRoot[] },
   source: ContentStore | RecoveryReferenceReader,
+  bounds: { maxBytes: number; maxFiles: number } = {
+    maxBytes: Number.MAX_SAFE_INTEGER,
+    maxFiles: Number.MAX_SAFE_INTEGER,
+  },
 ): Promise<ContinuationReferences> {
   const refs = new Map(
     description.contentRefs.map((ref) => [refKey(ref), ref]),
@@ -692,11 +731,67 @@ async function verifyDescription(
     const key =
       root.kind === "accounting"
         ? `accounting:${root.accounting!.digest}`
-        : `${root.kind}:${refKey(root.ref)}`;
+        : `${root.kind}:${refKey(root.ref)}:${JSON.stringify(root.identity ?? null)}`;
     if (visited.has(key)) continue;
     visited.add(key);
     const bytes = await readReference(source, root.ref);
-    if (root.kind === "accounting") {
+    if (root.kind === "restoration-original") {
+      const value = object(
+        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+      );
+      const identity = root.identity!;
+      if (
+        value.repository !== identity.repository ||
+        (identity.objective !== undefined &&
+          value.objective !== identity.objective) ||
+        (identity.runId !== undefined && value.runId !== identity.runId) ||
+        (identity.configDigest !== undefined &&
+          value.configDigest !== identity.configDigest) ||
+        (identity.schemaVersion !== undefined &&
+          value.schemaVersion !== identity.schemaVersion)
+      )
+        throw new Error(
+          "Restoration original snapshot differs from its immutable identity",
+        );
+      merge(continuationReferences(value));
+    } else if (root.kind === "restoration-archive") {
+      const value = object(
+        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+      );
+      const binding =
+        value.binding as import("./recovery-checkpoint.js").RecoveryCheckpointBinding;
+      assertRecoveryCheckpointManifest(value, binding, bounds);
+      if (value.binding.repository !== root.identity!.repository)
+        throw new Error(
+          "Restoration archive repository differs from its continuation",
+        );
+      for (const ref of value.contentRefs) add(ref);
+      for (const file of value.files) {
+        add(file.ref);
+        if (file.kind === "continuation") {
+          const match = /^objectives\/([1-9][0-9]*)\/state\.json$/.exec(
+            file.path,
+          );
+          if (!match)
+            throw new Error("Restoration archive continuation path is invalid");
+          roots.push({
+            ref: file.ref,
+            kind: "restoration-original",
+            identity: {
+              repository: binding.repository,
+              objective: Number(match[1]),
+            },
+          });
+        }
+      }
+      for (const entry of value.gitObjects ?? [])
+        objects.set(`commit:${entry.commitSha}`, {
+          sha: entry.commitSha,
+          kind: "commit",
+          role: entry.role,
+        });
+      gaps.push(...(value.gaps as RecoveryClosureGap[]));
+    } else if (root.kind === "accounting") {
       const seal = root.accounting!;
       await assertAccountingSealContent(
         seal.repository,
@@ -770,8 +865,9 @@ async function verifyDescription(
 export async function verifyContinuationReferenceClosure(
   value: unknown,
   source: ContentStore | RecoveryReferenceReader,
+  bounds?: { maxBytes: number; maxFiles: number },
 ): Promise<ContinuationReferences> {
-  return verifyDescription(continuationReferences(value), source);
+  return verifyDescription(continuationReferences(value), source, bounds);
 }
 export async function verifyMemoryBodyReferenceClosure(
   role: string,
@@ -915,6 +1011,7 @@ export async function buildRecoveryCheckpointClosure(input: {
           const description = await verifyContinuationReferenceClosure(
             state,
             reader,
+            config.gitPersistence,
           );
           for (const ref of description.contentRefs) refs.set(refKey(ref), ref);
           for (const entry of description.gitObjects)

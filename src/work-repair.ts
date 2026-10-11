@@ -1377,7 +1377,7 @@ export async function diagnoseWorkRepair(args: {
               rejected,
               invocation: {
                 invocationId: invocation.id,
-                ...(state.schemaVersion === 17
+                ...([17, 19].includes(state.schemaVersion)
                   ? {
                       beforeProviderAttempt: () =>
                         awaitCheckpointAdmission(

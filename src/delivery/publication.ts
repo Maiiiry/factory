@@ -120,14 +120,14 @@ export function assertPublicationIntents(state: FactoryState): void {
         throw new Error("Publication request disposition invalid");
       if (
         (intent.effects !== undefined || intent.submission === "preparing") &&
-        state.schemaVersion !== 17
+        ![17, 19].includes(state.schemaVersion)
       )
         throw new Error(
           "Publication effect admission requires execution snapshot 17",
         );
       if (
         intent.admissionBlockedAt !== undefined &&
-        (state.schemaVersion !== 17 ||
+        (![17, 19].includes(state.schemaVersion) ||
           intent.observation ||
           !Number.isFinite(Date.parse(intent.admissionBlockedAt)))
       )
@@ -387,7 +387,7 @@ export function publicationControl(
     assertRequest,
     async beforeEffect(request, effect) {
       assertRequest(request);
-      if (state.schemaVersion !== 17) return;
+      if (![17, 19].includes(state.schemaVersion)) return;
       if (retained || consumed || created?.submission === "possibly-submitted")
         throw fenced(
           "Retained publication preparation cannot authorize another external effect",
@@ -415,7 +415,10 @@ export function publicationControl(
       try {
         await awaitCheckpointAdmission(state.repository, "before-effect");
       } catch (error) {
-        if (isCheckpointAdmissionFailure(error) && state.schemaVersion === 17) {
+        if (
+          isCheckpointAdmissionFailure(error) &&
+          [17, 19].includes(state.schemaVersion)
+        ) {
           if (
             created?.effects?.at(-1)?.disposition === "intent" &&
             created.submission === "preparing"
@@ -432,7 +435,7 @@ export function publicationControl(
     },
     async observedEffect(request, effect) {
       assertRequest(request);
-      if (state.schemaVersion !== 17) return;
+      if (![17, 19].includes(state.schemaVersion)) return;
       const intent = retained ?? created;
       const prior = intent?.effects?.find(
         (prior) => prior.request.kind === effect.kind,
@@ -474,7 +477,10 @@ export function publicationControl(
       try {
         await awaitCheckpointAdmission(state.repository, "before-effect");
       } catch (error) {
-        if (isCheckpointAdmissionFailure(error) && state.schemaVersion === 17) {
+        if (
+          isCheckpointAdmissionFailure(error) &&
+          [17, 19].includes(state.schemaVersion)
+        ) {
           if (created) created.admissionBlockedAt = new Date().toISOString();
           advanceHistory();
           save();
@@ -563,7 +569,7 @@ export function mergeControl(
   itemId: string,
   save: () => void,
 ): MergeControl {
-  if (state.schemaVersion !== 17)
+  if (![17, 19].includes(state.schemaVersion))
     return {
       beforeMerge: async () => undefined,
       observedMerge: async () => undefined,

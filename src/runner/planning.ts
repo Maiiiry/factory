@@ -1,3 +1,8 @@
+import { restoredSessionIsHistorical } from "../agent-session.js";
+import {
+  assertRestoredInstallationDispatchReady,
+  assertRestoredContinuationReady,
+} from "../state-store.js";
 import { markCheckpointDirty } from "../recovery-checkpoint.js";
 import { createHash, randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
@@ -216,6 +221,7 @@ export async function planObjective(
     "planningModel" | "github" | "contentStore"
   > & { driver?: ExecutionDriver },
 ): Promise<PlanCandidate> {
+  assertRestoredInstallationDispatchReady(config);
   if (
     config.queue?.project ||
     config.gitPersistence?.scope === "private-history"
@@ -393,6 +399,7 @@ export async function decidePlan(
       throw new Error(
         "Objective has no persisted plan awaiting a decision; run it first",
       );
+    assertRestoredContinuationReady(preparation, config);
     if (input.outcome === "refuse") {
       if (!input.actor.trim() || !input.reason.trim())
         throw new Error("A plan refusal needs actor and reason");
@@ -408,7 +415,11 @@ export async function decidePlan(
         [
           ...Object.values(preparation.agentSessions ?? {}),
           ...(preparation.agentSessionHistory ?? []),
-        ].some((ref) => ref.status !== "released") &&
+        ].some(
+          (ref) =>
+            ref.status !== "released" &&
+            !restoredSessionIsHistorical(preparation, ref),
+        ) &&
         !services.planningModel?.releaseSession
       )
         throw new Error(
@@ -424,7 +435,11 @@ export async function decidePlan(
         [
           ...Object.values(preparation.agentSessions ?? {}),
           ...(preparation.agentSessionHistory ?? []),
-        ].some((ref) => ref.status !== "released")
+        ].some(
+          (ref) =>
+            ref.status !== "released" &&
+            !restoredSessionIsHistorical(preparation, ref),
+        )
       )
         throw new Error(
           "Planner disposal did not authenticate every retained receipt; preparation is preserved",
@@ -446,7 +461,9 @@ export async function decidePlan(
         preparation.baseSha,
         config.checkout,
         input,
-        factoryConfigDigest(config),
+        preparation.restoration
+          ? preparation.configDigest
+          : factoryConfigDigest(config),
       );
       delete preparation.coordinator.waitReason;
       saveState(path, preparation);
@@ -505,6 +522,9 @@ export async function prepareObjective(args: {
     cancellationRequested,
     reportRunStatus,
   } = args;
+  assertRestoredInstallationDispatchReady(args.config);
+  if (args.preparation)
+    assertRestoredContinuationReady(args.preparation, args.config);
   let { preparation } = args;
   const adaptive = adaptiveWorkflowEnabled(issue.body);
   if (adaptive && !config.planningContext?.enabled)
@@ -698,6 +718,7 @@ export async function prepareObjective(args: {
                 {
                   contextResolver: createPlanningContextResolver({
                     config,
+                    continuation: preparation!,
                     objective,
                     objectiveBody: issue.body,
                     runId: preparation!.runId,
@@ -735,7 +756,7 @@ export async function prepareObjective(args: {
       );
     }
   preparation.plan = plan;
-  if (preparation.schemaVersion === 18) {
+  if ([18, 20].includes(preparation.schemaVersion)) {
     // The checkpoint contract applies equally to static and adaptive plans.
   } else if (plan.schemaVersion === 7) preparation.schemaVersion = 16;
   else if (plan.schemaVersion === 6) preparation.schemaVersion = 14;

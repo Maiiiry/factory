@@ -1,27 +1,53 @@
+import { isDeepStrictEqual } from "node:util";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { LocalContentStore } from "./content/local.js";
+import type { ContentRef } from "./contracts.js";
+import { decodeAccountingRecord } from "./accounting.js";
+import {
+  pinnedGit,
+  pinnedGitCommand,
+  pinnedGitEnvironment,
+} from "./process.js";
+import {
+  adoptRecoveryCheckpointBaseline,
+  readVerifiedRecoveryCheckpoint,
+  recoveryCheckpointClosureDigest,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
 import { assertGraphProjectionIntents } from "./graph-projection-control.js";
 import { assertPlanningLookupRecord } from "./compiler/context.js";
 import {
   assertRepositoryMemoryBindings,
   retainStateMemory,
 } from "./repository-memory.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { markCheckpointDirty } from "./recovery-checkpoint.js";
 import {
   closeSync,
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readdirSync,
+  realpathSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep, relative } from "node:path";
 import { assertAgentSessions } from "./agent-session.js";
-import { stateRoot, validateCapacity } from "./config.js";
+import {
+  stateRoot,
+  validateCapacity,
+  factoryConfigDigest,
+  factoryAuthorityDigest,
+  type FactoryConfig,
+} from "./config.js";
 import {
   assertApprovedPlaybookPin,
   assertPlanningExecutionBounds,
@@ -50,6 +76,8 @@ import {
   type FactoryState,
   type PreparationState,
   parseFactoryState,
+  assertContinuationRestoration,
+  type ContinuationRestoration,
 } from "./state.js";
 
 /** An Objective's private directory: its snapshot, owner and validation trees. */
@@ -133,7 +161,11 @@ export function readPreState(
  * Write a snapshot atomically. It is validated exactly as a load validates
  * it first, so no write can persist state a later run would refuse.
  */
-export function saveState(path: string, state: ContinuationState): void {
+export function saveState(
+  path: string,
+  state: ContinuationState,
+  options?: { observeMemory?: boolean },
+): void {
   let text = `${JSON.stringify(state, null, 2)}\n`;
   try {
     parseContinuation(JSON.parse(text), state.repository, state.objective);
@@ -144,7 +176,10 @@ export function saveState(path: string, state: ContinuationState): void {
   }
   // Memory observes validated state. Availability never changes lifecycle evidence.
   try {
-    const observed = retainStateMemory(state, stateRoot(state.repository));
+    const observed =
+      options?.observeMemory === false
+        ? []
+        : retainStateMemory(state, stateRoot(state.repository));
     assertRepositoryMemoryBindings(observed);
     const merged = [...(state.memoryBindings ?? [])];
     const ids = new Set(merged.map((binding) => binding.id));
@@ -200,7 +235,9 @@ const currentVersion = (value: unknown): boolean => {
     version === 15 ||
     version === 16 ||
     version === 17 ||
-    version === 18
+    version === 18 ||
+    version === 19 ||
+    version === 20
   );
 };
 
@@ -242,7 +279,7 @@ export function assertNoEarlierVersion(repository: string): void {
 
 function refuseEarlierVersion(directories: string[]): never {
   throw new Error(
-    `State from an earlier Factory version: ${directories.join(", ")}. v0.2.0 starts fresh: run \`factory supervisor uninstall\` (add \`--config PATH\` unless it is the default configuration), then \`rm -r ${directories.map((directory) => (/^[\w@%+=:,./-]+$/.test(directory) ? directory : `'${directory.replaceAll("'", "'\\''")}'`)).join(" ")}\` (this leaves worktrees and open PRs from that state in place), or finish them with the old version first`,
+    `State from an unsupported Factory version: ${directories.join(", ")}. Preserve the original state and owned resources; use the compatible Factory version and supported lifecycle recovery before starting another run`,
   );
 }
 
@@ -288,6 +325,7 @@ function parsePreparation(
   repository: string,
   objective: number,
 ): PreparationState {
+  assertContinuationRestoration(value);
   if (value.memoryBindings !== undefined)
     assertRepositoryMemoryBindings(value.memoryBindings);
   const lookup = value.planningRecovery?.contextLookup;
@@ -297,7 +335,7 @@ function parsePreparation(
       value.schemaVersion !== 12 &&
       value.schemaVersion !== 14 &&
       value.schemaVersion !== 16 &&
-      value.schemaVersion !== 18
+      ![18, 20].includes(value.schemaVersion)
     )
       throw new Error(
         "Adaptive context requires preparation schema version 10",
@@ -326,12 +364,12 @@ function parsePreparation(
       (conditional &&
         value.schemaVersion !== 14 &&
         value.schemaVersion !== 16 &&
-        value.schemaVersion !== 18) ||
+        ![18, 20].includes(value.schemaVersion)) ||
       (expanded &&
         value.schemaVersion !== 12 &&
         value.schemaVersion !== 14 &&
         value.schemaVersion !== 16 &&
-        value.schemaVersion !== 18)
+        ![18, 20].includes(value.schemaVersion))
     )
       throw new Error(
         "Preparation plan schema differs from adaptive semantics",
@@ -356,7 +394,7 @@ function parsePreparation(
       value.schemaVersion !== 12 &&
       value.schemaVersion !== 14 &&
       value.schemaVersion !== 16 &&
-      value.schemaVersion !== 18) ||
+      ![18, 20].includes(value.schemaVersion)) ||
     value.kind !== "preparing" ||
     value.repository !== repository ||
     value.objective !== objective ||
@@ -464,7 +502,10 @@ function parseExecution(
     };
     if (
       typeof active.worktree !== "string" ||
-      !resolve(active.worktree).startsWith(`${join(root, "worktrees")}${sep}`)
+      (!state.restoration &&
+        !resolve(active.worktree).startsWith(
+          `${join(root, "worktrees")}${sep}`,
+        ))
     )
       throw new Error(
         `Work Item ${id} attempt worktree is outside Factory state`,
@@ -677,4 +718,677 @@ export function releaseControllerLock(
   closeSync(lock.fd);
   const current = readControllerOwner(path);
   if (current?.token === lock.token) rmSync(path);
+}
+
+/** An explicit rebind verifies the frozen configuration; no digest is rewritten. */
+export function continuationConfigurationMatches(
+  state: ContinuationState,
+  config: FactoryConfig,
+): boolean {
+  if (state.repository !== config.repository) return false;
+  const receipt = state.restoration;
+  if (!receipt) return state.configDigest === factoryConfigDigest(config);
+  try {
+    assertContinuationRestoration(state);
+    return (
+      !!receipt.source &&
+      receipt.original.configDigest === receipt.source.configDigest &&
+      receipt.source.authorityDigest === factoryAuthorityDigest(config) &&
+      receipt.installation.authorityDigest === factoryAuthorityDigest(config) &&
+      receipt.installation.configDigest === factoryConfigDigest(config) &&
+      receipt.installation.checkout === config.checkout &&
+      receipt.installation.stateRoot === stateRoot(config.repository) &&
+      factoryConfigDigest({ ...config, checkout: receipt.source.checkout }) ===
+        state.configDigest
+    );
+  } catch {
+    return false;
+  }
+}
+export function assertRestoredContinuationReady(
+  state: ContinuationState,
+  config: FactoryConfig,
+): void {
+  if (!state.restoration) return;
+  if (
+    state.restoration.status !== "reconciled" ||
+    !continuationConfigurationMatches(state, config)
+  )
+    throw new Error(
+      "Restored continuation requires supported inspection and ownership reconciliation; foreign process absence does not establish cessation",
+    );
+}
+
+/** A foreign resource is fenced by retained authority, never by destination PID absence. */
+export function restoredContinuationOwnershipHold(
+  state: ContinuationState,
+): string | undefined {
+  if (Object.values(state.repeats ?? {}).some((record) => record.inFlight))
+    return "Retained paid call has no recorded settlement";
+  if (state.coordinator?.processes?.length)
+    return "Recorded controller subprocess ownership requires source-host reconciliation";
+  for (const ref of [
+    ...Object.values(state.agentSessions ?? {}),
+    ...(state.agentSessionHistory ?? []),
+  ]) {
+    if (
+      ref.status === "in-flight" ||
+      (ref.status === "ready" &&
+        (!ref.currentTurn?.terminal ||
+          ref.currentTurn.resources !== "settled")) ||
+      (ref.currentTurn && ref.currentTurn.resources !== "settled")
+    )
+      return "Foreign native session ownership is not portable or authoritatively settled";
+  }
+  const planning = state.planningRecovery;
+  if (
+    planning?.phase === "submitted" &&
+    planning.response === undefined &&
+    !planning.invocations?.some(
+      (entry) => entry.id === planning.invocation?.id && entry.resultDigest,
+    )
+  )
+    return "Submitted planning invocation has no authenticated settlement";
+  if (isPreparationState(state)) return undefined;
+  if (
+    Object.values(state.work).some((work) =>
+      work.recovery?.history?.some(
+        (entry) =>
+          entry.diagnosisInvocation?.submitted &&
+          entry.diagnosisInvocation.response === undefined,
+      ),
+    )
+  )
+    return "Historical submitted diagnosis has no authenticated settlement";
+  for (const work of Object.values(state.work).flatMap((work) => [
+    work,
+    ...(work.recovery?.history ?? []).map((entry) => entry.work),
+  ])) {
+    if (work.execution) {
+      if (
+        !["local", "openai-agents", "claude-managed-agents"].includes(
+          work.execution.provider,
+        )
+      )
+        return "Foreign execution adapter has no supported portable settlement contract";
+      const data = work.execution.data as Record<string, unknown> | undefined;
+      if (
+        !data?.result &&
+        !data?.rejectedCollection &&
+        data?.stopped === undefined
+      )
+        return "Foreign execution ownership lacks an authenticated terminal collection or cessation receipt";
+    }
+    const recovery = (work as import("./state.js").WorkState).recovery;
+    if (
+      recovery?.diagnosisInvocation?.submitted &&
+      recovery.diagnosisInvocation.response === undefined
+    )
+      return "Submitted work diagnosis invocation has no authenticated settlement";
+    if ((work.status === "running" && !work.execution) || work.branchUpdateFrom)
+      return "Work retains an unresolved execution or delivery effect";
+  }
+  for (const amendment of [
+    state.pendingAmendment,
+    ...(state.rejectedAmendments ?? []),
+  ]) {
+    if (
+      (amendment?.planningInvocation &&
+        amendment.planningInvocation.response === undefined) ||
+      (amendment?.reviewInvocation &&
+        amendment.reviewInvocation.response === undefined)
+    )
+      return "Submitted amendment invocation has no authenticated settlement";
+  }
+  if (
+    Object.values(state.stackNumbers ?? {}).some(
+      (value) => typeof value !== "number" && value.disposition !== "observed",
+    ) ||
+    Object.values(state.stackMerges ?? {}).some((value) => !value.uuid)
+  )
+    return "Native publication or merge submission remains unresolved";
+  if (
+    Object.values(state.publicationIntents ?? {})
+      .flat()
+      .some(
+        (intent) =>
+          intent.effects?.some((effect) => effect.disposition === "intent") ||
+          (!intent.observation &&
+            intent.submission === "possibly-submitted" &&
+            !intent.admissionBlockedAt),
+      )
+  )
+    return "Publication submission remains unresolved";
+  if (
+    !state.cancelledAt &&
+    Object.values(state.graphProjectionIntents ?? {}).some((intent) =>
+      intent.effects.some(
+        (effect) => !effect.observation && effect.admission !== "blocked",
+      ),
+    )
+  )
+    return "Graph projection submission remains unresolved";
+  return undefined;
+}
+
+/** Install verified typed originals; no adapter, provider, queue or process is activated. */
+export async function restoreRecoveryCheckpoint(args: {
+  config: FactoryConfig;
+  checkpoint?: string;
+}): Promise<{
+  checkpoint: string;
+  payloadDigest: string;
+  disposition: "inspection" | "reconciliation-required";
+  objectives: {
+    objective: number;
+    runId: string;
+    disposition: "held";
+    reason: string;
+  }[];
+  memoryRecords: number;
+  learningRecords: number;
+  catalog: "ready" | "unavailable";
+  pendingSync: boolean;
+}> {
+  const { config } = args;
+  const { installExactMemoryLearning } = await import(
+    "./repository-memory-transfer.js"
+  );
+  const { parseQueueRecord } = await import("./project-queue-state.js");
+  const assertProjectQueueWriteReceipt: typeof import("./github-project-queue.js").assertProjectQueueWriteReceipt =
+    (await import("./github-project-queue.js")).assertProjectQueueWriteReceipt;
+  const { proposalPersistenceReferences } = await import("./proposals.js");
+  const { verifyContinuationReferenceClosure } = await import(
+    "./recovery-checkpoint-closure.js"
+  );
+  const lock = acquireInstallationLock(config.repository);
+  let staging: string | undefined;
+  try {
+    const checkpoint = await readVerifiedRecoveryCheckpoint(
+      config,
+      args.checkpoint,
+    );
+    const source = checkpoint.manifest.authority;
+    if (source && source.authorityDigest !== factoryAuthorityDigest(config))
+      throw new Error(
+        "Recovery checkpoint semantic authority differs from the current configuration",
+      );
+    const bytes = new Map<string, Buffer>();
+    const key = (ref: ContentRef) =>
+      JSON.stringify([ref.digest, ref.bytes, ref.mediaType]);
+    for (const ref of [
+      ...checkpoint.manifest.files.map((file) => file.ref),
+      ...checkpoint.manifest.contentRefs,
+    ])
+      if (!bytes.has(key(ref)))
+        bytes.set(
+          key(ref),
+          Buffer.from(await checkpoint.readVerifiedBlob(ref)),
+        );
+    const readBytes = async (ref: ContentRef) => {
+      const data = bytes.get(key(ref));
+      if (!data)
+        throw new Error(
+          "Required original reference is absent from the verified checkpoint closure",
+        );
+      return data;
+    };
+    const replicaFiles: typeof checkpoint.manifest.files = [];
+    const originals: { state: ContinuationState; ref: ContentRef }[] = [];
+    const gitObjects = new Map<string, { sha: string; kind: string }>();
+    for (const file of checkpoint.manifest.files) {
+      if (file.kind === "continuation") {
+        const match = /^objectives\/([1-9][0-9]*)\/state\.json$/.exec(
+          file.path,
+        );
+        if (!match)
+          throw new Error(
+            "Recovery continuation path is outside its exact Objective identity",
+          );
+        const state = parsePortableContinuation(
+          JSON.parse((await readBytes(file.ref)).toString("utf8")),
+          config.repository,
+          Number(match[1]),
+        );
+        const closure = await verifyContinuationReferenceClosure(
+          state,
+          { readBytes },
+          config.gitPersistence,
+        );
+        if (closure.gaps.some((gap) => gap.required !== false))
+          throw new Error(
+            "Recovery continuation has an unresolved required original",
+          );
+        for (const object of closure.gitObjects)
+          gitObjects.set(`${object.kind}:${object.sha}`, object);
+        const current = readContinuation(config.repository, state.objective);
+        if (
+          current &&
+          (!current.restoration ||
+            current.restoration.status !== "held" ||
+            current.restoration.original.snapshot.digest !== file.ref.digest ||
+            current.restoration.checkpoint.payloadDigest !==
+              checkpoint.payloadDigest)
+        )
+          throw new Error(
+            "Recovery would replace an existing or changed continuation; inspection requires its original installation",
+          );
+        if (current) {
+          const { restoration: _currentReceipt, ...currentFields } = current;
+          const { restoration: _sourceReceipt, ...sourceFields } = state;
+          currentFields.schemaVersion = state.schemaVersion;
+          if (!isDeepStrictEqual(currentFields, sourceFields))
+            throw new Error(
+              "Restored continuation changed after installation; preserve its exact local history",
+            );
+        }
+        originals.push({ state, ref: file.ref });
+      } else if (file.path.startsWith("accounting/")) {
+        decodeAccountingRecord(
+          config.repository,
+          file.path,
+          await readBytes(file.ref),
+        );
+        replicaFiles.push(file);
+      } else if (
+        file.kind === "historical" &&
+        /^project-queue-history\/[a-f0-9-]{36}\.json$/.test(file.path)
+      ) {
+        const record = parseQueueRecord(
+          await readBytes(file.ref),
+          config.repository,
+          file.path.split("/")[1]!.slice(0, -5),
+        );
+        if (record.kind === "project-queue-operation")
+          for (const effect of record.effects) {
+            if (effect.original)
+              assertProjectQueueWriteReceipt({
+                ...effect.receipt,
+                original: JSON.parse(
+                  (await readBytes(effect.original)).toString("utf8"),
+                ),
+              });
+            if (effect.rejectedOriginal)
+              await readBytes(effect.rejectedOriginal);
+          }
+        replicaFiles.push(file);
+      } else if (
+        file.kind === "historical" &&
+        /^proposals\/[a-f0-9-]{36}\.json$/.test(file.path)
+      ) {
+        const description = proposalPersistenceReferences(
+          await readBytes(file.ref),
+          config.repository,
+          file.path.split("/")[1]!.slice(0, -5),
+          (ref) => {
+            const data = bytes.get(key(ref));
+            if (!data)
+              throw new Error(
+                "Required proposal original is absent from the verified closure",
+              );
+            return data;
+          },
+        );
+        if (description.gaps.some((gap) => gap.required !== false))
+          throw new Error(
+            "Proposal original has an unresolved required reference",
+          );
+        gitObjects.set(`commit:${description.baseSha}`, {
+          sha: description.baseSha,
+          kind: "commit",
+        });
+        replicaFiles.push(file);
+      } else if (file.kind === "pre-state") {
+        const value = JSON.parse((await readBytes(file.ref)).toString("utf8"));
+        assertRepeats(value.repeats, "repeats");
+        assertWait(value.wait, "wait");
+        if (!/^objectives\/[1-9][0-9]*\/pre-state\.json$/.test(file.path))
+          throw new Error(
+            "Recovery pre-state path is outside its Objective identity",
+          );
+        replicaFiles.push(file);
+      }
+    }
+    for (const object of checkpoint.manifest.gitObjects ?? [])
+      gitObjects.set(`commit:${object.commitSha}`, {
+        sha: object.commitSha,
+        kind: "commit",
+      });
+    // Authenticate the entire pack in an isolated Git object database before installing any live record.
+    const packs = checkpoint.manifest.files.filter(
+      (file) => file.kind === "git-pack",
+    );
+    if (gitObjects.size && !packs.length)
+      throw new Error("Recovery source Git objects have no retained pack");
+    if (packs.length) {
+      staging = mkdtempSync(join(tmpdir(), "factory-restore-"));
+      execFileSync("git", ["init", "--bare", staging], {
+        env: pinnedGitEnvironment(),
+        stdio: "pipe",
+      });
+      for (const file of packs) {
+        const command = pinnedGitCommand(staging, ["index-pack", "--stdin"]);
+        execFileSync("git", command.args, {
+          env: command.env,
+          input: await readBytes(file.ref),
+          timeout: config.gitPersistence?.timeoutMs,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      }
+      for (const object of gitObjects.values())
+        if (pinnedGit(staging, "cat-file", "-t", object.sha) !== object.kind)
+          throw new Error("Recovery source Git object has the wrong type");
+      pinnedGit(config.checkout, "rev-parse", "--git-dir");
+    }
+    // Refuse mutable path conflicts before canonical replicas or operational snapshots are installed.
+    for (const file of replicaFiles) {
+      assertRecoveryReplicaPath(
+        join(stateRoot(config.repository), file.path),
+        stateRoot(config.repository),
+      );
+      const path = join(stateRoot(config.repository), file.path);
+      if (
+        existsSync(path) &&
+        (!lstatSync(path).isFile() ||
+          !readFileSync(path).equals(await readBytes(file.ref)))
+      )
+        throw new Error(
+          "Recovery immutable accounting path conflicts with an existing original",
+        );
+    }
+    const root = stateRoot(config.repository);
+    for (const entry of originals)
+      assertRecoveryReplicaPath(
+        statePath(config.repository, entry.state.objective),
+        root,
+      );
+    const store = new LocalContentStore(join(root, "content"));
+    for (const ref of [
+      ...checkpoint.manifest.files.map((file) => file.ref),
+      ...checkpoint.manifest.contentRefs,
+    ])
+      store.putBytes(await readBytes(ref), { mediaType: ref.mediaType });
+    const archive = store.putBytes(checkpoint.manifestBytes, {
+      mediaType: "application/json",
+    });
+    if (archive.digest !== checkpoint.payloadDigest)
+      throw new Error(
+        "Restoration archive fingerprint differs from its verified payload",
+      );
+    for (const file of packs) {
+      const command = pinnedGitCommand(config.checkout, [
+        "index-pack",
+        "--stdin",
+      ]);
+      execFileSync("git", command.args, {
+        env: command.env,
+        input: await readBytes(file.ref),
+        timeout: config.gitPersistence?.timeoutMs,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
+    const memory = await installExactMemoryLearning({
+      repository: config.repository,
+      root,
+      access: {
+        repository: config.repository,
+        visibility: ["private", "repository"],
+      },
+      files: checkpoint.manifest.files,
+      contentRefs: [
+        ...checkpoint.manifest.contentRefs,
+        ...checkpoint.manifest.files.map((file) => file.ref),
+      ],
+      readVerifiedBlob: readBytes,
+    });
+    for (const file of replicaFiles) {
+      const path = join(root, file.path);
+      if (!existsSync(path)) {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        const fd = openSync(temporary, "wx", 0o600);
+        try {
+          writeFileSync(fd, await readBytes(file.ref));
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        try {
+          linkSync(temporary, path);
+        } finally {
+          rmSync(temporary, { force: true });
+        }
+      }
+    }
+    const objectives: {
+      objective: number;
+      runId: string;
+      disposition: "held";
+      reason: string;
+    }[] = [];
+    for (const { state, ref } of originals) {
+      const previous = readContinuation(
+        config.repository,
+        state.objective,
+      )?.restoration;
+      const receipt: ContinuationRestoration = {
+        schemaVersion: 1,
+        checkpoint: {
+          commitSha: checkpoint.commitSha,
+          payloadDigest: checkpoint.payloadDigest,
+        },
+        archive,
+        original: {
+          snapshot: ref,
+          configDigest: state.configDigest,
+          schemaVersion: state.schemaVersion,
+        },
+        ...(source
+          ? {
+              source:
+                state.restoration &&
+                state.restoration.installation.configDigest ===
+                  source.configDigest &&
+                state.restoration.installation.checkout ===
+                  source.hostLayout.checkout &&
+                state.restoration.installation.authorityDigest ===
+                  source.authorityDigest &&
+                state.restoration.source?.authorityDigest ===
+                  source.authorityDigest &&
+                factoryConfigDigest({
+                  ...config,
+                  checkout: source.hostLayout.checkout,
+                }) === source.configDigest
+                  ? structuredClone(state.restoration.source)
+                  : {
+                      authorityDigest: source.authorityDigest,
+                      configDigest: source.configDigest,
+                      ...source.hostLayout,
+                    },
+            }
+          : {}),
+        installation: {
+          identity: previous?.installation.identity ?? randomUUID(),
+          configDigest: factoryConfigDigest(config),
+          authorityDigest: factoryAuthorityDigest(config),
+          checkout: config.checkout,
+          stateRoot: root,
+        },
+        status: "held",
+        reason:
+          "Verified originals installed for inspection; foreign ownership and frozen configuration require explicit reconciliation",
+      };
+      state.schemaVersion = isPreparationState(state) ? 20 : 19;
+      state.restoration = receipt;
+      if (!continuationConfigurationMatches(state, config))
+        receipt.reason =
+          "Historical snapshot configuration cannot be authenticated by this checkpoint's publisher authority; inspection only";
+      assertRecoveryReplicaPath(
+        statePath(config.repository, state.objective),
+        root,
+      );
+      saveState(statePath(config.repository, state.objective), state, {
+        observeMemory: false,
+      });
+      objectives.push({
+        objective: state.objective,
+        runId: state.runId,
+        disposition: "held",
+        reason: receipt.reason,
+      });
+    }
+    let adopted = false;
+    if (source && checkpoint.commitSha === checkpoint.remoteTip) {
+      await adoptRecoveryCheckpointBaseline(config, {
+        checkpoint,
+        installedClosureDigest: recoveryCheckpointClosureDigest(
+          checkpoint.manifest,
+        ),
+        lock,
+      });
+      adopted = true;
+    }
+    return {
+      checkpoint: checkpoint.commitSha,
+      payloadDigest: checkpoint.payloadDigest,
+      disposition: adopted ? "reconciliation-required" : "inspection",
+      objectives,
+      ...memory,
+      pendingSync: adopted,
+    };
+  } finally {
+    if (staging) rmSync(staging, { recursive: true, force: true });
+    releaseControllerLock(installationLockPath(config.repository), lock);
+  }
+}
+
+/** Explicitly release only a verified idle continuation from its inspection fence. */
+export async function reconcileRestoredContinuation(args: {
+  config: FactoryConfig;
+  objective: number;
+}): Promise<{ objective: number; runId: string; status: "reconciled" }> {
+  const { config, objective } = args;
+  const { verifyContinuationReferenceClosure, buildRecoveryCheckpointClosure } =
+    await import("./recovery-checkpoint-closure.js");
+  const lock = acquireInstallationLock(config.repository, objective);
+  try {
+    const state = readContinuation(config.repository, objective);
+    if (!state?.restoration)
+      throw new Error("Objective has no supported restored continuation");
+    if (
+      state.cancelledAt ||
+      (!isPreparationState(state) && state.finalAcceptance)
+    )
+      throw new Error(
+        "Terminal or cancelled restored Objectives remain terminal inspection records",
+      );
+    if (!continuationConfigurationMatches(state, config))
+      throw new Error(
+        "Frozen original configuration authority cannot be rebound to this installation",
+      );
+    const store = new LocalContentStore(
+      join(stateRoot(config.repository), "content"),
+    );
+    const original = parsePortableContinuation(
+      JSON.parse(
+        store.readBytes(state.restoration.original.snapshot).toString("utf8"),
+      ),
+      config.repository,
+      objective,
+    );
+    if (
+      original.runId !== state.runId ||
+      original.configDigest !== state.configDigest ||
+      createHash("sha256")
+        .update(store.readBytes(state.restoration.archive))
+        .digest("hex") !== state.restoration.checkpoint.payloadDigest
+    )
+      throw new Error(
+        "Restored original identity or archive changed before reconciliation",
+      );
+    const hold = restoredContinuationOwnershipHold(state);
+    if (hold) throw new Error(`Restored continuation remains held: ${hold}`);
+    const closure = await verifyContinuationReferenceClosure(
+      state,
+      store,
+      config.gitPersistence,
+    );
+    if (closure.gaps.some((gap) => gap.required !== false))
+      throw new Error(
+        "Restored continuation has an unresolved required original",
+      );
+    for (const object of closure.gitObjects)
+      if (
+        pinnedGit(config.checkout, "cat-file", "-t", object.sha) !== object.kind
+      )
+        throw new Error(
+          "Restored source Git object is unavailable or has the wrong type",
+        );
+    for (const [key, ref] of Object.entries(state.agentSessions ?? {})) {
+      if (ref.status !== "ready") continue;
+      state.agentSessionHistory ??= [];
+      state.agentSessionHistory.push(structuredClone(ref));
+      state.agentSessions![key] = { ...ref, status: "unavailable" };
+    }
+    state.restoration.status = "reconciled";
+    state.restoration.reason =
+      "Exact source configuration and retained terminal ownership receipts authenticated; new local execution remains within original allowances";
+    await withRecoveryCheckpointScope(
+      {
+        config,
+        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+      },
+      async () =>
+        saveState(statePath(config.repository, objective), state, {
+          observeMemory: false,
+        }),
+    );
+    return { objective, runId: state.runId, status: "reconciled" };
+  } finally {
+    releaseControllerLock(installationLockPath(config.repository), lock);
+  }
+}
+
+/** Held foreign owners also fence a fresh Objective using this installation's limits. */
+export function assertRestoredInstallationDispatchReady(
+  config: FactoryConfig,
+): void {
+  const root = join(stateRoot(config.repository), "objectives");
+  if (!existsSync(root)) return;
+  for (const name of readdirSync(root).filter((name) =>
+    /^[1-9][0-9]*$/.test(name),
+  )) {
+    const state = readContinuation(config.repository, Number(name));
+    if (!state?.restoration || state.restoration.status !== "held") continue;
+    const hold = restoredContinuationOwnershipHold(state);
+    if (hold)
+      throw new Error(
+        `Restored installation retains unsettled foreign ownership: ${hold}`,
+      );
+  }
+}
+
+function assertRecoveryReplicaPath(path: string, root: string): void {
+  const scope = relative(resolve(root), resolve(path));
+  if (
+    !scope ||
+    scope.startsWith(`..${sep}`) ||
+    scope === ".." ||
+    resolve(root) !== realpathSync(root)
+  )
+    throw new Error("Recovery replica resolves outside its private root");
+  let current = root;
+  for (const part of scope.split(sep).slice(0, -1)) {
+    current = join(current, part);
+    if (
+      existsSync(current) &&
+      (!lstatSync(current).isDirectory() || lstatSync(current).isSymbolicLink())
+    )
+      throw new Error("Recovery replica parent is not a private directory");
+  }
+  if (
+    existsSync(path) &&
+    (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())
+  )
+    throw new Error("Recovery replica is not a regular original file");
 }

@@ -2087,7 +2087,9 @@ export class LocalExecutionDriver implements ExecutionDriver {
                   provider: this.adapterIdentity,
                   model: "not-exposed",
                 },
-                configDigest: this.captureSettings.configDigest,
+                configDigest:
+                  request.captureContext.configDigest ??
+                  this.captureSettings.configDigest,
                 sourceDigest: createHash("sha256")
                   .update(request.objectiveBody ?? "")
                   .digest("hex"),
