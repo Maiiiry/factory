@@ -313,6 +313,7 @@ async function planObjectiveObserved(
           baseSha,
           sources: planningSources(issue.body, baseSha, config.checkout),
           contentStore: services.contentStore,
+          workflowRecipe,
         }),
         state: {
           autonomy: resolveAutonomy(config.autonomy),
@@ -688,6 +689,7 @@ export async function prepareObjective(args: {
                       config.checkout,
                     ),
                     contentStore: args.contentStore,
+                    workflowRecipe,
                   }),
                   state: preparation!,
                   sessionState: preparation!,
