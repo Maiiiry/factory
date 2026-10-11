@@ -464,6 +464,14 @@ export function checkServiceState(
   configPath: string,
 ): void {
   assertRestoredInstallationDispatchReady(config);
+  checkObjectiveServiceState(config, objective, configPath);
+}
+
+function checkObjectiveServiceState(
+  config: FactoryConfig,
+  objective: number,
+  configPath: string,
+): void {
   const state = readContinuation(config.repository, objective);
   if (
     state?.restoration &&
@@ -501,11 +509,13 @@ export async function checkIntakeServiceState(
 ): Promise<IntakeAuthorization> {
   assertRestoredInstallationDispatchReady(config);
   const intake = await readIntake(config);
+  assertRestoredInstallationDispatchReady(config);
   if (!intake?.watch)
     throw new Error(
       "The background service is not set up; run `factory setup --background`",
     );
-  for (const id of intake.objectives) checkServiceState(config, id, configPath);
+  for (const id of intake.objectives)
+    checkObjectiveServiceState(config, id, configPath);
   return intake;
 }
 
