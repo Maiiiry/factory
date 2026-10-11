@@ -1135,10 +1135,41 @@ export function parseFactoryState(
     throw new Error(
       "Adaptive execution lacks its retained context or discovery semantics",
     );
+  const checkpointState = state as unknown as FactoryState;
   if (
     (state.schemaVersion === 13 ||
       state.schemaVersion === 15 ||
-      (state.schemaVersion === 17 && state.workflowRecipePin !== undefined)) &&
+      (state.schemaVersion === 17 &&
+        (state.workflowRecipePin !== undefined ||
+          state.conditionFacts !== undefined ||
+          state.workflowReflection !== undefined ||
+          state.adaptiveContexts !== undefined ||
+          state.pendingExpansion !== undefined ||
+          state.expansionHistory !== undefined ||
+          [
+            checkpointState.graph,
+            ...(checkpointState.graphRevisions ?? []).map(
+              (revision) => revision.graph,
+            ),
+            ...[
+              checkpointState.pendingAmendment,
+              ...(checkpointState.rejectedAmendments ?? []),
+            ].flatMap((amendment) =>
+              amendment
+                ? [
+                    ...(amendment.graph ? [amendment.graph] : []),
+                    ...(amendment.proposal.graph
+                      ? [amendment.proposal.graph]
+                      : []),
+                  ]
+                : [],
+            ),
+          ].some(
+            (retained) =>
+              retained.conditions?.length ||
+              retained.expansions?.length ||
+              retained.items.some((item) => item.kind === "discovery"),
+          )))) &&
     lookup === undefined
   )
     throw new Error(

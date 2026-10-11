@@ -2088,14 +2088,24 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
   };
   const missingRoutingAdmission = structuredClone(routeState);
   delete missingRoutingAdmission.planningRecovery.contextLookup;
-  assert.throws(
-    () =>
-      parseFactoryState(
-        missingRoutingAdmission,
-        routingConfig.repository,
-        producer.objective,
-      ),
-    /requires its original admitted planning context/,
+  for (const schemaVersion of [13, 17]) {
+    missingRoutingAdmission.schemaVersion = schemaVersion;
+    assert.throws(
+      () =>
+        parseFactoryState(
+          missingRoutingAdmission,
+          routingConfig.repository,
+          producer.objective,
+        ),
+      /requires its original admitted planning context/,
+    );
+  }
+  const checkpointRoutingAdmission = structuredClone(routeState);
+  checkpointRoutingAdmission.schemaVersion = 17;
+  parseFactoryState(
+    checkpointRoutingAdmission,
+    routingConfig.repository,
+    producer.objective,
   );
   const snapshot = join(root, "routing-state.json");
   const routeArgs = {
