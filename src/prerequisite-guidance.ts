@@ -457,7 +457,9 @@ export function derivePrerequisiteGuidance(
         ["local", "claude-managed-agents", "openai-agents"].includes(
           current.execution.provider,
         ) &&
-        request?.attemptId === current.attempt &&
+        request &&
+        current.attempt &&
+        request.attemptId === current.attempt &&
         object(request.item)?.id === item.id &&
         typeof result.treeSha === "string" &&
         /^[a-f0-9]{40}$/.test(result.treeSha) &&
