@@ -2,6 +2,7 @@ export {
   assertAgentSessionCapabilities,
   planningSessionInputDigest,
 } from "./agent-session.js";
+export { adaptiveWorkflowEnabled } from "./adaptive-workflow.js";
 export type { AnalysisField, AnalysisOptions } from "./analysis.js";
 export {
   analysisFields,
