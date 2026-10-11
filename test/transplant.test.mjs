@@ -1113,6 +1113,7 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     JSON.parse(rankedBatch[2].matches[0].content).content[0].text,
     originalBody,
   );
+  rankedRecord.packet.batches.push(rankedBatch);
   assert.doesNotThrow(() => assertContextFactsResolved(rankedRecord.packet));
 
   const memoryStore = new LocalContentStore(
