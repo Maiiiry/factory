@@ -21,7 +21,6 @@ import { captureAssetSets } from "../dist/media.js";
 import {
   assertAccountingSealContent,
   buildAccountingSeal,
-  decodeAccountingRecord,
   readAccountingRecords,
 } from "../dist/accounting.js";
 import {
@@ -46,7 +45,13 @@ import {
 } from "../dist/compiler/context.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
 import { parseFactoryState } from "../dist/state.js";
-import { saveState, statePath } from "../dist/state-store.js";
+import {
+  readContinuation,
+  reconcileRestoredContinuation,
+  restoreRecoveryCheckpoint,
+  saveState,
+  statePath,
+} from "../dist/state-store.js";
 import {
   authenticateWorkRouting,
   assertWorkRoutingState,
@@ -75,10 +80,7 @@ import {
   readVerifiedRecoveryCheckpoint,
   synchronizeRecoveryCheckpoint,
 } from "../dist/recovery-checkpoint.js";
-import {
-  buildMemoryLearningClosure,
-  installExactMemoryLearning,
-} from "../dist/repository-memory-transfer.js";
+import { buildMemoryLearningClosure } from "../dist/repository-memory-transfer.js";
 import {
   authenticateDiscoveryOutput,
   discoverRepository,
@@ -425,7 +427,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       scope: "private-history",
       maxBytes: 16 * 1024 * 1024,
       maxFiles: 4096,
-      timeoutMs: 10000,
+      timeoutMs: 1000,
       coalesceMs: 0,
     },
   };
@@ -937,6 +939,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const accountingOriginals = closure.files
     .filter((file) => file.path.startsWith("accounting/"))
     .map((file) => ({ ...file, bytes: readFileSync(join(state, file.path)) }));
+  const originalSnapshot = readFileSync(statePath(repository, 1));
   // The only surviving originals are in the remote Git archive. Fetch into an
   // independent repository after both the source workspace and replicas are gone.
   rmSync(checkout, { recursive: true });
@@ -960,26 +963,93 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     recovered.readVerifiedBlob,
   );
   assert.equal(existsSync(join(state, "content")), false);
-  await installExactMemoryLearning({
-    repository,
-    root: state,
-    access: privateAccess,
-    files: recovered.manifest.files,
-    contentRefs: recovered.manifest.contentRefs,
-    readVerifiedBlob: recovered.readVerifiedBlob,
+  const reconstructed = join(root, "reconstructed");
+  execFileSync("git", ["init", reconstructed], { stdio: "pipe" });
+  const freshConfig = { ...config, checkout: reconstructed };
+  assert.notEqual(factoryConfigDigest(freshConfig), cancelled.configDigest);
+  await assert.rejects(
+    restoreRecoveryCheckpoint({
+      config: {
+        ...freshConfig,
+        gitPersistence: { ...freshConfig.gitPersistence, maxFiles: 1 },
+      },
+      checkpoint: recovered.commitSha,
+    }),
+    /bound|limit/i,
+  );
+  assert.equal(existsSync(statePath(repository, 1)), false);
+  assert.equal(existsSync(join(state, "content")), false);
+  await assert.rejects(
+    restoreRecoveryCheckpoint({
+      config: {
+        ...freshConfig,
+        policy: { ...freshConfig.policy, network: "on" },
+      },
+      checkpoint: recovered.commitSha,
+    }),
+    /authority|configuration/i,
+  );
+  assert.equal(existsSync(statePath(repository, 1)), false);
+  assert.equal(existsSync(join(state, "content")), false);
+  const historicalRestore = await restoreRecoveryCheckpoint({
+    config: freshConfig,
+    checkpoint: recovered.commitSha,
   });
-  for (const file of recovered.manifest.files.filter((entry) =>
-    entry.path.startsWith("accounting/"),
-  )) {
-    const bytes = Buffer.from(await recovered.readVerifiedBlob(file.ref));
-    decodeAccountingRecord(repository, file.path, bytes);
-    mkdirSync(join(state, "accounting"), { recursive: true, mode: 0o700 });
-    writeFileSync(join(state, file.path), bytes, { mode: 0o600 });
-  }
-  for (const ref of recovered.manifest.contentRefs)
-    store.putBytes(Buffer.from(await recovered.readVerifiedBlob(ref)), {
-      mediaType: ref.mediaType,
-    });
+  assert.equal(historicalRestore.checkpoint, recovered.commitSha);
+  assert.equal(historicalRestore.disposition, "inspection");
+  const restoredPreparation = readContinuation(repository, 1);
+  assert.equal(restoredPreparation.schemaVersion, 20);
+  assert.equal(restoredPreparation.restoration.status, "held");
+  assert.equal(
+    restoredPreparation.restoration.original.configDigest,
+    cancelled.configDigest,
+  );
+  assert.equal(
+    restoredPreparation.restoration.installation.configDigest,
+    factoryConfigDigest(freshConfig),
+  );
+  assert.equal(
+    restoredPreparation.restoration.installation.checkout,
+    reconstructed,
+  );
+  assert.equal(restoredPreparation.restoration.source.checkout, checkout);
+  assert.deepEqual(
+    store.readBytes(restoredPreparation.restoration.original.snapshot),
+    originalSnapshot,
+  );
+  const restoredOriginalFields = structuredClone(restoredPreparation);
+  delete restoredOriginalFields.restoration;
+  restoredOriginalFields.schemaVersion = cancelled.schemaVersion;
+  assert.deepEqual(restoredOriginalFields, cancelled);
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(freshConfig, {
+      reason: "explicit",
+      buildClosure: () =>
+        buildRecoveryCheckpointClosure({ config: freshConfig }),
+    }),
+    /baseline|restor|inspection/i,
+  );
+  const needsRestoration = gitPersistenceStatus(freshConfig);
+  assert.equal(needsRestoration.status, "needs-restore");
+  assert.equal(needsRestoration.attemptedCommit, undefined);
+  assert.equal(needsRestoration.restoredBaseline, undefined);
+  assert.equal(
+    execFileSync(
+      "git",
+      [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+      { encoding: "utf8" },
+    ).trim(),
+    foreign,
+  );
+  assert.throws(() =>
+    execFileSync(
+      "git",
+      ["-C", reconstructed, "rev-parse", "--verify", "HEAD"],
+      {
+        stdio: "pipe",
+      },
+    ),
+  );
   for (const original of accountingOriginals)
     assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
   assert.equal(existsSync(join(state, "captures")), false);
@@ -1011,8 +1081,14 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   );
   for (const original of originals)
     assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
+  assert.equal(historicalRestore.catalog, "ready");
+  assert.equal(existsSync(join(state, "memory", "catalog.sqlite")), true);
   const restored = new LocalRepositoryMemory(state, repository);
-  restored.rebuild();
+  assert.equal(
+    restored.search({ access: privateAccess, query: "orchard", limit: 1 })
+      .length,
+    1,
+  );
   assert.equal(restored.catalogStatus, "ready");
   assert.deepEqual(
     restored
@@ -1039,15 +1115,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     readDreamCheckpoint(repository, proposal.consolidation),
     prepared.checkpoint,
   );
-  const reconstructed = join(root, "reconstructed");
-  execFileSync("git", ["init", reconstructed], { stdio: "pipe" });
-  const packed = recovered.manifest.files.find(
-    (file) => file.kind === "git-pack",
-  );
-  execFileSync("git", ["-C", reconstructed, "index-pack", "--stdin"], {
-    input: Buffer.from(await recovered.readVerifiedBlob(packed.ref)),
-    stdio: ["pipe", "pipe", "pipe"],
-  });
   assert.deepEqual(
     execFileSync("git", [
       "-C",
@@ -1057,6 +1124,122 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     ]),
     source,
   );
+  await assert.rejects(
+    reconcileRestoredContinuation({ config: freshConfig, objective: 1 }),
+    /terminal|cancelled/i,
+  );
+  assert.deepEqual(readContinuation(repository, 1), restoredPreparation);
+  const latestRestore = await restoreRecoveryCheckpoint({
+    config: freshConfig,
+  });
+  assert.equal(latestRestore.checkpoint, foreign);
+  assert.equal(latestRestore.payloadDigest, historicalRestore.payloadDigest);
+  const restoredStatus = gitPersistenceStatus(freshConfig);
+  assert.equal(restoredStatus.restoredBaseline.source, "verified-restoration");
+  assert.equal(restoredStatus.restoredBaseline.commitSha, foreign);
+  assert.equal(restoredStatus.restoredBaseline.transportOutcome, "unavailable");
+  assert.deepEqual(restoredStatus.restoredBaseline.priorHold, {
+    kind: "needs-restore",
+    error: needsRestoration.error,
+  });
+  assert.equal(restoredStatus.attemptedCommit, undefined);
+  assert.equal(restoredStatus.pendingChanges, true);
+  const latestPreparation = readContinuation(repository, 1);
+  assert.equal(latestPreparation.restoration.status, "held");
+  assert.equal(latestPreparation.cancelledAt, cancelled.cancelledAt);
+  assert.deepEqual(latestPreparation.charges, cancelled.charges);
+  assert.deepEqual(
+    store.readBytes(latestPreparation.restoration.original.snapshot),
+    originalSnapshot,
+  );
+  const reboundCheckpoint = await synchronizeRecoveryCheckpoint(freshConfig, {
+    reason: "explicit",
+    buildClosure: () => buildRecoveryCheckpointClosure({ config: freshConfig }),
+  });
+  assert.equal(reboundCheckpoint.status, "acknowledged");
+  const reboundArchive = await readVerifiedRecoveryCheckpoint(
+    freshConfig,
+    reboundCheckpoint.lastAcknowledged.commitSha,
+  );
+  assert.deepEqual(
+    Buffer.from(
+      await reboundArchive.readVerifiedBlob(
+        latestPreparation.restoration.original.snapshot,
+      ),
+    ),
+    originalSnapshot,
+  );
+  execFileSync("git", [
+    `--git-dir=${remote}`,
+    "merge-base",
+    "--is-ancestor",
+    foreign,
+    reboundCheckpoint.lastAcknowledged.commitSha,
+  ]);
+  assert.equal(
+    readContinuation(repository, 1).cancelledAt,
+    cancelled.cancelledAt,
+  );
+  assert.equal(readContinuation(repository, 1).restoration.status, "held");
+  // A second fresh installation must authenticate the original approval through
+  // the rebound publisher's snapshot, without treating its new layout as authority.
+  const reboundSnapshot = readFileSync(statePath(repository, 1));
+  rmSync(reconstructed, { recursive: true });
+  rmSync(state, { recursive: true });
+  const nextCheckout = join(root, "rebound-reconstructed");
+  execFileSync("git", ["init", nextCheckout], { stdio: "pipe" });
+  const nextConfig = { ...freshConfig, checkout: nextCheckout };
+  const nextRestore = await restoreRecoveryCheckpoint({
+    config: nextConfig,
+    checkpoint: reboundCheckpoint.lastAcknowledged.commitSha,
+  });
+  assert.equal(
+    nextRestore.checkpoint,
+    reboundCheckpoint.lastAcknowledged.commitSha,
+  );
+  const nextPreparation = readContinuation(repository, 1);
+  assert.equal(nextPreparation.configDigest, cancelled.configDigest);
+  assert.equal(nextPreparation.cancelledAt, cancelled.cancelledAt);
+  assert.equal(nextPreparation.restoration.status, "held");
+  assert.equal(nextPreparation.restoration.source.checkout, checkout);
+  assert.equal(nextPreparation.restoration.installation.checkout, nextCheckout);
+  assert.deepEqual(
+    store.readBytes(nextPreparation.restoration.original.snapshot),
+    reboundSnapshot,
+  );
+  const parentSnapshot = JSON.parse(reboundSnapshot.toString("utf8"));
+  assert.deepEqual(
+    store.readBytes(parentSnapshot.restoration.original.snapshot),
+    originalSnapshot,
+  );
+  const nextOriginalFields = structuredClone(nextPreparation);
+  delete nextOriginalFields.restoration;
+  nextOriginalFields.schemaVersion = cancelled.schemaVersion;
+  assert.deepEqual(nextOriginalFields, cancelled);
+  for (const original of [...originals, ...accountingOriginals])
+    assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
+  assert.deepEqual(readAccountingRecords(repository, 1), accountingBefore);
+  assert.deepEqual(
+    summarizeDiagnosticUsage(readUsageSummaryEvents(repository, 1)),
+    usageBefore,
+  );
+  assert.equal(
+    readInteractionContent(repository, retainedCapture),
+    retainedText,
+  );
+  assert.equal(nextRestore.catalog, "ready");
+  assert.equal(existsSync(join(state, "memory", "catalog.sqlite")), true);
+  assert.deepEqual(readPinnedPlaybook(repository, pin), originalPlaybook);
+  assert.deepEqual(
+    execFileSync("git", [
+      "-C",
+      nextCheckout,
+      "show",
+      `${cancelled.baseSha}:api.md`,
+    ]),
+    source,
+  );
+  assert.equal(gitPersistenceStatus(nextConfig).attemptedCommit, undefined);
 });
 
 test("selector-bound discovery retains exact bytes, distinguishes incomplete output, and transfers declared fields without delivery", async (t) => {
