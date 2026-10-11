@@ -728,6 +728,146 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           gitPersistenceStatus(rejectedConfig).protectedContinuation,
           true,
         );
+        // Hold the genuine private-Git admission while the stock driver's
+        // prepared start is owned, then cancel before its actual ACK returns.
+        // This exercises the complete cleanup caller without native dispatch.
+        const raceState = structuredClone(rejectedSnapshot);
+        const raceAttempt = randomUUID();
+        raceState.work.api = {
+          status: "running",
+          step: "execute",
+          attempt: raceAttempt,
+          baseSha: raceState.baseSha,
+          startedAt: new Date().toISOString(),
+        };
+        const raceSave = () => saveState(rejectedSnapshotFile, raceState);
+        raceSave();
+        const conversation = agentSessionContinuation(
+          raceState,
+          "implementation",
+          "api",
+          raceSave,
+        );
+        const raceContext = executionContext(
+          raceState.work.api,
+          raceSave,
+          () => Boolean(raceState.cancelRequested),
+          undefined,
+          undefined,
+          raceState.repository,
+          true,
+        );
+        raceContext.checkpointSession = (ref) => conversation.checkpoint(ref);
+        let admissionEntered;
+        const entered = new Promise((resolve) => {
+          admissionEntered = resolve;
+        });
+        let releaseAdmission;
+        const held = new Promise((resolve) => {
+          releaseAdmission = resolve;
+        });
+        const originalAdmission = raceContext.admitEffect;
+        raceContext.admitEffect = async (reason) => {
+          if (reason === "before-effect") {
+            admissionEntered();
+            await held;
+          }
+          await originalAdmission(reason);
+        };
+        const credentials = join(root, "cancel-before-dispatch-credentials");
+        const raceDriver = new LocalExecutionDriver(
+          checkout,
+          join(stateRoot(raceState.repository), "worktrees"),
+          new CodexHarness(credentials, "off", {
+            model: "unused",
+            reasoningEffort: "low",
+          }),
+          1,
+          store,
+          "codex",
+        );
+        await withRecoveryCheckpointScope(
+          {
+            config: rejectedConfig,
+            buildClosure: () =>
+              buildRecoveryCheckpointClosure({ config: rejectedConfig, store }),
+          },
+          async () => {
+            const start = raceDriver
+              .start(
+                {
+                  item: consumer,
+                  baseSha: raceState.baseSha,
+                  attemptId: raceAttempt,
+                  session: {
+                    scope: conversation.scope,
+                    identity: conversation.identity,
+                  },
+                },
+                raceContext,
+              )
+              .then(
+                () => assert.fail("Cancelled admission dispatched a worker"),
+                (error) => error,
+              );
+            await entered;
+            const prepared = structuredClone(raceState.work.api.execution);
+            assert.equal(prepared.data.phase, "prepared");
+            assert.equal(prepared.data.handle, undefined);
+            const staleContext = executionContext(raceState.work.api, raceSave);
+            raceState.cancelRequested = true;
+            raceSave();
+            const cancellation = cancelKnownWork(
+              raceState,
+              raceDriver,
+              raceSave,
+            );
+            assert.equal(raceState.work.api.execution.data.stopped, undefined);
+            releaseAdmission();
+            const startError = await start;
+            assert.equal(attachedFault(startError).kind, "cancelled");
+            assert.match(
+              String(startError),
+              /Cancelled before native worker dispatch/,
+            );
+            await cancellation;
+            await awaitCheckpointAdmission(raceState.repository, "explicit");
+            const cancelled = parseFactoryState(
+              JSON.parse(readFileSync(rejectedSnapshotFile, "utf8")),
+              raceState.repository,
+              1,
+            );
+            assert.equal(cancelled.work.api.execution.identity, raceAttempt);
+            assert.equal(cancelled.work.api.execution.data.phase, "prepared");
+            assert.equal(cancelled.work.api.execution.data.handle, undefined);
+            assert.match(
+              cancelled.work.api.execution.data.stopped,
+              /Prepared local launch cancelled/,
+            );
+            assert.deepEqual(
+              cancelled.work.api.execution.data.preparedHarnessRequest,
+              prepared.data.preparedHarnessRequest,
+            );
+            const cancelledSession = Object.values(
+              cancelled.agentSessions,
+            ).find((ref) => ref.identity === conversation.identity);
+            assert.equal(cancelledSession.status, "unavailable");
+            assert.equal(cancelledSession.turn, 1);
+            assert.equal(cancelledSession.executionIdentity, raceAttempt);
+            assert.equal(cancelledSession.currentTurn, undefined);
+            assert.equal(
+              existsSync(
+                join(stateRoot(raceState.repository), "worktrees", raceAttempt),
+              ),
+              false,
+            );
+            assert.equal(existsSync(credentials), false);
+            assert.throws(
+              () => staleContext.checkpoint(prepared),
+              /superseded/,
+            );
+          },
+        );
         git(checkout, "worktree", "remove", "--force", rejectedWorktree);
       } finally {
         if (previousRejectedStateHome === undefined)

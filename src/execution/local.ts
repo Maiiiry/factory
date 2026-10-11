@@ -1598,6 +1598,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
   readonly freshCheckoutReadiness = true as const;
   readonly retainedFailedResultContext = true as const;
   private active = new Map<string, Active>();
+  private starting = new Map<string, Promise<ExecutionHandle>>();
 
   private require(handle: ExecutionHandle): Active {
     const active =
@@ -1789,6 +1790,34 @@ export class LocalExecutionDriver implements ExecutionDriver {
    */
   @classifyFaults(executionFault)
   async start(
+    request: ExecutionRequest,
+    context?: ExecutionContext,
+  ): Promise<ExecutionHandle> {
+    const identity = request.attemptId ?? randomUUID();
+    if (this.starting.has(identity))
+      throw new Error("Local attempt already has an owned start in progress");
+    const operation = Promise.resolve().then(() =>
+      this.startOwned({ ...request, attemptId: identity }, context),
+    );
+    this.starting.set(identity, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.starting.get(identity) === operation)
+        this.starting.delete(identity);
+    }
+  }
+
+  async settleStartingAttempt(attemptId: string): Promise<void> {
+    // Joining is sequencing, not a stopped receipt. The original start caller
+    // records its error; cancellation must still verify every owned resource.
+    await this.starting.get(attemptId)?.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
+  private async startOwned(
     request: ExecutionRequest,
     context?: ExecutionContext,
   ): Promise<ExecutionHandle> {
@@ -2157,6 +2186,8 @@ export class LocalExecutionDriver implements ExecutionDriver {
           });
         throw error;
       }
+      if (context?.cancelled())
+        throw cancelledFault("Cancelled before native worker dispatch");
       const handle = await harness.start(preparedHarnessRequest);
       assertDurableHandle(handle);
       const active = {
@@ -2204,6 +2235,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
     attemptId: string,
     context?: ExecutionContext,
   ): Promise<void> {
+    await this.settleStartingAttempt(attemptId);
     await cessationAdmission(context);
     const running = this.active.get(attemptId);
     if (running) {
@@ -2357,6 +2389,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
     handle: ExecutionHandle,
     context?: ExecutionContext,
   ): Promise<void> {
+    await this.settleStartingAttempt(handle.identity);
     const settled = handle.data as Partial<Settled> | undefined;
     // An ended attempt retains its original session receipt; cancellation must
     // not allocate another unavailable turn after that receipt was released.
