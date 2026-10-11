@@ -829,6 +829,19 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     "version one\ncomplete interface body\n",
   );
   writeFileSync(join(checkout, "secret.txt"), "outside admitted selector\n");
+  const tabPath = "api/tab\tcontract.txt";
+  writeFileSync(join(checkout, tabPath), "literal tab filename body\n");
+  mkdirSync(join(checkout, "unrelated"));
+  for (let index = 0; index < 500; index++)
+    writeFileSync(
+      join(
+        checkout,
+        "unrelated",
+        `${String(index).padStart(4, "0")}-${"x".repeat(120)}.txt`,
+      ),
+      "unrelated body\n",
+    );
+
   git(checkout, "add", ".");
   git(checkout, "commit", "-qm", "immutable context baseline");
   const baseSha = git(checkout, "rev-parse", "HEAD");
@@ -998,6 +1011,17 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     if (oldGitDir === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = oldGitDir;
   }
+
+  writeFileSync(join(checkout, tabPath), "dirty tab filename body\n");
+  const literalTab = repositoryContextResult(
+    checkout,
+    baseSha,
+    { ...required, id: "literal-tab", selector: tabPath },
+    remaining,
+  );
+  assert.equal(literalTab.disposition, "complete");
+  assert.equal(literalTab.matches[0].content, "literal tab filename body\n");
+  assert.equal(literalTab.matches[0].provenance.path, tabPath);
   const record = await initializeContextLookup(resolver);
   assertContextFactsResolved(record.packet);
   assert.equal(

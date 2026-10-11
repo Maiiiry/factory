@@ -541,7 +541,13 @@ export function repositoryContextResult(
       stdio: ["ignore", "pipe", "pipe"],
     });
   try {
-    const entries = run(["ls-tree", "-rz", "--full-tree", baseSha])
+    const entries = run([
+      "ls-tree",
+      "-rz",
+      "--full-tree",
+      baseSha,
+      ...(request.selector ? ["--", request.selector] : []),
+    ])
       .toString("utf8")
       .split("\0")
       .filter(Boolean)
