@@ -48,6 +48,7 @@ import {
   structuredRequestDigest,
 } from "../dist/compiler/transport.js";
 import { factoryConfigDigest, stateRoot } from "../dist/config.js";
+import { checkServiceState } from "../dist/supervision.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { requestControl, serveControl } from "../dist/coordinator-control.js";
 import { NativeStackDelivery } from "../dist/delivery/native-stack.js";
@@ -1087,6 +1088,14 @@ test("cancellation stops an owned shell and its process group", async () => {
       execution: { kind: "local" },
       policy: { allowedSecretNames: [] },
     };
+    const changedConfig = {
+      ...config,
+      execution: { ...config.execution, concurrency: 2 },
+    };
+    assert.notEqual(
+      factoryConfigDigest(changedConfig),
+      factoryConfigDigest(config),
+    );
     const baseSha = git("rev-parse", "HEAD");
     const graph = {
       objective: 1,
@@ -1253,6 +1262,18 @@ test("cancellation stops an owned shell and its process group", async () => {
           const savePreparation = () =>
             saveState(statePath(config.repository, 1), preparation);
           savePreparation();
+          const preparingOriginal = readFileSync(
+            statePath(config.repository, 1),
+          );
+          assert.throws(
+            () =>
+              checkServiceState(changedConfig, 1, join(root, "config.json")),
+            /different configuration binding/,
+          );
+          assert.deepEqual(
+            readFileSync(statePath(config.repository, 1)),
+            preparingOriginal,
+          );
           if (route === "controller") {
             // The real intake socket can receive handoff while registration is
             // still awaiting startup. Replay it to the stock Objective handler
@@ -1443,6 +1464,17 @@ test("cancellation stops an owned shell and its process group", async () => {
           );
           assert.deepEqual(cancelled.autonomy, snapshot.autonomy);
           assert.equal(existsSync(stoppedReceipt.data.sessionRoot), false);
+          // The genuine cancelled continuation remains an immutable inspection
+          // record under a new configuration; the runnable original above refused.
+          const terminalOriginal = readFileSync(
+            statePath(config.repository, 1),
+          );
+          checkServiceState(changedConfig, 1, join(root, "config.json"));
+          assert.deepEqual(
+            readFileSync(statePath(config.repository, 1)),
+            terminalOriginal,
+          );
+          assert.equal(cancelled.configDigest, factoryConfigDigest(config));
           // Repeated cancellation also disposes a retained old terminal checkpoint.
           Object.assign(preparation, cancelled);
           restoreOwnedHome();

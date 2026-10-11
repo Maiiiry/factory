@@ -34,6 +34,7 @@ import {
   stateRoot,
 } from "./config.js";
 import { objectiveComplete } from "./completion.js";
+import { canHandoff } from "./runner/ownership.js";
 import {
   type ControllerReadiness,
   ControllerReadinessPendingError,
@@ -45,6 +46,7 @@ import {
   assertRestoredContinuationReady,
   assertRestoredInstallationDispatchReady,
   continuationConfigurationMatches,
+  restoredContinuationOwnershipHold,
   readContinuation,
   readControllerOwner,
   liveControllerOwner,
@@ -455,7 +457,7 @@ function setupCommand(configPath: string, credentials: string[]): string {
     ),
   ].join(" ");
 }
-/** Continuation state an Objective already has must match this installation. */
+/** Runnable continuation must match; settled terminal history is inspection-only. */
 export function checkServiceState(
   config: FactoryConfig,
   objective: number,
@@ -469,6 +471,14 @@ export function checkServiceState(
   )
     return;
   if (state && !continuationConfigurationMatches(state, config)) {
+    if (
+      !state.restoration &&
+      (state.cancelledAt ||
+        (isExecutionState(state) && objectiveComplete(state))) &&
+      canHandoff(state) &&
+      !restoredContinuationOwnershipHold(state)
+    )
+      return;
     const setup = setupCommand(configPath, requiredProviderCredentials(config));
     throw new Error(
       `Objective ${objective} continuation has a different configuration binding. Preserve its records and restore the original configuration at ${resolve(configPath)}, then run \`${setup}\`; a moved checkout requires supported Git restoration and ownership reconciliation`,
