@@ -284,8 +284,9 @@ export async function reviewAcceptance(args: {
         }),
         { mediaType: "application/json" },
       );
-      if (!evidence.nativeReturns?.some((entry) => entry.digest === ref.digest))
-        (evidence.nativeReturns ??= []).push(ref);
+      evidence.nativeReturns ??= [];
+      if (!evidence.nativeReturns.some((entry) => entry.digest === ref.digest))
+        evidence.nativeReturns.push(ref);
       checkpoint();
       await prior?.(receipt);
       // The native transport may release its last copy after this callback.
