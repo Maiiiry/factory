@@ -598,7 +598,10 @@ export class LocalRepositoryMemory {
         continue;
       try {
         const bytes = this.store.readBytes(body.ref);
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        const decoded = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes);
         if (!decoded.includes("\0") && Buffer.from(decoded).equals(bytes))
           bodies.push(decoded);
       } catch {
@@ -745,7 +748,10 @@ export class LocalRepositoryMemory {
         const bytes = this.store.readBytes(body.ref);
         let decoded: string;
         try {
-          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          decoded = new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: true,
+          }).decode(bytes);
           if (decoded.includes("\0") || !Buffer.from(decoded).equals(bytes))
             throw new Error("Binary body");
         } catch {
