@@ -39,10 +39,15 @@ import {
   progressDigest,
 } from "./github-progress-state.js";
 import { projectStatusOnGitHub } from "./github-project.js";
+import {
+  projectQueueReadOnGitHub,
+  projectQueueWriteOnGitHub,
+} from "./github-project-queue.js";
 import { availableIssueType } from "./issue-type.js";
 
 type Issue = {
   id: number;
+  node_id?: string;
   number: number;
   title: string;
   body: string | null;
@@ -135,6 +140,38 @@ export class RealGitHubGateway implements GitHubGateway {
   ) {}
 
   private login?: string;
+
+  projectQueueRead(
+    binding: Parameters<NonNullable<GitHubGateway["projectQueueRead"]>>[0],
+  ) {
+    return projectQueueReadOnGitHub(
+      this.repository,
+      binding,
+      this.queueGraphql,
+    );
+  }
+
+  projectQueueWrite(
+    request: Parameters<NonNullable<GitHubGateway["projectQueueWrite"]>>[0],
+  ) {
+    return projectQueueWriteOnGitHub(
+      this.repository,
+      request,
+      this.queueGraphql,
+    );
+  }
+
+  private queueGraphql = <T>(
+    query: string,
+    variables: Record<string, unknown>,
+    readOnly: boolean,
+  ): Promise<T> =>
+    classifiedGitHubCall(
+      this.client,
+      this.repository,
+      { method: "POST", path: "graphql" },
+      () => this.client.projectQueueGraphql<T>(query, variables, readOnly),
+    );
 
   projectStatus(
     request: Parameters<NonNullable<GitHubGateway["projectStatus"]>>[0],
@@ -672,6 +709,10 @@ export class RealGitHubGateway implements GitHubGateway {
     )
       throw foreignChange("Objective issue identity or state changed");
     return {
+      ...(typeof issue.node_id === "string" &&
+      /^[A-Za-z0-9_-]{1,256}$/.test(issue.node_id)
+        ? { nodeId: issue.node_id }
+        : {}),
       title: issue.title,
       body: issue.body ?? "",
       state: issue.state,
