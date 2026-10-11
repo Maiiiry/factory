@@ -309,6 +309,22 @@ export function assertPlanningLookupRecord(record: PlanningLookupRecord): void {
 export class MissingPlanningContext extends Error {
   override readonly name = "MissingPlanningContext";
 }
+/** Complete scoped absence resolves inventory/search facts; exact reads still need bodies. */
+function resolvedContextResult(result: ContextResult): boolean {
+  const currentTime = Date.now();
+  return (
+    (result.disposition === "complete" ||
+      (result.disposition === "no-match" &&
+        result.request.operation !== "read")) &&
+    result.matches.every(
+      (match) =>
+        match.provenance.validUntil === undefined ||
+        (typeof match.provenance.validUntil === "string" &&
+          Number.isFinite(Date.parse(match.provenance.validUntil)) &&
+          Date.parse(match.provenance.validUntil) > currentTime),
+    )
+  );
+}
 export function assertContextFactsResolved(
   packet: PlanningContextPacket,
 ): void {
@@ -327,15 +343,7 @@ export function assertContextFactsResolved(
       );
   }
   const missing = [...latest.values()].filter(
-    (r) =>
-      (r.disposition !== "complete" &&
-        !(r.disposition === "no-match" && r.request.operation !== "read")) ||
-      r.matches.some(
-        (m) =>
-          typeof m.provenance.validUntil === "string" &&
-          (!Number.isFinite(Date.parse(m.provenance.validUntil)) ||
-            Date.parse(m.provenance.validUntil) <= Date.now()),
-      ),
+    (result) => !resolvedContextResult(result),
   );
   if (missing.length)
     throw new MissingPlanningContext(
@@ -766,8 +774,9 @@ export function assertHumanPlanningDependency(
       .find((entry) => identity(entry.request) === identity(result.request));
     if (
       !result.request.required ||
-      result.disposition === "complete" ||
-      latest?.disposition === "complete"
+      resolvedContextResult(result) ||
+      !latest ||
+      resolvedContextResult(latest)
     )
       throw new Error(
         "Human context dependency must cite a still-unresolved required lookup result",

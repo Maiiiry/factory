@@ -811,6 +811,7 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   const { LocalContentStore } = await import("../dist/content/local.js");
   const {
     assertContextFactsResolved,
+    assertHumanPlanningDependency,
     assertPlanningLookupRecord,
     contextDigest,
     initializeContextLookup,
@@ -1125,6 +1126,34 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   assert.equal(persistedBytes, JSON.stringify(restarted.packet));
   await store.verify(restarted.packetRef);
   assertContextFactsResolved(restarted.packet);
+  assert.throws(
+    () =>
+      assertHumanPlanningDependency(
+        {
+          kind: "human-dependency",
+          dependencyKind: "unavailable-context",
+          requestIds: ["empty"],
+          question: "Supply missing inventory facts",
+          detail: "The scoped inventory returned no matches",
+        },
+        restarted.packet,
+      ),
+    /still-unresolved required lookup result/,
+  );
+  assert.doesNotThrow(() =>
+    assertHumanPlanningDependency(
+      {
+        kind: "human-dependency",
+        dependencyKind: "human-choice",
+        requestIds: [],
+        question: "Which new entries should the empty inventory contain?",
+        detail:
+          "A complete scoped inventory establishes absence; choosing new entries is a human decision",
+      },
+      restarted.packet,
+    ),
+  );
+
   const missing = await resolveContextRequests(restarted, resolver, [
     { ...required, id: "missing-body", selector: "api/missing.txt" },
   ]);
