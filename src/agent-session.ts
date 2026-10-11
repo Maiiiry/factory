@@ -1,3 +1,4 @@
+import { isExecutionState, isPreparationState } from "./state.js";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type {
@@ -272,7 +273,7 @@ export function assertAgentSessions(state: ContinuationState): void {
       ref.scope.configDigest !== state.configDigest ||
       (ref.scope.role === "planning"
         ? ref.scope.planningInputDigest !== planningSessionInputDigest(state)
-        : state.schemaVersion === 8 ||
+        : isPreparationState(state) ||
           (ref.scope.itemId !== undefined &&
             !state.graph.items.some((item) => item.id === ref.scope.itemId)))
     )
@@ -306,7 +307,7 @@ export function agentSessionContinuation(
       planningInputDigest: planningSessionInputDigest(state),
     };
   } else {
-    if (state.schemaVersion !== 7)
+    if (!isExecutionState(state))
       throw new Error("Preparation cannot own a graph session");
     const binding = {
       ...objectiveScope,
@@ -322,8 +323,9 @@ export function agentSessionContinuation(
     }
   }
   assertAgentSessionScope(scope);
-  const admittedGraphDigest =
-    state.schemaVersion === 7 ? graphDigest(state.graph) : undefined;
+  const admittedGraphDigest = isExecutionState(state)
+    ? graphDigest(state.graph)
+    : undefined;
   const entryKey = key(scope);
   if (
     role === "implementation" &&
@@ -362,9 +364,9 @@ export function agentSessionContinuation(
       : {}),
     checkpoint(ref) {
       if (
-        (state.schemaVersion === 7 && state.finalAcceptance) ||
+        (isExecutionState(state) && state.finalAcceptance) ||
         state.cancelledAt ||
-        (state.schemaVersion === 7 && state.objectiveClosure === "complete")
+        (isExecutionState(state) && state.objectiveClosure === "complete")
       )
         throw new Error(
           "Terminal or cancelling Objective cannot continue an agent session",
@@ -372,7 +374,7 @@ export function agentSessionContinuation(
       if (
         scope.role === "planning"
           ? planningSessionInputDigest(state) !== scope.planningInputDigest
-          : state.schemaVersion !== 7 ||
+          : !isExecutionState(state) ||
             graphDigest(state.graph) !== scope.graphDigest
       )
         throw new Error("Agent session checkpoint was superseded");
