@@ -1,4 +1,3 @@
-import { isExecutionState, isPreparationState } from "../state.js";
 import { agentSessionContinuation } from "../agent-session.js";
 import { closeCancelledWorkItems } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
@@ -15,6 +14,7 @@ import { workerIdentity } from "../item-steps.js";
 import { linuxProcessIdentity, processGroupExists } from "../process.js";
 import { serviceLoginSecrets } from "../provider-credentials.js";
 import type { ContinuationState, FactoryState } from "../state.js";
+import { isExecutionState, isPreparationState } from "../state.js";
 import {
   acquireObjectiveLock,
   assertRestoredContinuationReady,
