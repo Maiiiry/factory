@@ -39,6 +39,14 @@ import { createPlanningContextResolver } from "../dist/compiler/context-runtime.
 import { initializeContextLookup } from "../dist/compiler/context.js";
 import { stateRoot, validateConfig } from "../dist/config.js";
 import {
+  recordRetrospective,
+  prepareDreamInput,
+  readDreamCheckpoint,
+  learningPersistenceClosure,
+  dreamSubmissionHolds,
+  DEFAULT_PLAYBOOK_BUDGET_BYTES,
+} from "../dist/learning.js";
+import {
   reflectWorkflow,
   readWorkflowReflection,
   workflowStageObligations,
@@ -767,6 +775,132 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           retainedBody,
         );
         assert.equal(reflectionSaves, 2);
+        // A terminal cancellation of this same real Git workflow retains the
+        // original material observations; consolidation never upgrades them to
+        // acceptance or causal evidence and performs no provider call.
+        reflected.cancelledAt = new Date().toISOString();
+        const terminalPath = statePath(config.repository, reflected.objective);
+        saveState(terminalPath, reflected);
+        const terminalBytes = readFileSync(terminalPath, "utf8");
+        const learningStoreRoot = join(stateRoot(config.repository), "content");
+        mkdirSync(stateRoot(config.repository), {
+          recursive: true,
+          mode: 0o700,
+        });
+        cpSync(join(root, "private-content"), learningStoreRoot, {
+          recursive: true,
+        });
+        const episode = recordRetrospective(config, reflected.objective);
+        assert.equal(episode.outcome, "cancelled");
+        assert.equal(
+          episode.snapshotDigest,
+          createHash("sha256").update(terminalBytes).digest("hex"),
+        );
+        assert.deepEqual(
+          episode.experiences.workflowReflection,
+          reflected.workflowReflection,
+        );
+        const prepared = await prepareDreamInput(config, {
+          budgetBytes: DEFAULT_PLAYBOOK_BUDGET_BYTES,
+          inputBudgetBytes: 262144,
+        });
+        assert.equal(prepared.checkpoint.bounds.maxResults, 1);
+        assert.equal(prepared.checkpoint.bounds.maxBytes, 262144);
+        assert.equal(prepared.checkpoint.playbookBudgetBytes, 16384);
+        assert.equal(prepared.checkpoint.included.length, 1);
+        assert.equal(prepared.checkpoint.included[0].supporting.length, 2);
+        const packet = JSON.parse(prepared.sourcePacket);
+        assert.equal(packet.parent, null);
+        assert.equal(packet.sources[0].episode.outcome, "cancelled");
+        assert.deepEqual(
+          packet.sources[0].supporting[1].body,
+          reassessmentBody,
+        );
+        assert.equal(
+          packet.sources[0].supporting[1].body.previousRecord.id,
+          reflection.id,
+        );
+        const binding = {
+          checkpointId: prepared.checkpoint.id,
+          checkpointDigest: prepared.checkpointDigest,
+        };
+        assert.deepEqual(
+          readDreamCheckpoint(config.repository, binding),
+          prepared.checkpoint,
+        );
+        const restartedStore = new LocalContentStore(learningStoreRoot);
+        assert.equal(
+          restartedStore
+            .readBytes(prepared.checkpoint.inputPacketRef)
+            .toString("utf8"),
+          prepared.sourcePacket,
+        );
+        // Budget the actual serialized episode and keep larger workflow bodies
+        // as explicit deferred identities rather than silently truncating them.
+        const episodeOnly = structuredClone(packet);
+        episodeOnly.sources[0].supporting = [];
+        const smaller = await prepareDreamInput(config, {
+          budgetBytes: DEFAULT_PLAYBOOK_BUDGET_BYTES,
+          inputBudgetBytes: Buffer.byteLength(JSON.stringify(episodeOnly)),
+        });
+        assert.equal(smaller.checkpoint.included.length, 1);
+        assert.deepEqual(smaller.checkpoint.included[0].supporting, []);
+        assert.equal(
+          smaller.checkpoint.deferred.filter((entry) =>
+            entry.reason.includes("input allowance"),
+          ).length,
+          2,
+        );
+        assert.ok(
+          Buffer.byteLength(smaller.sourcePacket) <=
+            smaller.checkpoint.bounds.maxBytes,
+        );
+        assert.equal(readFileSync(terminalPath, "utf8"), terminalBytes);
+        assert.deepEqual(dreamSubmissionHolds(config.repository), []);
+        const closure = learningPersistenceClosure(config.repository);
+        assert.ok(
+          closure.records.some(
+            (entry) =>
+              entry.path ===
+              `learning/checkpoints/${prepared.checkpoint.id}.json`,
+          ),
+        );
+        const original = closure.records.find((entry) =>
+          entry.path.startsWith("learning/snapshots/"),
+        );
+        assert.equal(
+          restartedStore.readBytes(original.ref).toString("utf8"),
+          terminalBytes,
+        );
+        assert.ok(
+          closure.contentRefs.some(
+            (ref) => ref.digest === reassessed.bodyRef.digest,
+          ),
+        );
+        assert.deepEqual(closure.unavailable, []);
+        // A checkpoint is usable only with its exact retained packet body.
+        const packetPath = join(
+          learningStoreRoot,
+          prepared.checkpoint.inputPacketRef.digest.slice(0, 2),
+          prepared.checkpoint.inputPacketRef.digest,
+        );
+        const originalPacket = readFileSync(packetPath);
+        writeFileSync(packetPath, "changed bytes");
+        assert.throws(
+          () => readDreamCheckpoint(config.repository, binding),
+          /digest|content|integrity|changed/i,
+        );
+        writeFileSync(packetPath, originalPacket, { mode: 0o600 });
+        rmSync(packetPath);
+        assert.throws(
+          () => readDreamCheckpoint(config.repository, binding),
+          /ENOENT|missing|unavailable|content/i,
+        );
+        writeFileSync(packetPath, originalPacket, { mode: 0o600 });
+        assert.deepEqual(
+          readDreamCheckpoint(config.repository, binding),
+          prepared.checkpoint,
+        );
       }
       saveState(rolePath, roleReload);
       const peerSnapshot = readFileSync(rolePath, "utf8");
