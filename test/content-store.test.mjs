@@ -526,6 +526,22 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     buildClosure,
   });
   assert.equal(firstCheckpoint.status, "acknowledged");
+  const unchangedCheckpoint = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(unchangedCheckpoint.status, "acknowledged");
+  assert.equal(
+    unchangedCheckpoint.lastAcknowledged.commitSha,
+    firstCheckpoint.lastAcknowledged.commitSha,
+  );
+  assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "second-local-source-read" },
+    summary: "A second local read confirms the complete orchard API reference",
+  });
   const secondCheckpoint = await synchronizeRecoveryCheckpoint(config, {
     reason: "explicit",
     buildClosure,
@@ -555,6 +571,13 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     ...config,
     gitPersistence: { ...config.gitPersistence, timeoutMs: 1000 },
   };
+  assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "third-local-source-read" },
+    summary: "A third local read confirms the complete orchard API reference",
+  });
   await assert.rejects(
     synchronizeRecoveryCheckpoint(boundedConfig, {
       reason: "explicit",
@@ -564,6 +587,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   );
   const unknown = gitPersistenceStatus(config);
   assert.equal(unknown.status, "unknown");
+  assert.equal(unknown.attemptedTransportOutcome, "unknown");
   assert.equal(
     execFileSync(
       "git",
@@ -581,6 +605,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       ),
   });
   assert.equal(reconciled.status, "acknowledged");
+  assert.equal(reconciled.attemptedTransportOutcome, "unknown");
   assert.equal(reconciled.lastAcknowledged.commitSha, unknown.attemptedCommit);
   assert.equal(readFileSync(received, "utf8"), "received\n");
   rmSync(receiveHook);
@@ -638,12 +663,9 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(gitPersistenceStatus(config).durability, "local-only");
   const recovered = await readVerifiedRecoveryCheckpoint(
     config,
-    secondCheckpoint.lastAcknowledged.commitSha,
+    reconciled.lastAcknowledged.commitSha,
   );
-  assert.equal(
-    recovered.commitSha,
-    secondCheckpoint.lastAcknowledged.commitSha,
-  );
+  assert.equal(recovered.commitSha, reconciled.lastAcknowledged.commitSha);
   assert.equal(recovered.manifest.binding.repository, repository);
   assert.equal(recovered.manifest.binding.ref, config.gitPersistence.ref);
   assert.equal(existsSync(join(state, "content")), false);
