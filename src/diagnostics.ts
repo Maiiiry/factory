@@ -40,6 +40,10 @@ import type { GitHubTransportObservation } from "./github-client.js";
 import type { GitHubProgressProjection } from "./github-progress-state.js";
 import { graphDigest } from "./graph-amendments.js";
 import { FACTORY_VERSION } from "./package-metadata.js";
+import {
+  derivePrerequisiteGuidance,
+  type PrerequisiteGuidanceContext,
+} from "./prerequisite-guidance.js";
 import { objectiveCandidate } from "./qa.js";
 import {
   consumption,
@@ -50,8 +54,8 @@ import {
 } from "./repair-policy.js";
 import {
   pendingItemBlocker,
-  schedulingObservations,
   type SchedulingObservation,
+  schedulingObservations,
 } from "./scheduler.js";
 import type {
   ContinuationState,
@@ -64,6 +68,7 @@ import { isPreparationState, projectionStarted } from "./state.js";
 import type { PreState } from "./state-store.js";
 import {
   type PendingDecisionView,
+  type StatusView,
   shortPlanDigest,
   summarizeStatus,
 } from "./status-summary.js";
@@ -1849,6 +1854,27 @@ function sessionStatus(
   }));
 }
 
+function guidedStatus<T extends StatusView & { repository?: string }>(
+  state: ContinuationState | undefined,
+  view: T,
+  secrets: string[],
+  context: PrerequisiteGuidanceContext,
+) {
+  const prerequisiteGuidance = derivePrerequisiteGuidance(
+    state,
+    { ...view, ...summarizeStatus(view) },
+    (text) => redactDiagnosticDetail(text, secrets),
+    context,
+  );
+  const summary = summarizeStatus({ ...view, prerequisiteGuidance });
+  return {
+    ...summary,
+    nextAction: summary.nextAction ? { ...summary.nextAction } : null,
+    ...view,
+    prerequisiteGuidance,
+  };
+}
+
 export function statusDocument(
   state: FactoryState | undefined,
   repository: string,
@@ -1859,6 +1885,7 @@ export function statusDocument(
   runActive: boolean | null = null,
   preState?: PreState,
   installationConfigDigest?: string,
+  guidanceContext: PrerequisiteGuidanceContext = {},
 ) {
   if (!state) {
     const view = {
@@ -1878,7 +1905,7 @@ export function statusDocument(
           }
         : {}),
     };
-    return { ...summarizeStatus(view), ...view };
+    return guidedStatus(state, view, secrets, guidanceContext);
   }
   const unitByItem = new Map(
     linearDeliveryUnits(state.graph).flatMap((unit) =>
@@ -2184,7 +2211,7 @@ export function statusDocument(
     ...waitStatus(state, state.wait, "objective", secrets),
     work,
   };
-  return { ...summarizeStatus(view), ...view };
+  return guidedStatus(state, view, secrets, guidanceContext);
 }
 
 /** Status of an Objective still planning; no executable graph exists yet. */
@@ -2193,6 +2220,7 @@ export function preparationStatusDocument(
   secrets: string[] = [],
   runActive: boolean | null = null,
   installationConfigDigest?: string,
+  guidanceContext: PrerequisiteGuidanceContext = {},
 ) {
   const redact = (value: string | undefined) =>
     value ? redactDiagnosticDetail(value, secrets) : null;
@@ -2258,7 +2286,7 @@ export function preparationStatusDocument(
     waitReason: redact(preparation.coordinator.waitReason),
     ...waitStatus(preparation, preparation.wait, "objective", secrets),
   };
-  return { ...summarizeStatus(view), ...view };
+  return guidedStatus(preparation, view, secrets, guidanceContext);
 }
 
 /** The status document for whichever continuation snapshot exists. */
@@ -2272,6 +2300,7 @@ export function continuationStatusDocument(
   runActive: boolean | null = null,
   preState?: PreState,
   installationConfigDigest?: string,
+  guidanceContext: PrerequisiteGuidanceContext = {},
 ) {
   return isPreparationState(continuation)
     ? preparationStatusDocument(
@@ -2279,6 +2308,7 @@ export function continuationStatusDocument(
         secrets,
         runActive,
         installationConfigDigest,
+        guidanceContext,
       )
     : statusDocument(
         continuation,
@@ -2290,6 +2320,7 @@ export function continuationStatusDocument(
         runActive,
         preState,
         installationConfigDigest,
+        guidanceContext,
       );
 }
 

@@ -1,3 +1,5 @@
+import { assertWorkRoutingState } from "./runner/routing.js";
+import { assertWorkflowReflection } from "./workflow-reflection.js";
 import { assertWorkItemScheduling } from "./scheduler.js";
 import { assertAdaptiveContextPacket } from "./adaptive-context.js";
 import { assertPlanningLookupRecord } from "./compiler/context.js";
@@ -85,6 +87,7 @@ export type WorkStatus =
   | "published"
   | "waiting"
   | "done"
+  | "skipped"
   | "failed"
   | "cancelled";
 export type WorkStep =
@@ -115,6 +118,8 @@ export function pendingQuestions(
 }
 
 export interface WorkState {
+  /** Authenticated outcome routing, separate from implementation acceptance. */
+  routing?: import("./runner/routing.js").WorkRoutingDisposition;
   /** Immutable selected dispatch packet; operational ownership remains here. */
   adaptiveContextId?: string;
   knowledge?: import("./objective-knowledge.js").ObjectiveKnowledgeRecord;
@@ -224,7 +229,7 @@ export interface PreparationState {
   /** Worker ceiling and scheduling resolved when the Objective started. */
   capacity: import("./config.js").Capacity;
   charges?: import("./repair-policy.js").RepairLedger["charges"];
-  schemaVersion: 8 | 10 | 12;
+  schemaVersion: 8 | 10 | 12 | 14;
   kind: "preparing";
   repository: string;
   objective: number;
@@ -264,7 +269,8 @@ export function isPreparationState(
   return (
     state?.schemaVersion === 8 ||
     state?.schemaVersion === 10 ||
-    state?.schemaVersion === 12
+    state?.schemaVersion === 12 ||
+    state?.schemaVersion === 14
   );
 }
 
@@ -274,7 +280,8 @@ export function isExecutionState(
   return (
     state?.schemaVersion === 7 ||
     state?.schemaVersion === 9 ||
-    state?.schemaVersion === 11
+    state?.schemaVersion === 11 ||
+    state?.schemaVersion === 13
   );
 }
 
@@ -313,6 +320,11 @@ export function setCoordinatorMode(
 }
 
 export interface FactoryState {
+  conditionFacts?: Record<
+    string,
+    import("./runner/routing.js").WorkConditionSettlement
+  >;
+  workflowReflection?: import("./workflow-reflection.js").WorkflowReflectionState;
   /** Exact role packets selected before calls; historical absence stays absent. */
   adaptiveContexts?: Record<
     string,
@@ -365,7 +377,7 @@ export interface FactoryState {
   prerequisitesDigest?: string;
   /** Immutable authenticated admission facts, bound to prerequisitesDigest. */
   prerequisites?: import("./contracts.js").PlanningPrerequisites;
-  schemaVersion: 7 | 9 | 11;
+  schemaVersion: 7 | 9 | 11 | 13;
   approvedPlaybookAdmission?: import("./contracts.js").ApprovedPlaybookAdmission;
   approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
   repository: string;
@@ -738,6 +750,7 @@ const statuses = new Set<WorkStatus>([
   "published",
   "waiting",
   "done",
+  "skipped",
   "failed",
   "cancelled",
 ]);
@@ -760,7 +773,8 @@ export function parseFactoryState(
   if (
     (state.schemaVersion !== 7 &&
       state.schemaVersion !== 9 &&
-      state.schemaVersion !== 11) ||
+      state.schemaVersion !== 11 &&
+      state.schemaVersion !== 13) ||
     state.repository !== repository ||
     state.objective !== objective
   )
@@ -773,7 +787,11 @@ export function parseFactoryState(
   const lookup = (state.planningRecovery as FactoryState["planningRecovery"])
     ?.contextLookup;
   if (lookup !== undefined) {
-    if (state.schemaVersion !== 9 && state.schemaVersion !== 11)
+    if (
+      state.schemaVersion !== 9 &&
+      state.schemaVersion !== 11 &&
+      state.schemaVersion !== 13
+    )
       throw new Error("Adaptive context requires execution schema version 9");
     assertPlanningLookupRecord(lookup);
   }
@@ -846,13 +864,23 @@ export function parseFactoryState(
   assertGraphProjectionIntents(state as unknown as FactoryState);
   assertExpansionState(state as unknown as FactoryState);
   assertAgentSessions(state as unknown as FactoryState);
+  assertWorkRoutingState(state as unknown as FactoryState);
+  if (state.workflowReflection !== undefined && state.schemaVersion !== 13)
+    throw new Error(
+      "Workflow reflection requires execution snapshot version 13",
+    );
+  assertWorkflowReflection(state as unknown as FactoryState);
   assertRepairLedger(state as unknown as FactoryState);
   const ids = new Set<string>();
   for (const [index, raw] of graph.items.entries()) {
     const item = record(raw, `graph.items[${index}]`);
     const id = string(item.id, "Work Item ID");
     if (item.kind === "discovery") {
-      if (state.schemaVersion !== 9 && state.schemaVersion !== 11)
+      if (
+        state.schemaVersion !== 9 &&
+        state.schemaVersion !== 11 &&
+        state.schemaVersion !== 13
+      )
         throw new Error("Discovery requires execution schema version 9");
       assertDiscoverySpecification(item.discovery);
     } else if (item.discovery !== undefined) {
@@ -937,7 +965,11 @@ export function parseFactoryState(
       throw new Error(`${id}.validation is invalid`);
   }
   if (state.discoveryAttemptCounts !== undefined) {
-    if (state.schemaVersion !== 9 && state.schemaVersion !== 11)
+    if (
+      state.schemaVersion !== 9 &&
+      state.schemaVersion !== 11 &&
+      state.schemaVersion !== 13
+    )
       throw new Error(
         "Discovery start admissions require execution schema version 9",
       );
@@ -982,6 +1014,10 @@ export function parseFactoryState(
   )
     throw new Error(
       "Adaptive execution lacks its retained context or discovery semantics",
+    );
+  if (state.schemaVersion === 13 && lookup === undefined)
+    throw new Error(
+      "Execution snapshot version 13 requires its original admitted planning context",
     );
   for (const raw of graph.items) {
     const item = raw as Record<string, unknown>;
@@ -1248,7 +1284,7 @@ export function parseFactoryState(
       throw new Error(`Work Item ${id} PR identity is invalid`);
     if (
       item.githubClosure !== undefined &&
-      (item.status !== "done" ||
+      (!["done", "skipped"].includes(String(item.status)) ||
         !["pending", "complete"].includes(String(item.githubClosure)))
     )
       throw new Error(`Work Item ${id} GitHub closure is invalid`);

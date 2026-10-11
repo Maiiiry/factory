@@ -20,6 +20,18 @@ import {
   LocalRepositoryMemory,
   retainPlanningSourceMemory,
 } from "../dist/repository-memory.js";
+import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
+import { initializeContextLookup } from "../dist/compiler/context.js";
+import { resolveAutonomy } from "../dist/repair-policy.js";
+import { parseFactoryState } from "../dist/state.js";
+import { saveState } from "../dist/state-store.js";
+import {
+  authenticateWorkRouting,
+  assertWorkRoutingState,
+  settleWorkRouting,
+} from "../dist/runner/routing.js";
+import { objectiveReviewEvidence } from "../dist/result-evidence.js";
+import { objectiveCandidate } from "../dist/qa.js";
 import { stateRoot } from "../dist/config.js";
 import {
   authenticateDiscoveryOutput,
@@ -1047,6 +1059,412 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     () =>
       assertCompletedCoverage({ graph: emptyExpansion.graph, work: waiting }),
     /completed exact-tree proof/,
+  );
+  // Declared conditions use this exact real Git inventory and ordinary atomic state.
+  // The opposite branch settles without a worker; the unconditional original proof remains pending.
+  const routingConfig = {
+    schemaVersion: 1,
+    repository: "fixture/conditions",
+    checkout,
+    planning: {
+      kind: "codex-sdk",
+      planner: { model: "unused-local-check", reasoningEffort: "low" },
+      reviewer: { model: "unused-local-check", reasoningEffort: "low" },
+    },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: {
+        kind: "codex-sdk",
+        model: "unused-local-check",
+        reasoningEffort: "low",
+      },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    planningContext: {
+      enabled: true,
+      memory: false,
+      selectors: ["src/", ...emptySpec.selectors],
+      bounds: {
+        maxRounds: 1,
+        maxRequestsPerRound: 1,
+        maxResults: 4,
+        maxBytes: 2048,
+        maxElapsedMs: 5000,
+        maxProviderCalls: 1,
+      },
+    },
+  };
+  const lookup = await initializeContextLookup(
+    createPlanningContextResolver({
+      config: routingConfig,
+      objective: producer.objective,
+      runId: producer.runId,
+      baseSha,
+      sources: [],
+      objectiveBody: "## Adaptive workflow\nenabled\n",
+      contentStore: store,
+    }),
+  );
+  const routeDefaults = {
+    ...common,
+    resources: [],
+    sourceAssets: [],
+    expectedOutputRoles: [],
+    requiredLfsRoles: [],
+    minimumAssetSets: 0,
+  };
+  const condition = {
+    schemaVersion: 1,
+    id: "empty-inventory",
+    input: {
+      producerItemId: inventory.id,
+      role: specification.role,
+      schema: specification.schema,
+    },
+    predicate: { kind: "inventory-empty" },
+  };
+  const routeGraph = {
+    objective: producer.objective,
+    baseSha,
+    conditions: [condition],
+    items: [
+      { ...routeDefaults, ...inventory },
+      {
+        ...routeDefaults,
+        id: "has-files",
+        ownedPaths: ["src/"],
+        dependencies: [inventory.id],
+        condition: { conditionId: condition.id, when: false },
+      },
+      {
+        ...routeDefaults,
+        id: "no-files",
+        ownedPaths: ["notes.txt"],
+        dependencies: [inventory.id],
+        condition: { conditionId: condition.id, when: true },
+      },
+      {
+        ...routeDefaults,
+        id: "integration",
+        kind: "qa",
+        dependencies: [inventory.id, "has-files", "no-files"],
+      },
+    ],
+    coverage: structuredClone(graph.coverage),
+  };
+  validateAndOrderGraph(
+    routeGraph,
+    producer.objective,
+    baseSha,
+    new Set(["OBJECTIVE"]),
+  );
+  const invalidPublishedCi = structuredClone(routeGraph);
+  invalidPublishedCi.coverage[0].proof = {
+    kind: "published-ci",
+    checkName: "gate",
+    targetItem: "has-files",
+  };
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidPublishedCi,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /Published CI cannot require a conditional branch delivery/,
+  );
+  const invalidPreparation = structuredClone(routeGraph);
+  invalidPreparation.coverage[0].environment.readiness = "prepare";
+  invalidPreparation.coverage[0].environment.preparedBy = "has-files";
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidPreparation,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /Mandatory environment preparation cannot depend on a conditional branch/,
+  );
+  const invalidAggregate = structuredClone(routeGraph);
+  invalidAggregate.items.push({
+    ...routeDefaults,
+    id: "branch-aggregate",
+    kind: "aggregate",
+    children: ["has-files"],
+    dependencies: ["has-files"],
+    acceptance: aggregateAcceptance({ id: "branch-aggregate" }),
+  });
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidAggregate,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /explicit aggregate child/,
+  );
+  const routeState = {
+    schemaVersion: 13,
+    repository: routingConfig.repository,
+    objective: producer.objective,
+    runId: producer.runId,
+    configDigest: "a".repeat(64),
+    baseSha,
+    graph: routeGraph,
+    planGraphDigest: graphDigest(routeGraph),
+    capacity: { concurrency: 1 },
+    autonomy: resolveAutonomy(),
+    coordinator: {
+      mode: "running",
+      phase: "execution",
+      phaseStartedAt: new Date().toISOString(),
+    },
+    planningRecovery: { phase: "ready", history: [], contextLookup: lookup },
+    issueByItemId: {
+      inventory: 41,
+      "has-files": 42,
+      "no-files": 43,
+      integration: 44,
+    },
+    work: {
+      inventory: {
+        status: "done",
+        attempt: producer.attemptId,
+        baseSha,
+        discoveryOutput: manifest,
+      },
+      "has-files": { status: "pending" },
+      "no-files": { status: "pending" },
+      integration: { status: "pending" },
+    },
+  };
+  const missingRoutingAdmission = structuredClone(routeState);
+  delete missingRoutingAdmission.planningRecovery.contextLookup;
+  assert.throws(
+    () =>
+      parseFactoryState(
+        missingRoutingAdmission,
+        routingConfig.repository,
+        producer.objective,
+      ),
+    /requires its original admitted planning context/,
+  );
+  const snapshot = join(root, "routing-state.json");
+  const routeArgs = {
+    config: routingConfig,
+    state: routeState,
+    store,
+    save: () => saveState(snapshot, routeState),
+    cancelled: () => false,
+  };
+  await settleWorkRouting(routeArgs);
+  assert.equal(routeState.work["has-files"].routing.disposition, "selected");
+  assert.equal(routeState.work["no-files"].status, "skipped");
+  assert.equal(routeState.work["no-files"].attempt, undefined);
+  assert.equal(routeState.work["no-files"].validation, undefined);
+  assert.equal(routeState.work["no-files"].pullRequest, undefined);
+  assert.deepEqual(
+    readyItems(routeGraph, routeState.work, new Set(), 2).map(
+      (item) => item.id,
+    ),
+    ["has-files"],
+  );
+  assert.throws(
+    () => assertCompletedCoverage(routeState),
+    /completed exact-tree proof/,
+  );
+  assert.deepEqual(routeState.graph.coverage, graph.coverage);
+  const restored = parseFactoryState(
+    JSON.parse(readFileSync(snapshot, "utf8")),
+    routingConfig.repository,
+    producer.objective,
+  );
+  await authenticateWorkRouting({
+    config: routingConfig,
+    state: restored,
+    store: new LocalContentStore(join(root, "content")),
+  });
+  await settleWorkRouting({
+    ...routeArgs,
+    state: restored,
+    save: () =>
+      assert.fail("An unchanged routing receipt must not be rewritten"),
+  });
+  const changedBinding = structuredClone(restored);
+  changedBinding.graph.items.find(
+    (item) => item.id === "no-files",
+  ).condition.when = false;
+  assert.throws(
+    () => assertWorkRoutingState(changedBinding),
+    /admitted branch binding/,
+  );
+  const fabricatedAttempt = structuredClone(restored);
+  fabricatedAttempt.work["no-files"].attempt = "fabricated";
+  assert.throws(
+    () => assertWorkRoutingState(fabricatedAttempt),
+    /owned attempt/,
+  );
+  const receipt = routeState.conditionFacts[condition.id];
+  const receiptPath = join(
+    root,
+    "content",
+    receipt.inputPacketRef.digest.slice(0, 2),
+    receipt.inputPacketRef.digest,
+  );
+  const receiptBytes = readFileSync(receiptPath);
+  rmSync(receiptPath);
+  await assert.rejects(
+    authenticateWorkRouting({ config: routingConfig, state: restored, store }),
+    /Retained condition facts are unavailable/,
+  );
+  writeFileSync(receiptPath, receiptBytes);
+  // A genuinely empty complete inventory skips the sole implementation branch; QA still owes its proof on the pinned baseline.
+  const emptyRoute = structuredClone(routeState);
+  delete emptyRoute.conditionFacts;
+  emptyRoute.graph.items = emptyRoute.graph.items.filter(
+    (item) => item.id !== "no-files",
+  );
+  emptyRoute.graph.items.find((item) => item.id === "inventory").discovery =
+    emptySpec;
+  emptyRoute.graph.items.find(
+    (item) => item.id === "integration",
+  ).dependencies = [inventory.id, "has-files"];
+  emptyRoute.planGraphDigest = graphDigest(emptyRoute.graph);
+  delete emptyRoute.issueByItemId["no-files"];
+  delete emptyRoute.work["no-files"];
+  emptyRoute.work["has-files"] = { status: "pending" };
+  emptyRoute.work.inventory.discoveryOutput = empty;
+  await settleWorkRouting({
+    ...routeArgs,
+    state: emptyRoute,
+    save: () => saveState(snapshot, emptyRoute),
+  });
+  assert.equal(emptyRoute.work["has-files"].status, "skipped");
+  assert.deepEqual(objectiveCandidate(emptyRoute), {
+    basis: "pinned-baseline",
+    commitSha: baseSha,
+  });
+  assert.deepEqual(
+    readyItems(emptyRoute.graph, emptyRoute.work, new Set(), 2).map(
+      (item) => item.id,
+    ),
+    ["integration"],
+  );
+  assert.throws(
+    () => assertCompletedCoverage(emptyRoute),
+    /completed exact-tree proof/,
+  );
+  // Even after local closure checkpoints settle, observations and skips supply no QA acceptance.
+  const reviewReadiness = structuredClone(emptyRoute);
+  reviewReadiness.work.inventory.githubClosure = "complete";
+  reviewReadiness.work["has-files"].githubClosure = "complete";
+  parseFactoryState(
+    reviewReadiness,
+    routingConfig.repository,
+    producer.objective,
+  );
+  assert.throws(
+    () =>
+      objectiveReviewEvidence({
+        state: reviewReadiness,
+        checkout,
+        candidateCommitSha: baseSha,
+        candidateTreeSha: git("rev-parse", `${baseSha}^{tree}`),
+      }),
+    /Work Item integration lacks complete final-review identity/,
+  );
+  // Missing producer output never routes as false, and a held operator decision keeps its owner pending.
+  const unknownRoute = structuredClone(routeState);
+  delete unknownRoute.conditionFacts;
+  unknownRoute.work.inventory = { status: "pending" };
+  unknownRoute.work["has-files"] = { status: "pending" };
+  unknownRoute.work["no-files"] = { status: "pending" };
+  await settleWorkRouting({
+    ...routeArgs,
+    state: unknownRoute,
+    save: () => saveState(snapshot, unknownRoute),
+  });
+  assert.equal(unknownRoute.work["has-files"].routing.disposition, "held");
+  assert.equal(unknownRoute.work["no-files"].routing.disposition, "held");
+  assert.deepEqual(
+    readyItems(unknownRoute.graph, unknownRoute.work, new Set(), 2).map(
+      (item) => item.id,
+    ),
+    ["inventory"],
+  );
+  // The supported cancellation disposition keeps absent and held condition facts unresolved through atomic reload.
+  const cancelledHeld = structuredClone(unknownRoute);
+  cancelledHeld.cancelRequested = true;
+  for (const work of Object.values(cancelledHeld.work))
+    work.status = "cancelled";
+  saveState(snapshot, cancelledHeld);
+  cancelledHeld.cancelledAt = new Date().toISOString();
+  saveState(snapshot, cancelledHeld);
+  const restoredCancellation = parseFactoryState(
+    JSON.parse(readFileSync(snapshot, "utf8")),
+    routingConfig.repository,
+    producer.objective,
+  );
+  assert.equal(
+    restoredCancellation.work["has-files"].routing.disposition,
+    "held",
+  );
+  assert.equal(
+    restoredCancellation.work["no-files"].routing.disposition,
+    "held",
+  );
+  assert.equal(restoredCancellation.conditionFacts, undefined);
+  assert.equal(restoredCancellation.work["has-files"].attempt, undefined);
+  const cancelledAbsent = structuredClone(cancelledHeld);
+  delete cancelledAbsent.work["has-files"].routing;
+  delete cancelledAbsent.work["no-files"].routing;
+  for (const work of Object.values(cancelledAbsent.work))
+    work.completedAt = new Date().toISOString();
+  saveState(snapshot, cancelledAbsent);
+  parseFactoryState(
+    JSON.parse(readFileSync(snapshot, "utf8")),
+    routingConfig.repository,
+    producer.objective,
+  );
+  const cancellationNotRecorded = structuredClone(cancelledHeld);
+  delete cancellationNotRecorded.cancelRequested;
+  delete cancellationNotRecorded.cancelledAt;
+  assert.throws(
+    () => assertWorkRoutingState(cancellationNotRecorded),
+    /Unknown condition cannot start or skip/,
+  );
+  const cancellationStillOwned = structuredClone(cancelledHeld);
+  cancellationStillOwned.work["has-files"].phaseReservation = "coding";
+  assert.throws(
+    () => assertWorkRoutingState(cancellationStillOwned),
+    /Unknown condition cannot start or skip/,
+  );
+  const operatorRoute = structuredClone(routeState);
+  delete operatorRoute.conditionFacts;
+  operatorRoute.work["has-files"] = { status: "pending" };
+  operatorRoute.work["no-files"] = {
+    status: "pending",
+    wait: {
+      kind: "decision",
+      detail: "Retained operator choice",
+      step: "item/no-files/execute",
+    },
+  };
+  await settleWorkRouting({
+    ...routeArgs,
+    state: operatorRoute,
+    save: () => saveState(snapshot, operatorRoute),
+  });
+  assert.equal(operatorRoute.work["no-files"].status, "pending");
+  assert.equal(operatorRoute.work["no-files"].routing, undefined);
+  assert.equal(
+    operatorRoute.work["no-files"].wait.detail,
+    "Retained operator choice",
   );
   const boundedSpec = {
     ...specification,

@@ -45,6 +45,8 @@ export interface ExecutionProfileChoices {
 }
 
 export interface WorkItem {
+  /** A reviewed branch selector; absent or unknown facts never mean false. */
+  condition?: { conditionId: string; when: boolean };
   /** Read-only proof node; uses the ordinary scheduler without a worker or PR. */
   kind?: "work" | "qa" | "aggregate" | "discovery";
   /** Bound read-only observation; never coding or publication authority. */
@@ -146,7 +148,26 @@ export interface GraphExpansionEnvelope {
   template: WorkItem;
 }
 
+export interface DeclaredWorkCondition {
+  schemaVersion: 1;
+  id: string;
+  input: {
+    producerItemId: string;
+    role: string;
+    schema: "factory.repository-inventory/v1";
+  };
+  predicate:
+    | { kind: "inventory-empty" }
+    | {
+        kind: "has-classification";
+        classification: string;
+        otherClassifications: string[];
+      };
+}
+
 export interface WorkGraph {
+  /** Source-reviewed literal predicates over authenticated structured observations. */
+  conditions?: DeclaredWorkCondition[];
   /** Initially reviewed declarations; settlement remains in the atomic snapshot. */
   expansions?: GraphExpansionEnvelope[];
   /** Source-required gates on every ordinary delivery head, separate from final proof. */

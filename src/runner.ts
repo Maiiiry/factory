@@ -1128,7 +1128,11 @@ async function cancelObjectiveOwned(
               ),
             )
             .catch(() => undefined);
-        if (work.status !== "done" && work.status !== "published") {
+        if (
+          work.status !== "done" &&
+          work.status !== "published" &&
+          work.status !== "skipped"
+        ) {
           work.status = "cancelled";
           work.completedAt = new Date().toISOString();
         }

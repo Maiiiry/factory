@@ -3,6 +3,7 @@ import { pathsOverlap, validOwnershipPath } from "./ownership.js";
 export { pathsOverlap } from "./ownership.js";
 
 import type { WorkGraph, WorkItem } from "./contracts.js";
+import { assertDeclaredConditions } from "./adaptive-routing.js";
 import { assertCoverageShape } from "./qa.js";
 import { assertDiscoverySpecification } from "./discovery.js";
 import { expansionBlocksItem } from "./expansion-readiness.js";
@@ -123,6 +124,14 @@ export function assertWorkItemFields(
     );
 }
 
+/** Routing settles a dependency without supplying implementation acceptance. */
+export function workSettled(work: WorkState | undefined): boolean {
+  return (
+    work?.status === "done" ||
+    (work?.status === "skipped" && work.routing?.disposition === "skipped")
+  );
+}
+
 export function itemsConflict(left: WorkItem, right: WorkItem): boolean {
   return (
     left.ownedPaths.some((a) =>
@@ -162,6 +171,7 @@ export function validateAndOrderGraph(
   }
   for (const item of graph.items) assertWorkItemFields(item);
   assertCoverageShape(graph);
+  assertDeclaredConditions(graph);
   const byId = new Map<string, WorkItem>();
   for (const item of graph.items) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(item.id) || byId.has(item.id))
@@ -358,7 +368,13 @@ export function readyItems(
 }
 
 export interface SchedulingBlocker {
-  kind: "dependency" | "ownership" | "resource" | "expansion" | "operator";
+  kind:
+    | "dependency"
+    | "ownership"
+    | "resource"
+    | "expansion"
+    | "operator"
+    | "condition";
   detail: string;
   blockedBy?: string;
 }
@@ -370,12 +386,19 @@ export function pendingItemBlocker(
   item: WorkItem,
   active: ReadonlySet<string>,
   resolvedExpansionIds?: ReadonlySet<string>,
-  dependencyReady: (id: string) => boolean = (id) =>
-    work[id]?.status === "done",
+  dependencyReady: (id: string) => boolean = (id) => workSettled(work[id]),
 ): SchedulingBlocker | undefined {
   const wait = work[item.id]?.wait;
   if (wait && ["decision", "prerequisite"].includes(wait.kind))
     return { kind: "operator", detail: wait.detail };
+  if (item.condition && work[item.id]?.routing?.disposition !== "selected")
+    return {
+      kind: "condition",
+      detail:
+        work[item.id]?.routing?.disposition === "held"
+          ? (work[item.id]!.routing as { detail: string }).detail
+          : "Declared branch condition has no authenticated selected disposition",
+    };
   if (expansionBlocksItem(graph, item.id, resolvedExpansionIds))
     return {
       kind: "expansion",
@@ -437,21 +460,19 @@ export function criticalPathValues(
       throw new Error("Scheduling graph contains a dependency cycle");
     visiting.add(item.id);
     const children = (successors.get(item.id) ?? [])
-      .filter((child) => work[child.id]?.status !== "done")
+      .filter((child) => !workSettled(work[child.id]))
       .map(visit);
-    const remainingStages =
-      work[item.id]?.status === "done"
-        ? 0
-        : 1 + Math.max(0, ...children.map((child) => child.remainingStages));
+    const remainingStages = workSettled(work[item.id])
+      ? 0
+      : 1 + Math.max(0, ...children.map((child) => child.remainingStages));
     const estimate = item.scheduling?.estimatedDurationMs;
-    const duration =
-      work[item.id]?.status === "done"
-        ? 0
-        : estimate === undefined ||
-            children.some((child) => child.estimatedDurationMs === null)
-          ? null
-          : estimate +
-            Math.max(0, ...children.map((child) => child.estimatedDurationMs!));
+    const duration = workSettled(work[item.id])
+      ? 0
+      : estimate === undefined ||
+          children.some((child) => child.estimatedDurationMs === null)
+        ? null
+        : estimate +
+          Math.max(0, ...children.map((child) => child.estimatedDurationMs!));
     const estimatedDurationMs =
       duration !== null && !Number.isSafeInteger(duration) ? null : duration;
     const result = { remainingStages, estimatedDurationMs };
@@ -470,7 +491,7 @@ export function schedulingObservations(
 ) {
   const values = criticalPathValues(graph, work);
   const rankingBasis = graph.items
-    .filter((item) => work[item.id]?.status !== "done")
+    .filter((item) => !workSettled(work[item.id]))
     .every((item) => values.get(item.id)!.estimatedDurationMs !== null)
     ? "declared-duration"
     : "remaining-stages";
@@ -527,7 +548,7 @@ export function rankPending(
 ): WorkItem[] {
   const values = criticalPathValues(graph, work);
   const estimatesComplete = graph.items
-    .filter((item) => work[item.id]?.status !== "done")
+    .filter((item) => !workSettled(work[item.id]))
     .every((item) => values.get(item.id)!.estimatedDurationMs !== null);
   return [...graph.items].sort(
     (a, b) =>

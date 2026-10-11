@@ -1,3 +1,4 @@
+import { authenticateWorkRouting } from "./runner/routing.js";
 import { randomUUID } from "node:crypto";
 import { authenticateDiscoveryOutput } from "./discovery.js";
 import { assertWorkDiscoveryOutput } from "./state.js";
@@ -175,17 +176,23 @@ export async function runQaItem(args: {
     return true;
   };
   try {
+    await authenticateWorkRouting({
+      config: args.config,
+      state,
+      store: args.store,
+    });
     const candidate = objectiveCandidate(state);
     if (
       (item.kind !== "qa" && item.kind !== "aggregate") ||
       !item.dependencies.every(
         (id) =>
-          state.work[id]?.status === "done" &&
-          (state.graph.items.find((peer) => peer.id === id)?.kind ===
-            "discovery" ||
-            state.work[id]?.integratedSha ||
-            (candidate?.basis === "pinned-baseline" &&
-              state.work[id]?.changeRef === candidate.commitSha)),
+          state.work[id]?.status === "skipped" ||
+          (state.work[id]?.status === "done" &&
+            (state.graph.items.find((peer) => peer.id === id)?.kind ===
+              "discovery" ||
+              state.work[id]?.integratedSha ||
+              (candidate?.basis === "pinned-baseline" &&
+                state.work[id]?.changeRef === candidate.commitSha))),
       )
     )
       throw new Error("QA cannot run before actual dependency integration");

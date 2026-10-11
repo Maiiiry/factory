@@ -1,3 +1,5 @@
+import { workSettled } from "../scheduler.js";
+import { authenticateWorkRouting } from "./routing.js";
 import { createHash, randomUUID } from "node:crypto";
 import { buildAdaptiveContext } from "../adaptive-context.js";
 import { agentSessionContinuation } from "../agent-session.js";
@@ -100,11 +102,12 @@ export async function finalizeObjective(args: {
     state.coordinator!.mode !== "running" ||
     amendmentBlocksDispatch(state) ||
     graph.items.some(
-      (item) => state.work[item.id]?.status !== "done" || closeWaits(item.id),
+      (item) => !workSettled(state.work[item.id]) || closeWaits(item.id),
     )
   )
     return state;
   stopIfCancelled();
+  await authenticateWorkRouting({ state, config, store: contentStore });
   await authenticateObjectiveInputs({ state, config, contentStore });
   stopIfCancelled();
   /**

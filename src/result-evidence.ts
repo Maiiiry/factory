@@ -35,7 +35,12 @@ import type {
 } from "./contracts.js";
 import { assetSelectionDigest } from "./media.js";
 import { pinnedGit, pinnedGitEnvironment, pinnedGitRaw } from "./process.js";
-import type { FactoryState, WorkState } from "./state.js";
+import {
+  assertWorkDiscoveryOutput,
+  type FactoryState,
+  type WorkState,
+} from "./state.js";
+import { assertWorkRoutingState } from "./runner/routing.js";
 import { assertFailedValidationRecord } from "./failed-validation.js";
 import { deliveredHead } from "./delivery/branch-update.js";
 import {
@@ -2401,8 +2406,49 @@ export function objectiveReviewEvidence(args: {
       if (entry.complete) supplyLiteral(item.id, entry);
   }
   const acceptedWorkItemImages: AcceptedWorkItemImageObservation[] = [];
+  assertWorkRoutingState(state);
   const work = state.graph.items.map((item) => {
     const current = state.work[item.id];
+    if (current?.status === "skipped") {
+      if (
+        current.githubClosure !== "complete" ||
+        current.routing?.disposition !== "skipped"
+      )
+        throw new Error(`Work Item ${item.id} lacks settled routing closure`);
+      const facts = state.conditionFacts?.[current.routing.conditionId];
+      if (!facts)
+        throw new Error(`Work Item ${item.id} lacks retained condition facts`);
+      return {
+        itemId: item.id,
+        kind: item.kind ?? "work",
+        disposition: "skipped",
+        routing: current.routing,
+        conditionFactsRef: {
+          conditionId: current.routing.conditionId,
+          resultDigest: facts.resultDigest,
+        },
+        scope:
+          "Authenticated declared branch disposition only. No implementation, validation, acceptance review or integration occurred for this branch; original unconditional acceptance obligations remain required.",
+      };
+    }
+    if (item.kind === "discovery") {
+      assertWorkDiscoveryOutput(state, item.id, current!);
+      if (
+        current?.status !== "done" ||
+        current.githubClosure !== "complete" ||
+        current.execution ||
+        current.discoveryOutput?.status !== "complete"
+      )
+        throw new Error(`Discovery ${item.id} lacks settled output identity`);
+      return {
+        itemId: item.id,
+        kind: "discovery",
+        disposition: "observed",
+        output: current.discoveryOutput,
+        scope:
+          "Authenticated selector-bound structured observation only. This supplies no implementation, command receipt, acceptance verdict or GitHub delivery identity.",
+      };
+    }
     if (
       !current ||
       current.status !== "done" ||
@@ -2488,6 +2534,7 @@ export function objectiveReviewEvidence(args: {
     const supplied = suppliedByItem.get(item.id) ?? new Set<string>();
     return {
       ...proof.record,
+      ...(current.routing ? { routing: current.routing } : {}),
       acceptedReview: {
         attemptId: current.attempt,
         graphRevisionDigest: current.graphRevisionDigest ?? null,
@@ -2511,6 +2558,7 @@ export function objectiveReviewEvidence(args: {
   assertIntegrationBindings(checkout, integrationRecords);
   return {
     observations: JSON.stringify({
+      ...(state.conditionFacts ? { conditionFacts: state.conditionFacts } : {}),
       planningDecisionContext: acceptedPlanningDecisionContext(state),
       candidateBasis: candidate.basis,
       candidateCommitSha,

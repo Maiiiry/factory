@@ -1,3 +1,6 @@
+import { assertDeclaredConditions } from "./adaptive-routing.js";
+import { assertGraphExpansions } from "./graph-expansion.js";
+import { workSettled } from "./scheduler.js";
 import {
   adaptiveContextEvidence,
   authenticateAdaptiveContextPacket,
@@ -383,6 +386,22 @@ export function assertGraphRevisions(state: FactoryState): void {
 const amendmentEvent = (pending: PendingAmendment): string =>
   objectiveEvent("amend", pending.id);
 
+/** New pending graph semantics are capability-versioned before review or projection. */
+function admitAdvancedAmendmentFormat(
+  state: FactoryState,
+  graph: WorkGraph,
+): void {
+  if (!graph.conditions?.length && !graph.expansions?.length) return;
+  if (!state.planningRecovery?.contextLookup || state.schemaVersion === 7)
+    throw new Error(
+      "Adaptive graph changes require the original admitted planning context",
+    );
+  assertDeclaredConditions(graph);
+  assertGraphExpansions(graph);
+  if (graph.conditions?.length || state.schemaVersion === 9)
+    state.schemaVersion = 13;
+}
+
 export function submitAmendment(
   state: FactoryState,
   proposal: AmendmentProposal,
@@ -427,6 +446,7 @@ export function submitAmendment(
     if (!work || work.attempt !== proposal.worker.attempt)
       throw new Error("Discovery has stale worker attempt identity");
   }
+  if (proposal.graph) admitAdvancedAmendmentFormat(state, proposal.graph);
   if (rejected) {
     state.rejectedAmendments ??= [];
     state.rejectedAmendments.push(structuredClone(rejected));
@@ -574,6 +594,24 @@ export function validateAmendment(
   body: string,
 ): void {
   const pending = state.pendingAmendment!;
+  if (
+    (graph.conditions?.length || graph.expansions?.length) &&
+    !state.planningRecovery?.contextLookup
+  )
+    throw new Error(
+      "Reviewed adaptive graph changes require the original admitted planning context",
+    );
+  for (const id of Object.keys(state.conditionFacts ?? {})) {
+    if (
+      !isDeepStrictEqual(
+        state.graph.conditions?.find((entry) => entry.id === id),
+        graph.conditions?.find((entry) => entry.id === id),
+      )
+    )
+      throw new Error(
+        "An amendment cannot rewrite retained condition facts; add a reviewed successor condition",
+      );
+  }
   for (const settled of state.expansionHistory ?? []) {
     const previous = state.graph.expansions?.find(
       (entry) => entry.id === settled.envelopeId,
@@ -613,6 +651,11 @@ export function validateAmendment(
     if (!next)
       throw new Error("Amendments cannot remove stable Work Item identities");
     const changed = !sameItem(next, old);
+    if (
+      state.work[old.id]?.routing &&
+      !isDeepStrictEqual(next.condition, old.condition)
+    )
+      throw new Error("An amendment cannot change a settled branch binding");
     const work = state.work[old.id]!;
     // Only ownership widens, and only for the attempt that is run again.
     const widened =
@@ -1035,6 +1078,7 @@ async function advanceAmendment(args: {
           { configuredConcurrency: state.capacity.concurrency },
         );
       }
+      admitAdvancedAmendmentFormat(state, pending.graph!);
       calling = undefined;
       pending.phase = "compiled";
       save();
@@ -1178,7 +1222,10 @@ async function advanceAmendment(args: {
       stage = "projection";
       calling = "projection";
       if (
-        state.schemaVersion === 11 &&
+        (state.schemaVersion === 11 ||
+          state.schemaVersion === 13 ||
+          pending.graph!.conditions?.length ||
+          pending.graph!.expansions?.length) &&
         args.github.projectionMutationAdmission !== "controller-checkpoint-v1"
       )
         throw attachFault(
@@ -1192,7 +1239,10 @@ async function advanceAmendment(args: {
       // Projection finds existing issues by marker, so repeating it is safe.
       const projected = await args.github.projectGraph({
         graph: pending.graph!,
-        ...(state.schemaVersion === 11
+        ...(state.schemaVersion === 11 ||
+        state.schemaVersion === 13 ||
+        pending.graph!.conditions?.length ||
+        pending.graph!.expansions?.length
           ? {
               expansionControl: graphProjectionControl(
                 state,
@@ -1209,8 +1259,8 @@ async function advanceAmendment(args: {
           state.issueAuthor = login;
           save();
         },
-        completedItems: Object.keys(state.work).filter(
-          (id) => state.work[id]!.status === "done",
+        completedItems: Object.keys(state.work).filter((id) =>
+          workSettled(state.work[id]),
         ),
         beforeCreate: () => {
           stopIfCancelled();
@@ -1247,6 +1297,14 @@ async function advanceAmendment(args: {
         pending.graph!.items.find((item) => item.id === reattempt),
       );
     state.graph = pending.graph!;
+    if (
+      state.graph.conditions?.length ||
+      state.conditionFacts ||
+      state.workflowReflection ||
+      state.schemaVersion === 13
+    )
+      state.schemaVersion = 13;
+    else if (state.graph.expansions?.length) state.schemaVersion = 11;
     state.issueByItemId = pending.issueByItemId;
     for (const item of state.graph.items)
       state.work[item.id] ??= { status: "pending" };

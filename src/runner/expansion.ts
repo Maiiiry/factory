@@ -91,6 +91,7 @@ export function assertExpansionState(state: FactoryState): void {
   if (expansions !== undefined) assertGraphExpansions(state.graph);
   if (
     state.schemaVersion !== 11 &&
+    state.schemaVersion !== 13 &&
     (expansions !== undefined ||
       state.pendingExpansion !== undefined ||
       state.expansionHistory !== undefined)

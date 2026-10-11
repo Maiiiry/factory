@@ -1,3 +1,4 @@
+import { assertWorkRoutingState } from "./runner/routing.js";
 import { createHash } from "node:crypto";
 import type {
   AcceptanceCoverage,
@@ -33,7 +34,19 @@ export function objectiveCandidate(
       commitSha: string;
     }
   | undefined {
-  if (baselineQaGraph(state.graph)) {
+  const skippedBaseline =
+    state.graph.items.some(
+      (item) => state.work[item.id]?.status === "skipped",
+    ) &&
+    state.graph.items.every(
+      (item) =>
+        item.kind === "qa" ||
+        item.kind === "aggregate" ||
+        item.kind === "discovery" ||
+        state.work[item.id]?.status === "skipped",
+    );
+  if (skippedBaseline) assertWorkRoutingState(state as FactoryState);
+  if (baselineQaGraph(state.graph) || skippedBaseline) {
     if (
       state.integratedSha !== undefined ||
       Object.entries(state.work).some(

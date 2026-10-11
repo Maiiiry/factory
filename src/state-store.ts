@@ -261,25 +261,34 @@ function parsePreparation(
     assertRepositoryMemoryBindings(value.memoryBindings);
   const lookup = value.planningRecovery?.contextLookup;
   if (lookup !== undefined) {
-    if (value.schemaVersion !== 10 && value.schemaVersion !== 12)
+    if (
+      value.schemaVersion !== 10 &&
+      value.schemaVersion !== 12 &&
+      value.schemaVersion !== 14
+    )
       throw new Error(
         "Adaptive context requires preparation schema version 10",
       );
     assertPlanningLookupRecord(lookup);
   }
   if (value.plan) {
+    const conditional = !!value.plan.graph.conditions?.length;
     const expanded = !!value.plan.graph.expansions?.length;
     const adaptive =
       value.plan.contextLookup !== undefined ||
       value.plan.graph.items.some((item) => item.kind === "discovery");
     if (
-      (expanded
-        ? value.plan.schemaVersion !== 5
-        : adaptive !== (value.plan.schemaVersion === 4)) ||
+      (conditional
+        ? value.plan.schemaVersion !== 6
+        : expanded
+          ? value.plan.schemaVersion !== 5
+          : adaptive !== (value.plan.schemaVersion === 4)) ||
       (value.schemaVersion === 8 && adaptive) ||
       (value.schemaVersion === 10 && value.plan.schemaVersion !== 4) ||
       (value.schemaVersion === 12 && value.plan.schemaVersion !== 5) ||
-      (expanded && value.schemaVersion !== 12)
+      (value.schemaVersion === 14 && value.plan.schemaVersion !== 6) ||
+      (conditional && value.schemaVersion !== 14) ||
+      (expanded && value.schemaVersion !== 12 && value.schemaVersion !== 14)
     )
       throw new Error(
         "Preparation plan schema differs from adaptive semantics",
@@ -301,7 +310,8 @@ function parsePreparation(
   if (
     (value.schemaVersion !== 8 &&
       value.schemaVersion !== 10 &&
-      value.schemaVersion !== 12) ||
+      value.schemaVersion !== 12 &&
+      value.schemaVersion !== 14) ||
     value.kind !== "preparing" ||
     value.repository !== repository ||
     value.objective !== objective ||

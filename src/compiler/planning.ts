@@ -1,3 +1,4 @@
+import { assertDeclaredConditions } from "../adaptive-routing.js";
 import { assertGraphExpansions } from "../graph-expansion.js";
 import { createHash } from "node:crypto";
 import {
@@ -317,6 +318,7 @@ export function validateGraph(
 ): void {
   assertPreIntegrationCheckShape(graph);
   assertGraphExpansions(graph);
+  assertDeclaredConditions(graph);
   if (
     previousGraph &&
     JSON.stringify(graph.requiredPreIntegrationChecks ?? []) !==
