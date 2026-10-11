@@ -760,7 +760,10 @@ async function verifyDescription(
       );
       const binding =
         value.binding as import("./recovery-checkpoint.js").RecoveryCheckpointBinding;
-      assertRecoveryCheckpointManifest(value, binding, bounds);
+      assertRecoveryCheckpointManifest(value, binding, {
+        maxBytes: bounds.maxBytes,
+        maxFiles: bounds.maxFiles,
+      });
       if (value.binding.repository !== root.identity!.repository)
         throw new Error(
           "Restoration archive repository differs from its continuation",
