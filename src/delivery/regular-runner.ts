@@ -1,24 +1,3 @@
-import {
-  observeWorkflowReflection,
-  reconcileWorkRouting,
-} from "../runner/routing.js";
-import { publicationControl, confirmClosedPublication } from "./publication.js";
-import { packageManagerUpdate } from "../package-manager-update.js";
-import { deliveryDescription } from "./description.js";
-import { assertIntegrated, laterIntegration } from "./integration.js";
-import { cancelledFault } from "../fault.js";
-import { assertCheckSourcesAtIntegration } from "./check-sources.js";
-import { deliveryReadiness, unreportedGates } from "./readiness.js";
-import { runWorker, stopWorker as stopSharedWorker } from "../item-worker.js";
-import { recordWorkFailure, diagnoseWorkRepair } from "../work-repair.js";
-import {
-  reportCancelled,
-  reviewItem,
-  staysInPlace,
-  validateItem,
-} from "../item-steps.js";
-import { workspacePackageAdditions } from "../workspace-membership.js";
-import { graphDigest } from "../graph-amendments.js";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { planningSources } from "../compiler.js";
@@ -26,8 +5,8 @@ import { closeWorkItem } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
 import type {
   ContentStore,
-  DeliveryStrategy,
   DeliveryResult,
+  DeliveryStrategy,
   ExecutionDriver,
   GitHubGateway,
   PlanningModel,
@@ -35,40 +14,64 @@ import type {
 } from "../contracts.js";
 import { AuthenticationRequiredError } from "../contracts.js";
 import type { DiagnosticEmitter } from "../diagnostics.js";
-import { faultOf } from "../fault.js";
+import { expansionBlocksItem } from "../expansion-readiness.js";
+import { cancelledFault, faultOf } from "../fault.js";
+import { graphDigest } from "../graph-amendments.js";
+import {
+  reportCancelled,
+  reviewItem,
+  staysInPlace,
+  validateItem,
+} from "../item-steps.js";
+import { runWorker, stopWorker as stopSharedWorker } from "../item-worker.js";
 import { materializeAssetSet, validationLfsMembersForItem } from "../media.js";
+import { packageManagerUpdate } from "../package-manager-update.js";
+import { phaseAdmission } from "../phase-admission.js";
 import { currentProcessSignal } from "../process.js";
 import { runQaItem } from "../qa-execution.js";
 import { runDiscoveryItem } from "../runner/discovery.js";
-import { phaseAdmission } from "../phase-admission.js";
 import {
-  workSettled,
+  observeWorkflowReflection,
+  reconcileWorkRouting,
+} from "../runner/routing.js";
+import {
   pendingItemBlocker,
   readyItems,
   schedulingObservations,
+  workSettled,
 } from "../scheduler.js";
-import { expansionBlocksItem } from "../expansion-readiness.js";
 import type { FactoryState } from "../state.js";
 import {
   awaitsOperator,
   clearWait,
   repeatKey,
-  setWait,
   type StepContext,
   StepPaused,
+  setWait,
   step,
 } from "../step.js";
+import {
+  validateWorkItem,
+  workItemReviewEvidence,
+  workItemReviewObservations,
+} from "../validation.js";
+import { diagnoseWorkRepair, recordWorkFailure } from "../work-repair.js";
+import { workspacePackageAdditions } from "../workspace-membership.js";
 import {
   deliveredHead,
   deliveryEarlierHeads,
   retireDeliveredHead,
   updateBehindBranch,
 } from "./branch-update.js";
+import { assertCheckSourcesAtIntegration } from "./check-sources.js";
+import { deliveryDescription } from "./description.js";
+import { assertIntegrated, laterIntegration } from "./integration.js";
 import {
-  validateWorkItem,
-  workItemReviewEvidence,
-  workItemReviewObservations,
-} from "../validation.js";
+  confirmClosedPublication,
+  mergeControl,
+  publicationControl,
+} from "./publication.js";
+import { deliveryReadiness, unreportedGates } from "./readiness.js";
 
 export async function runRegularGraph(args: {
   config: FactoryConfig;
@@ -317,6 +320,8 @@ export async function runRegularGraph(args: {
     ): Promise<never> => {
       const head = await updateBehindBranch({
         github,
+        repository: state.repository,
+        checkpointedEffects: state.schemaVersion === 17,
         work,
         save,
         identity: { number: published.pullRequest, branch },
@@ -410,7 +415,10 @@ export async function runRegularGraph(args: {
           // Readiness can change after await-ci (a conflict, a failed
           // check): judge it again before the merge is sent.
           await ready(context);
-          const merged = await delivery.merge(published);
+          const merged = await delivery.merge(
+            published,
+            mergeControl(state, item.id, save),
+          );
           context.progress();
           await assertIntegrated(
             config.checkout,

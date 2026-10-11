@@ -28,7 +28,7 @@ import {
 } from "../dist/compiler/context.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
 import { parseFactoryState } from "../dist/state.js";
-import { saveState } from "../dist/state-store.js";
+import { saveState, statePath } from "../dist/state-store.js";
 import {
   authenticateWorkRouting,
   assertWorkRoutingState,
@@ -36,7 +36,27 @@ import {
 } from "../dist/runner/routing.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
 import { objectiveCandidate } from "../dist/qa.js";
-import { stateRoot } from "../dist/config.js";
+import { factoryConfigDigest, stateRoot } from "../dist/config.js";
+import {
+  decidePlaybook,
+  learningDigest,
+  prepareDreamInput,
+  readDreamCheckpoint,
+  readPinnedPlaybook,
+  recordRetrospective,
+  retainLearningMemory,
+  savePlaybookProposal,
+} from "../dist/learning.js";
+import { buildRecoveryCheckpointClosure } from "../dist/recovery-checkpoint-closure.js";
+import {
+  gitPersistenceStatus,
+  readVerifiedRecoveryCheckpoint,
+  synchronizeRecoveryCheckpoint,
+} from "../dist/recovery-checkpoint.js";
+import {
+  buildMemoryLearningClosure,
+  installExactMemoryLearning,
+} from "../dist/repository-memory-transfer.js";
 import {
   authenticateDiscoveryOutput,
   discoverRepository,
@@ -85,11 +105,15 @@ test("disk content survives storage and materialization, and corruption is refus
   await assert.rejects(store.verify(ref), /digest verification/);
 });
 
-test("repository memory verifies complete retained bodies and rebuilds scoped SQLite search after workspace disposal", (t) => {
+test("repository memory verifies complete retained bodies and rebuilds scoped SQLite search after workspace disposal", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-memory-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const checkout = join(root, "checkout");
-  const state = join(root, "state");
+  const repository = "fixture/memory";
+  const state = stateRoot(repository);
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const remote = join(root, "archive.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "pipe" });
   mkdirSync(checkout);
   const git = (...args) =>
     execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
@@ -305,7 +329,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(results.length, 1);
   assert.equal(results[0].record.producer.objective, 1);
   assert.equal(results[0].disposition, "current");
-  rmSync(checkout, { recursive: true });
   for (const suffix of ["", "-wal", "-shm"])
     rmSync(join(state, "memory", `catalog.sqlite${suffix}`), { force: true });
   const restarted = new LocalRepositoryMemory(state, "fixture/memory");
@@ -327,6 +350,380 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.throws(
     () => restarted.search({ access, query: "orchard", limit: 1 }),
     /owned private file/,
+  );
+  // Preserve actual cancelled observations and an explicit operator-reviewed
+  // advisory revision. No model call or implementation acceptance is invented.
+  chmodSync(join(state, "memory", "catalog.sqlite"), 0o600);
+  writeFileSync(
+    join(state, "content", sourceRef.digest.slice(0, 2), sourceRef.digest),
+    source,
+    { mode: 0o600 },
+  );
+  // Two authentic imported manifests can describe the same observation at
+  // different times. Restoration preserves both immutable identities.
+  const alternateBytes = Buffer.from(
+    store
+      .readBytes(binding.manifestRef)
+      .toString("utf8")
+      .replace(
+        `"createdAt":${JSON.stringify(record.createdAt)}`,
+        '"createdAt":"2000-01-01T00:00:00.000Z"',
+      ),
+  );
+  const alternateRef = store.putBytes(alternateBytes, {
+    mediaType: "application/json",
+  });
+  const alternateBinding = {
+    id: alternateRef.digest,
+    manifestRef: alternateRef,
+  };
+  assert.notEqual(alternateBinding.id, binding.id);
+  restarted.installExact(alternateBinding, alternateBytes, access);
+  const selection = { model: "unused-local-check", reasoningEffort: "low" };
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    planning: {
+      kind: "codex-sdk",
+      planner: selection,
+      reviewer: selection,
+    },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...selection },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    gitPersistence: {
+      remote,
+      ref: "refs/heads/factory-history",
+      visibility: "private",
+      scope: "private-history",
+      maxBytes: 16 * 1024 * 1024,
+      maxFiles: 4096,
+      timeoutMs: 10000,
+      coalesceMs: 0,
+    },
+  };
+  const cancelled = {
+    schemaVersion: 8,
+    kind: "preparing",
+    repository,
+    objective: 1,
+    runId: "cancelled-orchard-documentation",
+    configDigest: factoryConfigDigest(config),
+    baseSha: git("rev-parse", "HEAD"),
+    objectiveBodyDigest: learningDigest("Observe orchard API documentation"),
+    autonomy: resolveAutonomy(),
+    capacity: { concurrency: 1 },
+    charges: {},
+    issueByItemId: {},
+    coordinator: {
+      mode: "paused",
+      phase: "planning",
+      phaseStartedAt: new Date().toISOString(),
+    },
+    cancelledAt: new Date().toISOString(),
+  };
+  saveState(statePath(repository, 1), cancelled);
+  const episode = recordRetrospective(config, 1);
+  assert.equal(episode.outcome, "cancelled");
+  const prepared = await prepareDreamInput(config, { budgetBytes: 16384 });
+  assert.equal(prepared.episodes[0].episode.outcome, "cancelled");
+  const proposal = {
+    schemaVersion: 1,
+    repository,
+    configDigest: factoryConfigDigest(config),
+    id: prepared.checkpoint.id,
+    createdAt: prepared.checkpoint.createdAt,
+    parent: null,
+    budgetBytes: 16384,
+    sources: prepared.sources,
+    draft: {
+      lessons: [
+        {
+          text: "The cancelled observation retained the orchard API documentation.",
+          sources: prepared.sources,
+          previousLessons: [],
+        },
+      ],
+      summaries: [],
+      contradictions: [],
+      retired: [],
+    },
+    invocationId: prepared.checkpoint.invocationId,
+    generatedResponse: null,
+    consolidation: {
+      checkpointId: prepared.checkpoint.id,
+      checkpointDigest: prepared.checkpointDigest,
+    },
+  };
+  const proposalPath = savePlaybookProposal(proposal);
+  const reviewed = JSON.parse(readFileSync(proposalPath, "utf8"));
+  reviewed.draft.lessons[0].text =
+    "The cancelled orchard observation preserves documentation without granting acceptance.";
+  const reviewedPath = join(root, "reviewed-draft.json");
+  writeFileSync(reviewedPath, `${JSON.stringify(reviewed, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  const reviewedDigest = learningDigest(readFileSync(reviewedPath));
+  assert.notEqual(reviewedDigest, learningDigest(readFileSync(proposalPath)));
+  const approved = decidePlaybook(
+    config,
+    reviewedPath,
+    reviewedDigest,
+    "Fixture operator",
+    "approve",
+  );
+  const pin = {
+    version: approved.version,
+    digest: learningDigest(readFileSync(approved.path)),
+  };
+  const originalPlaybook = readPinnedPlaybook(repository, pin);
+  retainLearningMemory(repository);
+  const privateAccess = { repository, visibility: ["repository", "private"] };
+  const selectedClosure = await buildMemoryLearningClosure({
+    repository,
+    root: state,
+    access: privateAccess,
+    scope: { objective: 1, paths: ["api.md"] },
+  });
+  assert.equal(
+    selectedClosure.files.some((file) => file.path.includes(denied.id)),
+    false,
+  );
+  writeFileSync(
+    join(state, "content", secretRef.digest.slice(0, 2), secretRef.digest),
+    "Private unrelated orchard debugging notes",
+    { mode: 0o600 },
+  );
+  const buildClosure = () =>
+    buildRecoveryCheckpointClosure({
+      config,
+      scope: "private-history",
+    });
+  const closure = await buildClosure();
+  assert.equal(
+    closure.files.some((file) => file.kind === "git-pack"),
+    true,
+  );
+  for (const kind of [
+    "episodes",
+    "snapshots",
+    "proposals",
+    "reviews",
+    "versions",
+    "checkpoints",
+  ])
+    assert.equal(
+      closure.files.some((file) => file.path.startsWith(`learning/${kind}/`)),
+      true,
+    );
+  const firstCheckpoint = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(firstCheckpoint.status, "acknowledged");
+  const unchangedCheckpoint = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(unchangedCheckpoint.status, "acknowledged");
+  assert.equal(
+    unchangedCheckpoint.lastAcknowledged.commitSha,
+    firstCheckpoint.lastAcknowledged.commitSha,
+  );
+  assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "second-local-source-read" },
+    summary: "A second local read confirms the complete orchard API reference",
+  });
+  const secondCheckpoint = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(secondCheckpoint.status, "acknowledged");
+  assert.notEqual(
+    secondCheckpoint.lastAcknowledged.commitSha,
+    firstCheckpoint.lastAcknowledged.commitSha,
+  );
+  execFileSync("git", [
+    `--git-dir=${remote}`,
+    "merge-base",
+    "--is-ancestor",
+    firstCheckpoint.lastAcknowledged.commitSha,
+    secondCheckpoint.lastAcknowledged.commitSha,
+  ]);
+  // A real receiving Git process updates the ref, then outlives the bounded
+  // client wait. Reconciliation observes that exact publication without replay.
+  const received = join(root, "received.txt");
+  const receiveHook = join(remote, "hooks", "post-receive");
+  writeFileSync(
+    receiveHook,
+    `#!/bin/sh\nprintf 'received\\n' >> '${received}'\nsleep 2\n`,
+    { mode: 0o700 },
+  );
+  const boundedConfig = {
+    ...config,
+    gitPersistence: { ...config.gitPersistence, timeoutMs: 1000 },
+  };
+  assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "third-local-source-read" },
+    summary: "A third local read confirms the complete orchard API reference",
+  });
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(boundedConfig, {
+      reason: "explicit",
+      buildClosure,
+    }),
+    /publication outcome is unknown/,
+  );
+  const unknown = gitPersistenceStatus(config);
+  assert.equal(unknown.status, "unknown");
+  assert.equal(unknown.attemptedTransportOutcome, "unknown");
+  assert.equal(
+    execFileSync(
+      "git",
+      [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+      { encoding: "utf8" },
+    ).trim(),
+    unknown.attemptedCommit,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  const reconciled = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure: () =>
+      assert.fail(
+        "Exact publication reconciliation must not rebuild or repush",
+      ),
+  });
+  assert.equal(reconciled.status, "acknowledged");
+  assert.equal(reconciled.attemptedTransportOutcome, "unknown");
+  assert.equal(reconciled.lastAcknowledged.commitSha, unknown.attemptedCommit);
+  assert.equal(readFileSync(received, "utf8"), "received\n");
+  rmSync(receiveHook);
+  // Another actual writer advances the same archive with a normal Git push.
+  // The original writer holds the conflict and preserves the foreign tip.
+  const rival = join(root, "rival");
+  execFileSync("git", ["clone", "--branch", "factory-history", remote, rival], {
+    stdio: "pipe",
+  });
+  const rivalGit = (...args) =>
+    execFileSync("git", ["-C", rival, ...args], { encoding: "utf8" }).trim();
+  const foreign = execFileSync(
+    "git",
+    [
+      "-C",
+      rival,
+      "-c",
+      "user.name=Other archive writer",
+      "-c",
+      "user.email=other@example.test",
+      "commit-tree",
+      rivalGit("rev-parse", "HEAD^{tree}"),
+      "-p",
+      rivalGit("rev-parse", "HEAD"),
+    ],
+    { input: "Another archive writer\n", encoding: "utf8" },
+  ).trim();
+  rivalGit("push", "origin", `${foreign}:${config.gitPersistence.ref}`);
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(config, { reason: "explicit", buildClosure }),
+    /conflict/,
+  );
+  assert.equal(gitPersistenceStatus(config).status, "conflict");
+  assert.equal(
+    execFileSync(
+      "git",
+      [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+      { encoding: "utf8" },
+    ).trim(),
+    foreign,
+  );
+  const expectedBindings = new LocalRepositoryMemory(state, repository)
+    .metadata({ access: privateAccess, limit: 100 })
+    .entries.map((entry) => entry.binding)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const originals = closure.files
+    .filter((file) => file.kind === "learning-original")
+    .map((file) => ({ ...file, bytes: readFileSync(join(state, file.path)) }));
+  // The only surviving originals are in the remote Git archive. Fetch into an
+  // independent repository after both the source workspace and replicas are gone.
+  rmSync(checkout, { recursive: true });
+  rmSync(rival, { recursive: true });
+  rmSync(reviewedPath);
+  rmSync(state, { recursive: true });
+  assert.equal(gitPersistenceStatus(config).durability, "local-only");
+  const recovered = await readVerifiedRecoveryCheckpoint(
+    config,
+    reconciled.lastAcknowledged.commitSha,
+  );
+  assert.equal(recovered.commitSha, reconciled.lastAcknowledged.commitSha);
+  assert.equal(recovered.manifest.binding.repository, repository);
+  assert.equal(recovered.manifest.binding.ref, config.gitPersistence.ref);
+  assert.equal(existsSync(join(state, "content")), false);
+  await installExactMemoryLearning({
+    repository,
+    root: state,
+    access: privateAccess,
+    files: recovered.manifest.files,
+    contentRefs: recovered.manifest.contentRefs,
+    readVerifiedBlob: recovered.readVerifiedBlob,
+  });
+  for (const original of originals)
+    assert.deepEqual(readFileSync(join(state, original.path)), original.bytes);
+  const restored = new LocalRepositoryMemory(state, repository);
+  restored.rebuild();
+  assert.equal(restored.catalogStatus, "ready");
+  assert.deepEqual(
+    restored
+      .metadata({ access: privateAccess, limit: 100 })
+      .entries.map((entry) => entry.binding)
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    expectedBindings,
+  );
+  assert.equal(
+    restored.read({ access, id: alternateBinding.id }).record.createdAt,
+    "2000-01-01T00:00:00.000Z",
+  );
+  assert.equal(
+    restored.read({ access, id: binding.id }).disposition,
+    "historical",
+  );
+  assert.equal(
+    restored.read({ access, id: missing.id }).disposition,
+    "unavailable",
+  );
+  assert.equal(restored.read({ access, id: denied.id }), undefined);
+  assert.deepEqual(readPinnedPlaybook(repository, pin), originalPlaybook);
+  assert.deepEqual(
+    readDreamCheckpoint(repository, proposal.consolidation),
+    prepared.checkpoint,
+  );
+  const reconstructed = join(root, "reconstructed");
+  execFileSync("git", ["init", reconstructed], { stdio: "pipe" });
+  const packed = recovered.manifest.files.find(
+    (file) => file.kind === "git-pack",
+  );
+  execFileSync("git", ["-C", reconstructed, "index-pack", "--stdin"], {
+    input: Buffer.from(await recovered.readVerifiedBlob(packed.ref)),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  assert.deepEqual(
+    execFileSync("git", [
+      "-C",
+      reconstructed,
+      "show",
+      `${cancelled.baseSha}:api.md`,
+    ]),
+    source,
   );
 });
 
@@ -1691,14 +2088,24 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
   };
   const missingRoutingAdmission = structuredClone(routeState);
   delete missingRoutingAdmission.planningRecovery.contextLookup;
-  assert.throws(
-    () =>
-      parseFactoryState(
-        missingRoutingAdmission,
-        routingConfig.repository,
-        producer.objective,
-      ),
-    /requires its original admitted planning context/,
+  for (const schemaVersion of [13, 17]) {
+    missingRoutingAdmission.schemaVersion = schemaVersion;
+    assert.throws(
+      () =>
+        parseFactoryState(
+          missingRoutingAdmission,
+          routingConfig.repository,
+          producer.objective,
+        ),
+      /requires its original admitted planning context/,
+    );
+  }
+  const checkpointRoutingAdmission = structuredClone(routeState);
+  checkpointRoutingAdmission.schemaVersion = 17;
+  parseFactoryState(
+    checkpointRoutingAdmission,
+    routingConfig.repository,
+    producer.objective,
   );
   const snapshot = join(root, "routing-state.json");
   const routeArgs = {

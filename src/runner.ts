@@ -1,3 +1,9 @@
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import { graphExpansionPending } from "./runner/expansion.js";
 import {
   bindPlanningPlaybook,
@@ -165,7 +171,7 @@ export interface DecisionInput {
  * as the plan (its digest read from state); anything else is a result criterion, for the
  * Work Item or the final acceptance, against the exact pending tree in state.
  */
-export async function decideObjective(
+async function decideObjectiveUnscoped(
   config: FactoryConfig,
   objective: number,
   services: Pick<ApplicationServices, "github">,
@@ -252,7 +258,7 @@ function modeChangeResult(
   };
 }
 
-export async function controlObjective(
+async function controlObjectiveUnscoped(
   config: FactoryConfig,
   request: ControlRequest,
 ): Promise<unknown> {
@@ -337,7 +343,7 @@ export function observeObjectiveController<T>(
  * Plan if needed, then run within the configured autonomy until the Objective completes or
  * needs a human decision. A rerun resumes from state and never plans an existing plan again.
  */
-export async function runObjective(
+async function runObjectiveUnscoped(
   config: FactoryConfig,
   objective: number,
   services: ApplicationServices,
@@ -349,6 +355,19 @@ export async function runObjective(
     ) => void;
   } = {},
 ): Promise<ContinuationState> {
+  if (
+    config.gitPersistence?.scope === "private-history" &&
+    (services.planningModel.providerAttemptAdmission !==
+      "controller-checkpoint-v1" ||
+      services.driver.effectAdmission !== "controller-checkpoint-v1" ||
+      services.github.effectAdmission !== "controller-checkpoint-v1" ||
+      services.delivery.effectAdmission !== "controller-checkpoint-v1" ||
+      services.github.projectionMutationAdmission !==
+        "controller-checkpoint-v1")
+  )
+    throw new Error(
+      "Git-backed continuation requires planning, execution, delivery and GitHub adapters that enforce checkpoint admission",
+    );
   const digest = factoryConfigDigest(config);
   const emitter = new DiagnosticEmitter(
     config.repository,
@@ -703,7 +722,10 @@ async function runObjectiveOwned(
   process.on("SIGTERM", handoff);
   process.on("SIGUSR1", cancel);
   let progressTask: Promise<void> | undefined;
+  let progressAdmissionFailure: unknown;
   const projectProgress = (): Promise<void> => {
+    if (progressAdmissionFailure)
+      return Promise.reject(progressAdmissionFailure);
     if (!config.githubManagement) return Promise.resolve();
     if (progressTask) return progressTask;
     progressTask = withProcessCancellation(
@@ -727,7 +749,8 @@ async function runObjectiveOwned(
         });
       },
     )
-      .catch(() => {
+      .catch((error: unknown) => {
+        if (isCheckpointAdmissionFailure(error)) throw error;
         // A failed snapshot read/validation cannot authorize overwriting
         // disk from a remembered snapshot. Valid projection failures are
         // recorded inside the helper; unreadable state remains unreadable.
@@ -744,7 +767,10 @@ async function runObjectiveOwned(
   // publishes from complete validated snapshots under this same owner.
   const progressTimer = config.githubManagement
     ? setInterval(() => {
-        void projectProgress();
+        void projectProgress().catch((error: unknown) => {
+          progressAdmissionFailure = error;
+          wake();
+        });
       }, 30_000)
     : undefined;
   const observePhoneDecision = async (): Promise<boolean> => {
@@ -1036,7 +1062,7 @@ async function runObjectiveOwned(
   }
 }
 
-export async function cancelObjective(
+async function cancelObjectiveUnscoped(
   config: FactoryConfig,
   objective: number,
   driver: ExecutionDriver,
@@ -1125,6 +1151,10 @@ async function cancelObjectiveOwned(
                     continuation,
                   ),
                 () => true,
+                undefined,
+                undefined,
+                config.repository,
+                continuation.schemaVersion === 17 ? true : undefined,
               ),
             )
             .catch(() => undefined);
@@ -1724,7 +1754,7 @@ async function selectAssetSetWithSurface(
   }
 }
 
-export async function selectAssetSet(
+async function selectAssetSetUnscoped(
   config: FactoryConfig,
   objective: number,
   itemId: string,
@@ -1744,7 +1774,7 @@ export async function selectAssetSet(
 }
 
 /** CLI-only boundary: the invocation surface is fixed here, not caller data. */
-export async function selectAssetSetFromCli(
+async function selectAssetSetFromCliUnscoped(
   config: FactoryConfig,
   objective: number,
   itemId: string,
@@ -1764,7 +1794,7 @@ export async function selectAssetSetFromCli(
 }
 
 /** Write every candidate AssetSet of a waiting Work Item to `output/SET_ID/`, for the operator to look at before selecting. */
-export async function exportAssetSetsForReview(
+async function exportAssetSetsForReviewUnscoped(
   config: FactoryConfig,
   objective: number,
   itemId: string,
@@ -1803,4 +1833,107 @@ export async function exportAssetSetsForReview(
     metadata: { setCount: sets.length },
   });
   return sets.map((set) => set.id);
+}
+
+/** Bind direct library controllers to the same repository-specific durability boundary. */
+async function checkpointController<T>(
+  config: FactoryConfig,
+  task: () => Promise<T>,
+  store?: ContentStore,
+): Promise<T> {
+  return withRecoveryCheckpointScope(
+    {
+      config,
+      buildClosure: () => buildRecoveryCheckpointClosure({ config, store }),
+    },
+    async () => {
+      let result: T;
+      try {
+        result = await task();
+      } catch (error) {
+        try {
+          await awaitCheckpointAdmission(config.repository, "settled");
+        } catch (settlement) {
+          throw new AggregateError(
+            [error, settlement],
+            "Controller stopped with a pending Git checkpoint",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      await awaitCheckpointAdmission(config.repository, "settled");
+      return result;
+    },
+  );
+}
+
+export function decideObjective(
+  ...args: Parameters<typeof decideObjectiveUnscoped>
+): ReturnType<typeof decideObjectiveUnscoped> {
+  return checkpointController(
+    args[0],
+    () => decideObjectiveUnscoped(...args),
+    undefined,
+  );
+}
+
+export function controlObjective(
+  ...args: Parameters<typeof controlObjectiveUnscoped>
+): ReturnType<typeof controlObjectiveUnscoped> {
+  return checkpointController(
+    args[0],
+    () => controlObjectiveUnscoped(...args),
+    undefined,
+  );
+}
+
+export function runObjective(
+  ...args: Parameters<typeof runObjectiveUnscoped>
+): ReturnType<typeof runObjectiveUnscoped> {
+  return checkpointController(
+    args[0],
+    () => runObjectiveUnscoped(...args),
+    args[2].contentStore,
+  );
+}
+
+export function cancelObjective(
+  ...args: Parameters<typeof cancelObjectiveUnscoped>
+): ReturnType<typeof cancelObjectiveUnscoped> {
+  return checkpointController(
+    args[0],
+    () => cancelObjectiveUnscoped(...args),
+    undefined,
+  );
+}
+
+export function selectAssetSet(
+  ...args: Parameters<typeof selectAssetSetUnscoped>
+): ReturnType<typeof selectAssetSetUnscoped> {
+  return checkpointController(
+    args[0],
+    () => selectAssetSetUnscoped(...args),
+    args[4],
+  );
+}
+
+export function selectAssetSetFromCli(
+  ...args: Parameters<typeof selectAssetSetFromCliUnscoped>
+): ReturnType<typeof selectAssetSetFromCliUnscoped> {
+  return checkpointController(
+    args[0],
+    () => selectAssetSetFromCliUnscoped(...args),
+    args[4],
+  );
+}
+
+export function exportAssetSetsForReview(
+  ...args: Parameters<typeof exportAssetSetsForReviewUnscoped>
+): ReturnType<typeof exportAssetSetsForReviewUnscoped> {
+  return checkpointController(
+    args[0],
+    () => exportAssetSetsForReviewUnscoped(...args),
+    args[4],
+  );
 }

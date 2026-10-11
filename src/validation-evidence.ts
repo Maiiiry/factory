@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { ValidationCommandReceipt } from "./contracts.js";
+import type { ContentRef, ValidationCommandReceipt } from "./contracts.js";
 import type { ReviewArtifactEvidence } from "./review-artifacts.js";
 import type { HydrationReceipt } from "./media.js";
 import type {
@@ -28,6 +28,8 @@ export interface AcceptanceDecision {
 }
 
 export interface ValidationEvidence {
+  /** Original native review returns; observations, never replacement acceptance. */
+  nativeReturns?: ContentRef[];
   treeSha: string;
   commands: ValidationCommandReceipt[];
   /** Complete command-selected raw artifacts retained before checkout cleanup. */

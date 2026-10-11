@@ -271,8 +271,18 @@ export type ModelInvocationObserver = ((
 };
 
 export interface ModelInvocationContext {
-  /** Synchronous controller checkpoint immediately before each native provider submission; absent on cached decode. */
-  beforeProviderAttempt?: () => void;
+  /** Awaited controller admission after recording each native attempt, before submission; absent on cached decode. */
+  beforeProviderAttempt?: () => void | Promise<void>;
+  /** Exact native return retained by the controller before its last local copy is released. */
+  retainNativeReturn?(receipt: {
+    response: string;
+    representation: "literal-agent-text" | "sdk-structured-value";
+    /** Actual SDK JSON value, not literal model JSON text; serialized only for retention. */
+    structuredValue?: import("./config.js").JsonValue;
+    providerSessionId?: string;
+    terminal: "completed" | "failed" | "interrupted";
+    usage?: ModelInvocationUsage;
+  }): Promise<void>;
   invocationId: string;
   phase: ModelInvocationPhase;
   ordinal: number;
@@ -667,6 +677,9 @@ export type AgentSessionReconciliation =
       session: AgentSessionRef;
       /** Exact retained final bytes; normal shared decoding/grounding still applies. */
       response?: string;
+      nativeReturn?: Parameters<
+        NonNullable<ModelInvocationContext["retainNativeReturn"]>
+      >[0];
       usage?: ModelInvocationUsage;
     };
 
@@ -803,6 +816,11 @@ export interface ExecutionOrphan {
   detail: string;
 }
 export interface ExecutionContext {
+  /** Await durable admission after exact local checkpoint and before effects or result disposal. */
+  checkpointedEffects?: true;
+  admitEffect?(
+    reason?: "before-effect" | "settled" | "explicit",
+  ): Promise<void>;
   checkpointSession?(session: AgentSessionRef): void;
   observeReadiness?(observation: {
     workerIdentity: string;
@@ -831,6 +849,8 @@ export interface ExecutionContext {
 }
 
 export interface ExecutionDriver {
+  /** Enforces awaited controller barriers before owned effects and result disposal. */
+  readonly effectAdmission?: "controller-checkpoint-v1";
   /** Can enforce an explicitly requested child prohibition, or refuse before dispatch. */
   readonly childAgents?: "disabled";
   /** Semantic discovery is admitted only after this driver's selector-bound read-only preflight. */
@@ -933,6 +953,8 @@ export interface HarnessResult {
   evidence?: unknown;
 }
 export interface AgentHarnessCapabilities {
+  /** Starts one durable parent-admitted worker invocation; no opaque effect dispatch. */
+  effectAdmission?: "controller-checkpoint-v1";
   /** Can enforce HarnessRequest.childAgents; does not describe an omitted policy. */
   childAgents?: "disabled";
   discovery?: {
@@ -974,16 +996,34 @@ export interface AgentHarness {
   cancelUnrecorded?(identity: string): Promise<void>;
 }
 
+/** Exact ordinary publication preparation, recorded by its existing snapshot owner. */
+export interface PublicationEffectRequest {
+  kind: "lfs-upload" | "branch-push" | "merge";
+  pullRequest?: number;
+  branch: string;
+  headSha: string;
+  /** The exact remote head used by the existing leased product branch push. */
+  expectedRemoteHead?: string | null;
+}
+
 /** Exclusive controller ownership; persisted intent never regenerates a create permit. */
 export interface PublicationControl {
   readonly reconcileOnly: boolean;
   readonly expectedPublication?: { titleDigest: string; bodyDigest: string };
   assertRequest(request: PullRequestPublication): void;
-  beforeCreate(request: PullRequestPublication): void;
+  beforeEffect(
+    request: PullRequestPublication,
+    effect: PublicationEffectRequest,
+  ): Promise<void>;
+  observedEffect(
+    request: PullRequestPublication,
+    effect: PublicationEffectRequest,
+  ): Promise<void>;
+  beforeCreate(request: PullRequestPublication): void | Promise<void>;
   observed(
     request: PullRequestPublication,
     identity: PullRequestIdentity,
-  ): void;
+  ): void | Promise<void>;
 }
 
 export interface DeliveryRequest {
@@ -1039,11 +1079,20 @@ export interface DeliveryObservation {
 export interface MergeResult {
   integratedSha: string;
 }
+export interface MergeControl {
+  beforeMerge(identity: PullRequestIdentity): Promise<void>;
+  observedMerge(
+    identity: PullRequestIdentity,
+    result: MergeResult,
+  ): Promise<void>;
+}
+
 export interface DeliveryStrategy {
+  readonly effectAdmission?: "controller-checkpoint-v1";
   publish(request: DeliveryRequest): Promise<DeliveryResult>;
   observe(result: DeliveryResult): Promise<DeliveryObservation>;
   /** Merge the published head, or confirm a merge already made. */
-  merge(result: DeliveryResult): Promise<MergeResult>;
+  merge(result: DeliveryResult, control?: MergeControl): Promise<MergeResult>;
 }
 
 export interface ContentMetadata {
@@ -1186,6 +1235,9 @@ export interface GraphProjectionEffectObservation {
   identity?: { id?: number; number?: number; name?: string };
 }
 export interface GraphProjectionEffect extends GraphProjectionEffectRequest {
+  /** Set only after a known pre-transport checkpoint rejection. */
+  admission?: "blocked";
+  admissionFailures?: { at: string; reason: string }[];
   observation?: GraphProjectionEffectObservation;
   /** Read-only reconciliation never replaces the original transport observation. */
   reconciliation?: GraphProjectionEffectObservation;
@@ -1218,7 +1270,7 @@ export interface PullRequestPublication {
   /** Persisted unknown/observed requests allow reads only; absence is also read-only. */
   reconcileOnly?: boolean;
   /** One-shot owner callback saves exact intent immediately before the sole POST. */
-  beforeCreate?: () => void;
+  beforeCreate?: () => void | Promise<void>;
   /** Exact recorded observation or submitted request metadata during reconciliation. */
   expectedPublication?: { titleDigest: string; bodyDigest: string };
   branch: string;
@@ -1274,6 +1326,7 @@ export interface NamedCheckEvidence {
 }
 
 export interface GitHubGateway {
+  readonly effectAdmission?: "controller-checkpoint-v1";
   readonly projectionMutationAdmission?: "controller-checkpoint-v1";
   projectStatus?(
     request: import("./github-project-state.js").ProjectStatusRequest,
@@ -1291,10 +1344,13 @@ export interface GitHubGateway {
     snapshotId: string;
     pending?: import("./github-progress-state.js").ProgressCommentIntent;
     /** Durable exact intent immediately before the sole POST. */
-    beforeWrite: (actorId: number) => void;
+    beforeWrite: (actorId: number) => void | Promise<void>;
   }): Promise<import("./github-progress-state.js").ProgressCommentIdentity>;
   /** Strict protection: GitHub merges the base into the PR from exactly `identity.headSha`; returns the verified new head. */
-  updateBranch(identity: PullRequestIdentity): Promise<string>;
+  updateBranch(
+    identity: PullRequestIdentity,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<string>;
   intakePage?(page: number, etag?: string): Promise<IntakeIssuePage>;
   objectiveDependencies?(number: number): Promise<number[]>;
   namedCheck?(
@@ -1322,10 +1378,15 @@ export interface GitHubGateway {
   merge(
     identity: PullRequestIdentity,
     expectedHead: string,
+    control?: MergeControl,
   ): Promise<MergeResult>;
   ensureNativeStack(
     layers: NativeStackLayer[],
     baseBranch: string,
+    control?: {
+      beforeRequest(): Promise<void>;
+      observed(number: number): Promise<void>;
+    },
   ): Promise<number>;
   mergeNativeStack(
     layers: NativeStackLayer[],
@@ -1335,7 +1396,8 @@ export interface GitHubGateway {
       /** The pending merge request an earlier repeat recorded. */
       resumeUuid?: string;
       /** Record a pending merge request before it is polled. */
-      onPending: (uuid: string) => void;
+      beforeRequest?: () => void | Promise<void>;
+      onPending: (uuid: string) => void | Promise<void>;
       /** A poll answered: the merge is progressing. */
       progress?: () => void;
       /** Queued without a request to poll: wait for CI, then observe again. */

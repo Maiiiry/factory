@@ -1,4 +1,9 @@
 import type { GitHubGateway, PullRequestIdentity } from "../contracts.js";
+import { decision, StepFault } from "../fault.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "../recovery-checkpoint.js";
 import { earlierHeads } from "../repair-policy.js";
 import type { WorkState } from "../state.js";
 
@@ -38,6 +43,7 @@ export function retireDeliveredHead(work: WorkState): void {
     work.replacedHeads = [...new Set([...(work.replacedHeads ?? []), head])];
   delete work.deliveredHead;
   delete work.branchUpdateFrom;
+  delete work.branchUpdateAdmission;
 }
 
 /**
@@ -54,21 +60,48 @@ export async function updateBehindBranch(args: {
   save: () => void;
   identity: Pick<PullRequestIdentity, "number" | "branch">;
   from: string;
+  repository?: string;
+  checkpointedEffects?: boolean;
 }): Promise<string> {
   const { github, work, save, identity, from } = args;
-  if (work.branchUpdateFrom !== from) {
+  const fresh = work.branchUpdateFrom !== from;
+  if (fresh) {
     work.branchUpdateFrom = from;
     save();
   }
-  const head = await github.updateBranch({
-    number: identity.number,
-    branch: identity.branch,
-    headSha: from,
-    earlierHeads: deliveryEarlierHeads(work),
-  });
+  const head = await github.updateBranch(
+    {
+      number: identity.number,
+      branch: identity.branch,
+      headSha: from,
+      earlierHeads: deliveryEarlierHeads(work),
+    },
+    async () => {
+      if (!args.checkpointedEffects) return;
+      if (!fresh)
+        throw new StepFault(
+          decision(
+            "Branch update is retained but its exact outcome remains unresolved; read-only reconciliation must precede replacement",
+          ),
+        );
+      work.branchUpdateAdmission = "submitted";
+      save();
+      try {
+        await awaitCheckpointAdmission(args.repository, "before-effect");
+      } catch (error) {
+        if (isCheckpointAdmissionFailure(error)) {
+          work.branchUpdateAdmission = "blocked";
+          save();
+        }
+        throw error;
+      }
+    },
+  );
   work.replacedHeads = [...new Set([...(work.replacedHeads ?? []), from])];
   work.deliveredHead = head;
   delete work.branchUpdateFrom;
+  delete work.branchUpdateAdmission;
   save();
+  await awaitCheckpointAdmission(args.repository, "settled");
   return head;
 }

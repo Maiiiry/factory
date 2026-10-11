@@ -5,15 +5,13 @@ import type {
   PlanningModel,
   ResultReviewEvidenceSource,
 } from "./contracts.js";
-import {
-  loadReviewArtifactObservations,
-  type AcceptedWorkItemImageObservation,
-  reviewArtifactEvidence,
-  materializeReviewImages,
-} from "./review-image-evidence.js";
 import { installedControllerCapabilities } from "./controller-capabilities.js";
 import { attachFault, StepFault, transient } from "./fault.js";
 import { pinnedGit } from "./process.js";
+import {
+  awaitCheckpointAdmission,
+  hasPrivateCheckpointScope,
+} from "./recovery-checkpoint.js";
 import {
   assertCommandReceipts,
   commandPassEvidence,
@@ -32,6 +30,12 @@ import {
   resolveReviewReferences,
   reviewPacket,
 } from "./review-evidence.js";
+import {
+  type AcceptedWorkItemImageObservation,
+  loadReviewArtifactObservations,
+  materializeReviewImages,
+  reviewArtifactEvidence,
+} from "./review-image-evidence.js";
 import {
   SemanticAcceptanceFailure,
   type SemanticRefusalEvidence,
@@ -63,6 +67,8 @@ export async function reviewAcceptance(args: {
   invocation?: ModelInvocationContext;
   session?: AgentSessionContinuation;
   beforeSubmit?: () => void;
+  /** Save the actual evidence owner after an immutable native return is retained. */
+  checkpointReturnedEvidence?: () => void;
   /** Why the previous answer was invalid; the reviewer is asked again with it. */
   previousInvalid?: string;
   /** Called with the validation error before an invalid answer is reported. */
@@ -245,6 +251,48 @@ export async function reviewAcceptance(args: {
       ),
   );
   args.beforeSubmit?.();
+  if (undecided && hasPrivateCheckpointScope()) {
+    if (
+      !args.contentStore ||
+      !args.invocation ||
+      !args.checkpointReturnedEvidence
+    )
+      throw new Error(
+        "Git-backed review requires a retained native return and its evidence owner checkpoint",
+      );
+    const store = args.contentStore;
+    const invocation = args.invocation;
+    const checkpoint = args.checkpointReturnedEvidence;
+    const prior = invocation.retainNativeReturn;
+    invocation.retainNativeReturn = async (receipt) => {
+      const bytes = Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          invocationId: invocation.invocationId,
+          phase: invocation.phase,
+          ordinal: invocation.ordinal,
+          treeSha: evidence.treeSha,
+          ...receipt,
+        }),
+      );
+      const ref = await store.put(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+        { mediaType: "application/json" },
+      );
+      evidence.nativeReturns ??= [];
+      if (!evidence.nativeReturns.some((entry) => entry.digest === ref.digest))
+        evidence.nativeReturns.push(ref);
+      checkpoint();
+      await prior?.(receipt);
+      // The native transport may release its last copy after this callback.
+      await awaitCheckpointAdmission(undefined, "explicit");
+    };
+  }
   if (undecided && !model.reviewResult)
     throw attachFault(
       new Error("No independent result reviewer is configured"),
@@ -372,8 +420,8 @@ export async function reviewAcceptance(args: {
     invalidAnswers.unshift(decoded.packetError);
     firstInvalid ??= automaticCriterion;
   }
-  // Preserve independent valid assessments on existing item evidence; final raw
-  // response remains in existing diagnostics rather than a second durable store.
+  // Preserve valid assessments; configured private checkpoints also retain
+  // original native returns separately from these decoded findings.
   evidence.criteria = proven;
   delete evidence.reviewEvidence;
   {

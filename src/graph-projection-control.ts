@@ -10,6 +10,10 @@ import { attachFault, decision } from "./fault.js";
 import { graphDigest } from "./graph-amendments.js";
 import { isPreparationState, type ContinuationState } from "./state.js";
 import { assertStepAdmission } from "./step.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "./recovery-checkpoint.js";
 
 /** Existing projection's exact write receipts, owned by the atomic continuation snapshot. */
 export interface GraphProjectionIntent {
@@ -32,7 +36,7 @@ function fence(detail: string): Error {
 export function assertGraphProjectionIntents(state: ContinuationState): void {
   const intents = state.graphProjectionIntents;
   if (intents === undefined) return;
-  if (![11, 12, 13, 14, 15, 16].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16, 17, 18].includes(state.schemaVersion))
     throw new Error(
       "Bound graph projection requires expansion snapshot semantics",
     );
@@ -99,6 +103,32 @@ export function assertGraphProjectionIntents(state: ContinuationState): void {
         throw new Error(
           "Graph projection effect digest differs from its exact request",
         );
+      if (
+        effect.admission !== undefined ||
+        effect.admissionFailures !== undefined
+      ) {
+        if (
+          ![17, 18].includes(state.schemaVersion) ||
+          (effect.admission !== undefined && effect.admission !== "blocked") ||
+          !Array.isArray(effect.admissionFailures) ||
+          !effect.admissionFailures.length ||
+          effect.admissionFailures.some(
+            (entry) =>
+              !entry ||
+              Object.keys(entry).sort().join() !== "at,reason" ||
+              typeof entry.reason !== "string" ||
+              !entry.reason ||
+              typeof entry.at !== "string" ||
+              !Number.isFinite(Date.parse(entry.at)),
+          ) ||
+          (effect.admission === "blocked" &&
+            (effect.observation !== undefined ||
+              effect.reconciliation !== undefined))
+        )
+          throw new Error(
+            "Graph projection checkpoint admission record is invalid",
+          );
+      }
       keys.add(effect.key);
       ids.add(effect.id);
       for (const observation of [effect.observation, effect.reconciliation])
@@ -152,7 +182,7 @@ export function graphProjectionControl(
 ): NonNullable<GraphProjection["expansionControl"]> {
   assertGraphProjectionIntents(state);
   const digest = graphDigest(graph);
-  if (![11, 12, 13, 14, 15, 16].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16, 17, 18].includes(state.schemaVersion))
     throw fence("Expanded graph has no admitted projection semantics");
   state.graphProjectionIntents ??= {};
   let intent = state.graphProjectionIntents[digest];
@@ -183,23 +213,59 @@ export function graphProjectionControl(
       );
   };
   return {
-    effects: structuredClone(retained.effects),
-    beforeWrite: (request: GraphProjectionEffectRequest) => {
+    effects: structuredClone(
+      retained.effects.filter((effect) => effect.admission !== "blocked"),
+    ),
+    beforeWrite: async (request: GraphProjectionEffectRequest) => {
       assertStepAdmission();
       check();
-      if (
-        retained.effects.some(
-          (effect) => effect.id === request.id || effect.key === request.key,
+      let effect = retained.effects.find(
+        (entry) => entry.id === request.id || entry.key === request.key,
+      );
+      if (effect) {
+        if (
+          effect.admission !== "blocked" ||
+          effect.id !== request.id ||
+          effect.key !== request.key ||
+          effect.method !== request.method ||
+          effect.path !== request.path ||
+          effect.bodyDigest !== request.bodyDigest
         )
-      )
-        throw fence(
-          `Projection effect ${request.key} was already submitted; its outcome cannot authorize replay`,
-        );
-      retained.effects.push(structuredClone(request));
+          throw fence(
+            `Projection effect ${request.key} was already submitted; its outcome cannot authorize replay`,
+          );
+        delete effect.admission;
+      } else {
+        effect = structuredClone(request);
+        retained.effects.push(effect);
+      }
       assertGraphProjectionIntents(state);
       save();
+      try {
+        await awaitCheckpointAdmission(state.repository, "before-effect");
+        assertStepAdmission();
+        check();
+      } catch (error) {
+        if (
+          isCheckpointAdmissionFailure(error) &&
+          error.knownNotDispatched &&
+          [17, 18].includes(state.schemaVersion)
+        ) {
+          effect.admission = "blocked";
+          effect.admissionFailures ??= [];
+          effect.admissionFailures.push({
+            at: new Date().toISOString(),
+            reason: error.message,
+          });
+          save();
+        }
+        throw error;
+      }
     },
-    observed: (id: string, observation: GraphProjectionEffectObservation) => {
+    observed: async (
+      id: string,
+      observation: GraphProjectionEffectObservation,
+    ) => {
       check();
       const effect = retained.effects.find((entry) => entry.id === id);
       if (!effect)
@@ -211,6 +277,7 @@ export function graphProjectionControl(
       else effect.observation = structuredClone(observation);
       assertGraphProjectionIntents(state);
       save();
+      await awaitCheckpointAdmission(state.repository, "settled");
     },
   };
 }

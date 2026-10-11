@@ -3,8 +3,8 @@ import {
   closeSync,
   constants,
   existsSync,
-  fsyncSync,
   fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -16,6 +16,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { option } from "./cli-flags.js";
+import { DEFAULT_CONTEXT_LOOKUP_BOUNDS } from "./compiler/context.js";
+import { objectiveComplete } from "./completion.js";
 import type { FactoryConfig } from "./config.js";
 import {
   configPath,
@@ -23,15 +26,28 @@ import {
   stateRoot,
   validateTarget,
 } from "./config.js";
+import { LocalContentStore } from "./content/local.js";
 import type {
   ApprovedPlaybook,
   ContentRef,
   ModelInvocationContext,
   ModelInvocationObservation,
 } from "./contracts.js";
-import { DEFAULT_CONTEXT_LOOKUP_BOUNDS } from "./compiler/context.js";
-import { readWorkflowReflection } from "./workflow-reflection.js";
 import { DiagnosticEmitter, redactDiagnosticDetail } from "./diagnostics.js";
+import { operatorName } from "./operator.js";
+import { serviceLoginSecrets } from "./provider-credentials.js";
+import {
+  awaitCheckpointAdmission,
+  hasPrivateCheckpointScope,
+  markCheckpointDirty,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import {
+  LocalRepositoryMemory,
+  type RepositoryMemoryBinding,
+  type RepositoryMemoryRecord,
+} from "./repository-memory.js";
+import { isExecutionState } from "./state.js";
 import {
   acquireInstallationLock,
   installationLockPath,
@@ -39,18 +55,8 @@ import {
   releaseControllerLock,
   statePath,
 } from "./state-store.js";
-import { option } from "./cli-flags.js";
-import { operatorName } from "./operator.js";
-import { serviceLoginSecrets } from "./provider-credentials.js";
 import { configurationCommand, shellWord } from "./status-summary.js";
-import { objectiveComplete } from "./completion.js";
-import { isExecutionState } from "./state.js";
-import { LocalContentStore } from "./content/local.js";
-import {
-  LocalRepositoryMemory,
-  type RepositoryMemoryBinding,
-  type RepositoryMemoryRecord,
-} from "./repository-memory.js";
+import { readWorkflowReflection } from "./workflow-reflection.js";
 
 export const DEFAULT_PLAYBOOK_BUDGET_BYTES = 16_384;
 export const learningDigest = (value: string | Buffer): string =>
@@ -148,8 +154,11 @@ interface PlaybookRevision extends PlaybookProposal {
   };
 }
 
-function directory(repository: string, kind: string): string {
-  const root = stateRoot(repository);
+function directory(
+  repository: string,
+  kind: string,
+  root = stateRoot(repository),
+): string {
   for (const path of [
     root,
     join(root, "learning"),
@@ -161,7 +170,8 @@ function directory(repository: string, kind: string): string {
       !stat.isDirectory() ||
       stat.isSymbolicLink() ||
       stat.uid !== process.getuid?.() ||
-      stat.mode & 0o077
+      stat.mode & 0o077 ||
+      realpathSync(path) !== resolve(path)
     )
       throw new Error(
         "Learning storage must be an owned private directory without links",
@@ -176,14 +186,21 @@ function privateRead(path: string): string {
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077)
       throw new Error("Learning record must be an owned private regular file");
-    return readFileSync(fd, "utf8");
+    const bytes = readFileSync(fd);
+    const raw = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(bytes);
+    if (!Buffer.from(raw).equals(bytes))
+      throw new Error("Learning original is not exact UTF8");
+    return raw;
   } finally {
     closeSync(fd);
   }
 }
 
 /** Publish complete immutable bytes; link refuses replacing any existing record. */
-function append(path: string, text: string): void {
+function append(path: string, text: string, repository?: string): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, "wx", 0o600);
   try {
@@ -203,6 +220,11 @@ function append(path: string, text: string): void {
   } finally {
     closeSync(parent);
   }
+  if (repository && !path.endsWith(".draft.json"))
+    markCheckpointDirty(repository, {
+      path: relative(stateRoot(repository), path),
+      kind: "learning-original",
+    });
 }
 
 function encoded(value: unknown): string {
@@ -466,7 +488,7 @@ export function recordRetrospective(
     directory(config.repository, "snapshots"),
     `${id}.json`,
   );
-  if (!existsSync(snapshot)) append(snapshot, raw);
+  if (!existsSync(snapshot)) append(snapshot, raw, config.repository);
   else if (privateRead(snapshot) !== raw)
     throw new Error(
       "Retrospective snapshot identity already exists with other bytes",
@@ -541,7 +563,7 @@ export function recordRetrospective(
       recipe: state.workflowRecipePin ?? null,
     },
   };
-  append(path, encoded(episode));
+  append(path, encoded(episode), config.repository);
   return episode;
 }
 
@@ -570,6 +592,7 @@ export function validatePlaybookDraft(
   parent: PlaybookRevision | null,
   budgetBytes: number,
   suppliedSources?: EpisodeSource[],
+  originalEpisodes?: { source: EpisodeSource; episode: Retrospective }[],
 ): void {
   if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 1)
     throw new Error("Playbook budget must be a positive byte count");
@@ -585,7 +608,7 @@ export function validatePlaybookDraft(
     ].every(Array.isArray)
   )
     throw new Error("Invalid playbook draft");
-  const episodes = readRetrospectives(repository);
+  const episodes = originalEpisodes ?? readRetrospectives(repository);
   const sources = new Map(
     episodes.map((entry) => [entry.source.episodeId, entry.source.digest]),
   );
@@ -853,7 +876,7 @@ export function savePlaybookProposal(proposal: PlaybookProposal): string {
     directory(proposal.repository, "proposals"),
     `${proposal.id}.json`,
   );
-  append(path, encoded(proposal));
+  append(path, encoded(proposal), proposal.repository);
   return path;
 }
 
@@ -927,7 +950,7 @@ export function decidePlaybook(
     `${reviewedDigest}.json`,
   );
   const retainReview = () => {
-    if (!existsSync(reviewedPath)) append(reviewedPath, raw);
+    if (!existsSync(reviewedPath)) append(reviewedPath, raw, repository);
     else if (privateRead(reviewedPath) !== raw)
       throw new Error("Reviewed draft bytes changed");
   };
@@ -945,6 +968,7 @@ export function decidePlaybook(
         actor,
         at,
       }),
+      repository,
     );
     return { path: decision };
   }
@@ -984,7 +1008,7 @@ export function decidePlaybook(
     directory(repository, "versions"),
     `${String(revision.version).padStart(10, "0")}.json`,
   );
-  append(path, encoded(revision));
+  append(path, encoded(revision), repository);
   return { path, version: revision.version };
 }
 
@@ -1001,7 +1025,500 @@ function secrets(config: FactoryConfig): string[] {
   ];
 }
 
-/** Existing learning records form one portable closure, not another remote store. */
+const LEARNING_ORIGINAL_KINDS = [
+  "episodes",
+  "snapshots",
+  "proposals",
+  "reviews",
+  "decisions",
+  "versions",
+  "calls",
+  "checkpoints",
+  "submissions",
+  "returns",
+] as const;
+export type LearningOriginalKind = (typeof LEARNING_ORIGINAL_KINDS)[number];
+export interface LearningOriginal {
+  path: string;
+  bytes: Uint8Array;
+}
+
+/** Only named immutable originals can be installed; never a native home or state path. */
+export function decodeLearningOriginal(
+  repository: string,
+  path: string,
+  bytes: Uint8Array,
+): { kind: LearningOriginalKind; value: Record<string, unknown> } {
+  const match = /^learning\/([a-z]+)\/([^/]+)\.json$/.exec(path);
+  const kind = match?.[1] as LearningOriginalKind;
+  const identity = match?.[2];
+  if (!LEARNING_ORIGINAL_KINDS.includes(kind) || !identity)
+    throw new Error("Unsupported immutable learning path");
+  if (["episodes", "snapshots", "reviews"].includes(kind)) hash(identity);
+  else if (kind === "versions") {
+    if (!/^\d{10}$/.test(identity) || Number(identity) < 1)
+      throw new Error("Invalid immutable learning version path");
+  } else proposalIdentity(identity);
+  const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+    bytes,
+  );
+  if (!Buffer.from(raw).equals(Buffer.from(bytes)))
+    throw new Error("Learning original is not exact UTF8");
+  const value = record(JSON.parse(raw));
+  if (raw !== encoded(value))
+    throw new Error("Immutable learning bytes changed");
+  if (kind !== "calls" && value.schemaVersion !== 1 && kind !== "snapshots")
+    throw new Error("Unsupported learning original schema");
+  if (
+    kind !== "calls" &&
+    value.repository !== repository &&
+    kind !== "submissions" &&
+    kind !== "returns"
+  )
+    throw new Error("Learning original repository differs");
+  if (kind === "episodes" || kind === "snapshots") {
+    if (!Number.isSafeInteger(value.objective) || Number(value.objective) < 1)
+      throw new Error("Invalid learning original Objective");
+    text(value.runId);
+    if (
+      identity !==
+      learningDigest(JSON.stringify([repository, value.objective, value.runId]))
+    )
+      throw new Error("Learning original producer identity changed");
+    if (kind === "episodes") {
+      hash(value.snapshotDigest);
+      if (!["accepted", "cancelled"].includes(String(value.outcome)))
+        throw new Error("Invalid retrospective disposition");
+      for (const date of [value.recordedAt, value.endedAt])
+        if (typeof date !== "string" || !Number.isFinite(Date.parse(date)))
+          throw new Error("Invalid retrospective observation date");
+    }
+  }
+  if (["proposals", "reviews", "versions"].includes(kind)) {
+    proposalIdentity(value.id);
+    proposalIdentity(value.invocationId);
+    hash(value.configDigest);
+    if (kind === "proposals" && identity !== value.id)
+      throw new Error("Learning proposal filename changed");
+    if (kind === "reviews" && identity !== learningDigest(raw))
+      throw new Error("Learning review filename changed");
+    if (kind === "versions" && Number(identity) !== value.version)
+      throw new Error("Learning version filename changed");
+    if (
+      !Array.isArray(value.sources) ||
+      !Number.isSafeInteger(value.budgetBytes) ||
+      Number(value.budgetBytes) < 1
+    )
+      throw new Error("Invalid learning proposal selection");
+    for (const source of value.sources) {
+      const entry = record(source);
+      hash(entry.episodeId);
+      hash(entry.digest);
+    }
+  }
+  if (kind === "decisions") {
+    if (value.proposalId !== identity || value.outcome !== "reject")
+      throw new Error("Invalid learning decision identity or disposition");
+    hash(value.proposalDigest);
+    hash(value.reviewedDigest);
+    text(value.actor);
+    text(value.at);
+  }
+  if (["calls", "submissions", "checkpoints", "returns"].includes(kind)) {
+    proposalIdentity(value.invocationId);
+    if (kind === "calls") {
+      if (value.phase !== "dream" || !Array.isArray(value.observations))
+        throw new Error("Invalid Dream call original");
+      if (
+        value.observations.some((observation) => {
+          const entry = record(observation);
+          return (
+            entry.invocationId !== value.invocationId || entry.phase !== "dream"
+          );
+        })
+      )
+        throw new Error("Dream observation invocation changed");
+    } else if (value.id !== identity)
+      throw new Error("Dream checkpoint identity changed");
+    if (kind !== "checkpoints") hash(value.sourceDigest);
+    if (value.checkpointDigest !== undefined) hash(value.checkpointDigest);
+    if (kind === "returns") {
+      hash(value.checkpointDigest);
+      hash(value.configDigest);
+      const ref = record(value.responseRef);
+      hash(ref.digest);
+      if (
+        !Number.isSafeInteger(ref.bytes) ||
+        Number(ref.bytes) < 0 ||
+        ref.mediaType !== "text/plain" ||
+        Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+        !["literal-agent-text", "sdk-structured-value"].includes(
+          String(value.representation),
+        ) ||
+        !["completed", "failed", "interrupted"].includes(
+          String(value.terminal),
+        ) ||
+        value.phase !== "dream" ||
+        value.providerAttempt !== 1 ||
+        value.providerMaxAttempts !== 1
+      )
+        throw new Error("Invalid exact Dream native return original");
+    }
+  }
+  return { kind, value };
+}
+
+/** Private originals only; no shape-matching reference scan grants content access. */
+export function learningOriginals(
+  repository: string,
+  root = stateRoot(repository),
+): LearningOriginal[] {
+  const originals: LearningOriginal[] = [];
+  for (const kind of LEARNING_ORIGINAL_KINDS)
+    for (const name of readdirSync(directory(repository, kind, root))
+      .filter((name) => name.endsWith(".json") && !name.endsWith(".draft.json"))
+      .sort()) {
+      const path = `learning/${kind}/${name}`;
+      const bytes = Buffer.from(
+        privateRead(join(directory(repository, kind, root), name)),
+      );
+      decodeLearningOriginal(repository, path, bytes);
+      originals.push({ path, bytes });
+    }
+  return originals;
+}
+
+/** Authenticate the frozen typed Dream packet against original history before installing bytes. */
+export function validateDreamInputOriginal(
+  repository: string,
+  checkpoint: DreamInputCheckpoint,
+  bytes: Uint8Array,
+  originals: LearningOriginal[],
+): void {
+  proposalIdentity(checkpoint.id);
+  proposalIdentity(checkpoint.invocationId);
+  hash(checkpoint.configDigest);
+  if (
+    checkpoint.schemaVersion !== 1 ||
+    checkpoint.repository !== repository ||
+    !Number.isFinite(Date.parse(checkpoint.createdAt)) ||
+    !checkpoint.bounds ||
+    Object.keys(checkpoint.bounds).sort().join() !==
+      "maxBytes,maxElapsedMs,maxResults" ||
+    ![
+      checkpoint.playbookBudgetBytes,
+      ...Object.values(checkpoint.bounds),
+    ].every((value) => Number.isSafeInteger(value) && value > 0) ||
+    !Array.isArray(checkpoint.included) ||
+    !Array.isArray(checkpoint.ancestry) ||
+    !Array.isArray(checkpoint.sources) ||
+    checkpoint.included.length > checkpoint.bounds.maxResults
+  )
+    throw new Error("Invalid original Dream checkpoint bounds");
+  if (checkpoint.parent) {
+    hash(checkpoint.parent.digest);
+    if (
+      !Number.isSafeInteger(checkpoint.parent.version) ||
+      checkpoint.parent.version < 1
+    )
+      throw new Error("Invalid original Dream parent");
+  }
+  if (checkpoint.previous) {
+    proposalIdentity(checkpoint.previous.checkpointId);
+    hash(checkpoint.previous.checkpointDigest);
+    const previous = originals.find(
+      (original) =>
+        original.path ===
+        `learning/checkpoints/${checkpoint.previous!.checkpointId}.json`,
+    );
+    if (
+      !previous ||
+      learningDigest(Buffer.from(previous.bytes)) !==
+        checkpoint.previous.checkpointDigest
+    )
+      throw new Error("Original Dream previous checkpoint changed");
+  }
+  for (const source of checkpoint.sources) {
+    hash(source.episodeId);
+    hash(source.digest);
+    const episode = originals.find(
+      (original) =>
+        original.path === `learning/episodes/${source.episodeId}.json`,
+    );
+    if (
+      !episode ||
+      learningDigest(Buffer.from(episode.bytes)) !== source.digest
+    )
+      throw new Error("Original Dream source ancestry changed");
+  }
+  if (
+    !checkpoint.sources.length ||
+    new Set(checkpoint.sources.map((source) => source.episodeId)).size !==
+      checkpoint.sources.length ||
+    JSON.stringify([
+      ...checkpoint.ancestry,
+      ...checkpoint.included.map((entry) => entry.source),
+    ]) !== JSON.stringify(checkpoint.sources) ||
+    bytes.length > checkpoint.bounds.maxBytes ||
+    bytes.length !== checkpoint.inputPacketRef.bytes ||
+    learningDigest(Buffer.from(bytes)) !== checkpoint.inputPacketRef.digest
+  )
+    throw new Error("Original Dream source selection changed");
+  const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+    bytes,
+  );
+  if (!Buffer.from(raw).equals(Buffer.from(bytes)))
+    throw new Error("Original Dream packet is not exact UTF8");
+  const packet = record(JSON.parse(raw));
+  const supplied = packet.sources as {
+    source: EpisodeSource;
+    episode?: Retrospective;
+    supporting?: { ref: ContentRef }[];
+  }[];
+  const parent = packet.parent as { version: number; digest: string } | null;
+  if (
+    packet.schemaVersion !== 1 ||
+    packet.budgetBytes !== checkpoint.playbookBudgetBytes ||
+    !Array.isArray(supplied) ||
+    JSON.stringify(supplied.map((entry) => entry.source)) !==
+      JSON.stringify(checkpoint.sources) ||
+    JSON.stringify(
+      parent && { version: parent.version, digest: parent.digest },
+    ) !== JSON.stringify(checkpoint.parent)
+  )
+    throw new Error("Original Dream packet differs from its frozen selection");
+  for (const entry of checkpoint.included) {
+    const original = originals.find(
+      (value) =>
+        value.path === `learning/episodes/${entry.source.episodeId}.json`,
+    );
+    const suppliedEntry = supplied.find(
+      (value) => value.source.episodeId === entry.source.episodeId,
+    );
+    if (
+      !original ||
+      entry.episodeRef.digest !== entry.source.digest ||
+      entry.episodeRef.bytes !== original.bytes.length ||
+      !suppliedEntry?.episode ||
+      JSON.stringify(
+        (suppliedEntry.supporting ?? []).map((value) => value.ref),
+      ) !== JSON.stringify(entry.supporting)
+    )
+      throw new Error("Original Dream selected complete episode changed");
+  }
+}
+
+/** Verify original approval ancestry in memory before publishing any replica paths. */
+export function validateLearningOriginals(
+  repository: string,
+  originals: LearningOriginal[],
+): void {
+  const values = new Map<string, Record<string, unknown>>();
+  const bodies = new Map<string, Uint8Array>();
+  for (const original of originals) {
+    const { value } = decodeLearningOriginal(
+      repository,
+      original.path,
+      original.bytes,
+    );
+    if (values.has(original.path))
+      throw new Error("Duplicate learning original path");
+    values.set(original.path, value);
+    bodies.set(original.path, original.bytes);
+  }
+  const original = (path: string) => {
+    const value = values.get(path);
+    if (!value) throw new Error("Required learning original is absent");
+    return value;
+  };
+  const digest = (path: string) =>
+    learningDigest(Buffer.from(bodies.get(path) ?? []));
+  const episodes = [...values]
+    .filter(([path]) => path.startsWith("learning/episodes/"))
+    .map(([path, value]) => ({
+      source: {
+        episodeId: path.slice("learning/episodes/".length, -5),
+        digest: digest(path),
+      },
+      episode: value as unknown as Retrospective,
+    }));
+  for (const episode of episodes) {
+    const path = `learning/snapshots/${episode.source.episodeId}.json`;
+    // Absence remains legacy unavailability; a present original may never change.
+    if (bodies.has(path) && digest(path) !== episode.episode.snapshotDigest)
+      throw new Error("Retrospective original snapshot changed");
+  }
+  const checkProposal = (
+    proposal: PlaybookProposal,
+    parent: PlaybookRevision | null,
+  ) => {
+    if (
+      JSON.stringify(proposal.parent) !==
+      JSON.stringify(
+        parent
+          ? { version: parent.version, digest: learningDigest(encoded(parent)) }
+          : null,
+      )
+    )
+      throw new Error("Learning proposal parent ancestry changed");
+    validatePlaybookDraft(
+      repository,
+      proposal.draft,
+      parent,
+      proposal.budgetBytes,
+      proposal.sources,
+      episodes,
+    );
+    if (proposal.consolidation) {
+      const path = `learning/checkpoints/${proposal.consolidation.checkpointId}.json`;
+      const checkpoint = original(path) as unknown as DreamInputCheckpoint;
+      if (
+        digest(path) !== proposal.consolidation.checkpointDigest ||
+        checkpoint.id !== proposal.id ||
+        checkpoint.configDigest !== proposal.configDigest ||
+        checkpoint.invocationId !== proposal.invocationId ||
+        checkpoint.playbookBudgetBytes !== proposal.budgetBytes ||
+        JSON.stringify(checkpoint.parent) !== JSON.stringify(proposal.parent) ||
+        JSON.stringify(checkpoint.sources) !== JSON.stringify(proposal.sources)
+      )
+        throw new Error("Learning proposal checkpoint binding changed");
+    }
+  };
+  let previous: PlaybookRevision | null = null;
+  const revisions = new Map<number, PlaybookRevision>();
+  for (const [path, value] of [...values]
+    .filter(([path]) => path.startsWith("learning/versions/"))
+    .sort(([a], [b]) => a.localeCompare(b))) {
+    const revision = value as unknown as PlaybookRevision;
+    if (revision.version !== (previous?.version ?? 0) + 1)
+      throw new Error("Learning version ancestry is incomplete");
+    const proposalPath = `learning/proposals/${revision.id}.json`;
+    const proposal = original(proposalPath) as unknown as PlaybookProposal;
+    const reviewPath = `learning/reviews/${revision.approval?.reviewedDigest}.json`;
+    const review = original(reviewPath);
+    text(revision.approval?.actor);
+    text(revision.approval?.at);
+    hash(revision.approval?.proposalDigest);
+    hash(revision.approval?.reviewedDigest);
+    if (
+      digest(proposalPath) !== revision.approval.proposalDigest ||
+      digest(reviewPath) !== revision.approval.reviewedDigest ||
+      Object.keys(review).sort().join() !== Object.keys(proposal).sort().join()
+    )
+      throw new Error("Learning approval originals changed");
+    for (const key of Object.keys(proposal)) {
+      if (
+        key !== "draft" &&
+        JSON.stringify(value[key]) !==
+          JSON.stringify((proposal as unknown as Record<string, unknown>)[key])
+      )
+        throw new Error("Approval changed original proposal bindings");
+      if (
+        JSON.stringify(review[key]) !==
+        JSON.stringify(
+          key === "draft"
+            ? revision.draft
+            : (proposal as unknown as Record<string, unknown>)[key],
+        )
+      )
+        throw new Error("Approved draft differs from original reviewed bytes");
+    }
+    checkProposal(revision, previous);
+    if (digest(path) !== learningDigest(encoded(revision)))
+      throw new Error("Learning version bytes changed");
+    revisions.set(revision.version, revision);
+    previous = revision;
+  }
+  for (const [path, value] of values) {
+    if (path.startsWith("learning/proposals/")) {
+      const proposal = value as unknown as PlaybookProposal;
+      const parent = proposal.parent
+        ? revisions.get(proposal.parent.version)
+        : null;
+      if (proposal.parent && !parent)
+        throw new Error("Proposal's original parent is absent");
+      checkProposal(proposal, parent ?? null);
+    }
+    if (path.startsWith("learning/decisions/")) {
+      const proposalPath = `learning/proposals/${value.proposalId}.json`;
+      original(proposalPath);
+      original(`learning/reviews/${value.reviewedDigest}.json`);
+      if (digest(proposalPath) !== value.proposalDigest)
+        throw new Error("Learning rejection proposal changed");
+    }
+    if (
+      path.startsWith("learning/submissions/") ||
+      path.startsWith("learning/calls/") ||
+      path.startsWith("learning/returns/")
+    ) {
+      const identity = path.slice(path.lastIndexOf("/") + 1, -5);
+      const checkpointPath = `learning/checkpoints/${identity}.json`;
+      if (value.checkpointDigest !== undefined) {
+        const checkpoint = original(checkpointPath);
+        const packet = checkpoint.inputPacketRef as ContentRef;
+        if (
+          digest(checkpointPath) !== value.checkpointDigest ||
+          checkpoint.invocationId !== value.invocationId ||
+          packet.digest !== value.sourceDigest ||
+          (path.startsWith("learning/returns/") &&
+            (value.configDigest !== checkpoint.configDigest ||
+              JSON.stringify(value.parent) !==
+                JSON.stringify(checkpoint.parent)))
+        )
+          throw new Error("Dream original receipt binding changed");
+      }
+    }
+  }
+}
+
+/** Existing immutable append seam; install never calls approve, Dream or continuation APIs. */
+export function assertLearningOriginalDestination(
+  repository: string,
+  original: LearningOriginal,
+  root = stateRoot(repository),
+): void {
+  const { kind } = decodeLearningOriginal(
+    repository,
+    original.path,
+    original.bytes,
+  );
+  const path = join(
+    directory(repository, kind, root),
+    original.path.slice(original.path.lastIndexOf("/") + 1),
+  );
+  if (
+    existsSync(path) &&
+    privateRead(path) !== Buffer.from(original.bytes).toString("utf8")
+  )
+    throw new Error(
+      "Immutable learning path already has different original bytes",
+    );
+}
+export function installLearningOriginal(
+  repository: string,
+  original: LearningOriginal,
+  root = stateRoot(repository),
+): void {
+  assertLearningOriginalDestination(repository, original, root);
+  const { kind } = decodeLearningOriginal(
+    repository,
+    original.path,
+    original.bytes,
+  );
+  const name = original.path.slice(original.path.lastIndexOf("/") + 1);
+  const path = join(directory(repository, kind, root), name);
+  const raw = Buffer.from(original.bytes).toString("utf8");
+  if (existsSync(path)) {
+    if (privateRead(path) !== raw)
+      throw new Error(
+        "Immutable learning path already has different original bytes",
+      );
+    return;
+  }
+  append(path, raw);
+}
+
+/** Candidate inventory only; the supported transport verifies typed original reference closure. */
 export function learningPersistenceClosure(repository: string): {
   records: { path: string; ref: ContentRef }[];
   contentRefs: ContentRef[];
@@ -1040,6 +1557,7 @@ export function learningPersistenceClosure(repository: string): {
     "calls",
     "checkpoints",
     "submissions",
+    "returns",
   ])
     for (const name of readdirSync(directory(repository, kind))
       .filter((name) => name.endsWith(".json") && !name.endsWith(".draft.json"))
@@ -1572,7 +2090,11 @@ export async function prepareDreamInput(
   });
   const raw = encoded(checkpoint),
     checkpointDigest = learningDigest(raw);
-  append(join(directory(config.repository, "checkpoints"), `${id}.json`), raw);
+  append(
+    join(directory(config.repository, "checkpoints"), `${id}.json`),
+    raw,
+    config.repository,
+  );
   return {
     checkpoint,
     checkpointDigest,
@@ -1724,7 +2246,55 @@ async function dream(
     invocationId,
     phase: "dream",
     ordinal: 0,
-    beforeProviderAttempt: () => {
+    ...(hasPrivateCheckpointScope()
+      ? {
+          retainNativeReturn: async (
+            receipt: Parameters<
+              NonNullable<ModelInvocationContext["retainNativeReturn"]>
+            >[0],
+          ) => {
+            const store = new LocalContentStore(
+              join(stateRoot(config.repository), "content"),
+            );
+            const responseRef = store.putBytes(Buffer.from(receipt.response), {
+              mediaType: "text/plain",
+            });
+            const { response: _response, ...metadata } = receipt;
+            const path = join(
+              directory(config.repository, "returns"),
+              `${id}.json`,
+            );
+            const raw = encoded({
+              schemaVersion: 1,
+              id,
+              invocationId,
+              phase: "dream",
+              checkpointDigest,
+              sourceDigest: learningDigest(sourcePacket),
+              configDigest: checkpoint.configDigest,
+              parent: checkpoint.parent,
+              responseRef,
+              providerAttempt: invocation.providerAttempt,
+              providerMaxAttempts: invocation.providerMaxAttempts,
+              ...metadata,
+            });
+            decodeLearningOriginal(
+              config.repository,
+              `learning/returns/${id}.json`,
+              Buffer.from(raw),
+            );
+            if (existsSync(path)) {
+              if (privateRead(path) !== raw)
+                throw new Error(
+                  "Dream native return differs from its immutable original",
+                );
+            } else append(path, raw, config.repository);
+            // The adapter may release its last owned copy only after verified durable acknowledgment.
+            await awaitCheckpointAdmission(config.repository, "explicit");
+          },
+        }
+      : {}),
+    beforeProviderAttempt: async () => {
       if (
         invocation.providerAttempt !== 1 ||
         invocation.providerMaxAttempts !== 1
@@ -1749,7 +2319,9 @@ async function dream(
           usage: "unavailable",
           reconciliation: "not-exposed",
         }),
+        config.repository,
       );
+      await awaitCheckpointAdmission(config.repository, "before-effect");
     },
     observe: Object.assign(
       (observation: ModelInvocationObservation) => {
@@ -1778,7 +2350,14 @@ async function dream(
         outcome: "failed",
         error: redactDiagnosticDetail(String(error), secrets(config)),
       }),
+      config.repository,
     );
+    try {
+      await awaitCheckpointAdmission(config.repository, "settled");
+    } catch {
+      // Preserve the native failure and its receipt; synchronization remains visibly pending.
+      console.error("Dream checkpoint synchronization remains unavailable.");
+    }
     throw error;
   }
   append(
@@ -1793,7 +2372,9 @@ async function dream(
       outcome:
         "completed-provider-call; proposal validation and approval are separate",
     }),
+    config.repository,
   );
+  await awaitCheckpointAdmission(config.repository, "settled");
   if (
     Object.keys(record(result)).sort().join() !==
     "contradictions,lessons,retired,summaries"
@@ -1889,6 +2470,29 @@ export async function runDreamCommand(
   args: string[],
   configuration = configPath(),
 ): Promise<void> {
+  if (!config.gitPersistence)
+    return runDreamCommandUnscoped(config, args, configuration);
+  const { buildRecoveryCheckpointClosure } = await import(
+    "./recovery-checkpoint-closure.js"
+  );
+  await withRecoveryCheckpointScope(
+    {
+      config,
+      buildClosure: () =>
+        buildRecoveryCheckpointClosure({
+          config,
+          scope: config.gitPersistence!.scope,
+        }),
+    },
+    () => runDreamCommandUnscoped(config, args, configuration),
+  );
+}
+
+async function runDreamCommandUnscoped(
+  config: FactoryConfig,
+  args: string[],
+  configuration = configPath(),
+): Promise<void> {
   validateTarget(config.repository, config.checkout);
   const preview = args.includes("--preview");
   const show = args.includes("--show"),
@@ -1972,6 +2576,7 @@ export async function runDreamCommand(
         ),
       );
     } else await dream(config, args, configuration);
+    await awaitCheckpointAdmission(config.repository, "settled");
   } finally {
     releaseControllerLock(installationLockPath(config.repository), lock);
   }

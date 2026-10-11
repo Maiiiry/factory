@@ -1,0 +1,1417 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  factoryConfigDigest,
+  stateRoot,
+  type FactoryConfig,
+} from "./config.js";
+import { LocalContentStore } from "./content/local.js";
+import type { ContentRef } from "./contracts.js";
+import { attachFault, decision } from "./fault.js";
+import {
+  pinnedGitCommand,
+  pinnedGitEnvironment,
+  releaseGuard,
+  subprocessAsync,
+  takeGuard,
+  UnsettledSubprocessError,
+} from "./process.js";
+
+export interface GitPersistenceConfig {
+  remote: string;
+  ref: string;
+  visibility: "private" | "public";
+  scope: "private-history" | "repository-knowledge";
+  maxBytes: number;
+  maxFiles: number;
+  timeoutMs: number;
+  coalesceMs: number;
+}
+export type RecoveryCheckpointFileKind =
+  | "continuation"
+  | "pre-state"
+  | "memory-binding"
+  | "learning-original"
+  | "content"
+  | "git-pack"
+  | "historical";
+export interface RecoveryCheckpointFile {
+  kind: RecoveryCheckpointFileKind;
+  path: string;
+  ref: ContentRef;
+  visibility: "private" | "repository";
+}
+export interface RecoveryCheckpointGap {
+  path: string;
+  reason: string;
+  availability: string;
+  required?: boolean;
+}
+export interface RecoveryCheckpointClosure {
+  files: RecoveryCheckpointFile[];
+  contentRefs: ContentRef[];
+  gitObjects?: { commitSha: string; role: string }[];
+  gaps: RecoveryCheckpointGap[];
+}
+export interface RecoveryCheckpointBinding {
+  repository: string;
+  remoteDigest: string;
+  ref: string;
+  visibility: GitPersistenceConfig["visibility"];
+  scope: GitPersistenceConfig["scope"];
+}
+export interface RecoveryCheckpointManifest extends RecoveryCheckpointClosure {
+  schemaVersion: 1;
+  binding: RecoveryCheckpointBinding;
+  createdAt: string;
+  sequence: number;
+}
+interface CheckpointAttempt {
+  base?: string;
+  candidate: string;
+  payloadDigest: string;
+  sequence: number;
+  preparedAt: string;
+  submittedAt?: string;
+  status: "prepared" | "submitted" | "acknowledged" | "unknown" | "conflict";
+  transportOutcome: "not-dispatched" | "response-success" | "unknown";
+}
+interface CheckpointJournal {
+  schemaVersion: 1;
+  binding: RecoveryCheckpointBinding;
+  sequence: number;
+  acknowledgedSequence: number;
+  dirtySince?: string;
+  changed: { path: string; kind: string }[];
+  attempts: CheckpointAttempt[];
+  lastAcknowledged?: {
+    commitSha: string;
+    payloadDigest: string;
+    at: string;
+    sequence: number;
+  };
+  error?: string;
+  hold?: "conflict";
+}
+export interface RecoveryCheckpointStatus {
+  enabled: boolean;
+  durability: "local-only" | "verified-git";
+  status:
+    | "local-only"
+    | "pending"
+    | "acknowledged"
+    | "unknown"
+    | "conflict"
+    | "failed";
+  pendingChanges: boolean;
+  unsyncedSince?: string;
+  lastAcknowledged?: CheckpointJournal["lastAcknowledged"];
+  attemptedCommit?: string;
+  attemptedBase?: string;
+  attemptedTransportOutcome?: CheckpointAttempt["transportOutcome"];
+  error?: string;
+  coalesceMs?: number;
+  overdue?: boolean;
+  scope?: GitPersistenceConfig["scope"];
+  protectedContinuation: boolean;
+}
+export class CheckpointAdmissionFailure extends Error {
+  knownNotDispatched: boolean;
+  constructor(
+    message: string,
+    readonly boundary:
+      | "before-effect"
+      | "settled"
+      | "explicit" = "before-effect",
+  ) {
+    super(message);
+    this.knownNotDispatched = boundary === "before-effect";
+    attachFault(
+      this,
+      decision(
+        "Recovery checkpoint admission or retention is unavailable; preserve the retained owner and receipt",
+        `Checkpoint boundary: ${boundary}`,
+      ),
+    );
+  }
+}
+export function markCheckpointEffectDispatched(
+  error: CheckpointAdmissionFailure,
+): void {
+  error.knownNotDispatched = false;
+}
+class CheckpointConflict extends Error {}
+export function isCheckpointAdmissionFailure(
+  error: unknown,
+): error is CheckpointAdmissionFailure {
+  return error instanceof CheckpointAdmissionFailure;
+}
+const scopes = new AsyncLocalStorage<{
+  config: FactoryConfig;
+  buildClosure: () => Promise<RecoveryCheckpointClosure>;
+}>();
+export function hasPrivateCheckpointScope(): boolean {
+  const scope = scopes.getStore();
+  return Boolean(scope && settings(scope.config)?.scope === "private-history");
+}
+const hash = (bytes: Uint8Array | string) =>
+  createHash("sha256").update(bytes).digest("hex");
+const canonical = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`)
+      .join(",")}}`;
+  return JSON.stringify(value);
+};
+function keys(
+  value: unknown,
+  required: string[],
+  optional: string[] = [],
+): asserts value is Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    required.some((key) => !Object.hasOwn(value, key)) ||
+    Object.keys(value).some((key) => ![...required, ...optional].includes(key))
+  )
+    throw new Error("Invalid recovery checkpoint fields");
+}
+function safePath(path: unknown): asserts path is string {
+  if (
+    typeof path !== "string" ||
+    !path ||
+    path.length > 1024 ||
+    isAbsolute(path) ||
+    path.includes("\\") ||
+    [...path].some(
+      (character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    ) ||
+    path
+      .split("/")
+      .some((part) => !part || part === "." || part === ".." || part === ".git")
+  )
+    throw new Error("Checkpoint paths must be literal relative identities");
+}
+function assertRef(ref: unknown): asserts ref is ContentRef {
+  keys(ref, ["digest", "bytes", "mediaType"]);
+  if (
+    typeof ref.digest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(ref.digest) ||
+    !Number.isSafeInteger(ref.bytes) ||
+    (ref.bytes as number) < 0 ||
+    typeof ref.mediaType !== "string" ||
+    !ref.mediaType
+  )
+    throw new Error("Invalid checkpoint content reference");
+}
+export function assertGitPersistenceConfig(
+  value: unknown,
+): asserts value is GitPersistenceConfig {
+  keys(value, [
+    "remote",
+    "ref",
+    "visibility",
+    "scope",
+    "maxBytes",
+    "maxFiles",
+    "timeoutMs",
+    "coalesceMs",
+  ]);
+  if (
+    typeof value.remote !== "string" ||
+    !value.remote ||
+    value.remote.startsWith("-") ||
+    [...value.remote].some(
+      (character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    ) ||
+    (!isAbsolute(value.remote) && /\s/.test(value.remote)) ||
+    !(
+      isAbsolute(value.remote) ||
+      /^(https:\/\/|ssh:\/\/|git@)/.test(value.remote)
+    )
+  )
+    throw new Error(
+      "Git persistence requires an explicit Git URL or absolute local destination",
+    );
+  if (
+    typeof value.ref !== "string" ||
+    !/^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value.ref) ||
+    value.ref.includes("..") ||
+    value.ref.includes("@{") ||
+    value.ref.endsWith("/") ||
+    value.ref.endsWith(".") ||
+    value.ref
+      .split("/")
+      .some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
+  )
+    throw new Error("Git persistence requires one literal branch ref");
+  if (
+    !["private", "public"].includes(String(value.visibility)) ||
+    !["private-history", "repository-knowledge"].includes(
+      String(value.scope),
+    ) ||
+    (value.scope === "private-history" && value.visibility !== "private")
+  )
+    throw new Error(
+      "Private recovery history requires an explicitly private destination",
+    );
+  for (const name of ["maxBytes", "maxFiles", "timeoutMs", "coalesceMs"])
+    if (
+      !Number.isSafeInteger(value[name]) ||
+      (value[name] as number) < (name === "coalesceMs" ? 0 : 1)
+    )
+      throw new Error("Checkpoint bounds must be finite integers");
+}
+function settings(config: FactoryConfig): GitPersistenceConfig | undefined {
+  const value = (
+    config as FactoryConfig & { gitPersistence?: GitPersistenceConfig }
+  ).gitPersistence;
+  if (value) assertGitPersistenceConfig(value);
+  return value;
+}
+function binding(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+): RecoveryCheckpointBinding {
+  return {
+    repository: config.repository,
+    remoteDigest: hash(options.remote),
+    ref: options.ref,
+    visibility: options.visibility,
+    scope: options.scope,
+  };
+}
+function paths(repository: string) {
+  const root = join(stateRoot(repository), "recovery");
+  return {
+    root,
+    journal: join(root, "checkpoint.json"),
+    git: join(root, "git.git"),
+    mutationGuard: join(root, ".checkpoint.guard"),
+    publicationGuard: join(root, ".publication.guard"),
+  };
+}
+function privateFile(path: string): Buffer {
+  if (realpathSync(dirname(path)) !== resolve(dirname(path)))
+    throw new Error("Checkpoint metadata parent resolves through a symlink");
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.uid !== process.getuid?.() || st.mode & 0o077)
+      throw new Error("Checkpoint metadata must be an owned private file");
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+function writeAtomic(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (realpathSync(dirname(path)) !== resolve(dirname(path)))
+    throw new Error("Checkpoint directory resolves through a symlink");
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    writeFileSync(fd, `${canonical(value)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(temporary, path);
+  const directory = openSync(dirname(path), "r");
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+}
+function journal(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+): CheckpointJournal {
+  const expected = binding(config, options);
+  const path = paths(config.repository).journal;
+  if (!existsSync(path))
+    return {
+      schemaVersion: 1,
+      binding: expected,
+      sequence: 0,
+      acknowledgedSequence: -1,
+      changed: [],
+      attempts: [],
+    };
+  const value: CheckpointJournal = JSON.parse(
+    privateFile(path).toString("utf8"),
+  );
+  keys(
+    value,
+    [
+      "schemaVersion",
+      "binding",
+      "sequence",
+      "acknowledgedSequence",
+      "changed",
+      "attempts",
+    ],
+    ["dirtySince", "lastAcknowledged", "error", "hold"],
+  );
+  if (
+    value.schemaVersion !== 1 ||
+    canonical(value.binding) !== canonical(expected) ||
+    !Number.isSafeInteger(value.sequence) ||
+    value.sequence < 0 ||
+    !Number.isSafeInteger(value.acknowledgedSequence) ||
+    value.acknowledgedSequence < -1 ||
+    value.acknowledgedSequence > value.sequence ||
+    !Array.isArray(value.changed) ||
+    !Array.isArray(value.attempts)
+  )
+    throw new Error(
+      "Checkpoint journal binding or sequence differs from admitted configuration",
+    );
+  for (const attempt of value.attempts) {
+    keys(
+      attempt,
+      [
+        "candidate",
+        "payloadDigest",
+        "sequence",
+        "preparedAt",
+        "status",
+        "transportOutcome",
+      ],
+      ["base", "submittedAt"],
+    );
+    if (
+      !/^[a-f0-9]{40,64}$/.test(attempt.candidate) ||
+      (attempt.base !== undefined && !/^[a-f0-9]{40,64}$/.test(attempt.base)) ||
+      !/^[a-f0-9]{64}$/.test(attempt.payloadDigest) ||
+      ![
+        "prepared",
+        "submitted",
+        "acknowledged",
+        "unknown",
+        "conflict",
+      ].includes(attempt.status) ||
+      !["not-dispatched", "response-success", "unknown"].includes(
+        attempt.transportOutcome,
+      ) ||
+      !Number.isSafeInteger(attempt.sequence) ||
+      attempt.sequence < 0 ||
+      attempt.sequence > value.sequence ||
+      (attempt.submittedAt !== undefined &&
+        !Number.isFinite(Date.parse(attempt.submittedAt))) ||
+      !Number.isFinite(Date.parse(attempt.preparedAt))
+    )
+      throw new Error("Checkpoint attempted publication identity is invalid");
+  }
+  for (const changed of value.changed) {
+    keys(changed, ["path", "kind"]);
+    safePath(changed.path);
+    if (typeof changed.kind !== "string" || !changed.kind)
+      throw new Error("Invalid pending checkpoint mutation");
+  }
+  if (value.hold !== undefined && value.hold !== "conflict")
+    throw new Error("Invalid checkpoint conflict hold");
+  if (
+    value.dirtySince !== undefined &&
+    !Number.isFinite(Date.parse(value.dirtySince))
+  )
+    throw new Error("Invalid checkpoint loss window");
+  if (value.lastAcknowledged) {
+    keys(value.lastAcknowledged, [
+      "commitSha",
+      "payloadDigest",
+      "at",
+      "sequence",
+    ]);
+    const acknowledgement = value.lastAcknowledged;
+    if (
+      !/^[a-f0-9]{40,64}$/.test(acknowledgement.commitSha) ||
+      !/^[a-f0-9]{64}$/.test(acknowledgement.payloadDigest) ||
+      !Number.isFinite(Date.parse(acknowledgement.at)) ||
+      acknowledgement.sequence !== value.acknowledgedSequence ||
+      !value.attempts.some(
+        (attempt) =>
+          attempt.status === "acknowledged" &&
+          attempt.candidate === acknowledgement.commitSha &&
+          attempt.payloadDigest === acknowledgement.payloadDigest &&
+          attempt.sequence === acknowledgement.sequence,
+      )
+    )
+      throw new Error(
+        "Checkpoint acknowledgement lacks its exact attempted publication",
+      );
+  } else if (value.acknowledgedSequence !== -1)
+    throw new Error("Checkpoint acknowledged sequence has no verified receipt");
+  return value;
+}
+function mutate(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  update: (record: CheckpointJournal) => void,
+): CheckpointJournal {
+  const p = paths(config.repository);
+  mkdirSync(p.root, { recursive: true, mode: 0o700 });
+  takeGuard(p.mutationGuard);
+  try {
+    const record = journal(config, options);
+    update(record);
+    writeAtomic(p.journal, record);
+    return record;
+  } finally {
+    releaseGuard(p.mutationGuard);
+  }
+}
+function status(
+  record: CheckpointJournal,
+  options?: GitPersistenceConfig,
+): RecoveryCheckpointStatus {
+  const last = record.attempts.at(-1);
+  const pendingChanges = record.sequence > record.acknowledgedSequence;
+  return {
+    enabled: true,
+    durability: record.lastAcknowledged ? "verified-git" : "local-only",
+    status:
+      record.hold === "conflict" || last?.status === "conflict"
+        ? "conflict"
+        : last && ["submitted", "prepared", "unknown"].includes(last.status)
+          ? "unknown"
+          : record.error
+            ? "failed"
+            : pendingChanges
+              ? "pending"
+              : "acknowledged",
+    pendingChanges,
+    protectedContinuation:
+      options?.scope === "private-history" &&
+      Boolean(record.lastAcknowledged) &&
+      !pendingChanges &&
+      !record.hold &&
+      !record.error,
+    ...(options ? { scope: options.scope } : {}),
+    ...(record.dirtySince ? { unsyncedSince: record.dirtySince } : {}),
+    ...(record.lastAcknowledged
+      ? { lastAcknowledged: record.lastAcknowledged }
+      : {}),
+    ...(last
+      ? {
+          attemptedCommit: last.candidate,
+          attemptedTransportOutcome: last.transportOutcome,
+          ...(last.base ? { attemptedBase: last.base } : {}),
+        }
+      : {}),
+    ...(record.error ? { error: record.error } : {}),
+    ...(options
+      ? {
+          coalesceMs: options.coalesceMs,
+          overdue:
+            pendingChanges &&
+            (!record.dirtySince ||
+              Date.now() - Date.parse(record.dirtySince) >= options.coalesceMs),
+        }
+      : {}),
+  };
+}
+export function gitPersistenceStatus(
+  config: FactoryConfig,
+): RecoveryCheckpointStatus {
+  const options = settings(config);
+  if (!options)
+    return {
+      enabled: false,
+      durability: "local-only",
+      status: "local-only",
+      pendingChanges: false,
+      protectedContinuation: false,
+    };
+  return status(journal(config, options), options);
+}
+export function markCheckpointDirty(
+  repository: string,
+  descriptor: { path: string; kind: string },
+): void {
+  const scope = scopes.getStore();
+  if (!scope) return;
+  if (scope.config.repository !== repository)
+    throw new Error("Checkpoint scope repository differs from mutation");
+  const options = settings(scope.config);
+  if (!options) return;
+  if (
+    options.scope === "repository-knowledge" &&
+    descriptor.kind !== "memory-binding"
+  )
+    return;
+  descriptor = {
+    ...descriptor,
+    path: isAbsolute(descriptor.path)
+      ? relative(stateRoot(repository), descriptor.path)
+      : descriptor.path,
+  };
+  safePath(descriptor.path);
+  mutate(scope.config, options, (record) => {
+    record.sequence++;
+    if (!Number.isSafeInteger(record.sequence))
+      throw new Error("Checkpoint sequence overflow");
+    record.dirtySince ??= new Date().toISOString();
+    if (
+      !record.changed.some(
+        (entry) =>
+          entry.path === descriptor.path && entry.kind === descriptor.kind,
+      )
+    )
+      record.changed.push(descriptor);
+    if (record.changed.length > options.maxFiles)
+      throw new Error("Pending checkpoint file count exceeds admitted bound");
+  });
+}
+export function withRecoveryCheckpointScope<T>(
+  input: {
+    config: FactoryConfig;
+    buildClosure: () => Promise<RecoveryCheckpointClosure>;
+  },
+  task: () => T,
+): T {
+  const admitted = scopes.getStore();
+  if (admitted) {
+    if (
+      admitted.config.repository !== input.config.repository ||
+      factoryConfigDigest(admitted.config) !== factoryConfigDigest(input.config)
+    )
+      throw new CheckpointAdmissionFailure(
+        "Nested checkpoint configuration differs from its admitted repository binding",
+      );
+    return task();
+  }
+  return scopes.run(input, task);
+}
+export async function awaitCheckpointAdmission(
+  repository: string | undefined,
+  reason: "before-effect" | "settled" | "explicit",
+): Promise<void> {
+  const scope = scopes.getStore();
+  if (!scope) return;
+  if (repository !== undefined && scope.config.repository !== repository)
+    throw new CheckpointAdmissionFailure(
+      "Checkpoint scope differs from external-effect repository",
+    );
+  if (
+    reason === "before-effect" &&
+    settings(scope.config)?.scope === "repository-knowledge"
+  )
+    return;
+  await synchronizeRecoveryCheckpoint(scope.config, {
+    reason,
+    buildClosure: scope.buildClosure,
+  });
+}
+function git(
+  directory: string,
+  options: GitPersistenceConfig,
+  args: string[],
+  input?: Uint8Array | string,
+): Buffer {
+  return execFileSync(
+    "git",
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "protocol.file.allow=always",
+      `--git-dir=${directory}`,
+      ...args,
+    ],
+    {
+      env: pinnedGitEnvironment(),
+      input,
+      timeout: options.timeoutMs,
+      maxBuffer: options.maxBytes + 65536,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+}
+async function boundedCommand(
+  file: string,
+  args: string[],
+  options: GitPersistenceConfig,
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+  let bytes = 0;
+  try {
+    const result = await subprocessAsync(
+      file,
+      args,
+      { env, signal: controller.signal },
+      undefined,
+      (_stream, chunk) => {
+        bytes += chunk.length;
+        if (bytes > options.maxBytes + 65536) controller.abort();
+      },
+    );
+    if (result.status !== 0)
+      throw new Error("Bounded Git archive transport command failed");
+    return result.stdout;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function gitRemote(
+  directory: string,
+  options: GitPersistenceConfig,
+  args: string[],
+): Promise<string> {
+  const command = pinnedGitCommand(directory, [
+    "-c",
+    "protocol.file.allow=always",
+    ...args,
+  ]);
+  return boundedCommand("git", command.args, options, command.env);
+}
+function githubRepository(remote: string): string | undefined {
+  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(
+    remote,
+  )?.[1];
+}
+async function githubVisibility(
+  repository: string,
+  options: GitPersistenceConfig,
+): Promise<boolean> {
+  const bytes = await boundedCommand(
+    "gh",
+    ["api", "--hostname", "github.com", `repos/${repository}`],
+    options,
+  );
+  const value = JSON.parse(bytes);
+  if (
+    typeof value.private !== "boolean" ||
+    String(value.full_name).toLowerCase() !== repository.toLowerCase() ||
+    value.html_url !== `https://github.com/${value.full_name}`
+  )
+    throw new Error("Git destination visibility could not be authenticated");
+  return value.private;
+}
+async function verifyDestination(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+): Promise<void> {
+  if (isAbsolute(options.remote)) {
+    if (options.scope !== "private-history" || options.visibility !== "private")
+      throw new Error(
+        "Local Git archive destinations support private history only",
+      );
+    const target = realpathSync(options.remote);
+    if (target !== resolve(options.remote))
+      throw new Error("Local archive destination resolves through a symlink");
+    if (!lstatSync(target).isDirectory())
+      throw new Error("Local Git destination must already exist");
+    let ancestor = target;
+    let privateAncestor = false;
+    for (;;) {
+      const st = lstatSync(ancestor);
+      if (st.uid === process.getuid?.() && (st.mode & 0o077) === 0) {
+        privateAncestor = true;
+        break;
+      }
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    if (!privateAncestor)
+      throw new Error(
+        "Local archive must be within an owned private directory",
+      );
+    const bare = execFileSync(
+      "git",
+      [`--git-dir=${target}`, "rev-parse", "--is-bare-repository"],
+      {
+        env: pinnedGitEnvironment(),
+        timeout: options.timeoutMs,
+        encoding: "utf8",
+      },
+    ).trim();
+    if (bare !== "true")
+      throw new Error(
+        "Local archive destination must be an existing bare Git repository",
+      );
+    return;
+  }
+  const destination = githubRepository(options.remote);
+  if (!destination)
+    throw new Error(
+      "Archive host visibility cannot be verified; no publication is admitted",
+    );
+  const destinationPrivate = await githubVisibility(destination, options);
+  if (destinationPrivate !== (options.visibility === "private"))
+    throw new Error(
+      "Git destination actual visibility differs from its explicit binding",
+    );
+  if (
+    options.visibility === "public" &&
+    (await githubVisibility(config.repository, options))
+  )
+    throw new Error(
+      "Private source repository knowledge cannot be published to a public archive",
+    );
+}
+async function remoteTip(
+  directory: string,
+  options: GitPersistenceConfig,
+): Promise<string | undefined> {
+  const lines = (
+    await gitRemote(directory, options, [
+      "ls-remote",
+      "--refs",
+      "--",
+      options.remote,
+      options.ref,
+    ])
+  )
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  if (!lines.length) return undefined;
+  if (lines.length !== 1)
+    throw new Error("Archive ref observation is ambiguous");
+  const [sha, ref] = lines[0]!.split("\t");
+  if (!sha || !/^[a-f0-9]{40,64}$/.test(sha) || ref !== options.ref)
+    throw new Error("Archive ref observation differs from exact binding");
+  return sha;
+}
+function initializeGit(directory: string, options: GitPersistenceConfig): void {
+  if (existsSync(directory)) {
+    if (
+      realpathSync(directory) !== resolve(directory) ||
+      !lstatSync(directory).isDirectory()
+    )
+      throw new Error("Checkpoint Git replica must be a real directory");
+    return;
+  }
+  mkdirSync(dirname(directory), { recursive: true, mode: 0o700 });
+  execFileSync("git", ["init", "--bare", directory], {
+    env: pinnedGitEnvironment(),
+    timeout: options.timeoutMs,
+    stdio: "pipe",
+  });
+}
+function assertManifest(
+  value: unknown,
+  expected: RecoveryCheckpointBinding,
+  options: GitPersistenceConfig,
+): asserts value is RecoveryCheckpointManifest {
+  keys(
+    value,
+    [
+      "schemaVersion",
+      "binding",
+      "createdAt",
+      "sequence",
+      "files",
+      "contentRefs",
+      "gaps",
+    ],
+    ["gitObjects"],
+  );
+  if (
+    value.schemaVersion !== 1 ||
+    canonical(value.binding) !== canonical(expected) ||
+    !Number.isSafeInteger(value.sequence) ||
+    (value.sequence as number) < 0 ||
+    typeof value.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(value.createdAt)) ||
+    !Array.isArray(value.files) ||
+    !Array.isArray(value.contentRefs) ||
+    !Array.isArray(value.gaps) ||
+    value.gaps.some((gap: RecoveryCheckpointGap) => gap.required !== false)
+  )
+    throw new Error(
+      "Checkpoint manifest is incomplete or outside its admitted binding",
+    );
+  const pathsSeen = new Set<string>();
+  for (const gap of value.gaps) {
+    keys(gap, ["path", "reason", "availability"], ["required"]);
+    safePath(gap.path);
+    if (
+      typeof gap.reason !== "string" ||
+      !gap.reason ||
+      typeof gap.availability !== "string" ||
+      !gap.availability ||
+      (gap.required !== undefined && typeof gap.required !== "boolean")
+    )
+      throw new Error("Invalid declared checkpoint historical gap");
+  }
+  for (const raw of value.files) {
+    keys(raw, ["kind", "path", "ref", "visibility"]);
+    safePath(raw.path);
+    assertRef(raw.ref);
+    if (
+      ![
+        "continuation",
+        "pre-state",
+        "memory-binding",
+        "learning-original",
+        "content",
+        "git-pack",
+        "historical",
+      ].includes(String(raw.kind)) ||
+      !["private", "repository"].includes(String(raw.visibility)) ||
+      pathsSeen.has(raw.path)
+    )
+      throw new Error("Checkpoint file contract is invalid or duplicate");
+    pathsSeen.add(raw.path);
+    if (
+      options.scope === "repository-knowledge" &&
+      (raw.visibility !== "repository" ||
+        !["memory-binding", "content"].includes(String(raw.kind)))
+    )
+      throw new Error(
+        "Repository knowledge archives cannot contain operational or private history",
+      );
+  }
+  for (const ref of value.contentRefs) assertRef(ref);
+  if (value.gitObjects !== undefined) {
+    if (!Array.isArray(value.gitObjects))
+      throw new Error("Invalid checkpoint Git roots");
+    for (const root of value.gitObjects) {
+      keys(root, ["commitSha", "role"]);
+      if (
+        typeof root.commitSha !== "string" ||
+        !/^[a-f0-9]{40,64}$/.test(root.commitSha) ||
+        typeof root.role !== "string" ||
+        !root.role
+      )
+        throw new Error("Invalid checkpoint exact Git identity");
+    }
+    if (
+      value.gitObjects.length &&
+      !value.files.some((file) => file.kind === "git-pack")
+    )
+      throw new Error("Git identities require complete retained Git objects");
+  }
+  const refs = allRefs(value as unknown as RecoveryCheckpointManifest);
+  if (
+    value.files.length + refs.length + 1 > options.maxFiles ||
+    refs.reduce(
+      (sum, ref) => sum + ref.bytes,
+      Buffer.byteLength(canonical(value)),
+    ) > options.maxBytes
+  )
+    throw new Error("Complete checkpoint exceeds admitted file or byte bound");
+}
+function allRefs(
+  value: Pick<RecoveryCheckpointClosure, "files" | "contentRefs">,
+): ContentRef[] {
+  const refs = new Map<string, ContentRef>();
+  for (const ref of [
+    ...value.files.map((file) => file.ref),
+    ...value.contentRefs,
+  ]) {
+    const prior = refs.get(ref.digest);
+    if (prior && prior.bytes !== ref.bytes)
+      throw new Error("Conflicting checkpoint content identities");
+    refs.set(ref.digest, ref);
+  }
+  return [...refs.values()].sort((a, b) => (a.digest < b.digest ? -1 : 1));
+}
+function closureIdentity(value: RecoveryCheckpointClosure): string {
+  const ordered = (items: unknown[]) => items.map(canonical).sort();
+  return canonical({
+    files: ordered(value.files),
+    contentRefs: ordered(value.contentRefs),
+    gitObjects: ordered(value.gitObjects ?? []),
+    gaps: ordered(value.gaps),
+  });
+}
+function readArchive(
+  directory: string,
+  commitSha: string,
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+): {
+  manifest: RecoveryCheckpointManifest;
+  blobs: Map<string, Buffer>;
+  payloadDigest: string;
+} {
+  const manifestBytes = git(directory, options, [
+    "show",
+    `${commitSha}:checkpoint.json`,
+  ]);
+  const manifest = JSON.parse(
+    new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes),
+  );
+  assertManifest(manifest, binding(config, options), options);
+  if (canonical(manifest) !== manifestBytes.toString("utf8"))
+    throw new Error(
+      "Checkpoint manifest does not retain canonical exact bytes",
+    );
+  const refs = allRefs(manifest);
+  const names = git(directory, options, [
+    "ls-tree",
+    "-rz",
+    "--full-tree",
+    commitSha,
+  ])
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const tab = line.indexOf("\t");
+      const [mode, type] = line.slice(0, tab).split(" ");
+      if (mode !== "100644" || type !== "blob")
+        throw new Error("Archive contains nonregular payload entries");
+      return line.slice(tab + 1);
+    })
+    .sort();
+  const expected = [
+    "checkpoint.json",
+    ...refs.map((ref) => `blobs/${ref.digest}`),
+  ].sort();
+  if (canonical(names) !== canonical(expected))
+    throw new Error("Archive contains unexpected or missing bytes");
+  const blobs = new Map<string, Buffer>();
+  for (const ref of refs) {
+    const bytes = git(directory, options, [
+      "show",
+      `${commitSha}:blobs/${ref.digest}`,
+    ]);
+    if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+      throw new Error(
+        "Fetched checkpoint body failed exact digest verification",
+      );
+    blobs.set(ref.digest, bytes);
+  }
+  return { manifest, blobs, payloadDigest: hash(manifestBytes) };
+}
+async function freshArchive(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  expectedCommit?: string,
+) {
+  const directory = join(
+    paths(config.repository).root,
+    `verify-${randomUUID()}.git`,
+  );
+  initializeGit(directory, options);
+  let settled = true;
+  try {
+    const tip = await remoteTip(directory, options);
+    if (!tip) throw new Error("Configured Git archive ref has no checkpoint");
+    await gitRemote(directory, options, [
+      "fetch",
+      "--no-tags",
+      "--",
+      options.remote,
+      options.ref,
+    ]);
+    const fetched = git(directory, options, ["rev-parse", "FETCH_HEAD"])
+      .toString("utf8")
+      .trim();
+    if (fetched !== tip)
+      throw new Error("Archive ref changed during independent verification");
+    const commit = expectedCommit ?? tip;
+    if (expectedCommit)
+      git(directory, options, [
+        "merge-base",
+        "--is-ancestor",
+        expectedCommit,
+        tip,
+      ]);
+    return {
+      ...readArchive(directory, commit, config, options),
+      commitSha: commit,
+      remoteTip: tip,
+    };
+  } catch (error) {
+    if (error instanceof UnsettledSubprocessError) settled = false;
+    throw error;
+  } finally {
+    if (settled) rmSync(directory, { recursive: true, force: true });
+  }
+}
+export async function readVerifiedRecoveryCheckpoint(
+  config: FactoryConfig,
+  commitSha?: string,
+): Promise<{
+  manifest: RecoveryCheckpointManifest;
+  commitSha: string;
+  remoteTip: string;
+  readVerifiedBlob(ref: ContentRef): Promise<Uint8Array>;
+}> {
+  const options = settings(config);
+  if (!options) throw new Error("Git persistence is not configured");
+  if (commitSha !== undefined && !/^[a-f0-9]{40,64}$/.test(commitSha))
+    throw new Error("Invalid requested checkpoint commit");
+  await verifyDestination(config, options);
+  const archive = await freshArchive(config, options, commitSha);
+  return {
+    manifest: archive.manifest,
+    commitSha: archive.commitSha,
+    remoteTip: archive.remoteTip,
+    async readVerifiedBlob(ref) {
+      assertRef(ref);
+      const bytes = archive.blobs.get(ref.digest);
+      if (!bytes || bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+        throw new Error(
+          "Requested body is absent from verified archive closure",
+        );
+      return Uint8Array.from(bytes);
+    },
+  };
+}
+function acknowledge(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  attempt: CheckpointAttempt,
+): RecoveryCheckpointStatus {
+  return status(
+    mutate(config, options, (record) => {
+      const current = record.attempts.find(
+        (entry) => entry.candidate === attempt.candidate,
+      );
+      if (
+        !current ||
+        canonical({ ...current, status: attempt.status }) !== canonical(attempt)
+      )
+        throw new Error("Attempt changed before acknowledgement");
+      current.status = "acknowledged";
+      record.lastAcknowledged = {
+        commitSha: attempt.candidate,
+        payloadDigest: attempt.payloadDigest,
+        at: new Date().toISOString(),
+        sequence: attempt.sequence,
+      };
+      record.acknowledgedSequence = attempt.sequence;
+      if (record.sequence === attempt.sequence) {
+        record.changed = [];
+        delete record.dirtySince;
+      }
+      delete record.error;
+    }),
+    options,
+  );
+}
+export async function synchronizeRecoveryCheckpoint(
+  config: FactoryConfig,
+  input: {
+    reason: "before-effect" | "settled" | "explicit";
+    buildClosure?: () => Promise<RecoveryCheckpointClosure>;
+  },
+): Promise<RecoveryCheckpointStatus> {
+  const repository = config.repository;
+  const predecessor = publications.get(repository) ?? Promise.resolve();
+  let release!: () => void;
+  const completion = new Promise<void>((done) => {
+    release = done;
+  });
+  const tail = predecessor.then(() => completion);
+  publications.set(repository, tail);
+  await predecessor;
+  try {
+    return await publishCheckpoint(config, input);
+  } catch (error) {
+    if (isCheckpointAdmissionFailure(error)) throw error;
+    throw new CheckpointAdmissionFailure(
+      error instanceof Error ? error.message : "Checkpoint admission failed",
+      input.reason,
+    );
+  } finally {
+    release();
+    if (publications.get(repository) === tail) publications.delete(repository);
+  }
+}
+const publications = new Map<string, Promise<void>>();
+async function publishCheckpoint(
+  config: FactoryConfig,
+  input: {
+    reason: "before-effect" | "settled" | "explicit";
+    buildClosure?: () => Promise<RecoveryCheckpointClosure>;
+  },
+): Promise<RecoveryCheckpointStatus> {
+  const options = settings(config);
+  if (!options) return gitPersistenceStatus(config);
+  const p = paths(config.repository);
+  mkdirSync(p.root, { recursive: true, mode: 0o700 });
+  takeGuard(p.publicationGuard);
+  try {
+    await verifyDestination(config, options);
+    let record = journal(config, options);
+    const previous = record.attempts.at(-1);
+    if (previous && previous.status !== "acknowledged") {
+      // Observation can establish an old submission. It never grants a second push.
+      const recovered = await freshArchive(config, options, previous.candidate);
+      if (recovered.payloadDigest !== previous.payloadDigest)
+        throw new Error(
+          "Observed checkpoint differs from retained attempted payload",
+        );
+      acknowledge(config, options, previous);
+      record = journal(config, options);
+      if (
+        record.sequence === record.acknowledgedSequence ||
+        input.reason !== "before-effect"
+      )
+        return status(record, options);
+    }
+    if (record.hold)
+      throw new CheckpointConflict(
+        "Checkpoint publication is held after an archive conflict; verified restoration is required",
+      );
+    if (
+      record.lastAcknowledged &&
+      record.sequence === record.acknowledgedSequence &&
+      input.reason !== "explicit"
+    )
+      return status(record, options);
+    if (
+      input.reason === "settled" &&
+      record.dirtySince &&
+      Date.now() - Date.parse(record.dirtySince) < options.coalesceMs
+    )
+      return status(record, options);
+    const build =
+      input.buildClosure ??
+      scopes.getStore()?.buildClosure ??
+      (async () => {
+        const { buildRecoveryCheckpointClosure } = await import(
+          "./recovery-checkpoint-closure.js"
+        );
+        return buildRecoveryCheckpointClosure({ config, scope: options.scope });
+      });
+    let sequence = record.sequence;
+    const closure = await build();
+    record = journal(config, options);
+    const manifest: RecoveryCheckpointManifest = {
+      ...closure,
+      schemaVersion: 1,
+      binding: binding(config, options),
+      createdAt: new Date().toISOString(),
+      sequence,
+    };
+    assertManifest(manifest, manifest.binding, options);
+    const store = new LocalContentStore(
+      join(stateRoot(config.repository), "content"),
+    );
+    const blobs = allRefs(manifest).map((ref) => ({
+      ref,
+      bytes: store.readBytes(ref),
+    }));
+    if (
+      input.reason === "explicit" &&
+      record.lastAcknowledged &&
+      record.sequence === record.acknowledgedSequence
+    ) {
+      const acknowledged = await freshArchive(
+        config,
+        options,
+        record.lastAcknowledged.commitSha,
+      );
+      if (acknowledged.remoteTip !== record.lastAcknowledged.commitSha)
+        throw new CheckpointConflict(
+          "Remote archive advanced outside the acknowledged writer; conflict requires inspection",
+        );
+      if (acknowledged.payloadDigest !== record.lastAcknowledged.payloadDigest)
+        throw new Error(
+          "Verified archived bytes differ from the retained acknowledgement",
+        );
+      if (closureIdentity(closure) === closureIdentity(acknowledged.manifest))
+        return status(journal(config, options), options);
+      let observedSequence = sequence;
+      record = mutate(config, options, (current) => {
+        if (current.sequence !== sequence) return;
+        current.sequence++;
+        if (!Number.isSafeInteger(current.sequence))
+          throw new Error("Checkpoint sequence overflow");
+        observedSequence = current.sequence;
+        current.dirtySince ??= new Date().toISOString();
+        current.changed.push({
+          path: "archive/explicit-material",
+          kind: "historical",
+        });
+      });
+      sequence = observedSequence;
+      manifest.sequence = sequence;
+      assertManifest(manifest, manifest.binding, options);
+    }
+    initializeGit(p.git, options);
+    const base = await remoteTip(p.git, options);
+    if (base) {
+      if (!record.lastAcknowledged)
+        throw new CheckpointConflict(
+          "Existing archive has no locally acknowledged restored baseline; read-only restoration is required before publication",
+        );
+      if (base !== record.lastAcknowledged.commitSha)
+        throw new CheckpointConflict(
+          "Remote archive advanced outside the acknowledged writer; conflict requires inspection",
+        );
+      await gitRemote(p.git, options, [
+        "fetch",
+        "--no-tags",
+        "--",
+        options.remote,
+        options.ref,
+      ]);
+      const fetched = git(p.git, options, ["rev-parse", "FETCH_HEAD"])
+        .toString("utf8")
+        .trim();
+      if (fetched !== base)
+        throw new CheckpointConflict(
+          "Remote checkpoint changed during base fetch",
+        );
+      readArchive(p.git, base, config, options);
+    } else if (record.lastAcknowledged)
+      throw new CheckpointConflict(
+        "Acknowledged archive ref is missing; no branch recreation is admitted",
+      );
+    const manifestBytes = Buffer.from(canonical(manifest));
+    const manifestBlob = git(
+      p.git,
+      options,
+      ["hash-object", "-w", "--stdin"],
+      manifestBytes,
+    )
+      .toString("utf8")
+      .trim();
+    const blobEntries = blobs.map(({ ref, bytes }) => ({
+      ref,
+      oid: git(p.git, options, ["hash-object", "-w", "--stdin"], bytes)
+        .toString("utf8")
+        .trim(),
+    }));
+    const blobsTree = git(
+      p.git,
+      options,
+      ["mktree"],
+      blobEntries
+        .map(({ ref, oid }) => `100644 blob ${oid}\t${ref.digest}\n`)
+        .join(""),
+    )
+      .toString("utf8")
+      .trim();
+    const tree = git(
+      p.git,
+      options,
+      ["mktree"],
+      `040000 tree ${blobsTree}\tblobs\n100644 blob ${manifestBlob}\tcheckpoint.json\n`,
+    )
+      .toString("utf8")
+      .trim();
+    const candidate = git(
+      p.git,
+      options,
+      [
+        "-c",
+        "user.name=Factory checkpoint",
+        "-c",
+        "user.email=checkpoint@factory.invalid",
+        "commit-tree",
+        tree,
+        ...(base ? ["-p", base] : []),
+      ],
+      "Factory exact recovery checkpoint\n",
+    )
+      .toString("utf8")
+      .trim();
+    const attempt: CheckpointAttempt = {
+      ...(base ? { base } : {}),
+      candidate,
+      payloadDigest: hash(manifestBytes),
+      sequence,
+      preparedAt: new Date().toISOString(),
+      status: "prepared",
+      transportOutcome: "not-dispatched",
+    };
+    mutate(config, options, (current) => {
+      current.attempts.push(attempt);
+      delete current.error;
+    });
+    await verifyDestination(config, options);
+    if ((await remoteTip(p.git, options)) !== base) {
+      mutate(config, options, (current) => {
+        current.attempts.at(-1)!.status = "conflict";
+        current.error =
+          "Remote checkpoint changed before push; candidate was not dispatched";
+      });
+      throw new CheckpointConflict(
+        "Remote checkpoint changed before bounded publication",
+      );
+    }
+    mutate(config, options, (current) => {
+      const active = current.attempts.at(-1)!;
+      active.status = "submitted";
+      active.transportOutcome = "unknown";
+      active.submittedAt = new Date().toISOString();
+    });
+    try {
+      await gitRemote(p.git, options, [
+        "push",
+        "--porcelain",
+        "--",
+        options.remote,
+        `${candidate}:${options.ref}`,
+      ]);
+    } catch {
+      mutate(config, options, (current) => {
+        current.attempts.at(-1)!.status = "unknown";
+        current.error =
+          "Git publication outcome is unknown; only exact remote observation is allowed";
+      });
+      throw new Error(
+        "Git publication outcome is unknown; no automatic retry is admitted",
+      );
+    }
+    mutate(config, options, (current) => {
+      current.attempts.at(-1)!.transportOutcome = "response-success";
+    });
+    const verified = await freshArchive(config, options, candidate);
+    if (verified.payloadDigest !== attempt.payloadDigest)
+      throw new Error(
+        "Independent remote payload differs from submitted checkpoint",
+      );
+    const submitted = journal(config, options).attempts.at(-1)!;
+    return acknowledge(config, options, submitted);
+  } catch (error) {
+    try {
+      mutate(config, options, (record) => {
+        record.error =
+          error instanceof Error
+            ? error.message
+            : "Checkpoint synchronization failed";
+        const attempt = record.attempts.at(-1);
+        if (attempt?.status === "submitted") attempt.status = "unknown";
+        if (error instanceof CheckpointConflict) record.hold = "conflict";
+      });
+    } catch {
+      /* Original fence is preserved if even local status cannot be written. */
+    }
+    throw new CheckpointAdmissionFailure(
+      error instanceof Error
+        ? error.message
+        : "Recovery checkpoint is not remotely acknowledged",
+      input.reason,
+    );
+  } finally {
+    releaseGuard(p.publicationGuard);
+  }
+}

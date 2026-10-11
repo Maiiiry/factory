@@ -59,6 +59,8 @@ export interface CodexAppServerTurnOptions extends CodexAppServerOptions {
   threadId?: string;
   /** Operational checkpoint; rejection must precede further dispatch. */
   checkpoint?: (ref: CodexAppServerCheckpoint) => void;
+  /** Archive controller checkpoints before dispatch and after returned identities. */
+  admission?: (boundary: "before-effect" | "settled") => Promise<void>;
   /** Existing native exec projection for shared planning observations. */
   event: (event: ThreadEvent) => void;
 }
@@ -651,6 +653,7 @@ export async function runCodexAppServer(
   };
   try {
     await client.run(async (rpc, channel) => {
+      await args.admission?.("before-effect");
       const response = object(
         await rpc.request(args.threadId ? "thread/resume" : "thread/start", {
           ...settings,
@@ -677,6 +680,7 @@ export async function runCodexAppServer(
         );
       dispatch = "submitted";
       checkpoint();
+      await args.admission?.("before-effect");
       const turn = object(
         await rpc.request("turn/start", {
           threadId: id,
@@ -689,6 +693,7 @@ export async function runCodexAppServer(
         }),
       );
       acceptTurn(turn.turn);
+      await args.admission?.("settled");
       await Promise.race([
         finished,
         channel.closed.then(() => {

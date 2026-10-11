@@ -68,6 +68,43 @@ import {
   selectAssetSet,
 } from "./runner.js";
 import type { ContinuationState, PreparationState } from "./state.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import {
+  synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+
+/** Bind existing operations to their configured archive without changing lifecycle authority. */
+function checkpointOperations(config: FactoryConfig) {
+  const input = {
+    config,
+    buildClosure: () =>
+      buildRecoveryCheckpointClosure({
+        config,
+        scope: config.gitPersistence?.scope ?? "private-history",
+      }),
+  };
+  return {
+    local: <T>(task: () => T): T => withRecoveryCheckpointScope(input, task),
+    async: <T>(task: () => Promise<T>): Promise<T> =>
+      withRecoveryCheckpointScope(input, async () => {
+        let result: T;
+        try {
+          result = await task();
+        } catch (error) {
+          // Retain the original lifecycle error; sync failure remains in durability status.
+          try {
+            await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+          } catch {
+            // The journal retains sync failure; do not replace the lifecycle error.
+          }
+          throw error;
+        }
+        await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+        return result;
+      }),
+  };
+}
 
 export interface FactoryApplication {
   enqueueIntake(objectives: number[]): Promise<IntakeAuthorization>;
@@ -204,46 +241,80 @@ export function createApplication(
   assertSessionComposition(services.driver, "Execution driver", [
     "implementation",
   ]);
+  if (config.gitPersistence?.scope === "private-history") {
+    if (
+      services.planningModel.providerAttemptAdmission !==
+        "controller-checkpoint-v1" ||
+      services.driver.effectAdmission !== "controller-checkpoint-v1" ||
+      services.github.effectAdmission !== "controller-checkpoint-v1" ||
+      services.delivery.effectAdmission !== "controller-checkpoint-v1"
+    )
+      throw new Error(
+        "Git-backed continuation requires planning, execution, GitHub and delivery adapters that enforce checkpoint admission",
+      );
+  }
+  const checkpoint = checkpointOperations(config);
   return {
     enqueueIntake: (objectives) =>
-      enqueueIntake(config, services.github, objectives),
-    runIntake: () => runIntake(config, services),
-    planObjective: (objective) => planObjective(config, objective, services),
+      checkpoint.async(() =>
+        enqueueIntake(config, services.github, objectives),
+      ),
+    runIntake: () => checkpoint.async(() => runIntake(config, services)),
+    planObjective: (objective) => {
+      if (config.gitPersistence?.scope === "private-history")
+        return Promise.reject(
+          new Error(
+            "Use runObjective for Git-backed planning; transient plan previews have no continuation journal",
+          ),
+        );
+      return checkpoint.async(() => planObjective(config, objective, services));
+    },
     decidePlan: (objective, input) =>
-      decidePlan(config, objective, services, input),
+      checkpoint.async(() => decidePlan(config, objective, services, input)),
     decide: (objective, input) =>
-      decideObjective(config, objective, services, input),
+      checkpoint.async(() =>
+        decideObjective(config, objective, services, input),
+      ),
     proposeAmendment: (objective, proposal) =>
-      controlObjective(config, {
-        objective,
-        action: "propose-amendment",
-        input: proposal as unknown as Record<string, unknown>,
-      }),
+      checkpoint.async(() =>
+        controlObjective(config, {
+          objective,
+          action: "propose-amendment",
+          input: proposal as unknown as Record<string, unknown>,
+        }),
+      ),
     runObjective: (objective, options) =>
-      runObjective(config, objective, services, options),
+      checkpoint.async(() =>
+        runObjective(config, objective, services, options),
+      ),
     cancelObjective: (objective) =>
-      cancelObjective(
-        config,
-        objective,
-        services.driver,
-        services.github,
-        services.planningModel,
+      checkpoint.async(() =>
+        cancelObjective(
+          config,
+          objective,
+          services.driver,
+          services.github,
+          services.planningModel,
+        ),
       ),
     repairWorkItem: (objective, input) =>
-      repairWorkItem(config, objective, input),
+      checkpoint.local(() => repairWorkItem(config, objective, input)),
     retryWorkItem: (objective, itemId) =>
-      retryWorkItem(config, objective, itemId),
+      checkpoint.local(() => retryWorkItem(config, objective, itemId)),
     rereviewWorkItem: (objective, input) =>
-      rereviewWorkItem(config, objective, input),
-    decideResult: (objective, input) => decideResult(config, objective, input),
+      checkpoint.local(() => rereviewWorkItem(config, objective, input)),
+    decideResult: (objective, input) =>
+      checkpoint.local(() => decideResult(config, objective, input)),
     selectAssetSet: (objective, itemId, setId, decision) =>
-      selectAssetSet(
-        config,
-        objective,
-        itemId,
-        setId,
-        services.contentStore,
-        decision,
+      checkpoint.async(() =>
+        selectAssetSet(
+          config,
+          objective,
+          itemId,
+          setId,
+          services.contentStore,
+          decision,
+        ),
       ),
     exportAssetSetsForReview: (objective, itemId, output) =>
       exportAssetSetsForReview(
@@ -265,8 +336,10 @@ export function composeIntake(
     config.repository,
     new NativeStackDelivery(config.repository),
   );
+  const checkpoint = checkpointOperations(config);
   return {
-    enqueueIntake: (objectives) => enqueueIntake(config, github, objectives),
+    enqueueIntake: (objectives) =>
+      checkpoint.async(() => enqueueIntake(config, github, objectives)),
   };
 }
 
@@ -321,12 +394,29 @@ export function composePlanning(
         new NativeStackDelivery(config.repository),
       ),
   };
+  if (
+    config.gitPersistence?.scope === "private-history" &&
+    services.planningModel.providerAttemptAdmission !==
+      "controller-checkpoint-v1"
+  )
+    throw new Error("Git-backed planning requires checkpoint admission");
+  const checkpoint = checkpointOperations(config);
   return {
-    planObjective: (objective) => planObjective(config, objective, services),
+    planObjective: (objective) => {
+      if (config.gitPersistence?.scope === "private-history")
+        return Promise.reject(
+          new Error(
+            "Use runObjective for Git-backed planning; transient plan previews have no continuation journal",
+          ),
+        );
+      return checkpoint.async(() => planObjective(config, objective, services));
+    },
     decidePlan: (objective, input) =>
-      decidePlan(config, objective, services, input),
+      checkpoint.async(() => decidePlan(config, objective, services, input)),
     decide: (objective, input) =>
-      decideObjective(config, objective, services, input),
+      checkpoint.async(() =>
+        decideObjective(config, objective, services, input),
+      ),
   };
 }
 

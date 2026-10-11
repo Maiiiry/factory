@@ -6,6 +6,7 @@ import type {
 } from "../contracts.js";
 import type { DiagnosticEmitter } from "../diagnostics.js";
 import type { WorkState } from "../state.js";
+import { awaitCheckpointAdmission } from "../recovery-checkpoint.js";
 
 /** A runner's driver context: checkpoints, plus usage and possible orphans recorded as diagnostics. */
 export function workerContext(
@@ -13,7 +14,12 @@ export function workerContext(
   save: () => void,
   cancelled: () => boolean,
   diagnostics: DiagnosticEmitter | undefined,
-  ids: { runId?: string; itemId: string },
+  ids: {
+    runId?: string;
+    itemId: string;
+    repository?: string;
+    checkpointedEffects?: true;
+  },
 ): ExecutionContext {
   const context = executionContext(
     work,
@@ -37,6 +43,10 @@ export function workerContext(
         detail: orphan.detail,
       }),
   );
+  if (ids.checkpointedEffects) context.checkpointedEffects = true;
+  if (ids.repository)
+    context.admitEffect = (reason = "before-effect") =>
+      awaitCheckpointAdmission(ids.repository!, reason);
   context.observeReadiness = (entry) =>
     diagnostics?.emit({
       ...ids,
@@ -80,10 +90,18 @@ export function executionContext(
   cancelled: () => boolean = () => false,
   observeUsage?: (observation: WorkerUsageObservation) => void,
   observeOrphan?: (orphan: ExecutionOrphan) => void,
+  repository?: string,
+  checkpointedEffects?: true,
 ): ExecutionContext {
   const attempt = work.attempt;
   let previous = JSON.stringify(work.execution);
   return {
+    ...(checkpointedEffects && { checkpointedEffects }),
+    ...(repository && {
+      admitEffect: (
+        reason: "before-effect" | "settled" | "explicit" = "before-effect",
+      ) => awaitCheckpointAdmission(repository, reason),
+    }),
     cancelled,
     observeUsage,
     observeOrphan,

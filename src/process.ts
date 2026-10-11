@@ -1466,6 +1466,14 @@ export function pinnedGitAsync(
   return gitProcess(checkout, args, true);
 }
 
+/** Existing pinned Git preparation for bounded controller-owned transports. */
+export function pinnedGitCommand(
+  directory: string,
+  args: string[],
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  return factoryGit(directory, args, true);
+}
+
 /** pinnedGitAsync whose pathspecs may use magic, such as `:(exclude)`. */
 export function pinnedGitMagicAsync(
   checkout: string,

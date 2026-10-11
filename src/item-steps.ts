@@ -14,6 +14,7 @@ import type {
 } from "./contracts.js";
 import type { DiagnosticEmitter } from "./diagnostics.js";
 import { isDeepStrictEqual } from "node:util";
+import { awaitCheckpointAdmission } from "./recovery-checkpoint.js";
 import { workerContext } from "./execution/checkpoint.js";
 import { cancelledFault, faultOf, workFault } from "./fault.js";
 import { repeatKey, StepPaused, step } from "./step.js";
@@ -113,6 +114,8 @@ export async function executeItem(
     ...workerContext(work, save, args.cancelled, args.diagnostics, {
       runId: state.runId,
       itemId: item.id,
+      repository: state.repository,
+      ...(state.schemaVersion === 17 && { checkpointedEffects: true as const }),
     }),
     ...(args.session ? { checkpointSession: args.session.checkpoint } : {}),
   });
@@ -218,7 +221,7 @@ export async function executeItem(
           settleSession(identity);
         }
         if (stopped(args)) throw cancelledFault();
-        handle = await ctx.paid(() => {
+        handle = await ctx.paid(async () => {
           if (item.kind === "discovery") {
             const allowance = item.discovery?.allowance.maxAttempts;
             const consumed = state.discoveryAttemptCounts?.[item.id] ?? 0;
@@ -232,6 +235,7 @@ export async function executeItem(
             };
             save();
           }
+          await awaitCheckpointAdmission(state.repository, "before-effect");
           return driver.start(args.request(workerIdentity(work)), context());
         });
         // Drivers checkpoint before start returns; record it otherwise.
@@ -345,6 +349,7 @@ export function reviewItem(
         return ctx.paid(() =>
           reviewAcceptance({
             ...request,
+            checkpointReturnedEvidence: args.save,
             ...(adaptive ? { adaptiveContext: adaptive.packet } : {}),
             evidenceSources: [
               ...(request.evidenceSources ?? []),

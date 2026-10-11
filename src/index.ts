@@ -26,6 +26,8 @@ export * from "./adaptive-context.js";
 export type { DiagnosticEvent } from "./diagnostics.js";
 export { summarizeFormalHistory } from "./diagnostics.js";
 export * from "./repository-memory.js";
+export * from "./repository-memory-transfer.js";
+export * from "./recovery-checkpoint.js";
 export {
   type Autonomy,
   type AutonomyConfig,

@@ -1,16 +1,11 @@
 import { createHash } from "node:crypto";
-import { projectStatusOnGitHub } from "./github-project.js";
-import type { GitHubDecisionComment } from "./github-plan-decisions.js";
-import { parsePlanDecision } from "./github-plan-decisions.js";
-import {
-  progressDigest,
-  type ProgressCommentIdentity,
-} from "./github-progress-state.js";
+import * as time from "./clock.js";
 import type {
   GitHubGateway,
-  IntakeIssuePage,
   GraphProjection,
   GraphProjectionEffectRequest,
+  IntakeIssuePage,
+  MergeControl,
   MergeResult,
   NamedCheckEvidence,
   NativeStackLayer,
@@ -21,24 +16,30 @@ import type {
   PullRequestPublication,
   WorkItem,
 } from "./contracts.js";
-import * as time from "./clock.js";
 import { notYet, settled } from "./delivery/lag.js";
 import type { NativeStackDelivery } from "./delivery/native-stack.js";
 import { deliveryReadiness } from "./delivery/readiness.js";
-import { availableIssueType } from "./issue-type.js";
 import { attachedFault, attachFault, decision, transient } from "./fault.js";
 import {
   classifiedGitHubCall,
-  type GitHubClient,
-  type GitHubCall,
   GITHUB_LAG_MS,
+  type GitHubCall,
+  type GitHubClient,
+  GitHubRequestError,
   gitHubFault,
   gitHubTransportOf,
-  GitHubRequestError,
   MERGE_COMMITS_REQUIRED,
   sharedGitHubClient,
   timelineMergeCommit,
 } from "./github-client.js";
+import type { GitHubDecisionComment } from "./github-plan-decisions.js";
+import { parsePlanDecision } from "./github-plan-decisions.js";
+import {
+  type ProgressCommentIdentity,
+  progressDigest,
+} from "./github-progress-state.js";
+import { projectStatusOnGitHub } from "./github-project.js";
+import { availableIssueType } from "./issue-type.js";
 
 type Issue = {
   id: number;
@@ -125,6 +126,7 @@ function unverifiedCreate(message: string): Error {
 }
 
 export class RealGitHubGateway implements GitHubGateway {
+  readonly effectAdmission = "controller-checkpoint-v1" as const;
   readonly projectionMutationAdmission = "controller-checkpoint-v1" as const;
   constructor(
     readonly repository: string,
@@ -310,7 +312,7 @@ export class RealGitHubGateway implements GitHubGateway {
       throw new Error(
         "GitHub progress marker exists without a retained publication identity",
       );
-    request.beforeWrite(actor.id);
+    await request.beforeWrite(actor.id);
     const comment = await this.api<Comment>(
       "POST",
       `issues/${request.objective}/comments`,
@@ -1625,7 +1627,7 @@ export class RealGitHubGateway implements GitHubGateway {
           `Unresolved exact request for ${request.branch}; only read-only reconciliation is allowed`,
         ),
       );
-    request.beforeCreate();
+    await request.beforeCreate();
     // No retry, negative-read release or in-memory authority: intent already survives restart.
     const detail = await this.api<Pull>("POST", "pulls", {
       head: request.branch,
@@ -1957,7 +1959,10 @@ export class RealGitHubGateway implements GitHubGateway {
    * repeat that finds the update already made returns it without another
    * request. The caller records the returned head as the PR's head.
    */
-  async updateBranch(identity: PullRequestIdentity): Promise<string> {
+  async updateBranch(
+    identity: PullRequestIdentity,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<string> {
     const key = `update:${identity.number}:${identity.headSha}`;
     const pull = await this.api<Pull>("GET", `pulls/${identity.number}`);
     if (pull.merged || pull.state !== "open")
@@ -1983,6 +1988,7 @@ export class RealGitHubGateway implements GitHubGateway {
           `PUT pulls/${identity.number}/update-branch at ${identity.headSha}`,
         ),
       );
+    await beforeRequest?.();
     try {
       await this.api("PUT", `pulls/${identity.number}/update-branch`, {
         expected_head_sha: identity.headSha,
@@ -2044,13 +2050,19 @@ export class RealGitHubGateway implements GitHubGateway {
   async merge(
     identity: PullRequestIdentity,
     expectedHead: string,
+    control?: MergeControl,
   ): Promise<MergeResult> {
+    const observed = async (result: MergeResult): Promise<MergeResult> => {
+      await control?.observedMerge(identity, result);
+      return result;
+    };
     if (expectedHead !== identity.headSha)
       throw new Error("Merge expected head differs from PR identity");
     // Observe first: a merge whose response was lost has already happened,
     // so it is confirmed rather than sent again.
     const current = await this.api<Pull>("GET", `pulls/${identity.number}`);
-    if (current.merged) return this.confirmMerged(identity, current);
+    if (current.merged)
+      return observed(await this.confirmMerged(identity, current));
     if (current.state === "closed")
       throw notYet(
         `closed:${identity.number}:${identity.headSha}`,
@@ -2064,6 +2076,7 @@ export class RealGitHubGateway implements GitHubGateway {
     await this.requireMergeCommits(current.base.ref);
     const refused = `merge-refused:${identity.number}:${identity.headSha}`;
     let result: { merged: boolean; sha: string };
+    await control?.beforeMerge(identity);
     try {
       result = await this.api<{ merged: boolean; sha: string }>(
         "PUT",
@@ -2084,7 +2097,8 @@ export class RealGitHubGateway implements GitHubGateway {
         !error.refusal
       ) {
         const after = await this.api<Pull>("GET", `pulls/${identity.number}`);
-        if (after.merged) return this.confirmMerged(identity, after);
+        if (after.merged)
+          return observed(await this.confirmMerged(identity, after));
         // Readiness changed since it was observed: a conflict or a failed
         // required check is work on the published result, not a decision.
         const waiting = deliveryReadiness(
@@ -2117,7 +2131,8 @@ export class RealGitHubGateway implements GitHubGateway {
         attachedFault(error)?.kind !== "transient"
       ) {
         const after = await this.api<Pull>("GET", `pulls/${identity.number}`);
-        if (after.merged) return this.confirmMerged(identity, after);
+        if (after.merged)
+          return observed(await this.confirmMerged(identity, after));
         if (await this.stacked(identity.number))
           throw foreignChange(
             `PR #${identity.number} is in a native stack Factory did not record`,
@@ -2134,7 +2149,8 @@ export class RealGitHubGateway implements GitHubGateway {
       !/^[a-f0-9]{40}$/.test(result.sha)
     ) {
       const after = await this.api<Pull>("GET", `pulls/${identity.number}`);
-      if (after.merged) return this.confirmMerged(identity, after);
+      if (after.merged)
+        return observed(await this.confirmMerged(identity, after));
       throw new Error("PR merge did not produce an integrated commit");
     }
     const key = `merge:${identity.number}:${identity.headSha}`;
@@ -2150,7 +2166,7 @@ export class RealGitHubGateway implements GitHubGateway {
         `PR #${identity.number} does not show its merge ${result.sha} yet`,
       );
     settled(key);
-    return { integratedSha: result.sha };
+    return observed({ integratedSha: result.sha });
   }
 
   /** Whether GitHub shows the PR in a native stack. */
@@ -2197,8 +2213,18 @@ export class RealGitHubGateway implements GitHubGateway {
   async ensureNativeStack(
     layers: NativeStackLayer[],
     baseBranch: string,
+    control?: {
+      beforeRequest(): Promise<void>;
+      observed(number: number): Promise<void>;
+    },
   ): Promise<number> {
-    return this.native.ensureStack(layers, baseBranch);
+    const number = await this.native.ensureStack(
+      layers,
+      baseBranch,
+      control?.beforeRequest,
+    );
+    await control?.observed(number);
+    return number;
   }
   async mergeNativeStack(
     layers: NativeStackLayer[],
@@ -2206,7 +2232,8 @@ export class RealGitHubGateway implements GitHubGateway {
     expectedStack: number,
     options: {
       resumeUuid?: string;
-      onPending: (uuid: string) => void;
+      beforeRequest?: () => void | Promise<void>;
+      onPending: (uuid: string) => void | Promise<void>;
       progress?: () => void;
       queued: (detail: string) => never;
       failed?: () => Promise<void>;

@@ -46,15 +46,15 @@ import type {
   WorkItem,
 } from "../contracts.js";
 import { AuthenticationRequiredError } from "../contracts.js";
-import { assertExecutionBinding } from "../execution-profiles.js";
 import {
+  assertDiscoveryBody,
+  assertDiscoveryOutputManifest,
+  assertDiscoverySpecification,
   authenticateDiscoveryOutput,
   classifyDiscoveryOutput,
-  assertDiscoverySpecification,
-  assertDiscoveryOutputManifest,
-  assertDiscoveryBody,
   discoverySpecificationDigest,
 } from "../discovery.js";
+import { assertExecutionBinding } from "../execution-profiles.js";
 import {
   attachedFault,
   cancelledFault,
@@ -85,10 +85,14 @@ import {
   UnsettledSubprocessError,
 } from "../process.js";
 import { DEFAULT_PROVIDER_TURN_IDLE_TIMEOUT_MS } from "../provider-turn.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "../recovery-checkpoint.js";
 import { assertPinnedNpmScripts, validateCheckout } from "../validation.js";
 import type { ValidationEvidence } from "../validation-evidence.js";
-import { workspacePackageAdditions } from "../workspace-membership.js";
 import { workerReadinessReceipt } from "../worker-readiness.js";
+import { workspacePackageAdditions } from "../workspace-membership.js";
 import { stoppedFault } from "./attempt.js";
 import { assertDurableValue } from "./checkpoint.js";
 import { executionFault } from "./fault.js";
@@ -174,6 +178,7 @@ export class CodexHarness implements AgentHarness {
   readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly sessionAdapter = "codex";
   readonly capabilities = {
+    effectAdmission: "controller-checkpoint-v1",
     childAgents: "disabled",
     protocolVersion: 1,
     worktree: "factory-owned-read-write",
@@ -703,6 +708,7 @@ export async function collectWorktreeResult(
   request: ExecutionRequest,
   store: ContentStore,
   result: HarnessResult,
+  checkpointResult?: (result: ExecutionResult) => Promise<void>,
 ): Promise<ExecutionResult> {
   const handoffPath = join(worktree, ".factory-handoff.json");
   const handoffNotes = judgedAsWork(() => readWorkHandoff(worktree));
@@ -886,11 +892,7 @@ export async function collectWorktreeResult(
     );
     handoffSources.push({ path, ref });
   }
-  if (discovery) rmSync(discoveryPath);
-  if (handoffNotes) rmSync(handoffPath);
-  rmSync(join(worktree, ".factory-inputs"), { recursive: true, force: true });
-  rmSync(join(worktree, ".factory-assets.json"), { force: true });
-  return {
+  const collected: ExecutionResult = {
     changeRef: commit,
     treeSha,
     evidence: result.evidence,
@@ -901,6 +903,12 @@ export async function collectWorktreeResult(
     collection: { acceptedIgnoredLinks },
     assets,
   };
+  await checkpointResult?.(collected);
+  if (discovery) rmSync(discoveryPath);
+  if (handoffNotes) rmSync(handoffPath);
+  rmSync(join(worktree, ".factory-inputs"), { recursive: true, force: true });
+  rmSync(join(worktree, ".factory-assets.json"), { force: true });
+  return collected;
 }
 
 /** Render only authenticated local Git context, never an execution base or proof. */
@@ -991,8 +999,17 @@ export function checkpointWorkerSession(
   return options.supportsResume ? session : undefined;
 }
 
+async function cessationAdmission(context?: ExecutionContext): Promise<void> {
+  try {
+    await context?.admitEffect?.("before-effect");
+  } catch (error) {
+    if (!isCheckpointAdmissionFailure(error)) throw error;
+  }
+}
+
 export class LocalExecutionDriver implements ExecutionDriver {
   readonly childAgents = "disabled" as const;
+  readonly effectAdmission = "controller-checkpoint-v1" as const;
   readonly readonlyDiscovery = "selector-bound-read-only-v1" as const;
   readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly freshCheckoutReadiness = true as const;
@@ -1002,6 +1019,13 @@ export class LocalExecutionDriver implements ExecutionDriver {
   private require(handle: ExecutionHandle): Active {
     const active =
       this.active.get(handle.identity) ?? (handle.data as Active | undefined);
+    if ((active as unknown as { phase?: string })?.phase === "prepared")
+      throw new StepFault({
+        kind: "decision",
+        evidence: [],
+        question:
+          "Local worker launch has a retained prepared intent; preserve its owner and use supported cancellation before any replacement",
+      });
     if (!active || handle.provider !== "local")
       throw new Error("Unknown local execution handle");
     if (
@@ -1217,6 +1241,13 @@ export class LocalExecutionDriver implements ExecutionDriver {
         );
     } else if (request.discovery)
       throw new Error("Unrequested discovery execution input");
+    if (
+      context?.checkpointedEffects &&
+      harness.capabilities.effectAdmission !== "controller-checkpoint-v1"
+    )
+      throw new Error(
+        "Configured Git persistence requires a harness with enforced controller effect admission",
+      );
     const identity = request.attemptId ?? randomUUID();
     const session = request.session
       ? structuredClone(request.session)
@@ -1248,6 +1279,10 @@ export class LocalExecutionDriver implements ExecutionDriver {
     const worktree = join(this.workRoot, identity);
     mkdirSync(this.workRoot, { recursive: true });
     if (existsSync(worktree)) {
+      if (context?.checkpointedEffects)
+        throw new Error(
+          "Prepared local checkout is retained; reconcile or cancel its owner before another launch",
+        );
       await (harness as RecoverableHarness).cancelUnrecorded?.(identity);
       await this.removeExecutionDirectory(worktree);
     }
@@ -1439,7 +1474,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
           0,
         ...(workerReadiness && { receiptDigest: workerReadiness.digest }),
       });
-      const handle = await harness.start({
+      const preparedHarnessRequest: HarnessRequest = {
         ...(request.childAgents && { childAgents: request.childAgents }),
         ...(request.discovery &&
           discoveryBody && {
@@ -1487,7 +1522,52 @@ export class LocalExecutionDriver implements ExecutionDriver {
             source,
         ),
         selectedAssets: boundSelected,
-      });
+      };
+      const preparedHandle: ExecutionHandle = {
+        provider: "local",
+        identity,
+        data: {
+          phase: "prepared",
+          request: structuredClone({
+            ...workerRequest,
+            attemptId: identity,
+            sourceAssets,
+          }),
+          worktree,
+          adapterIdentity:
+            request.item.executionBinding?.adapter ?? this.adapterIdentity,
+          ...(request.item.executionBinding
+            ? {
+                executionBinding: structuredClone(
+                  request.item.executionBinding,
+                ),
+              }
+            : {}),
+          ...(environmentReadiness && {
+            environmentReadiness: {
+              commitSha: request.baseSha,
+              worktree,
+              evidence: environmentReadiness,
+            },
+          }),
+          preparedHarnessRequest: structuredClone(preparedHarnessRequest),
+        },
+      };
+      if (context?.checkpointedEffects) context.checkpoint(preparedHandle);
+      try {
+        await context?.admitEffect?.("before-effect");
+      } catch (error) {
+        if (isCheckpointAdmissionFailure(error) && context?.checkpointedEffects)
+          context.checkpoint({
+            ...preparedHandle,
+            data: {
+              ...(preparedHandle.data as object),
+              admissionBlockedAt: new Date().toISOString(),
+            },
+          });
+        throw error;
+      }
+      const handle = await harness.start(preparedHarnessRequest);
       assertDurableHandle(handle);
       const active = {
         request: structuredClone({
@@ -1513,8 +1593,10 @@ export class LocalExecutionDriver implements ExecutionDriver {
       this.active.set(identity, active);
       const started = { provider: "local", identity, data: active };
       context?.checkpoint(started);
+      await context?.admitEffect?.("settled");
       return started;
     } catch (error) {
+      if (isCheckpointAdmissionFailure(error)) throw error;
       this.active.delete(identity);
       if (!hasUnresolvedSubprocesses())
         await this.removeExecutionDirectory(worktree);
@@ -1528,7 +1610,11 @@ export class LocalExecutionDriver implements ExecutionDriver {
    * its identity and stopped, and the worktree is removed.
    */
   @classifyFaults(executionFault)
-  async cancelUnrecorded(attemptId: string): Promise<void> {
+  async cancelUnrecorded(
+    attemptId: string,
+    context?: ExecutionContext,
+  ): Promise<void> {
+    await cessationAdmission(context);
     const running = this.active.get(attemptId);
     if (running) {
       await this.cancel({
@@ -1544,8 +1630,10 @@ export class LocalExecutionDriver implements ExecutionDriver {
     if (
       resolve(worktree).startsWith(`${resolve(this.workRoot)}${sep}`) &&
       existsSync(worktree)
-    )
+    ) {
+      await context?.admitEffect?.("explicit");
       await this.removeExecutionDirectory(worktree);
+    }
   }
 
   /** Every harness this driver can start a worker with. */
@@ -1580,6 +1668,13 @@ export class LocalExecutionDriver implements ExecutionDriver {
       return undefined;
     }
     if (this.active.has(handle.identity)) return handle;
+    if ((data as { phase?: string })?.phase === "prepared")
+      throw new StepFault({
+        kind: "decision",
+        evidence: [],
+        question:
+          "Local launch outcome is unresolved; preserve the prepared request and use supported cancellation before replacement",
+      });
     const active = this.require(handle);
     if (existsSync(active.worktree)) return handle;
     const harness = this.resolveHarness(
@@ -1591,6 +1686,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
     // proves cessation through the existing process-group contract.
     if ((await harness.observe(active.handle)).state === "running")
       return handle;
+    await cessationAdmission(context);
     await harness.cancel(active.handle);
     this.unavailableSession(handle, context);
     return undefined;
@@ -1652,7 +1748,24 @@ export class LocalExecutionDriver implements ExecutionDriver {
       if (context?.cancelled()) this.unavailableSession(handle, context);
       return;
     }
+    if (
+      (settled as { phase?: string })?.phase === "prepared" &&
+      !this.active.has(handle.identity)
+    ) {
+      await this.cancelUnrecorded(handle.identity, context);
+      context?.checkpoint({
+        ...handle,
+        data: {
+          ...settled,
+          stopped:
+            "Prepared local launch cancelled through its owned worker identity",
+        },
+      });
+      await context?.admitEffect?.("settled");
+      return;
+    }
     const active = this.require(handle);
+    await cessationAdmission(context);
     await this.resolveHarness(
       active.request.item,
       active.executionBinding,
@@ -1673,6 +1786,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
     const settled = handle.data as Partial<Settled> | undefined;
     // An ended attempt: its worktree goes if a crash kept it.
     if (settled?.result || settled?.stopped !== undefined) {
+      await context?.admitEffect?.("explicit");
       if (settled.worktree && existsSync(settled.worktree))
         await this.removeExecutionDirectory(settled.worktree);
       if (settled.result) return structuredClone(settled.result);
@@ -1744,6 +1858,16 @@ export class LocalExecutionDriver implements ExecutionDriver {
           active.request,
           this.contentStore,
           result,
+          async (collected) => {
+            context?.checkpoint({
+              ...handle,
+              data: {
+                ...active,
+                result: JSON.parse(JSON.stringify(collected)),
+              },
+            });
+            await context?.admitEffect?.("explicit");
+          },
         );
       if (result.session) collected.session = structuredClone(result.session);
     } catch (error) {
@@ -1788,6 +1912,13 @@ export class LocalExecutionDriver implements ExecutionDriver {
       ).cancel(active.handle);
       this.unavailableSession(handle, context);
     }
+    if (isCheckpointAdmissionFailure(collectionError)) throw collectionError;
+    if (
+      !collected &&
+      observed.interrupted !== true &&
+      attachedFault(collectionError)?.kind === "work"
+    )
+      throw collectionError;
     const interrupted = !collected && observed.interrupted === true;
     // Only a wrong result ends the attempt here. A transient, config or
     // defect fault from collecting a finished worker's result is not the
@@ -1816,6 +1947,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
               : String(collectionError),
         },
       });
+    await context?.admitEffect?.("explicit");
     this.active.delete(handle.identity);
     if (
       collected ||
@@ -1886,6 +2018,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
         "The retained session adapter is unavailable for cleanup",
       );
     }
+    await awaitCheckpointAdmission(session.scope.repository, "explicit");
     for (const harness of harnesses) {
       if (!harness.releaseSession)
         throw new Error(

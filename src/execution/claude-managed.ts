@@ -23,13 +23,19 @@ import type {
   ExecutionResult,
   ModelInvocationUsage,
 } from "../contracts.js";
-import { cancelledFault, classifyFaults } from "../fault.js";
+import {
+  cancelledFault,
+  classifyFaults,
+  decision,
+  StepFault,
+} from "../fault.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import {
   addWorktree,
   hasUnresolvedSubprocesses,
   removeWorktree,
 } from "../process.js";
+import { isCheckpointAdmissionFailure } from "../recovery-checkpoint.js";
 import { endAttempt, stoppedFault, transportFailure } from "./attempt.js";
 import { verifyClaudeBootstrap } from "./claude-managed-bootstrap.js";
 import {
@@ -84,6 +90,12 @@ type Phase =
   | "result-ready"
   | "disposed";
 interface Active {
+  checkpointAdmission?: {
+    phase: string;
+    boundary: "before-effect" | "settled";
+    knownNotDispatched: boolean;
+    at: string;
+  };
   root: string;
   request: ExecutionRequest;
   inputDigest: string;
@@ -92,6 +104,12 @@ interface Active {
   cleanupStartedAt?: number;
   phase: Phase;
   files: { id: string; name: string }[];
+  uploadIntent?: { name: string; digest: string; bytes: number };
+  cleanupIntent?: {
+    kind: "interrupt" | "delete-session" | "delete-file";
+    identity: string;
+    disposition: "intent" | "observed";
+  };
   deletedFiles: string[];
   /** Lower bound for finding sessions tagged with this attempt. */
   createdAfter?: string;
@@ -133,6 +151,7 @@ const interrupted = (detail: string): ExecutionObservation => ({
 /** Provider semantics are implemented here; live proof remains the separate #259 qualification. */
 export class ClaudeManagedExecutionDriver implements ExecutionDriver {
   readonly childAgents = "disabled" as const;
+  readonly effectAdmission = "controller-checkpoint-v1" as const;
   private readonly client: ClaudeManagedClient;
   constructor(
     private readonly args: {
@@ -166,12 +185,63 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       throw new Error("Invalid Claude managed attempt binding");
     return data;
   }
-  private save(handle: ExecutionHandle, context?: ExecutionContext): void {
+  private cessationContext(
+    context?: ExecutionContext,
+  ): ExecutionContext | undefined {
+    if (!context) return undefined;
+    return {
+      ...context,
+      admitEffect: async (reason) => {
+        try {
+          await context.admitEffect?.(reason);
+        } catch (error) {
+          if (!isCheckpointAdmissionFailure(error)) throw error;
+        }
+      },
+    };
+  }
+  private async saveCessation(
+    handle: ExecutionHandle,
+    context?: ExecutionContext,
+  ): Promise<void> {
+    try {
+      await this.save(handle, context, "before-effect");
+    } catch (error) {
+      if (!isCheckpointAdmissionFailure(error)) throw error;
+      delete this.active(handle).checkpointAdmission;
+      context?.checkpoint(handle);
+    }
+  }
+  private async save(
+    handle: ExecutionHandle,
+    context?: ExecutionContext,
+    reason: "before-effect" | "settled" = "settled",
+  ): Promise<void> {
     if (!context)
       throw new Error(
         "Managed execution requires controller checkpoint authority",
       );
+    const data = this.active(handle);
+    if (
+      data.checkpointAdmission &&
+      data.checkpointAdmission.phase !== data.phase
+    )
+      delete data.checkpointAdmission;
     context.checkpoint(handle);
+    try {
+      await context.admitEffect?.(reason);
+    } catch (error) {
+      if (isCheckpointAdmissionFailure(error) && context.checkpointedEffects) {
+        data.checkpointAdmission = {
+          phase: data.phase,
+          boundary: reason,
+          knownNotDispatched: reason === "before-effect",
+          at: new Date().toISOString(),
+        };
+        context.checkpoint(handle);
+      }
+      throw error;
+    }
   }
   private remaining(data: Active): number {
     const ms =
@@ -196,6 +266,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     handle: ExecutionHandle,
     context: ExecutionContext,
   ): Promise<never> {
+    if (isCheckpointAdmissionFailure(error)) throw error;
     const data = this.active(handle);
     return endAttempt(error, {
       expired: this.expired(data),
@@ -215,7 +286,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
   ): Promise<never> {
     const data = this.active(handle);
     data.stopped ??= { detail, interrupted };
-    this.save(handle, context);
+    await this.save(handle, context);
     await this.stop(handle, "failed", context);
     throw stoppedFault(data.stopped.detail, data.stopped.interrupted);
   }
@@ -392,7 +463,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       identity: attemptId,
       data,
     };
-    this.save(handle, context);
+    await this.save(handle, context);
     writeFileSync(
       join(root, "factory-bootstrap.mjs"),
       CLAUDE_BOOTSTRAP_SCRIPT,
@@ -431,6 +502,20 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         if (data.files.some((file) => file.name === name)) continue;
         if (context.cancelled())
           throw cancelledFault("Claude preparation cancelled before upload");
+        if (data.uploadIntent)
+          throw new StepFault(
+            decision(
+              "Managed file upload has an unresolved recorded intent; preserve its identity and do not repeat upload",
+            ),
+          );
+        const inputBytes = readFileSync(join(data.root, name));
+        if (context.checkpointedEffects)
+          data.uploadIntent = {
+            name,
+            digest: claudeByteDigest(inputBytes),
+            bytes: inputBytes.byteLength,
+          };
+        await this.save(handle, context, "before-effect");
         // An upload whose response was lost may leave an unreferenced file
         // that cannot be found; it is recorded for operator cleanup.
         const file = await this.client
@@ -445,7 +530,8 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
           });
         if (!file.id) throw new Error("Claude upload returned no identity");
         data.files.push({ id: file.id, name });
-        this.save(handle, context);
+        delete data.uploadIntent;
+        await this.save(handle, context);
       }
       if (context.cancelled())
         throw cancelledFault(
@@ -453,7 +539,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         );
       data.createdAfter ??= new Date(Date.now() - clockSkewMs).toISOString();
       data.phase = "create-submitted";
-      this.save(handle, context);
+      await this.save(handle, context, "before-effect");
       const resources: NonNullable<SessionCreateParams["resources"]> =
         data.files.map((file) => ({
           type: "file",
@@ -467,7 +553,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       );
       data.sessionId = session.id;
       data.phase = "created";
-      this.save(handle, context);
+      await this.save(handle, context);
     }
     if (data.phase !== "created") return;
     const session = await this.client.retrieve(
@@ -492,11 +578,11 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         "Claude session did not start as an idle bound allocation",
       );
     data.resourcesDigest = digest(session.resources);
-    this.save(handle, context);
+    await this.save(handle, context);
     if (context.cancelled())
       throw cancelledFault("Claude input cancelled before bootstrap");
     data.phase = "bootstrap-submitted";
-    this.save(handle, context);
+    await this.save(handle, context, "before-effect");
     const sent = await this.client.send(
       session.id,
       {
@@ -512,7 +598,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       );
     data.bootstrapEventId = event.id;
     data.phase = "bootstrap-running";
-    this.save(handle, context);
+    await this.save(handle, context);
   }
   private async file(
     data: Active,
@@ -585,7 +671,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         data.sessionId = found[0].id;
         data.phase = "created";
       } else data.phase = "prepared";
-      this.save(handle, context);
+      await this.save(handle, context);
     }
     if (data.phase === "prepared" || data.phase === "created")
       return { state: "running", detail: "Preparing the managed session" };
@@ -600,7 +686,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       this.remaining(data),
     );
     this.preserve(data, session, events);
-    this.save(handle, context);
+    await this.save(handle, context);
     if (data.phase === "bootstrap-submitted") {
       const sent = events.filter((event) => event.type === "user.message");
       if (
@@ -612,7 +698,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       } else if (!sent.length && session.status === "idle")
         data.phase = "created";
       else return interrupted("Bootstrap submission outcome is unknown");
-      this.save(handle, context);
+      await this.save(handle, context);
       if (data.phase === "created") return { state: "running" };
     }
     if (data.phase === "implementation-submitted") {
@@ -633,7 +719,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       )
         data.phase = "bootstrap-verified";
       else return interrupted("Implementation submission outcome is unknown");
-      this.save(handle, context);
+      await this.save(handle, context);
       if (data.phase === "bootstrap-verified") return { state: "running" };
     }
     if (
@@ -670,7 +756,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       proof.historyDigest = historyDigest(events);
       data.bootstrap = proof;
       data.phase = "bootstrap-verified";
-      this.save(handle, context);
+      await this.save(handle, context);
       return { state: "running" };
     }
     if (!data.implementationEventId)
@@ -707,7 +793,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       endEventId: turn.endEventId,
     };
     data.phase = "result-ready";
-    this.save(handle, context);
+    await this.save(handle, context);
     return { state: "complete" };
   }
   private async submitImplementation(
@@ -745,7 +831,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     if (context.cancelled())
       throw cancelledFault("Claude implementation cancelled before submission");
     data.phase = "implementation-submitted";
-    this.save(handle, context);
+    await this.save(handle, context, "before-effect");
     const sent = await this.client.send(
       data.sessionId,
       { type: "user.message", content: [{ type: "text", text }] },
@@ -758,7 +844,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       );
     data.implementationEventId = event.id;
     data.phase = "running";
-    this.save(handle, context);
+    await this.save(handle, context);
   }
   /** Interrupts a running turn. An interrupt whose response was lost is found in the session history. */
   private async interrupt(
@@ -773,6 +859,22 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         .at(-1);
       if (prior) data.interruptEventId = prior.id;
       else {
+        if (
+          data.cleanupIntent?.kind === "interrupt" &&
+          data.cleanupIntent.disposition === "intent"
+        )
+          throw new StepFault(
+            decision(
+              "Managed interrupt remains unknown; inspect the preserved session history before another mutation",
+            ),
+          );
+        if (context?.checkpointedEffects)
+          data.cleanupIntent = {
+            kind: "interrupt",
+            identity: sessionId,
+            disposition: "intent",
+          };
+        await this.saveCessation(handle, context);
         const sent = await this.client.send(
           sessionId,
           { type: "user.interrupt" },
@@ -782,8 +884,14 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         if (sent.data?.length !== 1 || event?.type !== "user.interrupt")
           throw new Error("Claude interrupt acknowledgement is ambiguous");
         data.interruptEventId = event.id;
+        if (context?.checkpointedEffects)
+          data.cleanupIntent = {
+            kind: "interrupt",
+            identity: sessionId,
+            disposition: "observed",
+          };
       }
-      this.save(handle, context);
+      await this.save(handle, context);
     }
     while (true) {
       const events = await this.client.events(sessionId, this.remaining(data));
@@ -843,26 +951,43 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         if (events) {
           this.preserve(data, session, events);
           this.usage(session, handle, context);
-          this.save(handle, context);
+          await this.save(handle, context);
         }
       }
       // Deleting a session removes its sandbox, not the reusable environment.
+      if (context?.checkpointedEffects)
+        data.cleanupIntent = {
+          kind: "delete-session",
+          identity: sessionId,
+          disposition: "intent",
+        };
+      await this.save(handle, context, "before-effect");
       await this.client.deleteSession(sessionId, this.remaining(data));
       if (await this.client.present(sessionId, this.remaining(data)))
         throw new Error(
           "Claude owned session/sandbox deletion is not confirmed",
         );
+      if (data.cleanupIntent) data.cleanupIntent.disposition = "observed";
+      await this.save(handle, context);
     }
     for (const file of data.files) {
       if (data.deletedFiles.includes(file.id)) continue;
+      if (context?.checkpointedEffects)
+        data.cleanupIntent = {
+          kind: "delete-file",
+          identity: file.id,
+          disposition: "intent",
+        };
+      await this.save(handle, context, "before-effect");
       await this.client.deleteFile(file.id, this.remaining(data));
       if (!(await this.client.fileAbsent(file.id, this.remaining(data))))
         throw new Error("Claude uploaded file deletion is not confirmed");
       data.deletedFiles.push(file.id);
-      this.save(handle, context);
+      if (data.cleanupIntent) data.cleanupIntent.disposition = "observed";
+      await this.save(handle, context);
     }
     data.phase = "disposed";
-    this.save(handle, context);
+    await this.save(handle, context);
   }
   /** Stops any running turn and disposes the attempt's resources. */
   private async stop(
@@ -882,14 +1007,14 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
       this.assertSession(session, handle);
       if (session.status === "running" || session.status === "rescheduling")
         try {
-          await this.interrupt(handle, context);
+          await this.interrupt(handle, this.cessationContext(context));
         } catch (error) {
           // A session deleted meanwhile has no turn left to interrupt.
           if (!claudeGone(error)) throw error;
         }
     }
     data.terminal ??= terminal;
-    this.save(handle, context);
+    await this.save(handle, context);
     await this.dispose(handle, context);
   }
   @classifyFaults(executionFault)
@@ -948,7 +1073,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         await this.fail(error, handle, context);
       }
       data.terminal = "complete";
-      this.save(handle, context);
+      await this.save(handle, context);
     }
     await this.dispose(handle, context);
     return data.result!;
@@ -1031,10 +1156,18 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
           assets: readProducedAssets({ item: data.request.item, worktree }),
           evidence,
         },
+        async (collected) => {
+          data.result = collected;
+          await this.save(handle, context);
+          await context.admitEffect?.("explicit");
+        },
       );
     } finally {
-      if (!hasUnresolvedSubprocesses())
+      if (data.result && !hasUnresolvedSubprocesses()) {
+        await this.save(handle, context);
+        await context.admitEffect?.("explicit");
         await removeWorktree(this.args.checkout, worktree);
+      }
     }
   }
 }

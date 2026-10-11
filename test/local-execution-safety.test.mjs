@@ -1183,7 +1183,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           .digest("hex"),
         ...effectMetadata,
       };
-      graphProjectionControl(
+      await graphProjectionControl(
         expanded,
         materialized.graph,
         saveExpanded,
@@ -1202,7 +1202,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           .effects[0].observation,
         undefined,
       );
-      assert.throws(
+      await assert.rejects(
         () =>
           graphProjectionControl(
             reloadedExpansion,

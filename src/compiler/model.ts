@@ -20,8 +20,8 @@ import {
   type PlanningRequest,
   type PlanReviewRequest,
   type ResultReviewEvidenceSource,
-  type ReviewImageInput,
   type ResultReviewFinding,
+  type ReviewImageInput,
   type ValidationCommandReceipt,
 } from "../contracts.js";
 import { attachedFault, attachFault, decision, transient } from "../fault.js";
@@ -33,6 +33,10 @@ import {
   ProviderTurnElapsedTimeoutError,
   ProviderTurnTimeoutError,
 } from "../provider-turn.js";
+import {
+  isCheckpointAdmissionFailure,
+  markCheckpointEffectDispatched,
+} from "../recovery-checkpoint.js";
 import {
   type ReviewBodyFile,
   type ReviewPacket,
@@ -796,7 +800,7 @@ export class StructuredPlanningModel implements PlanningModel {
         turn.stopped = true;
         throw new ProviderTurnElapsedTimeoutError(args.deadlineAt);
       }
-      invocation.beforeProviderAttempt?.();
+      await invocation.beforeProviderAttempt?.();
       await this.transport.run({
         role: args.role,
         prompt: args.prompt,
@@ -858,6 +862,18 @@ export class StructuredPlanningModel implements PlanningModel {
       });
       return parsed;
     } catch (error) {
+      if (isCheckpointAdmissionFailure(error)) {
+        if (turn.started || turn.nativeInvocationStarted || turn.ended)
+          markCheckpointEffectDispatched(error);
+        throw attachFault(
+          error,
+          decision(
+            error.knownNotDispatched
+              ? "Recovery checkpoint admission failed before dispatch. Preserve the exact invocation and consumed accounting until durable checkpoint admission is restored."
+              : "Recovery checkpoint retention is unavailable after a native dispatch or observed return. Preserve its actual receipts, owned resources and consumed accounting until the retained originals are durably acknowledged.",
+          ),
+        );
+      }
       const failureClass = invalidStructuredOutput
         ? "structured-output-parse"
         : (turn.failureClass ?? providerFailureClass(error));

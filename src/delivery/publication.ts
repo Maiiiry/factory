@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import type {
+  MergeControl,
   PublicationControl,
-  PullRequestPublication,
+  PublicationEffectRequest,
   PullRequestIdentity,
+  PullRequestPublication,
 } from "../contracts.js";
-import type { FactoryState } from "../state.js";
 import { attachFault, decision } from "../fault.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "../recovery-checkpoint.js";
+import type { FactoryState } from "../state.js";
+import { deliveredHead, deliveryEarlierHeads } from "./branch-update.js";
 
 const MAX_INTENTS = 64;
 export interface PublicationIntent {
@@ -21,7 +28,15 @@ export interface PublicationIntent {
   titleDigest: string;
   bodyDigest: string;
   recordedAt: string;
-  submission: "possibly-submitted" | "observed-without-create";
+  submission: "preparing" | "possibly-submitted" | "observed-without-create";
+  admissionBlockedAt?: string;
+  effects?: {
+    request: PublicationEffectRequest;
+    recordedAt: string;
+    disposition: "intent" | "observed" | "blocked";
+    observedAt?: string;
+    integratedSha?: string;
+  }[];
   observation?: {
     number: number;
     branch: string;
@@ -96,11 +111,72 @@ export function assertPublicationIntents(state: FactoryState): void {
       if (
         typeof intent.recordedAt !== "string" ||
         !Number.isFinite(Date.parse(intent.recordedAt)) ||
-        !["possibly-submitted", "observed-without-create"].includes(
-          intent.submission,
-        )
+        ![
+          "preparing",
+          "possibly-submitted",
+          "observed-without-create",
+        ].includes(intent.submission)
       )
         throw new Error("Publication request disposition invalid");
+      if (
+        (intent.effects !== undefined || intent.submission === "preparing") &&
+        state.schemaVersion !== 17
+      )
+        throw new Error(
+          "Publication effect admission requires execution snapshot 17",
+        );
+      if (
+        intent.admissionBlockedAt !== undefined &&
+        (state.schemaVersion !== 17 ||
+          intent.observation ||
+          !Number.isFinite(Date.parse(intent.admissionBlockedAt)))
+      )
+        throw new Error("Invalid blocked publication admission");
+      if (intent.effects !== undefined) {
+        if (
+          !Array.isArray(intent.effects) ||
+          !intent.effects.length ||
+          intent.effects.length > 3 ||
+          new Set(intent.effects.map((effect) => effect.request.kind)).size !==
+            intent.effects.length
+        )
+          throw new Error("Invalid publication preparation history");
+        for (const effect of intent.effects) {
+          const request = effect.request;
+          if (
+            !request ||
+            !["lfs-upload", "branch-push", "merge"].includes(request.kind) ||
+            (request.kind === "merge" &&
+              (!Number.isSafeInteger(request.pullRequest) ||
+                request.pullRequest! < 1 ||
+                request.pullRequest !== intent.observation?.number)) ||
+            (effect.integratedSha !== undefined &&
+              (request.kind !== "merge" ||
+                effect.disposition !== "observed" ||
+                !/^[a-f0-9]{40}$/.test(effect.integratedSha))) ||
+            request.branch !== intent.branch ||
+            (request.kind === "merge"
+              ? ![
+                  intent.headSha,
+                  deliveredHead(state.work[itemId]!),
+                  ...deliveryEarlierHeads(state.work[itemId]!),
+                ].includes(request.headSha)
+              : request.headSha !== intent.headSha) ||
+            !Number.isFinite(Date.parse(effect.recordedAt)) ||
+            !["intent", "observed", "blocked"].includes(effect.disposition) ||
+            (request.expectedRemoteHead !== undefined &&
+              request.expectedRemoteHead !== null &&
+              !/^[a-f0-9]{40}$/.test(request.expectedRemoteHead)) ||
+            (effect.disposition === "observed"
+              ? !effect.observedAt ||
+                !Number.isFinite(Date.parse(effect.observedAt))
+              : effect.observedAt !== undefined)
+          )
+            throw new Error(
+              "Publication preparation differs from its exact request",
+            );
+        }
+      }
       if (intent.observation) {
         const observed = intent.observation;
         if (
@@ -130,7 +206,7 @@ export function assertPublicationIntents(state: FactoryState): void {
           );
       } else {
         if (
-          intent.submission !== "possibly-submitted" ||
+          !["preparing", "possibly-submitted"].includes(intent.submission) ||
           index !== intents.length - 1
         )
           throw new Error(
@@ -285,7 +361,15 @@ export function publicationControl(
   return {
     get reconcileOnly() {
       assertCurrent();
-      return Boolean(retained || created || consumed);
+      return Boolean(
+        consumed ||
+          (retained &&
+            (retained.submission !== "preparing" ||
+              !retained.effects?.every(
+                (effect) => effect.disposition === "observed",
+              ))) ||
+          (created && created.submission !== "preparing"),
+      );
     },
     get expectedPublication() {
       assertCurrent();
@@ -301,17 +385,105 @@ export function publicationControl(
         : undefined;
     },
     assertRequest,
-    beforeCreate(request) {
+    async beforeEffect(request, effect) {
       assertRequest(request);
-      if (retained || created || consumed)
+      if (state.schemaVersion !== 17) return;
+      if (retained || consumed || created?.submission === "possibly-submitted")
+        throw fenced(
+          "Retained publication preparation cannot authorize another external effect",
+        );
+      if (
+        effect.branch !== request.branch ||
+        effect.headSha !== request.headSha
+      )
+        throw fenced(
+          "Publication preparation differs from the exact candidate",
+        );
+      created ??= record(request, "preparing");
+      created.effects ??= [];
+      if (created.effects.some((prior) => prior.request.kind === effect.kind))
+        throw fenced(
+          "Publication preparation effect is already recorded; reconcile its exact outcome",
+        );
+      created.effects.push({
+        request: structuredClone(effect),
+        recordedAt: new Date().toISOString(),
+        disposition: "intent",
+      });
+      advanceHistory();
+      save();
+      try {
+        await awaitCheckpointAdmission(state.repository, "before-effect");
+      } catch (error) {
+        if (isCheckpointAdmissionFailure(error) && state.schemaVersion === 17) {
+          if (
+            created?.effects?.at(-1)?.disposition === "intent" &&
+            created.submission === "preparing"
+          )
+            created.effects.at(-1)!.disposition = "blocked";
+          else if (created)
+            created.admissionBlockedAt = new Date().toISOString();
+          advanceHistory();
+          save();
+        }
+        throw error;
+      }
+      assertCurrent();
+    },
+    async observedEffect(request, effect) {
+      assertRequest(request);
+      if (state.schemaVersion !== 17) return;
+      const intent = retained ?? created;
+      const prior = intent?.effects?.find(
+        (prior) => prior.request.kind === effect.kind,
+      );
+      if (
+        !prior ||
+        prior.request.branch !== effect.branch ||
+        prior.request.headSha !== effect.headSha
+      )
+        throw fenced(
+          "Publication preparation outcome lacks its original exact intent",
+        );
+      prior.disposition = "observed";
+      prior.observedAt ??= new Date().toISOString();
+      advanceHistory();
+      save();
+      await awaitCheckpointAdmission(state.repository, "settled");
+      assertCurrent();
+    },
+    async beforeCreate(request) {
+      assertRequest(request);
+      const intent = retained ?? created;
+      if (
+        consumed ||
+        (intent &&
+          (intent.submission !== "preparing" ||
+            !intent.effects?.every(
+              (effect) => effect.disposition === "observed",
+            )))
+      )
         throw fenced(
           "Publication create permit is unavailable or already consumed",
         );
       consumed = true;
-      created = record(request, "possibly-submitted");
-      save(); // Only this invocation after successful atomic save may dispatch once.
+      created = intent ?? record(request, "possibly-submitted");
+      created.submission = "possibly-submitted";
+      advanceHistory();
+      save();
+      try {
+        await awaitCheckpointAdmission(state.repository, "before-effect");
+      } catch (error) {
+        if (isCheckpointAdmissionFailure(error) && state.schemaVersion === 17) {
+          if (created) created.admissionBlockedAt = new Date().toISOString();
+          advanceHistory();
+          save();
+        }
+        throw error;
+      }
+      assertCurrent();
     },
-    observed(request, identity) {
+    async observed(request, identity) {
       assertRequest(request);
       if (
         identity.branch !== request.branch ||
@@ -345,6 +517,7 @@ export function publicationControl(
           intent.observation.publication.bodyDigest !== publication.bodyDigest)
       )
         throw fenced("Recorded PR metadata changed during reconciliation");
+      delete intent.admissionBlockedAt;
       intent.observation = {
         number: identity.number,
         branch: identity.branch,
@@ -354,6 +527,8 @@ export function publicationControl(
       };
       advanceHistory();
       save(); // Persist positive binding before ordinary published/delivery state.
+      await awaitCheckpointAdmission(state.repository, "settled");
+      assertCurrent();
     },
   };
 }
@@ -380,4 +555,101 @@ export function confirmClosedPublication(
       "Closed PR retry lacks its recorded observed publication identity",
     );
   entry.closedConfirmedAt = new Date().toISOString();
+}
+
+/** The same retained publication owner admits its exact merge once. */
+export function mergeControl(
+  state: FactoryState,
+  itemId: string,
+  save: () => void,
+): MergeControl {
+  if (state.schemaVersion !== 17)
+    return {
+      beforeMerge: async () => undefined,
+      observedMerge: async () => undefined,
+    };
+  const work = state.work[itemId];
+  const intent = state.publicationIntents?.[itemId]?.at(-1);
+  const owner = {
+    runId: state.runId,
+    configDigest: state.configDigest,
+    attempt: work?.attempt,
+  };
+  const assertCurrent = (identity: PullRequestIdentity) => {
+    if (
+      !work ||
+      state.work[itemId] !== work ||
+      state.runId !== owner.runId ||
+      state.configDigest !== owner.configDigest ||
+      work.attempt !== owner.attempt ||
+      !intent ||
+      state.publicationIntents?.[itemId]?.at(-1) !== intent ||
+      intent.attemptId !== work.attempt ||
+      intent.observation?.number !== identity.number ||
+      deliveredHead(work) !== identity.headSha ||
+      intent.branch !== identity.branch
+    )
+      throw fenced(
+        "Merge lacks the exact retained publication owner and observation",
+      );
+  };
+  return {
+    async beforeMerge(identity) {
+      assertCurrent(identity);
+      if (intent!.effects?.some((effect) => effect.request.kind === "merge"))
+        throw fenced(
+          "Merge request is already retained; only exact read-only reconciliation is admitted",
+        );
+      intent!.effects ??= [];
+      intent!.effects.push({
+        request: {
+          kind: "merge",
+          pullRequest: identity.number,
+          branch: identity.branch,
+          headSha: identity.headSha,
+        },
+        recordedAt: new Date().toISOString(),
+        disposition: "intent",
+      });
+      save();
+      try {
+        await awaitCheckpointAdmission(state.repository, "before-effect");
+      } catch (error) {
+        if (isCheckpointAdmissionFailure(error)) {
+          intent!.effects!.at(-1)!.disposition = "blocked";
+          save();
+        }
+        throw error;
+      }
+      assertCurrent(identity);
+    },
+    async observedMerge(identity, result) {
+      assertCurrent(identity);
+      if (!/^[a-f0-9]{40}$/.test(result.integratedSha))
+        throw fenced("Merge receipt lacks an authenticated commit identity");
+      let effect = intent!.effects?.find(
+        (effect) => effect.request.kind === "merge",
+      );
+      if (!effect) {
+        intent!.effects ??= [];
+        effect = {
+          request: {
+            kind: "merge",
+            pullRequest: identity.number,
+            branch: identity.branch,
+            headSha: identity.headSha,
+          },
+          recordedAt: new Date().toISOString(),
+          disposition: "observed",
+        };
+        intent!.effects.push(effect);
+      }
+      effect.disposition = "observed";
+      effect.observedAt ??= new Date().toISOString();
+      effect.integratedSha = result.integratedSha;
+      save();
+      await awaitCheckpointAdmission(state.repository, "settled");
+      assertCurrent(identity);
+    },
+  };
 }

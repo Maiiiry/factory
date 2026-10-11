@@ -1,13 +1,19 @@
-import { isExecutionState, isPreparationState } from "./state.js";
 import { randomUUID } from "node:crypto";
+import { objectiveComplete } from "./completion.js";
 import type { FactoryConfig } from "./config.js";
 import { factoryConfigDigest } from "./config.js";
 import type { GitHubGateway } from "./contracts.js";
-import { objectiveComplete } from "./completion.js";
-import type { ProjectPhase } from "./github-project-state.js";
-import type { ContinuationState } from "./state.js";
-import { readContinuation } from "./state-store.js";
 import { gitHubTransportOf } from "./github-client.js";
+import type { ProjectPhase } from "./github-project-state.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import type { ContinuationState } from "./state.js";
+import { isExecutionState, isPreparationState } from "./state.js";
+import { readContinuation } from "./state-store.js";
 
 /** Derived presentation only; a Project card never grants lifecycle authority. */
 export function projectPhase(state: ContinuationState): ProjectPhase {
@@ -37,7 +43,7 @@ export function projectPhase(state: ContinuationState): ProjectPhase {
 }
 
 /** Same controlled checkpoint and atomic continuation as other projections. */
-export async function projectGitHubProjectStatus(args: {
+async function projectGitHubProjectStatusUnscoped(args: {
   config: FactoryConfig;
   objective: number;
   github: GitHubGateway;
@@ -102,7 +108,7 @@ export async function projectGitHubProjectStatus(args: {
       optionId,
       requestId,
       pending,
-      beforeWrite: (intent) => {
+      beforeWrite: async (intent) => {
         const state = live();
         // Revalidate phase after awaited reads; do not publish a stale checkpoint.
         if (projectPhase(state) !== phase)
@@ -117,6 +123,7 @@ export async function projectGitHubProjectStatus(args: {
         state.githubProjectStatus.requests.push(intent);
         delete state.githubProjectStatus.observed;
         args.save();
+        await awaitCheckpointAdmission(args.config.repository, "before-effect");
       },
     });
     const state = live();
@@ -162,7 +169,10 @@ export async function projectGitHubProjectStatus(args: {
       delete state.githubProjectStatus!.failure;
     }
     args.save();
+    // The exact original response must be durable before dependent work proceeds.
+    await awaitCheckpointAdmission(args.config.repository, "explicit");
   } catch (error) {
+    if (isCheckpointAdmissionFailure(error)) throw error;
     const state = live();
     state.githubProjectStatus ??= { requests: [] };
     const last = state.githubProjectStatus.requests.at(-1);
@@ -188,8 +198,27 @@ export async function projectGitHubProjectStatus(args: {
         ? "update-unknown"
         : "projection-unavailable";
     args.save();
+    await awaitCheckpointAdmission(args.config.repository, "settled");
     process.stderr.write(
       `Factory Project status for Objective #${args.objective}: ${state.githubProjectStatus.failure}; inspect Factory status.\n`,
     );
   }
+}
+
+/** Direct callers use the same admitted repository scope as owned controllers. */
+export function projectGitHubProjectStatus(
+  args: Parameters<typeof projectGitHubProjectStatusUnscoped>[0],
+): Promise<void> {
+  if (!args.config.githubManagement?.projectStatus) return Promise.resolve();
+  return withRecoveryCheckpointScope(
+    {
+      config: args.config,
+      buildClosure: () =>
+        buildRecoveryCheckpointClosure({ config: args.config }),
+    },
+    async () => {
+      await projectGitHubProjectStatusUnscoped(args);
+      await awaitCheckpointAdmission(args.config.repository, "settled");
+    },
+  );
 }

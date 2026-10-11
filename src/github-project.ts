@@ -198,7 +198,7 @@ export async function projectStatusOnGitHub(
       observedAt: new Date().toISOString(),
       kind: "unchanged",
     };
-  request.beforeWrite({
+  await request.beforeWrite({
     requestId: request.requestId,
     repository,
     objective: request.objective,

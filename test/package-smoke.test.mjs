@@ -294,6 +294,12 @@ assert.throws(() => assertPinnedNpmScripts(checkout, rawBase, rawChanged, [boots
     const installedConfig = JSON.parse(readFileSync(config, "utf8"));
     assert.equal(installedConfig.repository, "example/package-smoke");
     assert.equal(installedConfig.checkout, checkout);
+    const persistence = JSON.parse(
+      run("persistence", "status", "--config", config),
+    );
+    assert.equal(persistence.enabled, false);
+    assert.equal(persistence.durability, "local-only");
+    assert.equal(persistence.lastAcknowledged, undefined);
     const recipeConfig = join(root, "recipe-config.json");
     writeFileSync(
       recipeConfig,
