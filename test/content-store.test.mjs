@@ -1160,6 +1160,35 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     baseSha,
     new Set(["OBJECTIVE"]),
   );
+  const invalidPublishedCi = structuredClone(routeGraph);
+  invalidPublishedCi.coverage[0].proof = {
+    kind: "published-ci",
+    checkName: "gate",
+    targetItem: "has-files",
+  };
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidPublishedCi,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /Published CI cannot require a conditional branch delivery/,
+  );
+  const invalidPreparation = structuredClone(routeGraph);
+  invalidPreparation.coverage[0].environment.readiness = "prepare";
+  invalidPreparation.coverage[0].environment.preparedBy = "has-files";
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidPreparation,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /Mandatory environment preparation cannot depend on a conditional branch/,
+  );
   const invalidAggregate = structuredClone(routeGraph);
   invalidAggregate.items.push({
     ...routeDefaults,
@@ -1367,6 +1396,53 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
       (item) => item.id,
     ),
     ["inventory"],
+  );
+  // The supported cancellation disposition keeps absent and held condition facts unresolved through atomic reload.
+  const cancelledHeld = structuredClone(unknownRoute);
+  cancelledHeld.cancelRequested = true;
+  for (const work of Object.values(cancelledHeld.work))
+    work.status = "cancelled";
+  saveState(snapshot, cancelledHeld);
+  cancelledHeld.cancelledAt = new Date().toISOString();
+  saveState(snapshot, cancelledHeld);
+  const restoredCancellation = parseFactoryState(
+    JSON.parse(readFileSync(snapshot, "utf8")),
+    routingConfig.repository,
+    producer.objective,
+  );
+  assert.equal(
+    restoredCancellation.work["has-files"].routing.disposition,
+    "held",
+  );
+  assert.equal(
+    restoredCancellation.work["no-files"].routing.disposition,
+    "held",
+  );
+  assert.equal(restoredCancellation.conditionFacts, undefined);
+  assert.equal(restoredCancellation.work["has-files"].attempt, undefined);
+  const cancelledAbsent = structuredClone(cancelledHeld);
+  delete cancelledAbsent.work["has-files"].routing;
+  delete cancelledAbsent.work["no-files"].routing;
+  for (const work of Object.values(cancelledAbsent.work))
+    work.completedAt = new Date().toISOString();
+  saveState(snapshot, cancelledAbsent);
+  parseFactoryState(
+    JSON.parse(readFileSync(snapshot, "utf8")),
+    routingConfig.repository,
+    producer.objective,
+  );
+  const cancellationNotRecorded = structuredClone(cancelledHeld);
+  delete cancellationNotRecorded.cancelRequested;
+  delete cancellationNotRecorded.cancelledAt;
+  assert.throws(
+    () => assertWorkRoutingState(cancellationNotRecorded),
+    /Unknown condition cannot start or skip/,
+  );
+  const cancellationStillOwned = structuredClone(cancelledHeld);
+  cancellationStillOwned.work["has-files"].phaseReservation = "coding";
+  assert.throws(
+    () => assertWorkRoutingState(cancellationStillOwned),
+    /Unknown condition cannot start or skip/,
   );
   const operatorRoute = structuredClone(routeState);
   delete operatorRoute.conditionFacts;

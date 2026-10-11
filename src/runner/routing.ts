@@ -13,7 +13,7 @@ import type { FactoryConfig } from "../config.js";
 import type { ContentRef, ContentStore, GitHubGateway } from "../contracts.js";
 import { assertDiscoveryBody } from "../discovery.js";
 import { attachFault, cancelledFault, decision } from "../fault.js";
-import type { FactoryState } from "../state.js";
+import type { FactoryState, WorkState } from "../state.js";
 import { awaitsOperator, clearWait, setWait } from "../step.js";
 import { assertDiscoveryAdmission } from "./discovery.js";
 
@@ -107,6 +107,62 @@ export function assertSkippedWork(state: FactoryState, itemId: string): void {
     throw new Error(
       `Skipped Work Item ${itemId} cannot carry an owned attempt, uncertain effect or implementation acceptance`,
     );
+}
+
+/** Cancellation records an unstarted branch without resolving its unknown predicate. */
+function unownedCancellation(
+  state: FactoryState,
+  itemId: string,
+  work: WorkState,
+): boolean {
+  return (
+    work.status === "cancelled" &&
+    (state.cancelRequested === true ||
+      (typeof state.cancelledAt === "string" &&
+        Number.isFinite(Date.parse(state.cancelledAt)))) &&
+    !state.finalAcceptance &&
+    !state.coordinator?.processes?.length &&
+    !work.attempt &&
+    !work.startedAt &&
+    !work.execution &&
+    !work.worker &&
+    !work.step &&
+    !work.phaseReservation &&
+    !work.requestedPhase &&
+    !work.baseSha &&
+    !work.executionBaseSha &&
+    !work.changeRef &&
+    !work.treeSha &&
+    !work.validation &&
+    !work.failedValidation &&
+    !work.pullRequest &&
+    !work.integratedSha &&
+    !work.deliveredHead &&
+    !work.branchUpdateFrom &&
+    !work.replacedHeads?.length &&
+    !work.closedPullRequest &&
+    work.integratedShaAtStart === undefined &&
+    !work.qaChecks?.length &&
+    !work.preIntegrationChecks?.length &&
+    !work.assets?.length &&
+    !work.selectedAssetSet &&
+    !work.selection &&
+    !work.selectionDigest &&
+    !work.acceptancePending &&
+    !work.acceptanceDecisions?.length &&
+    !work.knowledge &&
+    !work.recovery &&
+    !work.discovery &&
+    !work.discoveryOutput &&
+    !state.publicationIntents?.[itemId]?.length &&
+    ![
+      ...Object.values(state.agentSessions ?? {}),
+      ...(state.agentSessionHistory ?? []),
+    ].some(
+      (session) =>
+        session.scope.itemId === itemId && session.status === "in-flight",
+    )
+  );
 }
 
 /** Restore identities and literal predicates only; artifact availability is a runtime gate. */
@@ -207,7 +263,8 @@ export function assertWorkRoutingState(state: FactoryState): void {
     if (!routing) {
       if (
         work &&
-        (work.status !== "pending" ||
+        ((work.status !== "pending" &&
+          !unownedCancellation(state, item.id, work)) ||
           work.attempt ||
           work.execution ||
           work.startedAt)
@@ -239,7 +296,8 @@ export function assertWorkRoutingState(state: FactoryState): void {
       throw new Error("Work routing differs from the admitted branch binding");
     if (routing.disposition === "held") {
       if (
-        work.status !== "pending" ||
+        (work.status !== "pending" &&
+          !unownedCancellation(state, item.id, work)) ||
         typeof routing.detail !== "string" ||
         !routing.detail ||
         work.attempt ||
