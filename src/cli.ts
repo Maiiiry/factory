@@ -110,7 +110,7 @@ function help(): void {
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
       "  queue add N [N ...] | list | sync | remove N | pause | resume | drain",
       "      The Objectives the background service runs, in order",
-      "  supervisor start | stop [--disable] | upgrade --cli ABSOLUTE_INSTALLED_CLI | uninstall",
+      "  supervisor start | check | stop [--disable] | upgrade --cli ABSOLUTE_INSTALLED_CLI | uninstall",
       "      Control the background service (stop drains and keeps state; --disable also stops it starting at login)",
       "  status [--objective N] [--json]",
       "      With --objective: the phase and the exact next command. Without: the service and the queue",
@@ -299,7 +299,7 @@ async function supervisorCommand(args: string[], path: string): Promise<void> {
     !["start", "stop", "upgrade", "uninstall", "check"].includes(action)
   )
     throw new Error(
-      `Unknown supervisor action ${action ?? "(none)"}; use start, stop, upgrade or uninstall`,
+      `Unknown supervisor action ${action ?? "(none)"}; use start, stop, check, upgrade or uninstall`,
     );
   if (args.includes("--disable") && action !== "stop")
     throw new Error("--disable belongs to factory supervisor stop");

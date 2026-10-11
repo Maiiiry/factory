@@ -21,7 +21,7 @@ factory setup --config-only --repository OWNER/REPO --checkout /abs/path/to/targ
 factory setup --background  --repository OWNER/REPO --checkout /abs/path/to/target
 ```
 
-`--config-only` writes the configuration and starts nothing. `--background` also checks readiness, then installs and starts the service that runs the queue. Running it is the service consent. It grants no provider spending and runs no Objective. The command prints JSON: `status` is `configured`, `ready` or `blocked`. A `blocked` result names the failed stage; fix it and repeat the same command.
+`--config-only` writes the configuration and starts nothing. `--background` also checks readiness, then installs and starts the service that runs the queue. Running it is the service consent. It grants no provider spending and runs no Objective. The command prints JSON: `status` is `configured`, `starting`, `ready` or `blocked`. A `starting` result preserves a successful service start request while authenticated ownership is still pending; inspect it with `factory supervisor check`. Setup reports `ready` only after ownership and fresh remote queue authorization are verified. A `blocked` result names the failed stage; fix it and repeat the same command.
 
 When a prerequisite needs you, Factory’s operator should collect all retained review findings, available readiness results and source-verified requirements into one checklist. Each missing or unknown item should include its reason, source, setup step and verification command; an unchecked stage remains unknown. Answer required choices together and put secrets only in the approved secret store or private credential file, never chat or issues. Verify the requirements before answering a decision. The checklist grants no new authority; independent work can continue only where already authorized and admitted by the current gates.
 
@@ -423,13 +423,14 @@ When a Project queue is configured, foreground `run` also requires a current app
 ```sh
 factory queue add N [N ...]   # consent to run these, in order, within the autonomy limits
 factory queue list | sync | remove N | pause | resume | drain
-factory supervisor start | stop [--disable] | upgrade --cli /abs/installed/dist/cli.js | uninstall
+factory supervisor start | check | stop [--disable] | upgrade --cli /abs/installed/dist/cli.js | uninstall
 ```
 
 - `queue add` never replaces the queue. An unchanged admission keeps its place; changed contents require explicit admission and cannot rewrite an active run's binding. `remove` withdraws a pending Objective and refuses an active one.
 - `queue list` and `queue sync` reread the Project and current definitions. They never approve work, reorder it or replay an uncertain mutation. Unavailable or incomplete GitHub observations hold new dispatch. Git fast-forward ownership claims prevent two hosts from consuming the same admission.
 - Queued Objectives that an earlier run left unfinished go first, one at a time in queue order. The service leaves an unfinished Objective that is not queued alone; `factory queue add N` hands it over.
 - With an empty queue the service only watches GitHub, makes no model calls and lists unqueued candidates. Labels and discovery never admit work. Polling uses `queue.pollSeconds` (default 30).
+- `supervisor start` and a restarted `upgrade` report `starting` when the exact live service is still awaiting authenticated local readiness at the bounded verification deadline. Keep that service and inspect `supervisor check`; a pending start is not a failed or fully verified start. `owned-ready` proves the live control socket and process identity. The local check does not observe the remote queue; ordinary status and dispatch retain their required Project and private-history authorization.
 - `supervisor stop` drains and keeps state. `--disable` also stops it starting at login. `upgrade` drains the owner, then switches the unit. The new package refuses state written by an incompatible version when it starts. If the restarted service does not take ownership, the error names `journalctl --user -u UNIT` and the `factory supervisor upgrade --cli PREVIOUS_CLI` command that returns to the previous package and restarts the service.
 - An Objective that needs a human exits the service with code 2. Decide it, run `factory queue resume`, then `factory supervisor start`.
 

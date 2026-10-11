@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -82,11 +82,16 @@ import {
   acquireControllerLock,
   objectiveLockPath,
   readContinuation,
+  readControllerOwner,
   releaseControllerLock,
   saveState,
   statePath,
 } from "../dist/state-store.js";
-import { requestControl, serveControl } from "../dist/coordinator-control.js";
+import {
+  ControllerReadinessPendingError,
+  requestControl,
+  serveControl,
+} from "../dist/coordinator-control.js";
 import { checkpointExecutionState } from "../dist/runner/execution.js";
 import { canHandoff } from "../dist/runner/ownership.js";
 import { setCoordinatorMode } from "../dist/state.js";
@@ -2419,6 +2424,22 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         },
         activated.objective,
       );
+      // Local readiness bypasses the ordinary handler and reveals no lock token.
+      const readiness = await requestControl(
+        activated.repository,
+        { objective: activated.objective, action: "readiness" },
+        { deadlineAt: Date.now() + 1_000 },
+      );
+      assert.equal(readiness.handled, true);
+      assert.deepEqual(readiness.result, {
+        protocol: "controller-readiness-v1",
+        owner: {
+          pid: process.pid,
+          startTime: readControllerOwner(lockPath).startTime,
+          objective: activated.objective,
+          intake: false,
+        },
+      });
       let paused;
       const preflight = await subprocessAsync(
         "sh",
@@ -2455,6 +2476,82 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           server.close((error) => (error ? reject(error) : resolve())),
         );
       releaseControllerLock(lockPath, lock);
+    }
+
+    // A genuinely suspended owner cannot answer; the read-only socket deadline
+    // ends that probe without a remote observation or lifecycle mutation.
+    const controllerModule = new URL(
+      "../dist/coordinator-control.js",
+      import.meta.url,
+    ).href;
+    const ownerModule = new URL("../dist/state-store.js", import.meta.url).href;
+    const controller = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        String.raw`
+      import {serveControl} from ${JSON.stringify(controllerModule)};
+      import {acquireControllerLock,objectiveLockPath,releaseControllerLock} from ${JSON.stringify(ownerModule)};
+      const repository=process.env.FACTORY_CONTROL_TEST_REPOSITORY;
+      const objective=Number(process.env.FACTORY_CONTROL_TEST_OBJECTIVE);
+      const path=objectiveLockPath(repository,objective);
+      const lock=acquireControllerLock(path,objective);
+      const server=await serveControl(repository,lock,async()=>{throw new Error("Unexpected ordinary control handler")},objective);
+      process.on("SIGTERM",async()=>{await new Promise(resolve=>server.close(resolve));releaseControllerLock(path,lock);process.exit(0)});
+      process.stdout.write("ready\n");
+    `,
+      ],
+      {
+        env: {
+          ...process.env,
+          FACTORY_CONTROL_TEST_REPOSITORY: activated.repository,
+          FACTORY_CONTROL_TEST_OBJECTIVE: String(activated.objective),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let childError = "";
+    controller.stderr.on("data", (part) => {
+      childError += part;
+    });
+    const controllerExit = new Promise((resolve) =>
+      controller.once("exit", resolve),
+    );
+    try {
+      await new Promise((resolve, reject) => {
+        controller.stdout.once("data", resolve);
+        controller.once("error", reject);
+        controller.once("exit", () =>
+          reject(new Error(childError || "Controller exited before readiness")),
+        );
+      });
+      controller.kill("SIGSTOP");
+      const started = Date.now();
+      await assert.rejects(
+        requestControl(
+          activated.repository,
+          { objective: activated.objective, action: "readiness" },
+          { deadlineAt: started + 50 },
+        ),
+        (error) =>
+          error instanceof ControllerReadinessPendingError &&
+          error.reason === "deadline",
+      );
+      assert.ok(Date.now() - started < 1_000);
+      controller.kill("SIGCONT");
+      const resumed = await requestControl(
+        activated.repository,
+        { objective: activated.objective, action: "readiness" },
+        { deadlineAt: Date.now() + 1_000 },
+      );
+      assert.equal(resumed.handled, true);
+      assert.equal(resumed.result.owner.pid, controller.pid);
+      assert.equal(resumed.result.protocol, "controller-readiness-v1");
+    } finally {
+      controller.kill("SIGCONT");
+      controller.kill("SIGTERM");
+      await controllerExit;
     }
     const reloadedActivation = parseFactoryState(
       JSON.parse(readFileSync(activationPath, "utf8")),

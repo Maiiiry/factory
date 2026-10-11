@@ -15,6 +15,7 @@ export interface ControlRequest {
   objective: number;
   action:
     | "status"
+    | "readiness"
     | "pause"
     | "drain"
     | "handoff"
@@ -31,6 +32,17 @@ export interface ControlRequest {
     | "watch"
     | "project-queue";
   input?: Record<string, unknown>;
+}
+export interface ControllerReadiness {
+  protocol: "controller-readiness-v1";
+  owner: { pid: number; startTime: string; objective: number; intake: boolean };
+}
+/** A read-only readiness probe ended before the endpoint was ready. */
+export class ControllerReadinessPendingError extends Error {
+  constructor(readonly reason: "endpoint-unavailable" | "deadline") {
+    super("Controller readiness is not yet established");
+    this.name = "ControllerReadinessPendingError";
+  }
 }
 /**
  * One private local transport in the owner's directory: the installation's
@@ -60,7 +72,30 @@ export async function serveControl(
           const request = JSON.parse(body.slice(0, body.indexOf("\n")));
           if (request.token !== lock.token)
             throw new Error("Controller owner changed");
-          const result = await handle(request);
+          let result: unknown;
+          if (request.action === "readiness") {
+            const owner = liveControllerOwner(
+              objective
+                ? objectiveLockPath(repository, objective)
+                : installationLockPath(repository),
+            );
+            if (
+              !owner ||
+              owner.token !== lock.token ||
+              owner.pid !== process.pid ||
+              (!owner.intake && request.objective !== owner.objective)
+            )
+              throw new Error("Controller readiness owner changed");
+            result = {
+              protocol: "controller-readiness-v1",
+              owner: {
+                pid: owner.pid,
+                startTime: owner.startTime,
+                objective: owner.objective,
+                intake: owner.intake === true,
+              },
+            } satisfies ControllerReadiness;
+          } else result = await handle(request);
           socket.end(`${JSON.stringify({ result })}\n`);
         } catch (error) {
           socket.end(
@@ -120,7 +155,16 @@ export class ForegroundControllerError extends Error {
 export async function requestControl(
   repository: string,
   request: ControlRequest,
+  options?: { deadlineAt: number },
 ): Promise<{ handled: boolean; result?: unknown }> {
+  if (options && request.action !== "readiness")
+    throw new Error("Only read-only readiness supports a control deadline");
+  if (request.action === "readiness") {
+    if (!options || !Number.isFinite(options.deadlineAt))
+      throw new Error("Controller readiness requires an absolute deadline");
+    if (options.deadlineAt <= Date.now())
+      throw new ControllerReadinessPendingError("deadline");
+  }
   // The service answers for every Objective; otherwise an Objective's own owner does.
   let owner = liveControllerOwner(installationLockPath(repository));
   let directoryPath = stateRoot(repository);
@@ -138,9 +182,18 @@ export async function requestControl(
   }
   if (!owner) return { handled: false };
   const token = owner.token;
+  const expectedOwner = owner;
+  const ownerPath = join(directoryPath, "controller.lock");
   return new Promise((resolve, reject) => {
     const directory = openSync(directoryPath, "r");
-    const socket = createConnection(`/proc/self/fd/${directory}/control.sock`);
+    let socket: ReturnType<typeof createConnection>;
+    try {
+      socket = createConnection(`/proc/self/fd/${directory}/control.sock`);
+    } catch (error) {
+      closeSync(directory);
+      reject(error);
+      return;
+    }
     let directoryOpen = true;
     const closeDirectory = () => {
       if (directoryOpen) {
@@ -148,6 +201,22 @@ export async function requestControl(
         closeSync(directory);
       }
     };
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: unknown, result?: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      closeDirectory();
+      socket.destroy();
+      if (error) reject(error);
+      else resolve({ handled: true, result });
+    };
+    if (options)
+      timer = setTimeout(
+        () => finish(new ControllerReadinessPendingError("deadline")),
+        Math.max(0, options.deadlineAt - Date.now()),
+      );
     socket.once("connect", closeDirectory);
     socket.once("error", closeDirectory);
     let body = "";
@@ -158,14 +227,48 @@ export async function requestControl(
     socket.on("data", (part) => {
       body += part;
     });
-    socket.on("error", reject);
+    socket.on("error", (error: NodeJS.ErrnoException) =>
+      finish(
+        request.action === "readiness" &&
+          ["ENOENT", "ECONNREFUSED"].includes(error.code ?? "")
+          ? new ControllerReadinessPendingError("endpoint-unavailable")
+          : error,
+      ),
+    );
     socket.on("end", () => {
       try {
         const reply = JSON.parse(body);
         if (reply.error) throw new Error(reply.error);
-        resolve({ handled: true, result: reply.result });
+        if (request.action === "readiness") {
+          const current = liveControllerOwner(ownerPath);
+          const ready = reply.result as ControllerReadiness | undefined;
+          if (
+            !current ||
+            current.token !== token ||
+            current.pid !== expectedOwner.pid ||
+            current.startTime !== expectedOwner.startTime ||
+            ready?.protocol !== "controller-readiness-v1" ||
+            ready.owner?.pid !== current.pid ||
+            ready.owner.startTime !== current.startTime ||
+            ready.owner.intake !== (current.intake === true) ||
+            ready.owner.objective !== current.objective ||
+            !Number.isSafeInteger(ready.owner.objective) ||
+            ready.owner.objective < 0 ||
+            Object.keys(ready).some(
+              (key) => !["protocol", "owner"].includes(key),
+            ) ||
+            Object.keys(ready.owner).some(
+              (key) =>
+                !["pid", "startTime", "objective", "intake"].includes(key),
+            )
+          )
+            throw new Error(
+              "Controller readiness response changed its live owner",
+            );
+        }
+        finish(undefined, reply.result);
       } catch (error) {
-        reject(error);
+        finish(error);
       }
     });
   });
