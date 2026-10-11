@@ -680,12 +680,24 @@ function assertBoundOrigin(
 function withOperatorRemoteSettings(
   directory: string,
   env: NodeJS.ProcessEnv,
+  operator: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
+  // Discover only the operator's config sources without restoring inherited
+  // repository, command-scope or index overrides into the pinned lookup.
+  const lookup = { ...env };
+  for (const key of [
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+  ]) {
+    if (operator[key] === undefined) delete lookup[key];
+    else lookup[key] = operator[key];
+  }
   const entries: [string, string][] = [];
   let sshCommand: string | undefined;
   for (const [scope, key, value = ""] of configEntries(
     directory,
-    env,
+    lookup,
     "^(credential\\..*helper|core\\.askpass|core\\.sshcommand)$",
   )) {
     if (scope !== "global" && scope !== "system") continue;
@@ -695,11 +707,12 @@ function withOperatorRemoteSettings(
   }
   return {
     ...withGitConfig(env, entries),
+    GIT_ASKPASS: operator.GIT_ASKPASS,
     GIT_SSH_COMMAND:
-      env.GIT_SSH_COMMAND ||
+      operator.GIT_SSH_COMMAND ||
       sshCommand ||
-      (env.GIT_SSH
-        ? `'${env.GIT_SSH.replaceAll("'", "'\\''")}'`
+      (operator.GIT_SSH
+        ? `'${operator.GIT_SSH.replaceAll("'", "'\\''")}'`
         : SSH_KEEPALIVE_COMMAND),
   };
 }
@@ -724,12 +737,13 @@ function factoryGit(
   pinned: boolean,
   overrides: NodeJS.ProcessEnv = {},
 ): { args: string[]; env: NodeJS.ProcessEnv } {
+  const operator = { ...process.env };
   let env = {
     ...(pinned ? pinnedGitEnvironment() : ambientGitEnvironment()),
     ...overrides,
   };
   const remote = GIT_REMOTE.has(gitSubcommand(args));
-  if (remote) env = withOperatorRemoteSettings(directory, env);
+  if (remote) env = withOperatorRemoteSettings(directory, env, operator);
   if (["fetch", "pull"].includes(gitSubcommand(args)))
     env = withGitConfig(env, LOCKED_NETWORK_CONFIG);
   assertNoRepositoryPrograms(directory, env, remote);
