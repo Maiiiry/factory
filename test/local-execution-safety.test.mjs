@@ -635,45 +635,82 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       // A real peer finishes after dispatch. Its newly published advisory facts
       // change live selection without changing this attempt's admitted input.
       const peerCheckout = join(root, "peer-target");
-      git(checkout, "worktree", "add", "--detach", peerCheckout, result.changeRef);
+      git(
+        checkout,
+        "worktree",
+        "add",
+        "--detach",
+        peerCheckout,
+        result.changeRef,
+      );
       writeFileSync(join(peerCheckout, "ui.json"), '{"format":"UTC"}\n');
       writeFileSync(
         join(peerCheckout, ".factory-handoff.json"),
-        JSON.stringify({ notes: [{
-          kind: "pitfall",
-          summary: "Peer UI requires the timestamp format",
-          paths: ["ui.json"],
-          consumers: ["api"],
-        }] }),
+        JSON.stringify({
+          notes: [
+            {
+              kind: "pitfall",
+              summary: "Peer UI requires the timestamp format",
+              paths: ["ui.json"],
+              consumers: ["api"],
+            },
+          ],
+        }),
       );
-      const peerResult = await collectWorktreeResult(checkout, peerCheckout, {
-        item: peer, baseSha: result.changeRef, attemptId: "ui-role-attempt",
-      }, store, {});
+      const peerResult = await collectWorktreeResult(
+        checkout,
+        peerCheckout,
+        {
+          item: peer,
+          baseSha: result.changeRef,
+          attemptId: "ui-role-attempt",
+        },
+        store,
+        {},
+      );
       roleReload.work.ui = {
-        status: "done", attempt: "ui-role-attempt",
-        changeRef: peerResult.changeRef, treeSha: peerResult.treeSha,
+        status: "done",
+        attempt: "ui-role-attempt",
+        changeRef: peerResult.changeRef,
+        treeSha: peerResult.treeSha,
       };
       await publishObjectiveKnowledge(roleReload, peer, peerResult, store);
       const changedKnowledge = await completeObjectiveKnowledge({
-        state: roleReload, item: consumer, checkout,
-        baseSha: result.changeRef, store,
+        state: roleReload,
+        item: consumer,
+        checkout,
+        baseSha: result.changeRef,
+        store,
       });
       assert.notDeepEqual(changedKnowledge.view, knowledge.view);
-      assert.ok(JSON.stringify(changedKnowledge.view).includes("Peer UI requires"));
+      assert.ok(
+        JSON.stringify(changedKnowledge.view).includes("Peer UI requires"),
+      );
       saveState(rolePath, roleReload);
       const peerSnapshot = readFileSync(rolePath, "utf8");
       let restartSaves = 0;
-      const resumeDispatch = (state, overrides = {}, save = () => {
-        restartSaves++;
-        saveState(rolePath, state);
-      }) => buildAdaptiveContext({
-        state, role: "dispatch", item: consumer,
-        baseSha: result.changeRef, checkout, store, config,
-        sources: [source],
-        required: { sources: [source], knowledge: changedKnowledge.view },
-        requiredSelections: changedKnowledge.selections,
-        save, ...overrides,
-      });
+      const resumeDispatch = (
+        state,
+        overrides = {},
+        save = () => {
+          restartSaves++;
+          saveState(rolePath, state);
+        },
+      ) =>
+        buildAdaptiveContext({
+          state,
+          role: "dispatch",
+          item: consumer,
+          baseSha: result.changeRef,
+          checkout,
+          store,
+          config,
+          sources: [source],
+          required: { sources: [source], knowledge: changedKnowledge.view },
+          requiredSelections: changedKnowledge.selections,
+          save,
+          ...overrides,
+        });
       const reused = await resumeDispatch(roleReload);
       assert.equal(reused.packet.id, selected.packet.id);
       assert.deepEqual(reused.payload, selected.payload);
@@ -690,8 +727,11 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       assert.deepEqual(recovered.payload, selected.payload);
       assert.equal(restartSaves, 1);
       assert.equal(
-        parseFactoryState(JSON.parse(readFileSync(rolePath, "utf8")),
-          adaptive.repository, adaptive.objective).work.api.adaptiveContextId,
+        parseFactoryState(
+          JSON.parse(readFileSync(rolePath, "utf8")),
+          adaptive.repository,
+          adaptive.objective,
+        ).work.api.adaptiveContextId,
         selected.packet.id,
       );
       assert.equal(readFileSync(rolePath, "utf8"), peerSnapshot);
@@ -701,27 +741,50 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         () => saveState(rolePath, changedOwner),
         /selected adaptive context differs/,
       );
-      await assert.rejects(() => resumeDispatch(changedOwner), /admitted attempt/);
+      await assert.rejects(
+        () => resumeDispatch(changedOwner),
+        /admitted attempt/,
+      );
       await assert.rejects(
         () => resumeDispatch(roleReload, { baseSha: adaptive.baseSha }),
         /admitted attempt/,
       );
       await assert.rejects(
-        () => resumeDispatch(roleReload, {
-          sources: [{ ...source, content: `${source.content}\nChanged source` }],
-        }),
+        () =>
+          resumeDispatch(roleReload, {
+            sources: [
+              { ...source, content: `${source.content}\nChanged source` },
+            ],
+          }),
         /complete supplied Source bytes/,
       );
       assert.equal(restartSaves, 1);
       assert.equal(readFileSync(rolePath, "utf8"), peerSnapshot);
       // Historical stopped local ownership is preserved; no provider is launched.
-      const stoppedWorktree = join(stateRoot(adaptive.repository), "worktrees", "api-role-attempt");
-      mkdirSync(join(stateRoot(adaptive.repository), "worktrees"), { recursive: true });
-      git(checkout, "worktree", "add", "--detach", stoppedWorktree, result.changeRef);
+      const stoppedWorktree = join(
+        stateRoot(adaptive.repository),
+        "worktrees",
+        "api-role-attempt",
+      );
+      mkdirSync(join(stateRoot(adaptive.repository), "worktrees"), {
+        recursive: true,
+      });
+      git(
+        checkout,
+        "worktree",
+        "add",
+        "--detach",
+        stoppedWorktree,
+        result.changeRef,
+      );
       const owned = structuredClone(roleReload);
       owned.work.api.execution = {
-        provider: "local", identity: owned.work.api.attempt,
-        data: { worktree: stoppedWorktree, stopped: "Historical local start ceased" },
+        provider: "local",
+        identity: owned.work.api.attempt,
+        data: {
+          worktree: stoppedWorktree,
+          stopped: "Historical local start ceased",
+        },
       };
       const legacyOwned = structuredClone(owned);
       delete legacyOwned.work.api.adaptiveContextId;
@@ -730,7 +793,8 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       const legacySnapshot = readFileSync(rolePath, "utf8");
       const legacyBefore = structuredClone(legacyOwned);
       await assert.rejects(
-        () => resumeDispatch(legacyOwned), /lacks its original dispatch packet/,
+        () => resumeDispatch(legacyOwned),
+        /lacks its original dispatch packet/,
       );
       assert.deepEqual(legacyOwned, legacyBefore);
       assert.equal(restartSaves, 1);
