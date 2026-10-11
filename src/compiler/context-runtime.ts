@@ -11,6 +11,7 @@ import { retainLearningMemory } from "../learning.js";
 import { pinnedGit, pinnedGitEnvironment } from "../process.js";
 import {
   LocalRepositoryMemory,
+  retainPlanningSourceMemory,
   type MemoryApplicability,
   type MemoryLookup,
   type MemoryResult,
@@ -70,7 +71,7 @@ export function createPlanningContextResolver(input: {
     environment: { configDigest },
     sources: Object.fromEntries(
       sources.map((source) => [
-        source.path,
+        `${source.path}#${source.heading ?? ""}`,
         { version: digest(source.content) },
       ]),
     ),
@@ -81,6 +82,11 @@ export function createPlanningContextResolver(input: {
       visibility: ["repository", "private"],
     },
     applicability,
+    suppliedSources: sources.map((source) => ({
+      path: source.path,
+      ...(source.heading === undefined ? {} : { heading: source.heading }),
+      digest: digest(source.content),
+    })),
     scope: { objective, paths: options.selectors },
     limit: 64,
     maxBytes: options.bounds.maxBytes,
@@ -90,6 +96,15 @@ export function createPlanningContextResolver(input: {
   if (options.memory) {
     try {
       retainLearningMemory(config.repository);
+      retainPlanningSourceMemory({
+        repository: config.repository,
+        objective,
+        runId,
+        baseSha,
+        treeSha,
+        configDigest,
+        sources,
+      });
       memory = new LocalRepositoryMemory(
         stateRoot(config.repository),
         config.repository,
