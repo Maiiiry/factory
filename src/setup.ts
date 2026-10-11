@@ -207,6 +207,7 @@ export async function setupTarget(
       registered: boolean;
       active: string;
       enabled: string;
+      readiness: string;
       binding?: {
         cli: string;
         config: string;
@@ -292,23 +293,42 @@ export async function setupTarget(
     }
     stage = "service-start";
     const observationAfter = Date.now();
-    await supervise("start", configPath);
-    completed.push("exact-owner-verified");
+    const start = (await supervise("start", configPath)) as {
+      readiness: string;
+    };
+    completed.push("service-start-requested");
     stage = "service-verification";
+    if (start.readiness === "starting") {
+      result.status = "starting";
+      result.service = start;
+      result.readinessCheck = configurationCommand(
+        "factory supervisor check",
+        redactDiagnosticDetail(configPath),
+      );
+      result.detail = `Service start requested; exact owner readiness is pending. Inspect \`${result.readinessCheck}\`; preserve the running service and retained state.`;
+      return result;
+    }
     service = (await supervise("status", configPath)) as typeof service;
     result.service = service;
-    const owner = await requestControl(config.repository, {
-      objective: 0,
-      action: "status",
-    });
+    if (service.readiness === "starting") {
+      result.status = "starting";
+      result.readinessCheck = configurationCommand(
+        "factory supervisor check",
+        redactDiagnosticDetail(configPath),
+      );
+      result.detail = `Service startup remains pending; inspect \`${result.readinessCheck}\` before completing setup verification.`;
+      return result;
+    }
     if (
-      !owner.handled ||
+      start.readiness !== "owned-ready" ||
+      service.readiness !== "owned-ready" ||
       service.active !== "active" ||
       service.enabled !== "enabled"
     )
       throw new Error(
         "Background setup did not establish an active enabled service with a responsive exact owner",
       );
+    completed.push("exact-owner-verified");
     stage = "service-observation";
     const deadline = Date.now() + 15_000;
     let serviceObservation: IntakeAuthorization["observation"];
@@ -413,16 +433,22 @@ export async function setupTarget(
       status:
         !background && index > 1
           ? "not-requested"
-          : result.status !== "blocked" || index < reached
-            ? "complete"
-            : index === reached
-              ? "blocked"
-              : "not-checked",
+          : result.status === "starting"
+            ? index < reached
+              ? "complete"
+              : index === reached
+                ? "starting"
+                : "not-checked"
+            : result.status !== "blocked" || index < reached
+              ? "complete"
+              : index === reached
+                ? "blocked"
+                : "not-checked",
       guidance,
       verification,
       ...(verificationNote ? { verificationNote } : {}),
     }));
     result.independentWork =
-      "This handoff admits no Objective. Configuration-only starts nothing; blocked setup does not establish a ready service. Already admitted work retains its own ownership, readiness and limits.";
+      "This handoff admits no Objective. Configuration-only starts nothing; starting or blocked setup does not establish a verified ready service. Already admitted work retains its own ownership, readiness and limits.";
   }
 }

@@ -46,6 +46,7 @@ Use exactly one. For a matching existing configuration, leave out the options it
 The command prints JSON and sets its exit status.
 
 - `configured`: configuration-only setup is finished.
+- `starting`: the start request succeeded and the exact live service is still awaiting authenticated ownership. Preserve it and inspect `factory supervisor check`; ownership and fresh remote queue authorization are not yet verified. Repeat the approved setup verification once the owner is ready.
 - `ready`: the service is active and its owner verified. Report the binding, the poll interval (`queue.pollSeconds`, default 30), the queued IDs or idle reason, and that sleep pauses and shutdown stops the service.
 - `blocked`: collect all available readiness stages, retained findings and source-verified prerequisites, not just the first error. Give one concise checklist of what is missing or unknown, why it is needed, its source, supported setup step and verification command. Unchecked stages stay unknown. Ask for required operator choices together; reuse answers already given. Fix verified prerequisites and repeat the same approved command. Never remove completed stages to get past a stop.
 
@@ -63,4 +64,4 @@ Only for Objectives the operator named:
 factory queue add N [N ...]
 ```
 
-They run one at a time, in Project order, within the [autonomy limits](https://github.com/clockgrove/factory/blob/main/docs/USER-GUIDE.md#autonomy-limits). Labels and roadmap cards never select an Objective. Manage the queue with `factory queue list|sync|remove N|pause|resume|drain` and the service with `factory supervisor start|stop [--disable]|upgrade --cli ABSOLUTE_INSTALLED_CLI|uninstall`. List/sync observe current Project data; they grant no authority or mutation replay. Legacy local queue files are ignored and preserved, never automatically imported or reapproved. Restored Git receipts do not activate a service or prove foreign ownership settled. Day-to-day operation is the `director` skill.
+They run one at a time, in Project order, within the [autonomy limits](https://github.com/clockgrove/factory/blob/main/docs/USER-GUIDE.md#autonomy-limits). Labels and roadmap cards never select an Objective. Manage the queue with `factory queue list|sync|remove N|pause|resume|drain` and the service with `factory supervisor start|check|stop [--disable]|upgrade --cli ABSOLUTE_INSTALLED_CLI|uninstall`. List/sync observe current Project data; they grant no authority or mutation replay. Legacy local queue files are ignored and preserved, never automatically imported or reapproved. Restored Git receipts do not activate a service or prove foreign ownership settled. Day-to-day operation is the `director` skill.

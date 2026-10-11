@@ -36,6 +36,8 @@ Project-bound foreground runs require a current approved admission. When the ope
 
 The first line of `status` is the phase and a one-line summary. `Next:` is the exact command that answers it; run it only when the request covers it. Without `--objective`, status shows the service and the queue. Keep the same `--config PATH` for every command; emitted status commands retain an explicitly selected configuration.
 
+Use `factory supervisor check` to inspect authenticated local service readiness without observing the remote queue. `starting` preserves an active service whose ownership handshake is still pending; keep the service and inspect it again. `owned-ready` proves local ownership only. Queue authorization and required Project/private-history checks still gate dispatch.
+
 ## Blocked prerequisites
 
 When setup, planning or review needs the operator, read `factory status --objective N --json` first. Its `prerequisiteGuidance` is the same derived packet shown by foreground and service status: current run/configuration/graph bindings, controller ownership and control mode, one owner per dependency, reason, actual readiness, completion condition, retained sources and exact supported action. Present its known blockers together without being asked to create a checklist. Distinguish inaccessible required facts, product choices, permission or limit boundaries, setup, unknown submitted effects and returned results awaiting propagation. Compiler retrieval has already tried the accessible facts; a catalog entry alone does not establish an unavailable fact. Keep the guidance digest with the conversation and coalesce unchanged checks instead of repeating the same questions.
