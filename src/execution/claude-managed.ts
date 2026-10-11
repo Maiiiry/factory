@@ -354,7 +354,9 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionHandle> {
     if (input.item.kind === "discovery" || input.discovery)
-      throw new Error("Managed execution does not support enforced read-only discovery");
+      throw new Error(
+        "Managed execution does not support enforced read-only discovery",
+      );
     if (input.environmentReadiness?.validationIndices.length)
       throw new Error(
         "Managed worker readiness in its fresh environment is unsupported; source decision required",
