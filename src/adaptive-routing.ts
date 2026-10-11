@@ -173,6 +173,22 @@ export function assertDeclaredConditions(graph: WorkGraph): void {
         "Conditional implementation cannot own original Objective coverage; unconditional proof must retain every substantive obligation",
       );
     if (
+      graph.coverage.some(
+        (entry) =>
+          entry.proof.kind === "published-ci" &&
+          entry.proof.targetItem === item.id,
+      )
+    )
+      throw new Error(
+        "Published CI cannot require a conditional branch delivery: skipped work has no PR or delivery head. Retain unconditional current integrated proof instead",
+      );
+    if (
+      graph.coverage.some((entry) => entry.environment.preparedBy === item.id)
+    )
+      throw new Error(
+        "Mandatory environment preparation cannot depend on a conditional branch: skipped work supplies no completed preparation. Use an unconditional source-authorized preparer",
+      );
+    if (
       graph.items.some(
         (parent) =>
           parent.kind === "aggregate" && parent.children?.includes(item.id),
