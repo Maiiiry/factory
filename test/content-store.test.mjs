@@ -1186,6 +1186,150 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     archivedClaim,
     queueArchive.readVerifiedBlob,
   );
+  // A second saved first-run cohort in this same private archive requires an
+  // independent witness query. The read may share transport, never either
+  // claim/run verdict or its logical original-body capacity charges.
+  const secondClaim = {
+    ...structuredClone(claim),
+    id: randomUUID(),
+    objective: 4,
+    admissionId: randomUUID(),
+    receiptId: randomUUID(),
+    ownerTokenDigest: learningDigest("second-original-owner"),
+    at: new Date().toISOString(),
+    deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  delete secondClaim.settled;
+  const secondClaimPath = join(claimDirectory, `${secondClaim.id}.json`);
+  const writeSecondClaim = () =>
+    writeFileSync(secondClaimPath, `${JSON.stringify(secondClaim)}\n`, {
+      mode: 0o600,
+    });
+  writeSecondClaim();
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const secondInitial = {
+    ...structuredClone(claimInitial),
+    objective: 4,
+    runId: randomUUID(),
+    coordinator: {
+      ...claimInitial.coordinator,
+      phaseStartedAt: new Date().toISOString(),
+      deadlineAt: secondClaim.deadlineAt,
+    },
+  };
+  saveState(statePath(repository, 4), secondInitial);
+  const secondInitialBytes = readFileSync(statePath(repository, 4));
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const secondTerminal = {
+    ...structuredClone(secondInitial),
+    cancelRequested: true,
+    cancelledAt: new Date().toISOString(),
+  };
+  saveState(statePath(repository, 4), secondTerminal);
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const secondLineageArchive = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    {
+      objective: 4,
+      claimId: secondClaim.id,
+      runId: secondInitial.runId,
+    },
+  );
+  const secondLineage = secondLineageArchive.queueOwnerLineage;
+  assert.ok(secondLineage);
+  for (const original of secondLineage.bodies)
+    retainProjectQueueOriginal(store, original.ref, original.bytes);
+  assert.deepEqual(
+    store.readBytes(secondLineage.initialSnapshot),
+    secondInitialBytes,
+  );
+  const secondTerminalFile = secondLineageArchive.manifest.files.find(
+    (file) => file.path === "objectives/4/state.json",
+  );
+  assert.ok(secondTerminalFile);
+  secondClaim.settled = {
+    at: new Date().toISOString(),
+    runId: secondInitial.runId,
+    disposition: "quiescent",
+    cancellation: {
+      schemaVersion: 1,
+      originalClaim: secondLineage.originalClaim,
+      initialSnapshot: secondLineage.initialSnapshot,
+      cancelledSnapshot: retainProjectQueueOriginal(
+        store,
+        secondTerminalFile.ref,
+        await secondLineageArchive.readVerifiedBlob(secondTerminalFile.ref),
+      ),
+      configDigest: secondInitial.configDigest,
+      owner: claim.settled.cancellation.owner,
+      lineage: {
+        kind: "verified-first-run",
+        checkpoints: secondLineage.checkpoints,
+      },
+    },
+  };
+  await authenticateQueueOwnerReferences(secondClaim, (reference) =>
+    store.readBytes(reference),
+  );
+  writeSecondClaim();
+  await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  const multiWitnessInspection = await inspectRecoveryCheckpoint(config);
+  assert.equal(
+    multiWitnessInspection.capacity.cancellationAncestry.availability,
+    "available",
+  );
+  const witnessCharges =
+    multiWitnessInspection.capacity.cancellationAncestry.traversals;
+  assert.equal(witnessCharges.length, 2);
+  assert.equal(
+    witnessCharges[0].manifestTransportBytes,
+    witnessCharges[1].manifestTransportBytes,
+  );
+  for (const charge of witnessCharges) {
+    assert.equal(charge.retainedOriginalBytes > 0, true);
+    assert.equal(
+      charge.chargedBytes,
+      charge.manifestTransportBytes + charge.retainedOriginalBytes,
+    );
+  }
+  const multiWitnessArchive = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    {
+      objective: 4,
+      claimId: secondClaim.id,
+      runId: secondInitial.runId,
+    },
+  );
+  assert.deepEqual(
+    multiWitnessArchive.queueOwnerLineage.checkpoints,
+    secondLineage.checkpoints,
+  );
+  assert.deepEqual(
+    multiWitnessArchive.queueOwnerLineage.originalClaim,
+    secondLineage.originalClaim,
+  );
+  await assert.rejects(
+    readVerifiedRecoveryCheckpoint(config, undefined, {
+      objective: 4,
+      claimId: secondClaim.id,
+      runId: claimInitial.runId,
+    }),
+    /replaced/,
+  );
   // The producer path freezes its literal first snapshot exactly once.
   const boundClaim = {
     ...claim,

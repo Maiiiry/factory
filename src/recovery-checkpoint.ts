@@ -1895,22 +1895,40 @@ function historicalManifestSummary(
   }
   return summary;
 }
-function queueOwnerLineage(
+interface QueueBodyDescription {
+  kind?: string;
+  objective?: number;
+  id?: string;
+  runId?: string;
+  repository?: string;
+  binding: string;
+}
+interface QueueAncestryObservation {
+  key: string;
+  tip: string;
+  manifestTransportBytes: number;
+  entries: readonly {
+    commit: string;
+    bytes: Buffer;
+    ref: ContentRef;
+  }[];
+  summary(
+    entry: QueueAncestryObservation["entries"][number],
+  ): HistoricalManifestSummary;
+  readOriginal(commit: string, ref: ContentRef): Buffer;
+  description(
+    ref: ContentRef,
+    bytes: Buffer,
+    claimBinding: boolean,
+  ): QueueBodyDescription;
+}
+/** One fresh read shares transport and intrinsic facts, never a query verdict. */
+function observeQueueAncestry(
   directory: string,
   options: GitPersistenceConfig,
   config: FactoryConfig,
   tip: string,
-  request: QueueOwnerLineageRequest,
-  observeCapacity?: (capacity: QueueLineageCapacity) => void,
-): VerifiedQueueOwnerLineage {
-  if (
-    options.scope !== "private-history" ||
-    !Number.isSafeInteger(request.objective) ||
-    request.objective < 1 ||
-    !/^[a-f0-9-]{36}$/.test(request.claimId) ||
-    !request.runId
-  )
-    throw new Error("Invalid queue cancellation lineage request");
+): QueueAncestryObservation {
   const capturedKey = verificationKey(config, options);
   const commits = git(directory, options, [
     "rev-list",
@@ -1963,86 +1981,8 @@ function queueOwnerLineage(
     throw new Error(
       "Queue lineage manifest transport differs from size inventory",
     );
-  const bodies = new Map<string, { ref: ContentRef; bytes: Uint8Array }>();
-  let retainedOriginalBytes = 0;
-  const body = (commit: string, ref: ContentRef) => {
-    const retained = bodies.get(ref.digest);
-    if (retained) {
-      if (
-        retained.ref.bytes !== ref.bytes ||
-        retained.ref.mediaType !== ref.mediaType
-      )
-        throw new Error("Queue lineage reference binding differs");
-      return Buffer.from(retained.bytes);
-    }
-    const bytes = git(directory, options, [
-      "show",
-      `${commit}:blobs/${ref.digest}`,
-    ]);
-    if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
-      throw new Error("Queue lineage original failed exact verification");
-    bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
-    retainedOriginalBytes = [...bodies.values()].reduce(
-      (total, entry) => total + entry.ref.bytes,
-      0,
-    );
-    if (batch.length + retainedOriginalBytes > options.maxBytes)
-      throw new Error(
-        `Queue cancellation ancestry exceeds admitted cumulative byte bound: manifestTransportBytes=${batch.length}, retainedOriginalBytes=${retainedOriginalBytes}, chargedBytes=${batch.length + retainedOriginalBytes}, maxBytes=${options.maxBytes}, commits=${commits.length}`,
-      );
-    return bytes;
-  };
-  const decoded = new Map<
-    string,
-    {
-      kind?: string;
-      objective?: number;
-      id?: string;
-      runId?: string;
-      repository?: string;
-      binding: string;
-    }
-  >();
-  const description = (
-    commit: string,
-    ref: ContentRef,
-    claimBinding = true,
-  ) => {
-    const bytes = body(commit, ref); // Fresh literal typed verification precedes intrinsic decoding.
-    const key = `${ref.digest}:${claimBinding}`;
-    let value = decoded.get(key);
-    if (!value) {
-      const original = JSON.parse(bytes.toString("utf8"));
-      const {
-        settled: ignoredSettlement,
-        runBinding: ignoredRunBinding,
-        ...immutableBinding
-      } = original;
-      value = {
-        kind: original.kind,
-        objective: original.objective,
-        id: original.id,
-        runId: original.runId,
-        repository: original.repository,
-        binding: claimBinding ? canonical(immutableBinding) : "",
-      };
-      decoded.set(key, value);
-    }
-    return value;
-  };
-  const claimPath = `project-queue-history/${request.claimId}.json`;
-  const statePaths = [
-    `objectives/${request.objective}/state.json`,
-    `objectives/${request.objective}/pre-state.json`,
-  ];
+  const entries: QueueAncestryObservation["entries"][number][] = [];
   let offset = 0;
-  let before: QueueCheckpointWitness | undefined;
-  let claimed: QueueCheckpointWitness | undefined;
-  let initial: QueueCheckpointWitness | undefined;
-  let originalClaim: ContentRef | undefined;
-  let initialSnapshot: ContentRef | undefined;
-  let priorSequence = -1;
-  let priorManifestDigest: string | undefined;
   for (const [index, commit] of commits.entries()) {
     const end = batch.indexOf(10, offset);
     const header = batch.subarray(offset, end).toString("utf8");
@@ -2067,25 +2007,186 @@ function queueOwnerLineage(
         .digest("hex") !== identities[index]!.oid
     )
       throw new Error("Queue lineage manifest Git identity differs");
-    const manifest = historicalManifestSummary(
-      bytes,
-      config,
-      options,
-      capturedKey,
+    entries.push(
+      Object.freeze({
+        commit,
+        bytes,
+        ref: Object.freeze({
+          digest: hash(bytes),
+          bytes: bytes.length,
+          mediaType: "application/json",
+        }),
+      }),
     );
+  }
+  if (offset !== batch.length)
+    throw new Error("Queue lineage manifest transport contains extra bytes");
+  const summaries = new Map<string, HistoricalManifestSummary>();
+  const originals = new Map<string, Buffer>();
+  const descriptions = new Map<string, QueueBodyDescription>();
+  let memoBytes = 0;
+  const budget = Math.max(0, options.maxBytes - batch.length);
+  const retain = (charge: number) => {
+    if (charge > budget) return false;
+    if (
+      summaries.size + originals.size + descriptions.size >= options.maxFiles ||
+      memoBytes + charge > budget
+    ) {
+      summaries.clear();
+      originals.clear();
+      descriptions.clear();
+      memoBytes = 0;
+    }
+    memoBytes += charge;
+    return true;
+  };
+  const tuple = (ref: ContentRef) =>
+    canonical([ref.digest, ref.bytes, ref.mediaType ?? null]);
+  return {
+    key: capturedKey,
+    tip,
+    manifestTransportBytes: batch.length,
+    entries: Object.freeze(entries),
+    summary(entry) {
+      const key = entry.ref.digest;
+      const hit = summaries.get(key);
+      if (hit) return hit;
+      const value = historicalManifestSummary(
+        entry.bytes,
+        config,
+        options,
+        capturedKey,
+      );
+      if (retain(Buffer.byteLength(key) + Buffer.byteLength(canonical(value))))
+        summaries.set(key, value);
+      return value;
+    },
+    readOriginal(commit, ref) {
+      // The historical source association must be authenticated before another
+      // query can reuse literal bytes. A current-tip body is not that proof.
+      const key = canonical([commit, `blobs/${ref.digest}`, tuple(ref)]);
+      const retained = originals.get(key);
+      if (retained) return retained;
+      const bytes = git(directory, options, [
+        "show",
+        `${commit}:blobs/${ref.digest}`,
+      ]);
+      if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+        throw new Error("Queue lineage original failed exact verification");
+      if (retain(bytes.length + Buffer.byteLength(key)))
+        originals.set(key, bytes);
+      return bytes;
+    },
+    description(ref, bytes, claimBinding) {
+      const key = canonical([tuple(ref), claimBinding]);
+      const hit = descriptions.get(key);
+      if (hit) return hit;
+      const original = JSON.parse(bytes.toString("utf8"));
+      const {
+        settled: ignoredSettlement,
+        runBinding: ignoredRunBinding,
+        ...immutableBinding
+      } = original;
+      const value = Object.freeze({
+        kind: original.kind,
+        objective: original.objective,
+        id: original.id,
+        runId: original.runId,
+        repository: original.repository,
+        binding: claimBinding ? canonical(immutableBinding) : "",
+      });
+      if (
+        retain(
+          Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(value)),
+        )
+      )
+        descriptions.set(key, value);
+      return value;
+    },
+  };
+}
+function assertQueueLineageRequest(
+  options: GitPersistenceConfig,
+  request: QueueOwnerLineageRequest,
+): void {
+  if (
+    options.scope !== "private-history" ||
+    !Number.isSafeInteger(request.objective) ||
+    request.objective < 1 ||
+    !/^[a-f0-9-]{36}$/.test(request.claimId) ||
+    !request.runId
+  )
+    throw new Error("Invalid queue cancellation lineage request");
+}
+function queueOwnerLineage(
+  options: GitPersistenceConfig,
+  config: FactoryConfig,
+  tip: string,
+  request: QueueOwnerLineageRequest,
+  observeCapacity: ((capacity: QueueLineageCapacity) => void) | undefined,
+  observation: QueueAncestryObservation,
+): VerifiedQueueOwnerLineage {
+  assertQueueLineageRequest(options, request);
+  if (
+    observation.key !== verificationKey(config, options) ||
+    observation.tip !== tip
+  )
+    throw new Error(
+      "Queue ancestry observation has a different admitted binding",
+    );
+  const commits = observation.entries;
+  const manifestTransportBytes = observation.manifestTransportBytes;
+  const manifestBufferBytes = options.maxBytes + 65536;
+  const bodies = new Map<string, { ref: ContentRef; bytes: Uint8Array }>();
+  let retainedOriginalBytes = 0;
+  const body = (commit: string, ref: ContentRef) => {
+    const retained = bodies.get(ref.digest);
+    if (retained) {
+      if (
+        retained.ref.bytes !== ref.bytes ||
+        retained.ref.mediaType !== ref.mediaType
+      )
+        throw new Error("Queue lineage reference binding differs");
+      return Buffer.from(retained.bytes);
+    }
+    const bytes = observation.readOriginal(commit, ref);
+    bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
+    retainedOriginalBytes = [...bodies.values()].reduce(
+      (total, entry) => total + entry.ref.bytes,
+      0,
+    );
+    if (manifestTransportBytes + retainedOriginalBytes > options.maxBytes)
+      throw new Error(
+        `Queue cancellation ancestry exceeds admitted cumulative byte bound: manifestTransportBytes=${manifestTransportBytes}, retainedOriginalBytes=${retainedOriginalBytes}, chargedBytes=${manifestTransportBytes + retainedOriginalBytes}, maxBytes=${options.maxBytes}, commits=${commits.length}`,
+      );
+    return bytes;
+  };
+  const description = (commit: string, ref: ContentRef, claimBinding = true) =>
+    observation.description(ref, body(commit, ref), claimBinding);
+  const claimPath = `project-queue-history/${request.claimId}.json`;
+  const statePaths = [
+    `objectives/${request.objective}/state.json`,
+    `objectives/${request.objective}/pre-state.json`,
+  ];
+  let before: QueueCheckpointWitness | undefined;
+  let claimed: QueueCheckpointWitness | undefined;
+  let initial: QueueCheckpointWitness | undefined;
+  let originalClaim: ContentRef | undefined;
+  let initialSnapshot: ContentRef | undefined;
+  let priorSequence = -1;
+  let priorManifestDigest: string | undefined;
+  for (const entry of observation.entries) {
+    const { commit, bytes } = entry;
+    const manifest = observation.summary(entry);
     if (
       manifest.sequence < priorSequence ||
       (manifest.sequence === priorSequence &&
-        hash(bytes) !== priorManifestDigest)
+        entry.ref.digest !== priorManifestDigest)
     )
       throw new Error("Queue lineage manifest ancestry is ambiguous");
     priorSequence = manifest.sequence;
-    priorManifestDigest = hash(bytes);
-    const ref: ContentRef = {
-      digest: hash(bytes),
-      bytes: bytes.length,
-      mediaType: "application/json",
-    };
+    priorManifestDigest = entry.ref.digest;
+    const ref = { ...entry.ref };
     const witness = { commitSha: commit, manifest: ref };
     const claim = manifest.files.find((file) => file.path === claimPath);
     const states = manifest.files.filter((file) =>
@@ -2149,20 +2250,12 @@ function queueOwnerLineage(
       bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
     }
   }
-  if (
-    offset !== batch.length ||
-    !before ||
-    !claimed ||
-    !initial ||
-    !originalClaim ||
-    !initialSnapshot
-  )
+  if (!before || !claimed || !initial || !originalClaim || !initialSnapshot)
     throw new Error("Authenticated first-run queue lineage is unavailable");
   // Keep only selected witnesses and originals, not an additional journal.
-  const beforeBytes = git(directory, options, [
-    "show",
-    `${before.commitSha}:checkpoint.json`,
-  ]);
+  const beforeBytes = observation.entries.find(
+    (entry) => entry.commit === before.commitSha,
+  )!.bytes;
   bodies.set(before.manifest.digest, {
     ref: before.manifest,
     bytes: Uint8Array.from(beforeBytes),
@@ -2176,18 +2269,25 @@ function queueOwnerLineage(
   ];
   observeCapacity?.({
     commits: commits.length,
-    manifestTransportBytes: batch.length,
+    manifestTransportBytes,
     retainedOriginalBytes,
-    chargedBytes: batch.length + retainedOriginalBytes,
-    byteHeadroom: options.maxBytes - batch.length - retainedOriginalBytes,
+    chargedBytes: manifestTransportBytes + retainedOriginalBytes,
+    byteHeadroom:
+      options.maxBytes - manifestTransportBytes - retainedOriginalBytes,
     commitHeadroom: options.maxFiles - commits.length,
-    manifestBufferHeadroom: manifestBufferBytes - batch.length,
+    manifestBufferHeadroom: manifestBufferBytes - manifestTransportBytes,
   });
   return {
     checkpoints: { before, claimed, initial },
     originalClaim,
     initialSnapshot,
-    bodies: selected.map((ref) => bodies.get(ref.digest)!),
+    bodies: selected.map((ref) => {
+      const original = bodies.get(ref.digest)!;
+      return {
+        ref: { ...original.ref },
+        bytes: Uint8Array.from(original.bytes),
+      };
+    }),
   };
 }
 function assertRemoteOnlyVerifier(
@@ -2328,16 +2428,21 @@ async function freshArchiveOwned(
       commitSha: commit,
       remoteTip: tip,
     };
-    let lineage = lineageRequest
-      ? queueOwnerLineage(
-          directory,
-          options,
-          config,
-          tip,
-          lineageRequest,
-          observeCapacity,
-        )
-      : undefined;
+    let observation: QueueAncestryObservation | undefined;
+    const verifyLineage = (request: QueueOwnerLineageRequest) => {
+      assertQueueLineageRequest(options, request);
+      if (!observation)
+        observation = observeQueueAncestry(directory, options, config, tip);
+      return queueOwnerLineage(
+        options,
+        config,
+        tip,
+        request,
+        observeCapacity,
+        observation,
+      );
+    };
+    let lineage = lineageRequest ? verifyLineage(lineageRequest) : undefined;
     // Retained cancellation witnesses must still be actual ancestor packets,
     // rather than manually shaped manifest text in the current body store.
     for (const file of archive.manifest.files.filter((file) =>
@@ -2351,18 +2456,11 @@ async function freshArchiveOwned(
           ? record.settled?.cancellation
           : undefined;
       if (proof?.lineage?.kind !== "verified-first-run") continue;
-      const verified = queueOwnerLineage(
-        directory,
-        options,
-        config,
-        tip,
-        {
-          objective: record.objective,
-          claimId: record.id,
-          runId: record.settled.runId,
-        },
-        observeCapacity,
-      );
+      const verified = verifyLineage({
+        objective: record.objective,
+        claimId: record.id,
+        runId: record.settled.runId,
+      });
       if (
         canonical(verified.checkpoints) !==
           canonical(proof.lineage.checkpoints) ||
@@ -2390,6 +2488,10 @@ async function freshArchiveOwned(
     if (context && context.key !== verificationKey(config, options))
       throw new Error(
         "Queue verifier admitted binding changed during archive verification",
+      );
+    if (observation && observation.key !== verificationKey(config, options))
+      throw new Error(
+        "Queue ancestry observation binding changed during archive verification",
       );
     return result;
   } catch (error) {
