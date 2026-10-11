@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { assertDiscoverySpecification } from "./discovery.js";
 import {
+  assertHumanPlanningDependency,
   assertContextRequest,
   assertPlanningContextPacket,
   type PlanningTurnResponse,
@@ -907,8 +908,17 @@ export function compilerWire(
           }),
           strict({
             kind: { type: "string", enum: ["human-dependency"] },
-            question: { ...text, minLength: 1 },
-            detail: { ...text, minLength: 1 },
+            dependencyKind: {
+              type: "string",
+              enum: ["human-choice", "permission", "unavailable-context"],
+            },
+            requestIds: {
+              type: "array",
+              maxItems: request.contextLookup.bounds.maxResults,
+              items: { ...text, minLength: 1, maxLength: 128 },
+            },
+            question: { ...text, minLength: 1, maxLength: 4096 },
+            detail: { ...text, minLength: 1, maxLength: 4096 },
           }),
         ],
       },
@@ -933,7 +943,12 @@ export function compilerWire(
             request.contextLookup!.bounds.maxRequestsPerRound
         )
           throw new Error("Context request batch exceeds admitted bounds");
-        const ids = new Set<string>();
+        const ids = new Set(
+          [
+            ...request.contextLookup!.automatic,
+            ...request.contextLookup!.batches.flat(),
+          ].map((result) => result.request.id),
+        );
         for (const entry of outcome.requests) {
           assertContextRequest(entry);
           if (ids.has(entry.id))
@@ -945,23 +960,32 @@ export function compilerWire(
       if (outcome.kind === "human-dependency") {
         keys(
           outcome,
-          ["kind", "question", "detail"],
+          ["kind", "dependencyKind", "requestIds", "question", "detail"],
           "human dependency outcome",
         );
         if (
           typeof outcome.question !== "string" ||
           !outcome.question.trim() ||
+          outcome.question.length > 4096 ||
           typeof outcome.detail !== "string" ||
-          !outcome.detail.trim()
+          !outcome.detail.trim() ||
+          outcome.detail.length > 4096
         )
           throw new Error(
             "Human dependency must state a concrete question and missing fact",
           );
-        return {
-          kind: "human-dependency",
+        const response = {
+          kind: "human-dependency" as const,
+          dependencyKind: outcome.dependencyKind as
+            | "human-choice"
+            | "permission"
+            | "unavailable-context",
+          requestIds: outcome.requestIds as string[],
           question: outcome.question,
           detail: outcome.detail,
         };
+        assertHumanPlanningDependency(response, request.contextLookup!);
+        return response;
       }
       throw new Error("Invalid planning context response kind");
     },

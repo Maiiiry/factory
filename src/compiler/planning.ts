@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  assertHumanPlanningDependency,
   assertDiscoveryContextScope,
   assertContextFactsResolved,
   type PlanningContextPacket,
@@ -417,6 +418,8 @@ export async function compileObjective(
   let graph: WorkGraph;
   if (contextLookup) {
     const response = result as PlanningTurnResponse;
+    if (response.kind === "human-dependency")
+      assertHumanPlanningDependency(response, contextLookup);
     if (
       response.kind === "context-request" ||
       response.kind === "human-dependency"

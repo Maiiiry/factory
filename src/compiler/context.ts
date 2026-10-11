@@ -68,7 +68,13 @@ export interface PlanningContextPacket {
 export type PlanningTurnResponse =
   | { kind: "graph"; graph: WorkGraph }
   | { kind: "context-request"; requests: ContextRequest[] }
-  | { kind: "human-dependency"; question: string; detail: string };
+  | {
+      kind: "human-dependency";
+      dependencyKind: "human-choice" | "permission" | "unavailable-context";
+      requestIds: string[];
+      question: string;
+      detail: string;
+    };
 export interface PlanningLookupRecord {
   packet: PlanningContextPacket;
   startedAt: string;
@@ -250,8 +256,12 @@ export function assertPlanningContextPacket(
   }
   let bytes = 0,
     results = 0;
+  const requestIds = new Set<string>();
   for (const result of [...packet.automatic, ...packet.batches.flat()]) {
     assertResult(result);
+    if (requestIds.has(result.request.id))
+      throw new Error("Retained context repeats a request identity");
+    requestIds.add(result.request.id);
     bytes += contextResultBytes(result);
     results += result.matches.length;
   }
@@ -392,11 +402,17 @@ export async function resolveContextRequests(
   const deadlineAt =
     start + Math.max(0, bounds.maxElapsedMs - record.elapsedMs);
   const results: ContextResult[] = [];
-  const seen = new Set<string>();
+  const seen = new Set(
+    [...record.packet.automatic, ...record.packet.batches.flat()].map(
+      (result) => result.request.id,
+    ),
+  );
   for (const request of requests) {
     assertContextRequest(request);
     if (seen.has(request.id))
-      throw new Error("Context request batch repeats an identity");
+      throw new Error(
+        "Context request identity is already retained or repeated in this batch",
+      );
     seen.add(request.id);
     const collection = record.packet.catalog.find(
       (c) => c.id === request.collection,
@@ -690,6 +706,65 @@ export function assertDiscoveryContextScope(
     )
       throw new Error(
         `Discovery ${item.id} exceeds admitted repository selectors`,
+      );
+  }
+}
+
+/** A context absence question cites actual unresolved required receipts, never catalog availability alone. */
+export function assertHumanPlanningDependency(
+  response: Extract<PlanningTurnResponse, { kind: "human-dependency" }>,
+  packet: PlanningContextPacket,
+): void {
+  if (
+    !["human-choice", "permission", "unavailable-context"].includes(
+      response.dependencyKind,
+    ) ||
+    !Array.isArray(response.requestIds) ||
+    response.requestIds.length > packet.bounds.maxResults ||
+    response.requestIds.some(
+      (id) => typeof id !== "string" || !id || id.length > 128,
+    ) ||
+    new Set(response.requestIds).size !== response.requestIds.length
+  )
+    throw new Error(
+      "Human dependency requires a supported kind and unique bounded receipt references",
+    );
+  if (response.dependencyKind !== "unavailable-context") {
+    if (response.requestIds.length)
+      throw new Error(
+        "Human choice and permission dependencies do not reinterpret lookup receipts as authority",
+      );
+    return;
+  }
+  if (!response.requestIds.length)
+    throw new Error(
+      "Unavailable context requires an actual required unsuccessful lookup receipt before asking a human",
+    );
+  const results = [...packet.automatic, ...packet.batches.flat()];
+  const identity = (request: ContextRequest) =>
+    contextDigest([
+      request.collection,
+      request.operation,
+      request.selector,
+      request.query,
+    ]);
+  for (const id of response.requestIds) {
+    const matches = results.filter((result) => result.request.id === id);
+    if (matches.length !== 1)
+      throw new Error(
+        "Human dependency lookup receipt identity is unavailable or ambiguous",
+      );
+    const result = matches[0]!;
+    const latest = [...results]
+      .reverse()
+      .find((entry) => identity(entry.request) === identity(result.request));
+    if (
+      !result.request.required ||
+      result.disposition === "complete" ||
+      latest?.disposition === "complete"
+    )
+      throw new Error(
+        "Human context dependency must cite a still-unresolved required lookup result",
       );
   }
 }
