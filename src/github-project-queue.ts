@@ -246,7 +246,7 @@ function fieldValues(values: unknown[], binding: ProjectQueueBinding) {
     if (value.field === undefined) {
       if (
         ![
-          "ProjectV2ItemFieldAssigneeValue",
+          "ProjectV2ItemFieldUserValue",
           "ProjectV2ItemFieldLabelValue",
           "ProjectV2ItemFieldMilestoneValue",
           "ProjectV2ItemFieldPullRequestValue",
