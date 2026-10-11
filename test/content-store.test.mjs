@@ -94,6 +94,8 @@ import {
   gitPersistenceStatus,
   inspectRecoveryCheckpoint,
   readVerifiedRecoveryCheckpoint,
+  readRecoveryCheckpointBodies,
+  writeRecoveryCheckpointBodies,
   synchronizeRecoveryCheckpoint,
   withRecoveryCheckpointScope,
 } from "../dist/recovery-checkpoint.js";
@@ -836,6 +838,35 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   assert.equal(firstInspection.current.logicalFiles, closure.files.length);
   assert.equal(firstInspection.current.manifestBytes > 0, true);
   assert.equal(firstInspection.storage, "git-logical-bytes");
+  // Round-trip the workflow's retained originals and an opaque body through
+  // the same batch I/O used by full archive publication and verification.
+  const opaque = Buffer.alloc(1024 * 1024, 0xff);
+  opaque.set([0xff, 0x00, 0x0a, 0x80]);
+  const opaqueRef = store.putBytes(opaque, {
+    mediaType: "application/octet-stream",
+  });
+  const batchObjects = join(root, "batch-objects.git");
+  execFileSync(
+    "git",
+    ["init", "--bare", "--object-format=sha256", batchObjects],
+    { stdio: "pipe" },
+  );
+  const batchBodies = [
+    ...closure.contentRefs.map((ref) => ({ ref, bytes: store.readBytes(ref) })),
+    { ref: opaqueRef, bytes: opaque },
+  ];
+  const batchEntries = writeRecoveryCheckpointBodies(
+    batchObjects,
+    config.gitPersistence,
+    batchBodies,
+  );
+  const readBodies = readRecoveryCheckpointBodies(
+    batchObjects,
+    config.gitPersistence,
+    batchEntries,
+  );
+  for (const { ref, bytes } of batchBodies)
+    assert.deepEqual(readBodies.get(ref.digest), bytes);
   assert.equal(firstInspection.reachableHistory.availability, "available");
   assert.equal(
     firstInspection.reachableHistory.logicalObjectBytes >
