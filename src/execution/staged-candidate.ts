@@ -276,20 +276,25 @@ export async function checkStagedCandidate(
   checkWorktreeEntries(worktree, acceptedIgnoredLinks);
   const paths = changedPaths(worktree);
   if (observationBounds) {
-    let bytes = 0;
-    for (const path of paths) {
-      const entry = stagedEntry(worktree, path);
-      if (entry)
-        bytes += Number(pinnedGit(worktree, "cat-file", "-s", entry.blob));
-    }
-    if (
-      bytes > observationBounds.maxBytes ||
-      paths.length > observationBounds.maxFiles ||
-      Date.now() > observationBounds.deadline
-    )
+    const refuse = () => {
       throw new Error(
         "Rejected staged candidate exceeds its admitted checkpoint bounds",
       );
+    };
+    if (
+      paths.length > observationBounds.maxFiles ||
+      Date.now() > observationBounds.deadline
+    )
+      refuse();
+    let bytes = 0;
+    for (const path of paths) {
+      if (Date.now() > observationBounds.deadline) refuse();
+      const entry = stagedEntry(worktree, path);
+      if (entry)
+        bytes += Number(pinnedGit(worktree, "cat-file", "-s", entry.blob));
+      if (bytes > observationBounds.maxBytes) refuse();
+    }
+    if (Date.now() > observationBounds.deadline) refuse();
   }
   const unowned = paths.filter((path) => !ownsPath(path, ownedPaths));
   if (unowned.length)
