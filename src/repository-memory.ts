@@ -1497,7 +1497,9 @@ export function retainPlanningSourceMemory(input: {
             commitSha: input.baseSha,
             treeSha: input.treeSha,
             retrievedAt: observedAt,
-            complete: !selectedSection,
+            // Completeness applies to this explicit path/heading selection.
+            // The heading and summary retain that the whole file was not supplied.
+            complete: true,
             ref: sourceRef,
           },
         ],
