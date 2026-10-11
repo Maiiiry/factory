@@ -256,6 +256,22 @@ export async function cancelKnownWork(
           continue;
         if (!work.execution && !work.attempt) continue;
         tasks.push(async () => {
+          const startingIdentity =
+            work.execution?.identity ?? workerIdentity(work);
+          const startingAttempt = work.attempt;
+          const startingProvider = work.execution?.provider;
+          await driver.settleStartingAttempt?.(startingIdentity);
+          if (
+            work.attempt !== startingAttempt ||
+            (work === current && state.work[itemId] !== current) ||
+            (startingProvider !== undefined &&
+              work.execution?.provider !== startingProvider) ||
+            (work.execution?.identity ?? workerIdentity(work)) !==
+              startingIdentity
+          )
+            throw new Error(
+              "Cancellation start owner was superseded by another attempt",
+            );
           const session =
             work === current &&
             driver.sessionCapabilities?.resumeRoles.includes("implementation")

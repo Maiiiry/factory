@@ -873,6 +873,12 @@ export interface ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionHandle>;
   /**
+   * Join this driver's existing start owner before capturing cleanup checkpoints.
+   * Uses that operation's existing bounds; completion alone proves no cessation.
+   * Its original caller retains any rejection and submitted-effect uncertainty.
+   */
+  settleStartingAttempt?(attemptId: string): Promise<void>;
+  /**
    * Adopt a recorded attempt before repeating its step (#515): the handle to
    * continue with, or undefined once the driver confirmed nothing of the
    * attempt runs and it left no result, so a new attempt may start. A worker
