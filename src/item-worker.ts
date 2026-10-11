@@ -141,6 +141,13 @@ export async function runWorker(
   },
 ): Promise<ExecutionResult> {
   const { state, item, phases, baseSha } = args;
+  const disableChildAgents =
+    Boolean(state.planningRecovery?.contextLookup?.packet) ||
+    adaptiveWorkflowEnabled(args.objectiveBody ?? "");
+  if (disableChildAgents && args.driver.childAgents !== "disabled")
+    throw new Error(
+      "Worker driver cannot enforce the adaptive native child-agent prohibition; no provider call was made",
+    );
   const work = state.work[item.id]!;
   const retained = work.recovery?.correction
     ? retainedFailedResultContext(work.recovery.history?.at(-1))
@@ -254,9 +261,7 @@ export async function runWorker(
     ...(session ? { session } : {}),
     request: (attemptId) => ({
       ...(context ? { adaptiveContext: context.packet } : {}),
-      ...(adaptiveWorkflowEnabled(args.objectiveBody ?? "")
-        ? { childAgents: "disabled" as const }
-        : {}),
+      ...(disableChildAgents ? { childAgents: "disabled" as const } : {}),
       ...(session
         ? {
             session: {
