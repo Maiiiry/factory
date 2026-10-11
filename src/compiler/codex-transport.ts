@@ -37,6 +37,7 @@ import { stepCancellationSignal } from "../step.js";
 import {
   awaitCheckpointAdmission,
   isCheckpointAdmissionFailure,
+  markCheckpointEffectDispatched,
 } from "../recovery-checkpoint.js";
 import { codexInvocationUsage, codexRawTokenUsage } from "../usage.js";
 import { observeModelInvocation } from "./observation.js";
@@ -393,7 +394,7 @@ export class CodexPlanningTransport implements PlanningTransport {
     // A settled session may have been disposed before its atomic state
     // checkpoint. Its exact adapter-owned path remains the disposal identity.
     if (!lstatSync(data.sessionRoot, { throwIfNoEntry: false })) return;
-    await awaitCheckpointAdmission(session.scope.repository, "settled");
+    await awaitCheckpointAdmission(session.scope.repository, "explicit");
     releaseCodexHome(data.sessionRoot, this.sessionOwner(session));
   }
 
@@ -591,6 +592,7 @@ export class CodexPlanningTransport implements PlanningTransport {
     let checkpointRejected = false;
     let turnCompleted = false;
     let nativeAttempted = false;
+    let nativeDispatchObserved = false;
     let initialCheckpointed = false;
     let streamError: Error | undefined;
     // A tree review's shell reads the tree alone, offline.
@@ -734,6 +736,8 @@ export class CodexPlanningTransport implements PlanningTransport {
               checkpoint: (
                 native: import("../codex-app-server.js").CodexAppServerCheckpoint,
               ) => {
+                if (native.threadId || native.turnId)
+                  nativeDispatchObserved = true;
                 if (native.threadId) thread.id = native.threadId;
                 if (sessionData && native.turnId)
                   sessionData.turnId = native.turnId;
@@ -824,6 +828,7 @@ export class CodexPlanningTransport implements PlanningTransport {
         deadlineAt: args.deadlineAt,
         event: (event) => {
           if (event.type === "thread.started") {
+            nativeDispatchObserved = true;
             if (thread.id && event.thread_id !== thread.id)
               throw new Error(
                 "Reviewer native continuation changed its thread identity",
@@ -957,6 +962,8 @@ export class CodexPlanningTransport implements PlanningTransport {
       requireCompletedProviderTurn(turnCompleted);
     } catch (error) {
       checkpointRejected = isCheckpointAdmissionFailure(error);
+      if (isCheckpointAdmissionFailure(error) && nativeDispatchObserved)
+        markCheckpointEffectDispatched(error);
       retainHome = error instanceof UnsettledSubprocessError;
       // runCodexExec throws ordinary failures only after the owned process group settles.
       state.stopped = !retainHome;
@@ -1036,7 +1043,7 @@ export class CodexPlanningTransport implements PlanningTransport {
         if (!checkpointRejected) {
           await awaitCheckpointAdmission(
             continuation?.scope.repository,
-            "settled",
+            "explicit",
           );
           if (session && !thread.id) {
             releaseCodexHome(home.root, this.sessionOwner(session));

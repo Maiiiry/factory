@@ -65,7 +65,9 @@ import { claudeCaptureEvents } from "./execution/interaction-capture.js";
 import {
   awaitCheckpointAdmission,
   isCheckpointAdmissionFailure,
+  markCheckpointEffectDispatched,
 } from "./recovery-checkpoint.js";
+import { assertDurableValue } from "./execution/checkpoint.js";
 import { type Fault, transient } from "./fault.js";
 import { serviceLoginSecrets } from "./provider-credentials.js";
 import {
@@ -486,7 +488,7 @@ class ClaudePlanningTransport implements PlanningTransport {
     const session = requireClaudeSession(this.sessionRoot, ref, this.adapter);
     if (session.data.settled !== true && session.data.process)
       await settleClaudeProcess(session.data.process);
-    await awaitCheckpointAdmission(ref.scope.repository, "settled");
+    await awaitCheckpointAdmission(ref.scope.repository, "explicit");
     releaseClaudeStorage(this.sessionRoot, ref, this.adapter);
   }
 
@@ -502,6 +504,9 @@ class ClaudePlanningTransport implements PlanningTransport {
     let completed: {
       session: AgentSessionRef;
       response?: string;
+      nativeReturn?: Parameters<
+        NonNullable<ModelInvocationContext["retainNativeReturn"]>
+      >[0];
       usage?: PlanningTurn["usage"];
     };
     try {
@@ -525,6 +530,20 @@ class ClaudePlanningTransport implements PlanningTransport {
       completed.session,
       this.adapter,
     );
+    if (completed.nativeReturn) {
+      assertDurableValue(completed.nativeReturn, "Claude native return");
+      if (
+        completed.nativeReturn.representation !== "literal-agent-text" ||
+        typeof completed.nativeReturn.response !== "string" ||
+        completed.nativeReturn.providerSessionId !==
+          native.data.nativeSessionId ||
+        completed.nativeReturn.terminal !==
+          completed.session.currentTurn?.terminal
+      )
+        throw new Error(
+          "Claude retained native return differs from its terminal session",
+        );
+    }
     const historyDigest = claudeHistoryDigest(native);
     const ready: AgentSessionRef = {
       ...completed.session,
@@ -535,6 +554,7 @@ class ClaudePlanningTransport implements PlanningTransport {
     return {
       disposition: "settled",
       session: ready,
+      ...(completed.nativeReturn && { nativeReturn: completed.nativeReturn }),
       ...(completed.response === undefined
         ? {}
         : { response: completed.response }),
@@ -813,6 +833,8 @@ class ClaudePlanningTransport implements PlanningTransport {
       this.settle(result!, { state, invocation, usage, started, facts });
     } catch (error) {
       checkpointRejected = isCheckpointAdmissionFailure(error);
+      if (isCheckpointAdmissionFailure(error) && nativeSpawnAttempted)
+        markCheckpointEffectDispatched(error);
       if (events && !closeStarted && !guard.signal.aborted) {
         closeStarted = true;
         try {
@@ -844,6 +866,28 @@ class ClaudePlanningTransport implements PlanningTransport {
         const totals = usage.totals();
         state.usage = Object.keys(totals).length ? totals : undefined;
       }
+      let nativeReturn:
+        | Parameters<
+            NonNullable<ModelInvocationContext["retainNativeReturn"]>
+          >[0]
+        | undefined;
+      if (nativeTerminal && result?.subtype === "success") {
+        nativeReturn = {
+          representation: "literal-agent-text",
+          response: result.result,
+          providerSessionId: result.session_id,
+          terminal,
+          ...(state.usage && { usage: state.usage }),
+        };
+        if (result.structured_output !== undefined) {
+          assertDurableValue(
+            result.structured_output,
+            "Claude SDK structured output",
+          );
+          nativeReturn.structuredValue =
+            result.structured_output as import("./config.js").JsonValue;
+        }
+      }
       if (owned && nativeTerminal) {
         // A genuine SDK result remains a native fact if later draining fails.
         // Response acceptance and reusable context still require full settlement.
@@ -870,6 +914,8 @@ class ClaudePlanningTransport implements PlanningTransport {
         };
         claudePrivateWrite(join(owned.data.root, "completed.json"), {
           session: { ...owned.ref, data: { ...owned.data } },
+          ...(nativeReturn && { nativeReturn }),
+          responseRepresentation: "derived-sdk-structured-json",
           ...(state.response ? { response: state.response } : {}),
           ...(state.usage && { usage: state.usage }),
         });
@@ -895,6 +941,8 @@ class ClaudePlanningTransport implements PlanningTransport {
           checkpoint("ready");
           claudePrivateWrite(join(owned.data.root, "completed.json"), {
             session: owned.ref,
+            ...(nativeReturn && { nativeReturn }),
+            responseRepresentation: "derived-sdk-structured-json",
             ...(state.response ? { response: state.response } : {}),
             ...(state.usage && { usage: state.usage }),
           });
@@ -913,20 +961,11 @@ class ClaudePlanningTransport implements PlanningTransport {
           );
         }
       }
-      if (nativeTerminal && result?.subtype === "success")
-        await invocation.retainNativeReturn?.({
-          representation: "literal-agent-text",
-          // This is the SDK's literal final text. structured_output is an
-          // already-decoded value, not an original JSON-text response.
-          response: result.result,
-          providerSessionId: result.session_id,
-          terminal,
-          ...(state.usage && { usage: state.usage }),
-        });
+      if (nativeReturn) await invocation.retainNativeReturn?.(nativeReturn);
       if (!checkpointRejected) {
         await awaitCheckpointAdmission(
           continuation?.scope.repository,
-          "settled",
+          "explicit",
         );
         if (root) rmSync(root, { recursive: true, force: true });
       }
