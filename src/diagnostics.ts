@@ -1866,8 +1866,10 @@ function guidedStatus<T extends StatusView & { repository?: string }>(
     (text) => redactDiagnosticDetail(text, secrets),
     context,
   );
+  const summary = summarizeStatus({ ...view, prerequisiteGuidance });
   return {
-    ...summarizeStatus({ ...view, prerequisiteGuidance }),
+    ...summary,
+    nextAction: summary.nextAction ? { ...summary.nextAction } : null,
     ...view,
     prerequisiteGuidance,
   };
