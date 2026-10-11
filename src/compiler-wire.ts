@@ -1,3 +1,7 @@
+import {
+  assertDeclaredWorkCondition,
+  assertDeclaredConditions,
+} from "./adaptive-routing.js";
 import { createHash } from "node:crypto";
 import { assertDiscoverySpecification } from "./discovery.js";
 import { assertGraphExpansionEnvelope } from "./graph-expansion.js";
@@ -237,6 +241,16 @@ export function compilerWire(
       ],
     };
     itemSchema.required!.push("scheduling");
+    itemSchema.properties!.condition = {
+      anyOf: [
+        { type: "null" },
+        strict({
+          conditionId: { ...text, minLength: 1 },
+          when: { type: "boolean" },
+        }),
+      ],
+    };
+    itemSchema.required!.push("condition");
     itemSchema.properties!.discoveryInputs = {
       type: "array",
       items: strict({
@@ -369,6 +383,7 @@ export function compilerWire(
     ...Object.keys(readonlyConstants),
     "newPackages",
     "executionProfile",
+    "condition",
   ];
   const outputFields = [
     "expectedOutputRoles",
@@ -529,6 +544,32 @@ export function compilerWire(
       }),
     };
     schema.required!.push("expansions");
+    schema.properties!.conditions = {
+      type: "array",
+      items: strict({
+        schemaVersion: { type: "integer", enum: [1] },
+        id: { ...text, minLength: 1 },
+        input: strict({
+          producerItemId: text,
+          role: text,
+          schema: { type: "string", enum: ["factory.repository-inventory/v1"] },
+        }),
+        predicate: {
+          anyOf: [
+            strict({ kind: { type: "string", enum: ["inventory-empty"] } }),
+            strict({
+              kind: { type: "string", enum: ["has-classification"] },
+              classification: { ...text, minLength: 1 },
+              otherClassifications: {
+                type: "array",
+                items: { ...text, minLength: 1 },
+              },
+            }),
+          ],
+        },
+      }),
+    };
+    schema.required!.push("conditions");
   }
   // Stable content first, so repeated and revised compilations share a
   // provider-cache prefix; the revision-specific parts and the context
@@ -588,7 +629,7 @@ export function compilerWire(
           "items",
           "coverage",
           "requiredPreIntegrationChecks",
-          ...(request.contextLookup ? ["expansions"] : []),
+          ...(request.contextLookup ? ["expansions", "conditions"] : []),
         ],
         "response",
       );
@@ -681,6 +722,7 @@ export function compilerWire(
           );
           if (item.kind === "discovery") expected.push("discovery");
           keys(item, expected, "item");
+          if (item.condition === null) delete item.condition;
           if (item.kind === "discovery") {
             assertDiscoverySpecification(item.discovery);
             if (!Array.isArray(item.validation) || item.validation.length)
@@ -1021,6 +1063,15 @@ export function compilerWire(
           "Planner QA node has no acceptance coverage",
         );
       if (request.contextLookup) {
+        if (!Array.isArray(wire.conditions))
+          throw new Error("Planner conditions must be an array");
+        if (wire.conditions.length)
+          graph.conditions = wire.conditions.map((value) => {
+            const condition = structuredClone(value);
+            assertDeclaredWorkCondition(condition);
+            return condition;
+          });
+        assertDeclaredConditions(graph);
         if (!Array.isArray(wire.expansions))
           throw new Error("Planner expansions must be an array");
         if (wire.expansions.length) {
@@ -1051,6 +1102,7 @@ export function compilerWire(
             return envelope;
           });
         }
+        assertDeclaredConditions(graph);
       }
       return graph;
     },

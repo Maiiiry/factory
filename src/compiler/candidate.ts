@@ -1,3 +1,4 @@
+import { assertDeclaredConditions } from "../adaptive-routing.js";
 import {
   assertDiscoveryContextScope,
   assertContextFactsResolved,
@@ -44,7 +45,7 @@ import { assertGraphExpansions } from "../graph-expansion.js";
 export interface PlanCandidate {
   contextLookup?: PlanningContextPacket;
   approvedPlaybookPin?: ApprovedPlaybookPin;
-  schemaVersion: 3 | 4 | 5;
+  schemaVersion: 3 | 4 | 5 | 6;
   prerequisites?: PlanningPrerequisites;
   localExecutables?: PlanningLocalExecutables;
   executionBounds?: PlanningExecutionBounds;
@@ -113,12 +114,14 @@ export function buildPlanCandidate(
     ...(review.failure ? { failure: review.failure } : {}),
   };
   return {
-    schemaVersion: graph.expansions?.length
-      ? 5
-      : packet.contextLookup ||
-          graph.items.some((item) => item.kind === "discovery")
-        ? 4
-        : 3,
+    schemaVersion: graph.conditions?.length
+      ? 6
+      : graph.expansions?.length
+        ? 5
+        : packet.contextLookup ||
+            graph.items.some((item) => item.kind === "discovery")
+          ? 4
+          : 3,
     ...(packet.contextLookup
       ? { contextLookup: structuredClone(packet.contextLookup) }
       : {}),
@@ -186,6 +189,7 @@ export function verifyPlanCandidate(
   if (candidate.contextLookup)
     assertContextFactsResolved(candidate.contextLookup);
   assertDiscoveryContextScope(candidate.graph, candidate.contextLookup);
+  assertDeclaredConditions(candidate.graph);
   assertGraphExpansions(candidate.graph, {
     executionProfiles: candidate.executionProfiles,
   });
@@ -226,12 +230,14 @@ export function verifyPlanCandidate(
         JSON.stringify(candidate.localExecutables.finalCommands) !==
           JSON.stringify(expectedPacket.finalCommands))) ||
     candidate.schemaVersion !==
-      (candidate.graph.expansions?.length
-        ? 5
-        : candidate.contextLookup ||
-            candidate.graph.items.some((item) => item.kind === "discovery")
-          ? 4
-          : 3) ||
+      (candidate.graph.conditions?.length
+        ? 6
+        : candidate.graph.expansions?.length
+          ? 5
+          : candidate.contextLookup ||
+              candidate.graph.items.some((item) => item.kind === "discovery")
+            ? 4
+            : 3) ||
     candidate.objective !== objective ||
     candidate.baseSha !== baseSha ||
     candidate.bodyDigest !== digest(body) ||
