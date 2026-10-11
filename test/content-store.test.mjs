@@ -1160,6 +1160,25 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     baseSha,
     new Set(["OBJECTIVE"]),
   );
+  const invalidAggregate = structuredClone(routeGraph);
+  invalidAggregate.items.push({
+    ...routeDefaults,
+    id: "branch-aggregate",
+    kind: "aggregate",
+    children: ["has-files"],
+    dependencies: ["has-files"],
+    acceptance: aggregateAcceptance({ id: "branch-aggregate" }),
+  });
+  assert.throws(
+    () =>
+      validateAndOrderGraph(
+        invalidAggregate,
+        producer.objective,
+        baseSha,
+        new Set(["OBJECTIVE"]),
+      ),
+    /explicit aggregate child/,
+  );
   const routeState = {
     schemaVersion: 13,
     repository: routingConfig.repository,
@@ -1195,6 +1214,17 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
       integration: { status: "pending" },
     },
   };
+  const missingRoutingAdmission = structuredClone(routeState);
+  delete missingRoutingAdmission.planningRecovery.contextLookup;
+  assert.throws(
+    () =>
+      parseFactoryState(
+        missingRoutingAdmission,
+        routingConfig.repository,
+        producer.objective,
+      ),
+    /requires its original admitted planning context/,
+  );
   const snapshot = join(root, "routing-state.json");
   const routeArgs = {
     config: routingConfig,

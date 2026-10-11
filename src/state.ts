@@ -1015,6 +1015,10 @@ export function parseFactoryState(
     throw new Error(
       "Adaptive execution lacks its retained context or discovery semantics",
     );
+  if (state.schemaVersion === 13 && lookup === undefined)
+    throw new Error(
+      "Execution snapshot version 13 requires its original admitted planning context",
+    );
   for (const raw of graph.items) {
     const item = raw as Record<string, unknown>;
     if (
