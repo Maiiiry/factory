@@ -142,6 +142,7 @@ export interface MemoryResult {
 export interface MemoryLookup {
   access: MemoryAccess;
   excludeIds?: string[];
+  suppliedSources?: { path: string; heading?: string; digest: string }[];
   scope?: { objective?: number; paths?: string[]; kinds?: MemoryKind[] };
   applicability?: MemoryApplicability;
   limit: number;
@@ -399,6 +400,29 @@ function canonical(value: unknown): string {
       .join(",")}}`;
   return JSON.stringify(value);
 }
+function meaningfulRecord(record: RepositoryMemoryRecord): string {
+  const immutableReference =
+    record.kind === "reference" &&
+    record.sources.length > 0 &&
+    record.sources.every(
+      (source) =>
+        source.commitSha && source.treeSha && source.version && source.ref,
+    );
+  return canonical({
+    ...record,
+    createdAt: undefined,
+    // An unchanged pinned Git selection keeps its first actual observation time.
+    // External/API refresh records still distinguish their retrieval events.
+    ...(immutableReference
+      ? {
+          sources: record.sources.map((source) => ({
+            ...source,
+            retrievedAt: undefined,
+          })),
+        }
+      : {}),
+  });
+}
 class MemoryStorageDenied extends Error {}
 function privateDirectory(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -495,12 +519,12 @@ export class LocalRepositoryMemory {
     for (const source of record.sources)
       if (source.ref !== undefined && source.complete)
         this.store.readBytes(source.ref);
-    const meaningful = canonical({ ...record, createdAt: undefined });
+    const meaningful = meaningfulRecord(record);
     // One verified metadata pass per producer batch; this cache is derived and is
     // never used to authenticate reads or continuation state.
     this.retainedIdentities ??= new Map(
       this.retained().entries.map((entry) => [
-        canonical({ ...entry.record, createdAt: undefined }),
+        meaningfulRecord(entry.record),
         entry.binding,
       ]),
     );
@@ -848,6 +872,16 @@ export class LocalRepositoryMemory {
       (!Array.isArray(lookup.excludeIds) || !lookup.excludeIds.every(isHash))
     )
       throw new Error("Invalid excluded memory identity");
+    if (lookup.suppliedSources !== undefined) {
+      if (!Array.isArray(lookup.suppliedSources))
+        throw new Error("Invalid supplied memory sources");
+      for (const source of lookup.suppliedSources) {
+        keys(source, ["path", "heading", "digest"]);
+        if (!validOwnershipPath(source.path) || !isHash(source.digest))
+          throw new Error("Invalid supplied memory source identity");
+        if (source.heading !== undefined) text(source.heading);
+      }
+    }
     if (lookup.access.repository !== this.repository)
       return { entries: [], unavailable: [] };
     if (
@@ -862,6 +896,19 @@ export class LocalRepositoryMemory {
     retained.entries = retained.entries.filter(
       (entry) =>
         !excluded.has(entry.binding.id) &&
+        !(
+          entry.record.kind === "reference" &&
+          entry.record.bodies.length === 1 &&
+          entry.record.sources.some((source) =>
+            (lookup.suppliedSources ?? []).some(
+              (supplied) =>
+                source.path === supplied.path &&
+                source.heading === supplied.heading &&
+                source.ref?.digest === supplied.digest &&
+                entry.record.bodies[0]?.ref?.digest === supplied.digest,
+            ),
+          )
+        ) &&
         this.accessible(lookup.access, entry.record) &&
         this.inScope(entry.record, lookup),
     );
