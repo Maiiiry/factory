@@ -46,7 +46,9 @@ export interface ExecutionProfileChoices {
 
 export interface WorkItem {
   /** Read-only proof node; uses the ordinary scheduler without a worker or PR. */
-  kind?: "work" | "qa" | "aggregate";
+  kind?: "work" | "qa" | "aggregate" | "discovery";
+  /** Bound read-only observation; never coding or publication authority. */
+  discovery?: import("./discovery.js").DiscoverySpecification;
   /** Hierarchy only; every required child also has an explicit dependency edge. */
   children?: string[];
   executionProfile?: { id: string; reason: string };
@@ -361,6 +363,8 @@ export function assertApprovedPlaybookPin(
 }
 
 export interface PlanningRequest<T> {
+  /** Retained controller-selected facts, separate from normative source authority. */
+  contextLookup?: import("./compiler/context.js").PlanningContextPacket;
   /** Controller-owned planner continuation; never model-authored or persisted in a graph. */
   session?: AgentSessionContinuation;
   approvedPlaybookPin?: ApprovedPlaybookPin;
@@ -415,6 +419,8 @@ export interface PlanCommandAuthorization {
 }
 
 export interface PlanReviewRequest {
+  /** The exact context packet used by compilation, independently reviewed. */
+  contextLookup?: import("./compiler/context.js").PlanningContextPacket;
   approvedPlaybookPin?: ApprovedPlaybookPin;
   prerequisites?: PlanningPrerequisites;
   localExecutables?: PlanningLocalExecutables;
@@ -639,6 +645,8 @@ export interface PlanningModel {
 }
 
 export interface ExecutionRequest {
+  /** Controller-authenticated selector-bound observation supplied to discovery. */
+  discovery?: { manifest: import("./discovery.js").DiscoveryOutputManifest };
   session?: AgentSessionRequest;
   captureContext?: { objective: number; runId: string };
   item: WorkItem;
@@ -702,6 +710,7 @@ export interface WorkDiscovery {
 }
 
 export interface ExecutionResult {
+  discoveryOutput?: import("./discovery.js").DiscoveryOutputManifest;
   session?: AgentSessionRef;
   handoff?: {
     notes: WorkHandoffNote[];
@@ -795,6 +804,11 @@ export interface ExecutionDriver {
 }
 
 export interface HarnessRequest {
+  /** Only authenticated selected blobs are exposed to a read-only discovery harness. */
+  discovery?: {
+    manifest: import("./discovery.js").DiscoveryOutputManifest;
+    body: import("./discovery.js").DiscoveryBody;
+  };
   /** Controller preparation in this exact checkout; never acceptance or lifetime proof. */
   workerReadiness?: import("./worker-readiness.js").WorkerReadinessReceipt;
   session?: AgentSessionRequest;
@@ -839,6 +853,13 @@ export interface HarnessResult {
   evidence?: unknown;
 }
 export interface AgentHarnessCapabilities {
+  discovery?: {
+    schema: "factory.repository-inventory/v1";
+    worktree: "read-only";
+    children: "disabled";
+    network: "off";
+    freshConversation: true;
+  };
   protocolVersion: 1;
   worktree: "factory-owned-read-write";
   head: "preserve";
