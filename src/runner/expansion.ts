@@ -5,7 +5,10 @@ import type {
   WorkGraph,
 } from "../contracts.js";
 import type { FactoryConfig } from "../config.js";
-import { authenticateDiscoveryOutput } from "../discovery.js";
+import {
+  authenticateDiscoveryOutput,
+  type DiscoveryBody,
+} from "../discovery.js";
 import {
   executionProfileChoices,
   verifyExecutionProfiles,
@@ -19,7 +22,10 @@ import {
   materializeGraphExpansion,
 } from "../graph-expansion.js";
 import { assertExpansionCoverage } from "../qa.js";
-import type { FactoryState } from "../state.js";
+import { assertWorkDiscoveryOutput, type FactoryState } from "../state.js";
+import { assertDiscoveryAdmission } from "./discovery.js";
+import { canHandoff } from "./ownership.js";
+import { assertExpansionsSettled } from "../expansion-readiness.js";
 import { step, type StepOptions } from "../step.js";
 
 export interface GraphExpansionReceipt {
@@ -170,6 +176,7 @@ async function materialization(
   graph: WorkGraph,
   envelopeId: string,
   immutableItemIds: string[] = [],
+  authenticatedBodies = new Map<string, DiscoveryBody>(),
 ) {
   const envelope = graph.expansions?.find((entry) => entry.id === envelopeId);
   if (!envelope) throw held("Expansion envelope is unavailable");
@@ -194,12 +201,20 @@ async function materialization(
     throw held(
       "Expansion requires its exact complete accepted discovery producer",
     );
-  const body = await authenticateDiscoveryOutput({
-    checkout: config.checkout,
+  const bodyIdentity = JSON.stringify({
     specification: producer.discovery,
     manifest,
-    store,
   });
+  let body = authenticatedBodies.get(bodyIdentity);
+  if (!body) {
+    body = await authenticateDiscoveryOutput({
+      checkout: config.checkout,
+      specification: producer.discovery,
+      manifest,
+      store,
+    });
+    authenticatedBodies.set(bodyIdentity, body);
+  }
   return materializeGraphExpansion({
     graph,
     envelopeId,
@@ -220,6 +235,7 @@ export async function authenticateExpansionInputs(args: {
   const { state, config, contentStore } = args;
   assertExpansionState(state);
   const ids = new Set<string>();
+  const authenticatedBodies = new Map<string, DiscoveryBody>();
   for (const retained of [
     ...(state.expansionHistory ?? []),
     ...(state.pendingExpansion ? [state.pendingExpansion] : []),
@@ -232,6 +248,8 @@ export async function authenticateExpansionInputs(args: {
         contentStore,
         parent,
         retained.envelopeId,
+        [],
+        authenticatedBodies,
       );
       await contentStore.verify(retained.inputPacketRef);
       const text = await new Response(
@@ -259,6 +277,34 @@ export async function authenticateExpansionInputs(args: {
     }
   }
   return ids;
+}
+/** One current acceptance-phase authentication shared by fresh and resumed finalization. */
+export async function authenticateObjectiveInputs(args: {
+  state: FactoryState;
+  config: FactoryConfig;
+  contentStore: ContentStore;
+}): Promise<ReadonlySet<string>> {
+  const resolved = await authenticateExpansionInputs(args);
+  assertExpansionsSettled(args.state.graph, resolved);
+  const authenticatedProducers = new Set(
+    (args.state.graph.expansions ?? [])
+      .filter((envelope) => resolved.has(envelope.id))
+      .map((envelope) => envelope.input.producerItemId),
+  );
+  for (const item of args.state.graph.items.filter(
+    (item) => item.kind === "discovery",
+  )) {
+    assertDiscoveryAdmission(args.config, args.state, item);
+    assertWorkDiscoveryOutput(args.state, item.id, args.state.work[item.id]!);
+    if (!authenticatedProducers.has(item.id))
+      await authenticateDiscoveryOutput({
+        checkout: args.config.checkout,
+        specification: item.discovery!,
+        manifest: args.state.work[item.id]!.discoveryOutput!,
+        store: args.contentStore,
+      });
+  }
+  return resolved;
 }
 /** True only when a completed producer can yield a new immutable graph pass. */
 export function graphExpansionPending(state: FactoryState): boolean {
@@ -294,6 +340,20 @@ export async function applyPendingGraphExpansion(
     )
   )
     return false;
+  const unsettledWorker = Object.entries(state.work).find(
+    ([, work]) =>
+      work.execution &&
+      (["failed", "waiting", "pending", "cancelled"].includes(work.status) ||
+        work.step === "execute" ||
+        !work.changeRef ||
+        !work.treeSha),
+  );
+  if (unsettledWorker || !canHandoff(state))
+    throw held(
+      unsettledWorker
+        ? `Work Item ${unsettledWorker[0]} retains unresolved worker ${unsettledWorker[1].execution!.identity}; preserve its handle and settle it through supported recovery before expansion`
+        : "Expansion retains an unresolved controller process, provider invocation or session resource; settle that recorded owner through supported recovery before projection",
+    );
   if (github.projectionMutationAdmission !== "controller-checkpoint-v1")
     throw held(
       "GitHub adapter cannot preserve exact expansion projection effects",

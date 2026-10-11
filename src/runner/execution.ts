@@ -1,6 +1,7 @@
 import {
   applyPendingGraphExpansion,
   authenticateExpansionInputs,
+  authenticateObjectiveInputs,
   graphExpansionPending,
 } from "./expansion.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
@@ -311,6 +312,14 @@ export async function runObjectivePass(
         state.capacity.concurrency,
       );
       const saveCurrent = () => save(state!);
+      if (
+        state.finalValidation?.passed &&
+        !state.finalAcceptance &&
+        state.objectiveClosure !== "complete"
+      ) {
+        await authenticateObjectiveInputs({ state, config, contentStore });
+        stopIfCancelled();
+      }
       for (const item of state.graph.items)
         if (state.work[item.id]?.status === "done")
           await closeWorkItem(
