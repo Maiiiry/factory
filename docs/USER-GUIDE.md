@@ -796,6 +796,8 @@ The current materialized checkpoint charges its exact manifest bytes plus dedupl
 
 Archive history is append-only; deduplicating bodies does not bound accumulated Git history, and Factory does not automatically delete it. Streaming can reduce allocation without removing cumulative byte or commit limits. Raising an actually binding history allowance requires an explicitly authorized resource-policy change; an inspection or restore does not grant that increase.
 
+The finite `queue pause`, `queue resume` and `queue drain` controls share a disposable verifier within that operation. It starts empty and receives Git objects only from the configured archive remote. Each read still fetches the current ref and authenticates its complete bodies, raw Git object identities and full ancestry semantics under the configured limits. Only bounded intrinsic manifest summaries are reused; no ownership, acceptance or transport verdict is cached. Settled resources are removed at operation closure; an unsettled Git process leaves the verifier quarantined and its outcome unresolved. Enqueue, watch, daemon, Objective runs and fresh restoration keep their ordinary independent verification path. This changes neither archive format nor resource limits and grants no additional execution or replay authority.
+
 ```sh
 factory persistence status --config /private/factory.json
 factory persistence sync --config /private/factory.json
