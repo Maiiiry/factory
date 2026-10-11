@@ -462,8 +462,11 @@ class ClaudePlanningTransport implements PlanningTransport {
   get sessionCapabilities() {
     return this.sessionRoot
       ? {
-          // Result and Objective review stay fresh until their installed lifecycle is qualified.
-          resumeRoles: ["planning"] as const,
+          resumeRoles: [
+            "planning",
+            "result-review",
+            "objective-review",
+          ] as const,
         }
       : undefined;
   }
