@@ -862,7 +862,9 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   const { createPlanningContextResolver } = await import(
     "../dist/compiler/context-runtime.js"
   );
-  const { validateConfig, stateRoot } = await import("../dist/config.js");
+  const { validateConfig, stateRoot, factoryConfigDigest } = await import(
+    "../dist/config.js"
+  );
   git(
     checkout,
     "remote",
@@ -1010,6 +1012,150 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
   );
   assert.equal(memoryPinned.disposition, "complete");
   assert.equal(memoryPinned.matches[0].content, originalBody);
+
+  const rankedConfig = validateConfig({
+    ...memoryConfig,
+    planningContext: {
+      ...memoryConfig.planningContext,
+      bounds: {
+        ...memoryConfig.planningContext.bounds,
+        maxResults: 64,
+        maxBytes: 131072,
+        maxElapsedMs: 30000,
+      },
+    },
+  });
+  const observedSource = sourceReference.record;
+  const observation = (summary) => ({
+    ...observedSource,
+    kind: "observation",
+    createdAt: new Date().toISOString(),
+    summary,
+    bindings: {
+      ...observedSource.bindings,
+      environment: { configDigest: factoryConfigDigest(rankedConfig) },
+    },
+  });
+  const relevantSummary =
+    "Adaptive workflow enabled: api interface version one, complete body; scopedretrievalneedle";
+  const relevant = retainedMemory.retain(observation(relevantSummary));
+  for (let index = 0; index < 66; index++)
+    retainedMemory.retain(
+      observation(`Observed immutable interface body, receipt ${index}`),
+    );
+  const rankedResolver = createPlanningContextResolver({
+    ...runtimeInput,
+    config: rankedConfig,
+  });
+  const rankedCatalog = rankedResolver.catalog.find(
+    (collection) => collection.id === "memory",
+  );
+  assert.equal(rankedCatalog.completeness, "incomplete");
+  assert.equal(rankedCatalog.selectors.length, 65);
+  assert.ok(
+    !rankedCatalog.selectors.includes(relevant.id),
+    "the older relevant observation falls outside the newest 64 displayed manifests",
+  );
+  assert.ok(!rankedCatalog.selectors.includes(sourceReference.binding.id));
+  const rankedRecord = await initializeContextLookup(rankedResolver);
+  const relevantAutomatic = rankedRecord.packet.automatic
+    .flatMap((result) => result.matches)
+    .find((match) => match.identity === `memory:${relevant.id}`);
+  assert.ok(
+    relevantAutomatic,
+    "automatic relevance ranking supplies the older exact body despite preview truncation",
+  );
+  assert.equal(
+    JSON.parse(relevantAutomatic.content).content[0].text,
+    originalBody,
+  );
+  assert.ok(
+    rankedRecord.packet.automatic.every((result) =>
+      result.matches.every(
+        (match) => match.identity !== `memory:${sourceReference.binding.id}`,
+      ),
+    ),
+  );
+  const focusedSearch = {
+    id: "focused-memory-search",
+    operation: "search",
+    collection: "memory",
+    selector: "",
+    query: "scopedretrievalneedle",
+    required: true,
+    reason: "Retrieve the exact earlier observed interface fact",
+  };
+  const rankedBatch = await resolveContextRequests(
+    rankedRecord,
+    rankedResolver,
+    [
+      focusedSearch,
+      {
+        ...focusedSearch,
+        id: "absent-memory-search",
+        query: "unobservedretrievalneedle",
+      },
+      {
+        ...focusedSearch,
+        id: "older-memory-read",
+        operation: "read",
+        selector: relevant.id,
+        query: "",
+      },
+    ],
+  );
+  assert.equal(rankedBatch[0].disposition, "complete");
+  assert.equal(rankedBatch[0].matches.length, 1);
+  assert.equal(rankedBatch[0].matches[0].identity, `memory:${relevant.id}`);
+  assert.equal(rankedBatch[1].disposition, "no-match");
+  assert.equal(rankedBatch[2].disposition, "complete");
+  assert.equal(
+    JSON.parse(rankedBatch[2].matches[0].content).content[0].text,
+    originalBody,
+  );
+  assert.doesNotThrow(() => assertContextFactsResolved(rankedRecord.packet));
+
+  const memoryStore = new LocalContentStore(
+    join(stateRoot(config.repository), "content"),
+  );
+  const outsideRef = memoryStore.putBytes(
+    execFileSync("git", ["-C", checkout, "show", `${baseSha}:secret.txt`]),
+    { mediaType: "text/plain; charset=utf-8" },
+  );
+  const outsideMemory = retainedMemory.retain({
+    ...observation("Observed a file outside the admitted source selectors"),
+    bodies: [
+      { role: "observed-file", ref: outsideRef, availability: "retained" },
+    ],
+    sources: [
+      {
+        identity: "secret.txt#",
+        path: "secret.txt",
+        complete: true,
+        ref: outsideRef,
+      },
+    ],
+    bindings: { paths: [{ path: "secret.txt", digest: outsideRef.digest }] },
+  });
+  const rankedRemaining = {
+    maxResults: 8,
+    maxBytes: 131072,
+    deadlineAt: Date.now() + 30000,
+  };
+  for (const selector of ["invalid-memory-identity", outsideMemory.id]) {
+    const deniedMemory = await rankedResolver.resolve(
+      {
+        ...focusedSearch,
+        id: `denied-${selector}`,
+        operation: "read",
+        selector,
+        query: "",
+      },
+      rankedRemaining,
+    );
+    assert.equal(deniedMemory.disposition, "denied");
+    assert.deepEqual(deniedMemory.matches, []);
+  }
 
   const outside = await runtimeResolver.resolve(
     {
