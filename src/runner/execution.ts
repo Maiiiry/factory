@@ -1,3 +1,8 @@
+import {
+  applyPendingGraphExpansion,
+  authenticateExpansionInputs,
+  graphExpansionPending,
+} from "./expansion.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import { checkRequiredEnvironment } from "../repair-policy.js";
 import { stopRetryCommand } from "../run-outcome.js";
@@ -421,6 +426,22 @@ export async function runObjectivePass(
       diagnostics,
     });
     if (state.coordinator.mode === "running" && !cancellationRequested()) {
+      await applyPendingGraphExpansion({
+        state,
+        config,
+        contentStore,
+        github,
+        save: () => save(state),
+        signal: objectiveSignal(),
+        pause: objectivePause(),
+      });
+    }
+    const resolvedExpansionIds = await authenticateExpansionInputs({
+      state,
+      config,
+      contentStore,
+    });
+    if (state.coordinator.mode === "running" && !cancellationRequested()) {
       for (const [id, work] of Object.entries(state.work)) {
         if (
           work.status === "failed" &&
@@ -516,7 +537,9 @@ export async function runObjectivePass(
           return workItemPauseSignal(owner);
         },
         paused: () => state.coordinator?.mode !== "running",
-        amendmentPending: () => amendmentBlocksDispatch(state),
+        resolvedExpansionIds,
+        amendmentPending: () =>
+          amendmentBlocksDispatch(state) || graphExpansionPending(state),
         diagnostics,
       });
       if (graph.items.some((item) => state.work[item.id]?.status === "waiting"))
@@ -543,12 +566,15 @@ export async function runObjectivePass(
           return workItemPauseSignal(owner);
         },
         paused: () => state.coordinator?.mode !== "running",
-        amendmentPending: () => amendmentBlocksDispatch(state),
+        resolvedExpansionIds,
+        amendmentPending: () =>
+          amendmentBlocksDispatch(state) || graphExpansionPending(state),
         woken: owner.woken,
         diagnostics,
       });
       if (awaitingSelection) return state;
     }
+    if (graphExpansionPending(state)) return state;
     return await finalizeObjective({
       config,
       objective,
