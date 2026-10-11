@@ -184,6 +184,20 @@ export function assertTerminalEligibility(state: FactoryState): void {
   assertCompletedCoverage(state);
 }
 
+/** Charge identities come from the retained execution attempts, not observations. */
+export function chargedWorkAttemptIds(state: FactoryState): string[] {
+  return [
+    ...new Set(
+      Object.values(state.work).flatMap((work) =>
+        [
+          work,
+          ...(work.recovery?.history ?? []).map((entry) => entry.work),
+        ].flatMap((attempt) => (attempt.attempt ? [attempt.attempt] : [])),
+      ),
+    ),
+  ].sort();
+}
+
 export function assertFinalAcceptance(
   state: FactoryState,
   options: { verifyAccountingBodies?: boolean } = {},
@@ -221,6 +235,11 @@ export function assertFinalAcceptance(
       seal.usage.accounting,
     );
     if (
+      JSON.stringify(seal.usage.accounting.chargedWorkAttempts) !==
+      JSON.stringify(chargedWorkAttemptIds(state))
+    )
+      throw new Error("Final accounting omits retained charged attempts");
+    if (
       seal.usage.availability !==
       (seal.usage.accounting.records.length ? "observed" : "unavailable")
     )
@@ -247,12 +266,7 @@ export function sealFinalAcceptance(state: FactoryState): void {
     state.repository,
     state.objective,
     state.runId,
-    Object.values(state.work).flatMap((work) =>
-      [
-        work,
-        ...(work.recovery?.history ?? []).map((entry) => entry.work),
-      ].flatMap((attempt) => (attempt.attempt ? [attempt.attempt] : [])),
-    ),
+    chargedWorkAttemptIds(state),
   );
   assertAccountingSeal(
     state.repository,
