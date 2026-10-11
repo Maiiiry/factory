@@ -118,6 +118,9 @@ export function bindPlanningPlaybook(
       },
     );
   return {
+    ...(model.providerAttemptAdmission
+      ? { providerAttemptAdmission: model.providerAttemptAdmission }
+      : {}),
     approvedPlaybookPin: pin,
     generateStructured: model.generateStructured.bind(model),
     reviewGraph: model.reviewGraph.bind(model),
@@ -497,6 +500,7 @@ Objective:\n`;
 }
 
 export class StructuredPlanningModel implements PlanningModel {
+  readonly providerAttemptAdmission = "controller-checkpoint-v1" as const;
   approvedPlaybook?: ApprovedPlaybook;
   approvedPlaybookPin?: ApprovedPlaybookPin;
   private readonly reviewCapacityRetryDelaysMs: readonly number[];
@@ -784,6 +788,7 @@ export class StructuredPlanningModel implements PlanningModel {
         turn.stopped = true;
         throw new ProviderTurnElapsedTimeoutError(args.deadlineAt);
       }
+      invocation.beforeProviderAttempt?.();
       await this.transport.run({
         role: args.role,
         prompt: args.prompt,

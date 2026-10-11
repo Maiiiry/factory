@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { ContentRef, ContentStore, WorkGraph } from "../contracts.js";
+import { pinnedGitEnvironment } from "../process.js";
 
 export type ContextDisposition =
   | "complete"
@@ -518,6 +519,7 @@ export function repositoryContextResult(
     );
   const run = (args: string[]): Buffer =>
     execFileSync("git", ["-C", checkout, ...args], {
+      env: pinnedGitEnvironment(),
       maxBuffer: remaining.maxBytes + 65536,
       timeout: Math.max(1, remaining.deadlineAt - Date.now()),
       stdio: ["ignore", "pipe", "pipe"],

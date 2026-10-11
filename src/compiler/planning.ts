@@ -227,6 +227,9 @@ export function paidModel(
 ): PlanningModel {
   const reviewResult = model.reviewResult?.bind(model);
   return {
+    ...(model.providerAttemptAdmission
+      ? { providerAttemptAdmission: model.providerAttemptAdmission }
+      : {}),
     ...(model.sessionCapabilities
       ? { sessionCapabilities: model.sessionCapabilities }
       : {}),

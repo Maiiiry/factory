@@ -221,6 +221,8 @@ export type ModelInvocationObserver = ((
 };
 
 export interface ModelInvocationContext {
+  /** Synchronous controller checkpoint immediately before each native provider submission; absent on cached decode. */
+  beforeProviderAttempt?: () => void;
   invocationId: string;
   phase: ModelInvocationPhase;
   ordinal: number;
@@ -611,6 +613,7 @@ export type AgentSessionReconciliation =
     };
 
 export interface PlanningModel {
+  readonly providerAttemptAdmission?: "controller-checkpoint-v1";
   readonly sessionCapabilities?: AgentSessionCapabilities;
   reconcileSession?(
     session: AgentSessionRef,
@@ -765,6 +768,8 @@ export interface ExecutionContext {
 }
 
 export interface ExecutionDriver {
+  /** Semantic discovery is admitted only after this driver's selector-bound read-only preflight. */
+  readonly readonlyDiscovery?: "selector-bound-read-only-v1";
   readonly sessionCapabilities?: AgentSessionCapabilities;
   releaseSession?(session: AgentSessionRef): Promise<void>;
   /** Supports authenticated preparation in its actual fresh worker checkout. */

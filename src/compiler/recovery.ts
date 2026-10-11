@@ -181,6 +181,13 @@ async function compilePlanAdmitted(
     );
   state.planningRecovery ??= { phase: "ready", history: [] };
   const record = state.planningRecovery;
+  if (
+    context.contextResolver &&
+    model.providerAttemptAdmission !== "controller-checkpoint-v1"
+  )
+    throw new PlanningReviewBindingError(
+      "Context-enabled planning requires a model with controller admission before every native provider attempt",
+    );
   if (record.contextLookup) {
     assertPlanningLookupRecord(record.contextLookup);
     if (
@@ -322,7 +329,6 @@ async function compilePlanAdmitted(
           "Frozen planning lookup provider allowance is exhausted",
         );
       }
-      record.contextLookup.providerCalls++;
     }
     const id = randomUUID();
     record.phase = "submitted";
@@ -331,6 +337,26 @@ async function compilePlanAdmitted(
     record.invocations.push({ id, phase });
     save();
     return {
+      ...(phase === "compile" && record.contextLookup
+        ? {
+            beforeProviderAttempt: () => {
+              const lookup = record.contextLookup!;
+              if (
+                lookup.providerCalls >= lookup.packet.bounds.maxProviderCalls
+              ) {
+                record.phase = "stopped";
+                save();
+                throw new StepFault(
+                  decision(
+                    "Frozen planning lookup provider allowance is exhausted",
+                  ),
+                );
+              }
+              lookup.providerCalls++;
+              save();
+            },
+          }
+        : {}),
       invocationId: id,
       phase,
       ordinal: consumption(state).planningRevisions,
@@ -342,6 +368,9 @@ async function compilePlanAdmitted(
     if (receipt) receipt.resultDigest = failureDigest(JSON.stringify(result));
   };
   const observedModel: PlanningModel = {
+    ...(model.providerAttemptAdmission
+      ? { providerAttemptAdmission: model.providerAttemptAdmission }
+      : {}),
     ...(model.sessionCapabilities
       ? { sessionCapabilities: model.sessionCapabilities }
       : {}),
