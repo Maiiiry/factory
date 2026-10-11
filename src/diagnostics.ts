@@ -48,7 +48,11 @@ import {
   remaining,
   repairScopes,
 } from "./repair-policy.js";
-import { itemsConflict } from "./scheduler.js";
+import {
+  pendingItemBlocker,
+  schedulingObservations,
+  type SchedulingObservation,
+} from "./scheduler.js";
 import type {
   ContinuationState,
   CoordinatorDisposition,
@@ -403,6 +407,38 @@ export class DiagnosticEmitter {
   }
   get objectiveIdentity(): number {
     return this.objective;
+  }
+
+  scheduling(args: {
+    runId: string;
+    itemId: string;
+    facts: SchedulingObservation;
+    blocker?: { kind: string; detail: string; blockedBy?: string };
+    providerAvailableSlots: number | "unknown";
+    codingReservations: number;
+  }): void {
+    const metadata = Object.fromEntries(
+      Object.entries(args.facts).map(([key, value]) => [
+        key,
+        value ?? "unknown",
+      ]),
+    ) as Record<string, string | number | boolean>;
+    this.emit({
+      runId: args.runId,
+      itemId: args.itemId,
+      operation: "scheduling-admission",
+      outcome: args.blocker ? "waiting" : "observed",
+      metadata: {
+        ...metadata,
+        blockerKind: args.blocker?.kind ?? "admitted",
+        ...(args.blocker?.blockedBy
+          ? { blockedBy: args.blocker.blockedBy }
+          : {}),
+        providerAvailableSlots: args.providerAvailableSlots,
+        codingReservations: args.codingReservations,
+      },
+      detail: args.blocker?.detail,
+    });
   }
 
   emit(
@@ -1890,6 +1926,19 @@ export function statusDocument(
     concurrency === undefined
       ? undefined
       : Math.max(0, concurrency - activeCount);
+  const scheduling = schedulingObservations(state.graph, state.work);
+  const owned = new Set(
+    state.graph.items
+      .filter((item) =>
+        ["running", "published", "waiting"].includes(
+          state.work[item.id]?.status ?? "",
+        ),
+      )
+      .map((item) => item.id),
+  );
+  const settled = new Set(
+    state.expansionHistory?.map((entry) => entry.envelopeId),
+  );
   const work = state.graph.items.map((item) => {
     const current = state.work[item.id]!;
     // A code only; a step's or the scheduler's wait is on `wait`.
@@ -1899,31 +1948,40 @@ export function statusDocument(
         ? "capacity"
         : undefined;
     let eligible = false;
+    let schedulingBlocker: ReturnType<typeof pendingItemBlocker>;
     if (current.status === "pending") {
-      const dependency = item.dependencies.find(
-        (id) =>
-          state.work[id]?.status !== "done" &&
-          !(
-            delivery === "native-stack" &&
-            state.work[id]?.status === "published" &&
-            unitByItem.get(id) === unitByItem.get(item.id)
+      schedulingBlocker = pendingItemBlocker(
+        state.graph,
+        state.work,
+        item,
+        new Set(
+          [...owned].filter(
+            (id) =>
+              !(
+                delivery === "native-stack" &&
+                state.work[id]?.status === "published" &&
+                unitByItem.get(id) === unitByItem.get(item.id)
+              ),
           ),
+        ),
+        settled,
+        (id) =>
+          state.work[id]?.status === "done" ||
+          (delivery === "native-stack" &&
+            state.work[id]?.status === "published" &&
+            unitByItem.get(id) === unitByItem.get(item.id)),
       );
-      const conflict = state.graph.items.find(
-        (candidate) =>
-          state.work[candidate.id]?.status === "running" &&
-          itemsConflict(item, candidate),
-      );
-      eligible = !dependency && !conflict;
-      blockedReason = dependency
-        ? `dependency:${dependency}`
-        : conflict
-          ? `resource:${conflict.id}`
-          : item.kind !== "qa" &&
-              item.kind !== "aggregate" &&
-              configuredSlots === 0
-            ? "capacity"
-            : blockedReason;
+      eligible = !schedulingBlocker;
+      blockedReason = schedulingBlocker
+        ? `${schedulingBlocker.kind}${schedulingBlocker.blockedBy ? `:${schedulingBlocker.blockedBy}` : ""}`
+        : item.kind !== "qa" &&
+            item.kind !== "aggregate" &&
+            !(
+              item.kind === "discovery" && item.discovery?.mode === "inventory"
+            ) &&
+            configuredSlots === 0
+          ? "capacity"
+          : blockedReason;
     } else if (current.status === "waiting")
       blockedReason =
         current.step === "approve-result"
@@ -1937,6 +1995,20 @@ export function statusDocument(
       phaseReservation: current.phaseReservation ?? null,
       requestedPhase: current.requestedPhase ?? null,
       priority: item.priority ?? 0,
+      scheduling: {
+        ...scheduling.get(item.id),
+        estimatedDurationMs: item.scheduling?.estimatedDurationMs ?? null,
+        estimateReason: item.scheduling
+          ? redactDiagnosticDetail(item.scheduling.reason, secrets)
+          : null,
+        blocker: schedulingBlocker
+          ? {
+              ...schedulingBlocker,
+              detail: redactDiagnosticDetail(schedulingBlocker.detail, secrets),
+            }
+          : null,
+        providerAvailableSlots: null,
+      },
       eligible,
       // Provider capacity is not persisted in the state snapshot.
       ready: current.status === "pending" && !blockedReason ? null : false,

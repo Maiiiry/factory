@@ -41,7 +41,13 @@ import { currentProcessSignal } from "../process.js";
 import { runQaItem } from "../qa-execution.js";
 import { runDiscoveryItem } from "../runner/discovery.js";
 import { phaseAdmission } from "../phase-admission.js";
-import { itemsConflict, rankPending } from "../scheduler.js";
+import {
+  itemsConflict,
+  pathsOverlap,
+  pendingItemBlocker,
+  rankPending,
+  schedulingObservations,
+} from "../scheduler.js";
 import type { FactoryState } from "../state.js";
 import { type StepContext, StepPaused, step } from "../step.js";
 import {
@@ -176,6 +182,7 @@ export async function runNativeGraph(args: {
         state,
         item,
         model: args.planningModel,
+        contentStore,
         diagnostics: args.diagnostics,
         sources: planningSources(
           args.objectiveBody,
@@ -243,14 +250,47 @@ export async function runNativeGraph(args: {
   // Admit independent roots whenever their predecessor units have integrated.
   // Publication stays ordered; a prepared change is replayed and validated
   // again if an earlier unit advanced the integrated head.
+  const observePreparationHold = (kind: string, detail: string): void => {
+    const facts = schedulingObservations(state.graph, state.work);
+    for (const item of state.graph.items.filter(
+      (candidate) =>
+        state.work[candidate.id]?.status === "pending" &&
+        !["qa", "aggregate", "discovery"].includes(candidate.kind ?? "work"),
+    ))
+      args.diagnostics?.scheduling({
+        runId: state.runId,
+        itemId: item.id,
+        facts: facts.get(item.id)!,
+        blocker: pendingItemBlocker(
+          state.graph,
+          state.work,
+          item,
+          new Set(),
+          args.resolvedExpansionIds,
+        ) ?? { kind, detail },
+        providerAvailableSlots: "unknown",
+        codingReservations: phases.codingCount(),
+      });
+  };
   const prepareReadyUnits = async (): Promise<void> => {
-    if (args.paused?.() || args.amendmentPending?.()) return;
+    if (args.paused?.() || args.amendmentPending?.()) {
+      observePreparationHold(
+        "operator",
+        "Objective is paused or awaits its admitted graph transition",
+      );
+      return;
+    }
     if (
       Object.values(state.work).some(
         (work) => work.status === "running" && work.step === "validate",
       )
-    )
+    ) {
+      observePreparationHold(
+        "completion",
+        "Native validation is settling before new independent preparation",
+      );
       return;
+    }
     if (
       state.graph.items.some(
         (item) =>
@@ -258,10 +298,22 @@ export async function runNativeGraph(args: {
             item.kind === "aggregate" ||
             item.kind === "discovery") &&
           state.work[item.id]?.status === "pending" &&
+          !pendingItemBlocker(
+            state.graph,
+            state.work,
+            item,
+            new Set(),
+            args.resolvedExpansionIds,
+          ) &&
           item.dependencies.every((id) => state.work[id]?.status === "done"),
       )
-    )
+    ) {
+      observePreparationHold(
+        "completion",
+        "An eligible proof or discovery completion receives the next scheduling opportunity",
+      );
       return;
+    }
     const reported = await driver.availableSlots();
     args.diagnostics?.emit({
       runId: state.runId,
@@ -273,36 +325,107 @@ export async function runNativeGraph(args: {
         codingReservations: phases.codingCount(),
       },
     });
-    const limit = phases.availableSlots(reported);
+    phases.availableSlots(reported);
     const prepared: typeof units = [];
     const runningUnits = units.filter((unit) =>
       unit.items.some((item) => state.work[item.id]?.status === "running"),
     );
     const ranked = rankPending(state.graph, state.work);
+    const facts = schedulingObservations(state.graph, state.work);
     for (const unit of [...units].sort(
       (a, b) => ranked.indexOf(a.items[0]!) - ranked.indexOf(b.items[0]!),
     )) {
-      if (prepared.length >= limit) break;
-      if (
+      if (state.work[unit.items[0]!.id]?.status !== "pending") continue;
+      const owned = new Set(
+        [...runningUnits, ...prepared].flatMap((other) =>
+          other.items.map((item) => item.id),
+        ),
+      );
+      const root = unit.items[0]!;
+      const graphBlocker = pendingItemBlocker(
+        state.graph,
+        state.work,
+        root,
+        owned,
+        args.resolvedExpansionIds,
+      );
+      const conflict = [...runningUnits, ...prepared].find((other) =>
         unit.items.some((item) =>
-          expansionBlocksItem(state.graph, item.id, args.resolvedExpansionIds),
-        ) ||
-        unit.items[0]!.kind === "qa" ||
-        phases.reason(unit.items[0]!.id, "coding") ||
-        unit.items[0]!.kind === "aggregate" ||
-        unit.items[0]!.kind === "discovery" ||
-        state.work[unit.items[0]!.id]?.status !== "pending" ||
-        !unit.externalDependencies.every(
-          (dependency) => state.work[dependency]?.status === "done",
-        ) ||
-        unit.items[0]!.expectedOutputRoles?.length ||
-        [...runningUnits, ...prepared].some((other) =>
-          unit.items.some((item) =>
-            other.items.some((candidate) => itemsConflict(item, candidate)),
+          other.items.some((candidate) => itemsConflict(item, candidate)),
+        ),
+      );
+      const readOnly =
+        root.kind === "qa" ||
+        root.kind === "aggregate" ||
+        root.kind === "discovery";
+      const unresolved = unit.items.find((item) =>
+        expansionBlocksItem(state.graph, item.id, args.resolvedExpansionIds),
+      );
+      const missingDependency = unit.externalDependencies.find(
+        (id) => state.work[id]?.status !== "done",
+      );
+      const conflictKind =
+        conflict &&
+        unit.items.some((item) =>
+          conflict.items.some((peer) =>
+            item.ownedPaths.some((a) =>
+              peer.ownedPaths.some((b) => pathsOverlap(a, b)),
+            ),
           ),
         )
-      )
-        continue;
+          ? "ownership"
+          : "resource";
+      const blocker =
+        graphBlocker ??
+        (unresolved
+          ? {
+              kind: "expansion",
+              blockedBy: unresolved.id,
+              detail: "Delivery unit awaits authenticated expansion settlement",
+            }
+          : undefined) ??
+        (missingDependency
+          ? {
+              kind: "dependency",
+              blockedBy: missingDependency,
+              detail:
+                "Delivery unit awaits actual dependency acceptance and integration",
+            }
+          : undefined) ??
+        (conflict
+          ? {
+              kind: conflictKind,
+              blockedBy: conflict.id,
+              detail:
+                conflictKind === "ownership"
+                  ? "A delivery unit holds overlapping literal ownership"
+                  : "A delivery unit holds the declared shared resource",
+            }
+          : undefined) ??
+        (readOnly
+          ? {
+              kind: "completion",
+              detail:
+                "Read-only proof or discovery is handled by the normal completion path",
+            }
+          : undefined) ??
+        phases.blocker(root.id, "coding") ??
+        phases.slotBlocker(reported, prepared.length) ??
+        (root.expectedOutputRoles?.length
+          ? {
+              kind: "delivery",
+              detail: "Asset selection requires the normal delivery path",
+            }
+          : undefined);
+      args.diagnostics?.scheduling({
+        runId: state.runId,
+        itemId: root.id,
+        facts: facts.get(root.id)!,
+        blocker,
+        providerAvailableSlots: reported,
+        codingReservations: phases.codingCount(),
+      });
+      if (blocker) continue;
       prepared.push(unit);
     }
     if (prepared.length) {
@@ -382,6 +505,16 @@ export async function runNativeGraph(args: {
     const ranked = rankPending(state.graph, state.work);
     const eligible = remainingUnits.filter(
       (unit) =>
+        !(
+          state.work[unit.items[0]!.id]?.status === "pending" &&
+          pendingItemBlocker(
+            state.graph,
+            state.work,
+            unit.items[0]!,
+            new Set(),
+            args.resolvedExpansionIds,
+          )
+        ) &&
         !unit.items.some((item) =>
           expansionBlocksItem(state.graph, item.id, args.resolvedExpansionIds),
         ) &&
@@ -428,6 +561,10 @@ export async function runNativeGraph(args: {
     if (!unit) {
       if (
         args.amendmentPending?.() ||
+        Object.values(state.work).some(
+          (work) =>
+            work.wait && ["decision", "prerequisite"].includes(work.wait.kind),
+        ) ||
         Object.values(state.work).some((work) => work.status === "failed")
       )
         return settlePrepared();
@@ -566,7 +703,41 @@ export async function runNativeGraph(args: {
       if (work.status === "pending" && args.paused?.()) return settlePrepared();
       if (work.status === "pending") {
         const available = await driver.availableSlots();
-        if (phases.availableSlots(available) <= 0) return settlePrepared();
+        const owned = new Set(
+          units
+            .filter((other) => other !== unit)
+            .flatMap((other) =>
+              other.items
+                .filter((peer) =>
+                  ["running", "published", "waiting"].includes(
+                    state.work[peer.id]?.status ?? "",
+                  ),
+                )
+                .map((peer) => peer.id),
+            ),
+        );
+        const graphBlocker = pendingItemBlocker(
+          state.graph,
+          state.work,
+          item,
+          owned,
+          args.resolvedExpansionIds,
+          (id) =>
+            state.work[id]?.status === "done" ||
+            (unit.items.some((peer) => peer.id === id) &&
+              state.work[id]?.status === "published"),
+        );
+        phases.availableSlots(available);
+        const slots = phases.slotBlocker(available);
+        args.diagnostics?.scheduling({
+          runId: state.runId,
+          itemId: item.id,
+          facts: schedulingObservations(state.graph, state.work).get(item.id)!,
+          blocker: graphBlocker ?? phases.blocker(item.id, "coding") ?? slots,
+          providerAvailableSlots: available,
+          codingReservations: phases.codingCount(),
+        });
+        if (graphBlocker || slots) return settlePrepared();
         await args.reconcile?.();
         if (stopped()) throw await cancelRun();
         if (args.paused?.()) return settlePrepared();
