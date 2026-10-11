@@ -1,4 +1,3 @@
-import { isExecutionState, isPreparationState } from "./state.js";
 import { randomUUID } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
 import { factoryConfigDigest } from "./config.js";
@@ -7,17 +6,24 @@ import {
   continuationStatusDocument,
   redactDiagnosticDetail,
 } from "./diagnostics.js";
+import { planDecisionTemplate } from "./github-plan-decisions.js";
 import {
-  renderGitHubProgress,
   type GitHubProgressDecision,
+  renderGitHubProgress,
 } from "./github-progress.js";
 import { progressDigest } from "./github-progress-state.js";
-import { planDecisionTemplate } from "./github-plan-decisions.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+  withRecoveryCheckpointScope,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import type { ContinuationState } from "./state.js";
+import { isExecutionState, isPreparationState } from "./state.js";
 import { readContinuation } from "./state-store.js";
 
 /** Controlled checkpoint projection; no diagnostics are used as recovery input. */
-export async function projectGitHubProgress(args: {
+async function projectGitHubProgressUnscoped(args: {
   config: FactoryConfig;
   objective: number;
   github: GitHubGateway;
@@ -213,7 +219,7 @@ export async function projectGitHubProgress(args: {
       snapshotId,
       body,
       pending,
-      beforeWrite: (actorId) => {
+      beforeWrite: async (actorId) => {
         const state = live();
         state.githubProgress ??= { requests: [] };
         const last = state.githubProgress.requests.at(-1);
@@ -230,6 +236,7 @@ export async function projectGitHubProgress(args: {
           presentationDigest,
         });
         save();
+        await awaitCheckpointAdmission(config.repository, "before-effect");
       },
     });
     const state = live();
@@ -247,23 +254,45 @@ export async function projectGitHubProgress(args: {
     intent.comment = observed;
     delete state.githubProgress!.failure;
     save();
+    // Force acknowledgement before a reconciled snapshot can publish its successor.
+    await awaitCheckpointAdmission(config.repository, "explicit");
     // A reconciled older snapshot may precede this checkpoint (including final
     // closure). Publish the current meaningful change once after settlement.
     flushCurrent = Boolean(
       pending && pending.presentationDigest !== presentationDigest,
     );
-  } catch {
+  } catch (error) {
+    if (isCheckpointAdmissionFailure(error)) throw error;
     const state = live();
     state.githubProgress ??= { requests: [] };
     const last = state.githubProgress.requests.at(-1);
     state.githubProgress.failure =
       last && !last.comment ? "publication-unknown" : "projection-unavailable";
     save();
+    await awaitCheckpointAdmission(config.repository, "settled");
     process.stderr.write(
       `Factory GitHub progress for Objective #${objective}: ${state.githubProgress.failure}; inspect Factory status.\n`,
     );
   }
   // Keep a fresh snapshot read outside the persistence catch: a corrupt or
   // unreadable continuation must never be repaired from a remembered owner.
-  if (flushCurrent) await projectGitHubProgress(args);
+  if (flushCurrent) await projectGitHubProgressUnscoped(args);
+}
+
+/** Direct callers use the same admitted repository scope as owned controllers. */
+export function projectGitHubProgress(
+  args: Parameters<typeof projectGitHubProgressUnscoped>[0],
+): Promise<void> {
+  if (!args.config.githubManagement?.progress) return Promise.resolve();
+  return withRecoveryCheckpointScope(
+    {
+      config: args.config,
+      buildClosure: () =>
+        buildRecoveryCheckpointClosure({ config: args.config }),
+    },
+    async () => {
+      await projectGitHubProgressUnscoped(args);
+      await awaitCheckpointAdmission(args.config.repository, "settled");
+    },
+  );
 }

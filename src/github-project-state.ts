@@ -63,7 +63,7 @@ export interface ProjectStatusRequest {
   optionId: string;
   requestId: string;
   pending?: ProjectStatusIntent;
-  beforeWrite: (intent: ProjectStatusIntent) => void;
+  beforeWrite: (intent: ProjectStatusIntent) => void | Promise<void>;
 }
 export interface ProjectStatusObservation {
   itemId: string;
