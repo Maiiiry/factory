@@ -125,6 +125,10 @@ export async function runCodexWorker(
   // A private HOME with only the Codex login; shell commands see the
   // worktree, the private HOME and TMPDIR, and the platform runtime alone.
   const discovery = request.discovery;
+  if ((request.item.kind === "discovery") !== Boolean(discovery))
+    throw new Error(
+      "Discovery worker requires its explicit read-only execution input",
+    );
   if (
     discovery &&
     (session ||
