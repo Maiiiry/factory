@@ -394,10 +394,13 @@ export function createPlanningContextResolver(input: {
           "Eligible retained manifest inventory; inventories do not prove underlying body availability",
         );
       }
-      if (request.operation === "read" && !eligible.has(request.selector))
+      if (
+        request.operation === "read" &&
+        !/^[a-f0-9]{64}$/.test(request.selector)
+      )
         return answer(
           "denied",
-          "Memory identity is outside current Objective, admitted source selectors and verified applicability",
+          "Memory reads require an exact retained SHA-256 identity",
         );
       if (request.operation === "search" && request.selector !== "")
         return answer(
@@ -413,14 +416,17 @@ export function createPlanningContextResolver(input: {
                 maxBytes: remaining.maxBytes,
               }),
             ].filter((result): result is MemoryResult => result !== undefined)
-          : memory
-              .search({
-                ...lookup,
-                query: request.query,
-                limit: Math.min(16, remaining.maxResults),
-                maxBytes: remaining.maxBytes,
-              })
-              .filter((result) => eligible.has(result.binding.id));
+          : memory.search({
+              ...lookup,
+              query: request.query,
+              limit: Math.min(16, remaining.maxResults),
+              maxBytes: remaining.maxBytes,
+            });
+      if (request.operation === "read" && !results.length)
+        return answer(
+          "denied",
+          "Memory identity is unavailable within the admitted repository, visibility and source scope",
+        );
       if (!results.length)
         return answer(
           metadata.complete ? "no-match" : "incomplete",
@@ -433,7 +439,7 @@ export function createPlanningContextResolver(input: {
       )
         ? "unavailable"
         : results.some((result) => result.disposition === "incomplete") ||
-            !metadata.complete ||
+            (request.operation === "search" && !metadata.complete) ||
             (request.operation === "search" &&
               results.length === Math.min(16, remaining.maxResults))
           ? "incomplete"
