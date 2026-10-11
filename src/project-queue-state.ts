@@ -186,6 +186,35 @@ export interface QueueCancellationProof {
         };
       };
 }
+function sameContentRef(left: ContentRef, right: ContentRef): boolean {
+  return (
+    left.digest === right.digest &&
+    left.bytes === right.bytes &&
+    left.mediaType === right.mediaType
+  );
+}
+function sameRunBinding(
+  left: QueueOwnerClaim["runBinding"],
+  right: QueueOwnerClaim["runBinding"],
+): boolean {
+  return left === undefined || right === undefined
+    ? left === right
+    : left.schemaVersion === right.schemaVersion &&
+        left.runId === right.runId &&
+        sameContentRef(left.initialSnapshot, right.initialSnapshot);
+}
+/** Retain literal archive originals without treating JSON key order as identity. */
+export function retainProjectQueueOriginal(
+  store: LocalContentStore,
+  reference: ContentRef,
+  bytes: Uint8Array,
+): ContentRef {
+  if (!ref(reference)) throw new Error("Invalid Project original reference");
+  const retained = store.putBytes(bytes, { mediaType: reference.mediaType });
+  if (!sameContentRef(retained, reference))
+    throw new Error("Project original retention differs");
+  return reference;
+}
 type QueueRecord = QueueOperation | QueueOwnerClaim;
 const ref = (value: unknown): value is ContentRef => {
   const row = object(value);
@@ -523,7 +552,7 @@ function save(record: QueueRecord): void {
       const { settled: newSettled, runBinding: newRun, ...newBinding } = record;
       if (
         JSON.stringify(oldBinding) !== JSON.stringify(newBinding) ||
-        (oldRun && JSON.stringify(oldRun) !== JSON.stringify(newRun)) ||
+        (oldRun && !sameRunBinding(oldRun, newRun)) ||
         (oldSettled &&
           JSON.stringify(oldSettled) !== JSON.stringify(newSettled))
       )
@@ -573,7 +602,7 @@ function queueOwnerReferences(record: QueueOwnerClaim): ContentRef[] {
   const distinct = new Map<string, ContentRef>();
   for (const reference of refs) {
     const previous = distinct.get(reference.digest);
-    if (previous && JSON.stringify(previous) !== JSON.stringify(reference))
+    if (previous && !sameContentRef(previous, reference))
       throw new Error("Project ownership reference binding differs");
     distinct.set(reference.digest, reference);
   }
@@ -658,9 +687,8 @@ function assertQueueOwnerReferenceBodies(
         !run ||
         !originalRun ||
         run.runId !== record.settled!.runId ||
-        JSON.stringify(run) !== JSON.stringify(originalRun) ||
-        JSON.stringify(run.initialSnapshot) !==
-          JSON.stringify(proof.initialSnapshot)
+        !sameRunBinding(run, originalRun) ||
+        !sameContentRef(run.initialSnapshot, proof.initialSnapshot)
       )
         throw new Error(
           "Cancellation differs from the producer-bound Project run",
@@ -703,20 +731,26 @@ function assertQueueOwnerReferenceBodies(
         `objectives/${record.objective}/state.json`,
         `objectives/${record.objective}/pre-state.json`,
       ];
+      const claimedRef = manifests.claimed.files.find(
+        (file: { path: string }) => file.path === claimPath,
+      )?.ref;
+      const initialClaimRef = manifests.initial.files.find(
+        (file: { path: string }) => file.path === claimPath,
+      )?.ref;
+      const initialStateRef = manifests.initial.files.find(
+        (file: { path: string }) => statePaths.includes(file.path),
+      )?.ref;
       if (
         manifests.before.files.some(
           (file: { path: string }) =>
             file.path === claimPath || statePaths.includes(file.path),
         ) ||
-        manifests.claimed.files.find(
-          (file: { path: string }) => file.path === claimPath,
-        )?.ref.digest !== proof.originalClaim.digest ||
-        manifests.initial.files.find(
-          (file: { path: string }) => file.path === claimPath,
-        )?.ref.digest !== proof.originalClaim.digest ||
-        manifests.initial.files.find((file: { path: string }) =>
-          statePaths.includes(file.path),
-        )?.ref.digest !== proof.initialSnapshot.digest ||
+        !claimedRef ||
+        !sameContentRef(claimedRef, proof.originalClaim) ||
+        !initialClaimRef ||
+        !sameContentRef(initialClaimRef, proof.originalClaim) ||
+        !initialStateRef ||
+        !sameContentRef(initialStateRef, proof.initialSnapshot) ||
         !(
           manifests.before.sequence < manifests.claimed.sequence &&
           manifests.claimed.sequence <= manifests.initial.sequence
@@ -1446,10 +1480,7 @@ export async function settleCancelledProjectQueueRun(
   );
   const retain = async (reference: ContentRef) => {
     const bytes = await archive.readVerifiedBlob(reference);
-    const retained = store.putBytes(bytes, { mediaType: "application/json" });
-    if (JSON.stringify(retained) !== JSON.stringify(reference))
-      throw new Error("Project original retention differs");
-    return reference;
+    return retainProjectQueueOriginal(store, reference, bytes);
   };
   const finalFile = archive.manifest.files.find(
     (file) => file.path === `objectives/${state.objective}/state.json`,
@@ -1480,11 +1511,7 @@ export async function settleCancelledProjectQueueRun(
     if (!verified)
       throw new Error("Project historical first-run binding is unavailable");
     for (const body of verified.bodies) {
-      const retained = store.putBytes(body.bytes, {
-        mediaType: "application/json",
-      });
-      if (JSON.stringify(retained) !== JSON.stringify(body.ref))
-        throw new Error("Project lineage original differs");
+      retainProjectQueueOriginal(store, body.ref, body.bytes);
     }
     originalClaim = verified.originalClaim;
     initialSnapshot = verified.initialSnapshot;
