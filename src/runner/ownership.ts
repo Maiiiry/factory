@@ -258,7 +258,9 @@ export async function cancelKnownWork(
           undefined,
           undefined,
           state.repository,
-          state.schemaVersion === 17 ? true : undefined,
+          state.schemaVersion === 17 || state.schemaVersion === 19
+            ? true
+            : undefined,
         );
         if (session)
           context.checkpointSession = (ref) => session.checkpoint(ref);

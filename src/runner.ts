@@ -136,25 +136,27 @@ function withGitHubDiagnostics<T>(
   objective: number,
   run: () => T,
 ): T {
+  let retained: ContinuationState | undefined;
+  try {
+    const candidate =
+      owners.get(ownerKey(config, objective))?.snapshot ??
+      readContinuation(config.repository, objective);
+    if (candidate && continuationConfigurationMatches(candidate, config))
+      retained = candidate;
+  } catch {
+    // Missing or unreadable context is unknown; normal lifecycle reads still decide.
+  }
   const diagnostics = new DiagnosticEmitter(
     config.repository,
     objective,
     configuredDiagnosticSecrets(config),
     config.capture,
-    factoryConfigDigest(config),
+    retained?.configDigest ?? factoryConfigDigest(config),
   );
-  let retainedRunId: string | undefined;
-  try {
-    retainedRunId = readContinuation(config.repository, objective)?.runId;
-  } catch {
-    // Missing or unreadable context is unknown; normal lifecycle reads still decide.
-  }
   return withGitHubTransportObserver(
     (transport) =>
       diagnostics.emit({
-        runId:
-          owners.get(ownerKey(config, objective))?.snapshot?.runId ??
-          retainedRunId,
+        runId: retained?.runId,
         operation: "github-transport",
         outcome: transport.outcome === "completed" ? "completed" : "failed",
         transport,
@@ -857,7 +859,7 @@ async function runObjectiveOwned(
               issue.body,
               current.baseSha,
               config.checkout,
-              factoryConfigDigest(config),
+              current.configDigest,
               true,
               current.capacity.concurrency,
             );
@@ -874,7 +876,7 @@ async function runObjectiveOwned(
                 answer: envelope.answer,
                 reason: envelope.reason,
               },
-              factoryConfigDigest(config),
+              current.configDigest,
             );
             // Pause/drain handlers may run during any await even under the same
             // installation lease. Recheck at the atomic consumption boundary.
