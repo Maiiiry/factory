@@ -420,7 +420,11 @@ export async function completeObjectiveKnowledge(input: {
   store: ContentStore;
   review?: "result" | "objective";
   suppliedDigests?: string[];
-}): Promise<{ view: object; selections: AdaptiveContextSelection[] }> {
+}): Promise<{
+  view: object;
+  selections: AdaptiveContextSelection[];
+  suppliedBodies: { ref: ContentRef; bytes: Uint8Array }[];
+}> {
   const view = objectiveKnowledgeView(
     input.state,
     input.item,
@@ -479,6 +483,10 @@ export async function completeObjectiveKnowledge(input: {
     });
   }
   return {
+    suppliedBodies: [...bodies.values()].map((body) => ({
+      ref: body.ref,
+      bytes: Buffer.from(body.bytes, "base64"),
+    })),
     view: {
       ...view,
       bodies: [...bodies.values()],

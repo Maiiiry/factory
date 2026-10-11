@@ -25,6 +25,7 @@ import {
 } from "./objective-knowledge.js";
 import { buildAdaptiveContext } from "./adaptive-context.js";
 import {
+  discoveryContextBodies,
   discoveryContextSelections,
   selectedDiscoveryInputs,
 } from "./runner/discovery.js";
@@ -312,6 +313,7 @@ export function reviewItem(
             store: request.contentStore,
           });
           const selected = discoveryContextSelections(discoveryInputs);
+          const discoveryBodies = discoveryContextBodies(discoveryInputs);
           const knowledge = await completeObjectiveKnowledge({
             state: args.state,
             item: args.item,
@@ -320,9 +322,7 @@ export function reviewItem(
             store: request.contentStore,
             review: "result",
             suppliedDigests: [
-              ...selected.flatMap((entry) =>
-                entry.refs.map((ref) => ref.digest),
-              ),
+              ...discoveryBodies.map((body) => body.ref.digest),
               ...request.sources.map((source) =>
                 createHash("sha256").update(source.content).digest("hex"),
               ),
@@ -336,6 +336,7 @@ export function reviewItem(
             baseSha: request.commit,
             store: request.contentStore,
             sources: request.sources,
+            suppliedBodies: [...discoveryBodies, ...knowledge.suppliedBodies],
             required: { knowledge: knowledge.view, discoveryInputs },
             requiredSelections: [...selected, ...knowledge.selections],
             save: args.save,

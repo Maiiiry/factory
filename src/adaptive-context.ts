@@ -267,6 +267,8 @@ export async function buildAdaptiveContext(input: {
   sources?: PlanningRequest<unknown>["sources"];
   required?: object;
   requiredSelections?: AdaptiveContextSelection[];
+  /** Complete already supplied bytes; provenance-only references never imply delivery. */
+  suppliedBodies?: { ref: ContentRef; bytes: Uint8Array }[];
   save: () => void;
 }): Promise<
   | {
@@ -304,6 +306,16 @@ export async function buildAdaptiveContext(input: {
         `Required role context ${selection.id} is ${selection.disposition}`,
       );
     for (const ref of selection.refs) await store.verify(ref);
+  }
+  for (const body of input.suppliedBodies ?? []) {
+    ref(body.ref);
+    if (
+      body.bytes.byteLength !== body.ref.bytes ||
+      createHash("sha256").update(body.bytes).digest("hex") !== body.ref.digest
+    )
+      throw new Error(
+        "Supplied complete adaptive body differs from its reference",
+      );
   }
   const sources = input.sources ?? [];
   for (const source of sources)
@@ -353,6 +365,20 @@ export async function buildAdaptiveContext(input: {
         stateRoot(state.repository),
         state.repository,
       );
+      for (const source of sources)
+        retained.suppliedContent(Buffer.from(source.content));
+      for (const body of input.suppliedBodies ?? []) {
+        retained.suppliedContent(body.bytes);
+      }
+      const bodyProviders = new Map<string, string>([
+        ...sources.map(
+          (source) =>
+            [byteHash(source.content), "supplied-source"] as [string, string],
+        ),
+        ...(input.suppliedBodies ?? []).map(
+          (body) => [body.ref.digest, "required-context"] as [string, string],
+        ),
+      ]);
       const relatedIds = new Set<string>();
       const visit = (id: string) => {
         if (relatedIds.has(id)) return;
@@ -396,13 +422,7 @@ export async function buildAdaptiveContext(input: {
           paths: admittedPaths,
           itemIds: [...relatedIds],
         },
-        suppliedBodyDigests: [
-          ...new Set(
-            selections.flatMap((selection) =>
-              selection.refs.map((ref) => ref.digest),
-            ),
-          ),
-        ],
+        suppliedBodyDigests: [...bodyProviders.keys()],
         suppliedSources: sources.map((source) => ({
           path: source.path,
           ...(source.heading === undefined ? {} : { heading: source.heading }),
@@ -449,12 +469,18 @@ export async function buildAdaptiveContext(input: {
           );
           break;
         }
-        if (
-          entry.record.bodies.reduce(
-            (total, body) => total + (body.ref?.bytes ?? 0),
-            0,
-          ) > remaining
-        ) {
+        const considered = new Set(bodyProviders.keys());
+        let freshBytes = 0;
+        let fullBytes = 0;
+        for (const body of entry.record.bodies)
+          if (body.ref) {
+            fullBytes += body.ref.bytes;
+            if (!considered.has(body.ref.digest)) {
+              freshBytes += body.ref.bytes;
+              considered.add(body.ref.digest);
+            }
+          }
+        if (freshBytes > remaining) {
           unavailable.push(
             `Optional memory ${entry.binding.id} exceeds remaining byte allowance`,
           );
@@ -463,28 +489,30 @@ export async function buildAdaptiveContext(input: {
         const result = retained.read({
           ...lookup,
           id: entry.binding.id,
-          maxBytes: remaining,
+          maxBytes: fullBytes,
         });
         if (!result) continue;
-        selections.push({
+        const selection: AdaptiveContextSelection = {
           id: `memory:${entry.binding.id}`,
           kind: "memory",
           disposition: result.disposition,
           required: false,
           refs: result.content.map((body) => body.ref),
-        });
+        };
         if (["incomplete", "unavailable"].includes(result.disposition)) {
+          selections.push({ ...selection, refs: [] });
           unavailable.push(`Memory ${entry.binding.id}: ${result.disposition}`);
           continue;
         }
-        const content = result.content.filter(
-          (body) =>
-            !sources.some(
-              (source) => byteHash(source.content) === body.ref.digest,
-            ),
-        );
-        remaining -= content.reduce((total, body) => total + body.ref.bytes, 0);
-        memory.push({
+        const newProviders = new Map(bodyProviders);
+        const content = result.content.map((body) => {
+          const provider = newProviders.get(body.ref.digest);
+          if (provider)
+            return { role: body.role, ref: body.ref, reuse: provider };
+          newProviders.set(body.ref.digest, `memory:${entry.binding.id}`);
+          return body;
+        });
+        const match = {
           binding: result.binding,
           provenance: {
             repository: result.record.repository,
@@ -499,7 +527,25 @@ export async function buildAdaptiveContext(input: {
           disposition: result.disposition,
           content,
           gaps: result.gaps,
-        });
+        };
+        const cost = Buffer.byteLength(JSON.stringify({ match, selection }));
+        if (cost > remaining) {
+          selections.push({
+            ...selection,
+            disposition: "incomplete",
+            refs: [],
+          });
+          unavailable.push(
+            `Optional memory ${entry.binding.id} deferred by serialized byte allowance`,
+          );
+          continue;
+        }
+        remaining -= cost;
+        selections.push(selection);
+        memory.push(match);
+        for (const body of result.content)
+          if (!bodyProviders.has(body.ref.digest))
+            bodyProviders.set(body.ref.digest, `memory:${entry.binding.id}`);
       }
     } catch {
       unavailable.push("Optional repository memory unavailable");

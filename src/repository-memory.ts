@@ -501,6 +501,7 @@ export class LocalRepositoryMemory {
   private readonly records: string;
   private readonly store: LocalContentStore;
   private retainedIdentities?: Map<string, RepositoryMemoryBinding>;
+  private readonly observedBodies = new Map<string, Buffer>();
   catalogStatus: "ready" | "unavailable" = "unavailable";
   constructor(
     root: string,
@@ -515,6 +516,25 @@ export class LocalRepositoryMemory {
     privateDirectory(this.directory);
     privateDirectory(this.records);
     this.store = store ?? new LocalContentStore(join(root, "content"));
+  }
+  /** Reuse already authenticated exact supplied bytes within this lookup instance. */
+  suppliedContent(bytes: Uint8Array): void {
+    const body = Buffer.from(bytes);
+    this.observedBodies.set(
+      createHash("sha256").update(body).digest("hex"),
+      body,
+    );
+  }
+  private observedBody(ref: ContentRef): Buffer {
+    const existing = this.observedBodies.get(ref.digest);
+    if (existing) {
+      if (existing.length !== ref.bytes)
+        throw new Error("Supplied memory body size differs");
+      return existing;
+    }
+    const bytes = this.store.readBytes(ref);
+    this.observedBodies.set(ref.digest, bytes);
+    return bytes;
   }
   retain(record: RepositoryMemoryRecord): RepositoryMemoryBinding {
     assertRepositoryMemoryRecord(record);
@@ -651,7 +671,7 @@ export class LocalRepositoryMemory {
       )
         continue;
       try {
-        const bytes = this.store.readBytes(body.ref);
+        const bytes = this.observedBody(body.ref);
         const decoded = new TextDecoder("utf-8", {
           fatal: true,
           ignoreBOM: true,
@@ -852,7 +872,7 @@ export class LocalRepositoryMemory {
         if (disposition !== "unavailable") disposition = "incomplete";
       } else {
         try {
-          this.store.readBytes(source.ref);
+          this.observedBody(source.ref);
         } catch {
           gaps.push(
             `source ${source.identity}: referenced bytes unavailable or corrupt`,

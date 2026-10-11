@@ -45,6 +45,7 @@ import {
 import type { FactoryState } from "./state.js";
 import { workspacePackageAdditions } from "./workspace-membership.js";
 import {
+  discoveryContextBodies,
   discoveryContextSelections,
   selectedDiscoveryInputs,
 } from "./runner/discovery.js";
@@ -172,6 +173,7 @@ export async function runWorker(
     store: args.store,
   });
   const discoverySelections = discoveryContextSelections(discoveryInputs);
+  const discoveryBodies = discoveryContextBodies(discoveryInputs);
   const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
   if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
     throw new Error(
@@ -185,9 +187,7 @@ export async function runWorker(
         baseSha,
         store: args.store,
         suppliedDigests: [
-          ...discoverySelections.flatMap((selection) =>
-            selection.refs.map((ref) => ref.digest),
-          ),
+          ...discoveryBodies.map((body) => body.ref.digest),
           ...(item.inputSources ?? []).map((source) =>
             createHash("sha256").update(source.content).digest("hex"),
           ),
@@ -203,6 +203,7 @@ export async function runWorker(
     store: args.store,
     config: args.config,
     sources: item.inputSources,
+    suppliedBodies: [...discoveryBodies, ...(knowledge?.suppliedBodies ?? [])],
     required: { knowledge: knowledge?.view ?? {}, discoveryInputs },
     requiredSelections: [
       ...discoverySelections,

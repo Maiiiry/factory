@@ -373,6 +373,7 @@ export async function finalizeObjective(args: {
         store: contentStore,
         config,
         sources: finalSources,
+        suppliedBodies: knowledge.suppliedBodies,
         required: { knowledge: knowledge.view },
         requiredSelections: knowledge.selections,
         save: () => save(state),

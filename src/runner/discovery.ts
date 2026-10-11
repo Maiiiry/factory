@@ -238,6 +238,24 @@ export function discoveryContextSelections(
     ],
   }));
 }
+export function discoveryContextBodies(
+  inputs: SelectedDiscoveryInput[],
+): { ref: ContentRef; bytes: Uint8Array }[] {
+  const bodies = new Map<string, { ref: ContentRef; bytes: Uint8Array }>();
+  for (const input of inputs)
+    for (const entry of input.entries) {
+      const ref = entry.contentRef as ContentRef | undefined;
+      const body = entry.contentBody as
+        | { encoding: string; bytes: string }
+        | undefined;
+      if (ref && body?.encoding === "base64")
+        bodies.set(ref.digest, {
+          ref,
+          bytes: Buffer.from(body.bytes, "base64"),
+        });
+    }
+  return [...bodies.values()];
+}
 export async function selectedDiscoveryInputs(args: {
   state: FactoryState;
   item: WorkItem;
