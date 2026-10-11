@@ -62,6 +62,10 @@ import {
 } from "./execution/claude-session.js";
 import { authenticationFailure, redact } from "./execution/harness-support.js";
 import { claudeCaptureEvents } from "./execution/interaction-capture.js";
+import {
+  awaitCheckpointAdmission,
+  isCheckpointAdmissionFailure,
+} from "./recovery-checkpoint.js";
 import { type Fault, transient } from "./fault.js";
 import { serviceLoginSecrets } from "./provider-credentials.js";
 import {
@@ -482,6 +486,7 @@ class ClaudePlanningTransport implements PlanningTransport {
     const session = requireClaudeSession(this.sessionRoot, ref, this.adapter);
     if (session.data.settled !== true && session.data.process)
       await settleClaudeProcess(session.data.process);
+    await awaitCheckpointAdmission(ref.scope.repository, "settled");
     releaseClaudeStorage(this.sessionRoot, ref, this.adapter);
   }
 
@@ -656,6 +661,7 @@ class ClaudePlanningTransport implements PlanningTransport {
     let nativeProcess: ClaudeNativeProcess | undefined;
     let nativeSpawnAttempted = false;
     let streamClosed = false;
+    let checkpointRejected = false;
     const checkpoint = (status: AgentSessionRef["status"]) => {
       if (!owned || !continuation) return;
       owned.ref = { ...owned.ref, status, data: { ...owned.data } };
@@ -711,6 +717,10 @@ class ClaudePlanningTransport implements PlanningTransport {
       }
       assertProviderTurnDeadline(args.deadlineAt);
       abortController.signal.throwIfAborted();
+      await awaitCheckpointAdmission(
+        continuation?.scope.repository,
+        "before-effect",
+      );
       events = query({ prompt: args.prompt, options })[Symbol.asyncIterator]();
       for (;;) {
         const next = await guard.race(events.next());
@@ -781,6 +791,11 @@ class ClaudePlanningTransport implements PlanningTransport {
               "Claude planning initialized a different native conversation",
             );
           facts.initialized = true;
+          checkpoint("in-flight");
+          await awaitCheckpointAdmission(
+            continuation?.scope.repository,
+            "settled",
+          );
         }
         if (message.type === "result") {
           result = message;
@@ -797,6 +812,7 @@ class ClaudePlanningTransport implements PlanningTransport {
         );
       this.settle(result!, { state, invocation, usage, started, facts });
     } catch (error) {
+      checkpointRejected = isCheckpointAdmissionFailure(error);
       if (events && !closeStarted && !guard.signal.aborted) {
         closeStarted = true;
         try {
@@ -897,7 +913,23 @@ class ClaudePlanningTransport implements PlanningTransport {
           );
         }
       }
-      if (root) rmSync(root, { recursive: true, force: true });
+      if (nativeTerminal && result?.subtype === "success")
+        await invocation.retainNativeReturn?.({
+          representation: "literal-agent-text",
+          // This is the SDK's literal final text. structured_output is an
+          // already-decoded value, not an original JSON-text response.
+          response: result.result,
+          providerSessionId: result.session_id,
+          terminal,
+          ...(state.usage && { usage: state.usage }),
+        });
+      if (!checkpointRejected) {
+        await awaitCheckpointAdmission(
+          continuation?.scope.repository,
+          "settled",
+        );
+        if (root) rmSync(root, { recursive: true, force: true });
+      }
     }
   }
 
