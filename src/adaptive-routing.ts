@@ -172,6 +172,15 @@ export function assertDeclaredConditions(graph: WorkGraph): void {
       throw new Error(
         "Conditional implementation cannot own original Objective coverage; unconditional proof must retain every substantive obligation",
       );
+    if (
+      graph.items.some(
+        (parent) =>
+          parent.kind === "aggregate" && parent.children?.includes(item.id),
+      )
+    )
+      throw new Error(
+        "Conditional implementation cannot be an explicit aggregate child: skipped work has no completed acceptance. Join alternative branches through an unconditional QA dependency barrier while preserving original proof requirements",
+      );
     referenced.add(condition.id);
   }
   for (const condition of graph.conditions)
