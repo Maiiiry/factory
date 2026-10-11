@@ -472,7 +472,7 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
   );
 });
 
-test("memory source admission precedes same-Objective relevance and binary bodies stay exact", (t) => {
+test("memory source admission precedes same-Objective relevance and binary bodies stay exact", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-memory-admission-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const checkout = join(root, "checkout");
@@ -648,4 +648,66 @@ test("memory source admission precedes same-Objective relevance and binary bodie
   assert.equal(reference.content[0].text, supplied);
   assert.equal(reference.record.sources[0].commitSha, baseSha);
   assert.equal(reference.record.sources[0].treeSha, treeSha);
+  const referenceLookup = {
+    access: {
+      repository: "fixture/supplied-reference",
+      visibility: ["private"],
+    },
+    scope: { objective: 1, paths: ["src/main.txt"] },
+    suppliedSources: [{ path: "src/main.txt", digest: allowed.ref.digest }],
+    limit: 0,
+  };
+  assert.equal(referenceMemory.metadata(referenceLookup).complete, true);
+  assert.equal(
+    referenceMemory.read({ ...referenceLookup, id: references[0].id }),
+    undefined,
+  );
+  assert.equal(
+    referenceMemory.search({ ...referenceLookup, limit: 10, query: "orchard" })
+      .length,
+    0,
+  );
+  assert.equal(
+    referenceMemory.metadata({
+      ...referenceLookup,
+      limit: 10,
+      suppliedSources: [
+        {
+          path: "src/main.txt",
+          heading: "Other selection",
+          digest: allowed.ref.digest,
+        },
+      ],
+    }).entries.length,
+    1,
+  );
+  assert.equal(
+    referenceMemory.metadata({
+      ...referenceLookup,
+      limit: 10,
+      suppliedSources: [{ path: "src/main.txt", digest: "b".repeat(64) }],
+    }).entries.length,
+    1,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(
+    retainPlanningSourceMemory({
+      repository: "fixture/supplied-reference",
+      objective: 1,
+      runId: baseSha,
+      baseSha,
+      treeSha,
+      configDigest: "a".repeat(64),
+      sources: [{ path: "src/main.txt", content: supplied }],
+    }),
+    references,
+  );
+  assert.equal(
+    referenceMemory.read({
+      ...referenceLookup,
+      suppliedSources: [],
+      id: references[0].id,
+    }).record.sources[0].retrievedAt,
+    reference.record.sources[0].retrievedAt,
+  );
 });
