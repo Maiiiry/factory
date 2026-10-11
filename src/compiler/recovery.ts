@@ -1,22 +1,12 @@
-import {
-  assertWorkflowRecipeInput,
-  type WorkflowRecipeInput,
-  type WorkflowRecipePin,
-} from "../workflow-recipes.js";
 import { randomUUID } from "node:crypto";
-import {
-  MissingPlanningContext,
-  assertPlanningLookupRecord,
-  contextDigest,
-  initializeContextLookup,
-  resolveContextRequests,
-  retainContextPacket,
-  type PlanningLookupRecord,
-  type PlanningContextResolver,
-} from "./context.js";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { stateRoot } from "../config.js";
+import { LocalContentStore } from "../content/local.js";
 import { COMPILER_READINESS_GUIDANCE } from "../compiler-wire.js";
 import type {
   ApprovedPlaybookPin,
+  ContentRef,
   ExecutionProfileChoices,
   ModelInvocationContext,
   ModelInvocationObservation,
@@ -34,6 +24,7 @@ import {
 } from "../controller-capabilities.js";
 import { attachedFault, decision, StepFault } from "../fault.js";
 import { UnsettledSubprocessError } from "../process.js";
+import { awaitCheckpointAdmission } from "../recovery-checkpoint.js";
 import {
   allowanceAvailable,
   chargeRepair,
@@ -52,10 +43,25 @@ import {
 } from "../review-evidence.js";
 import type { ContinuationState } from "../state.js";
 import {
+  assertWorkflowRecipeInput,
+  type WorkflowRecipeInput,
+  type WorkflowRecipePin,
+} from "../workflow-recipes.js";
+import {
   buildPlanCandidate,
   type PlanCandidate,
   verifyPlanCandidate,
 } from "./candidate.js";
+import {
+  assertPlanningLookupRecord,
+  contextDigest,
+  initializeContextLookup,
+  MissingPlanningContext,
+  type PlanningContextResolver,
+  type PlanningLookupRecord,
+  resolveContextRequests,
+  retainContextPacket,
+} from "./context.js";
 import {
   invalidOutput,
   MalformedPlannerOutput,
@@ -67,8 +73,8 @@ import {
   compileObjective,
   generatePlannerStructured,
   type PlanCorrection,
-  PlanningNeedsDecision,
   PlanningContextResponse,
+  PlanningNeedsDecision,
   withPlannerAdmission,
 } from "./planning.js";
 import { planningSources } from "./sources.js";
@@ -80,11 +86,19 @@ export interface PlanningReviewRecord {
   response?: Awaited<ReturnType<PlanningModel["reviewGraph"]>>;
 }
 
+export interface PlanningInvocationReceipt {
+  id: string;
+  phase: string;
+  resultDigest?: string;
+  /** Exact adapter-native bodies; these are evidence, never a reconstructed response. */
+  nativeReturns?: ContentRef[];
+}
+
 export interface PlanningRecoveryRecord {
   contextLookup?: PlanningLookupRecord;
   phase: "ready" | "submitted" | "complete" | "stopped";
   invocation?: { id: string; phase: string };
-  invocations?: { id: string; phase: string; resultDigest?: string }[];
+  invocations?: PlanningInvocationReceipt[];
   response?: unknown;
   responseFailure?: string;
   diagnosisResponse?: { kind: string; diagnosis: string; correction: string };
@@ -92,7 +106,7 @@ export interface PlanningRecoveryRecord {
   history: {
     failure: string;
     detail: string;
-    invocations: { id: string; phase: string; resultDigest?: string }[];
+    invocations: PlanningInvocationReceipt[];
     kind: RepairClass;
     diagnosis: string;
     correction: string;
@@ -307,6 +321,72 @@ async function compilePlanAdmitted(
   let corrections: PlanCorrection[] = record.history.length
     ? [{ source: "diagnosis", detail: record.history.at(-1)!.correction }]
     : [];
+  const invocationHooks = (
+    id: string,
+    phase: ModelInvocationPhase,
+  ): Pick<
+    ModelInvocationContext,
+    "beforeProviderAttempt" | "retainNativeReturn"
+  > => ({
+    beforeProviderAttempt: async () => {
+      if (phase === "compile" && record.contextLookup) {
+        const lookup = record.contextLookup;
+        if (lookup.providerCalls >= lookup.packet.bounds.maxProviderCalls) {
+          record.phase = "stopped";
+          save();
+          throw new StepFault(
+            decision("Frozen planning lookup provider allowance is exhausted"),
+          );
+        }
+        lookup.providerCalls++;
+        save();
+      }
+      await awaitCheckpointAdmission(
+        context.sessionState?.repository,
+        "before-effect",
+      );
+    },
+    ...(context.sessionState &&
+    [17, 18].includes(context.sessionState.schemaVersion)
+      ? {
+          retainNativeReturn: async (
+            receipt: Parameters<
+              NonNullable<ModelInvocationContext["retainNativeReturn"]>
+            >[0],
+          ) => {
+            const owner = record.invocations?.find(
+              (entry) => entry.id === id && entry.phase === phase,
+            );
+            if (!owner || record.invocation?.id !== id)
+              throw new Error(
+                "Native planning return has a superseded invocation owner",
+              );
+            const repository = context.sessionState!.repository;
+            const store =
+              context.contextResolver?.contentStore ??
+              new LocalContentStore(join(stateRoot(repository), "content"));
+            const bytes = Buffer.from(
+              JSON.stringify({
+                schemaVersion: 1,
+                invocationId: id,
+                phase,
+                ...receipt,
+              }),
+            );
+            const ref = await store.put(
+              Readable.toWeb(
+                Readable.from([bytes]),
+              ) as ReadableStream<Uint8Array>,
+              { mediaType: "application/json" },
+            );
+            owner.nativeReturns ??= [];
+            owner.nativeReturns.push(ref);
+            save();
+            await awaitCheckpointAdmission(repository, "explicit");
+          },
+        }
+      : {}),
+  });
   const invocation = (phase: ModelInvocationPhase): ModelInvocationContext => {
     if (context.stopped?.()) throw new Error("Planning is paused or cancelled");
     if (
@@ -329,23 +409,24 @@ async function compilePlanAdmitted(
           ),
         );
       return {
+        ...invocationHooks(record.invocation.id, phase),
         invocationId: record.invocation.id,
         phase,
         ordinal: consumption(state).planningRevisions,
         observe,
       };
     }
-    if (phase === "compile" && record.contextLookup) {
-      if (
-        record.contextLookup.providerCalls >=
+    if (
+      phase === "compile" &&
+      record.contextLookup &&
+      record.contextLookup.providerCalls >=
         record.contextLookup.packet.bounds.maxProviderCalls
-      ) {
-        record.phase = "stopped";
-        save();
-        throw new PlanningNeedsDecision(
-          "Frozen planning lookup provider allowance is exhausted",
-        );
-      }
+    ) {
+      record.phase = "stopped";
+      save();
+      throw new PlanningNeedsDecision(
+        "Frozen planning lookup provider allowance is exhausted",
+      );
     }
     const id = randomUUID();
     record.phase = "submitted";
@@ -354,26 +435,7 @@ async function compilePlanAdmitted(
     record.invocations.push({ id, phase });
     save();
     return {
-      ...(phase === "compile" && record.contextLookup
-        ? {
-            beforeProviderAttempt: () => {
-              const lookup = record.contextLookup!;
-              if (
-                lookup.providerCalls >= lookup.packet.bounds.maxProviderCalls
-              ) {
-                record.phase = "stopped";
-                save();
-                throw new StepFault(
-                  decision(
-                    "Frozen planning lookup provider allowance is exhausted",
-                  ),
-                );
-              }
-              lookup.providerCalls++;
-              save();
-            },
-          }
-        : {}),
+      ...invocationHooks(id, phase),
       invocationId: id,
       phase,
       ordinal: consumption(state).planningRevisions,

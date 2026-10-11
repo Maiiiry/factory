@@ -45,7 +45,8 @@ export function assertDiscoveryAdmission(
     (state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
-      state.schemaVersion !== 15) ||
+      state.schemaVersion !== 15 &&
+      state.schemaVersion !== 17) ||
     !config.planningContext?.enabled ||
     !admitted ||
     !item.discovery ||

@@ -1,3 +1,4 @@
+import { hasPrivateCheckpointScope } from "../recovery-checkpoint.js";
 import { assertDeclaredConditions } from "../adaptive-routing.js";
 import {
   assertWorkflowRecipeGraph,
@@ -198,6 +199,17 @@ export async function generatePlannerStructured<T>(
         "Reconciled planner response differs from its admitted owner",
       );
     session.checkpoint(result.session);
+    if (
+      hasPrivateCheckpointScope() &&
+      (!result.nativeReturn || !request.invocation?.retainNativeReturn)
+    )
+      throw new StepFault(
+        decision(
+          "Reconciled native planning output lacks its original literal return and durable receipt owner; preserve the settled session without fresh replay",
+        ),
+      );
+    if (result.nativeReturn)
+      await request.invocation?.retainNativeReturn?.(result.nativeReturn);
     if (
       result.response === undefined ||
       result.session.currentTurn?.terminal !== "completed"

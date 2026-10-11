@@ -405,6 +405,7 @@ export async function finalizeObjective(args: {
           const previousInvalid = context.previousInvalid();
           return context.paid(() =>
             reviewAcceptance({
+              checkpointReturnedEvidence: () => save(state),
               beforeSubmit: stopIfCancelled,
               model: planningModel,
               reviewPhase: "objective-review",

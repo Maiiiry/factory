@@ -23,6 +23,7 @@ import type {
   CapturedAssetSet,
   ExecutionHandle,
   NamedCheckEvidence,
+  NativeStackLayer,
   ResultReviewCandidate,
   WorkGraph,
 } from "./contracts.js";
@@ -168,6 +169,7 @@ export interface WorkState {
    * foreign change (#576, #620).
    */
   branchUpdateFrom?: string;
+  branchUpdateAdmission?: "blocked" | "submitted";
   /**
    * PR heads of this attempt that a later head replaced: GitHub's branch
    * update, or a replay onto a repaired lower native layer. A lease and a
@@ -235,7 +237,7 @@ export interface PreparationState {
   /** Worker ceiling and scheduling resolved when the Objective started. */
   capacity: import("./config.js").Capacity;
   charges?: import("./repair-policy.js").RepairLedger["charges"];
-  schemaVersion: 8 | 10 | 12 | 14 | 16;
+  schemaVersion: 8 | 10 | 12 | 14 | 16 | 18;
   kind: "preparing";
   repository: string;
   objective: number;
@@ -277,7 +279,8 @@ export function isPreparationState(
     state?.schemaVersion === 10 ||
     state?.schemaVersion === 12 ||
     state?.schemaVersion === 14 ||
-    state?.schemaVersion === 16
+    state?.schemaVersion === 16 ||
+    state?.schemaVersion === 18
   );
 }
 
@@ -289,7 +292,8 @@ export function isExecutionState(
     state?.schemaVersion === 9 ||
     state?.schemaVersion === 11 ||
     state?.schemaVersion === 13 ||
-    state?.schemaVersion === 15
+    state?.schemaVersion === 15 ||
+    state?.schemaVersion === 17
   );
 }
 
@@ -327,6 +331,23 @@ export function setCoordinatorMode(
     state.coordinator.mode = rejectionHoldsPause(state) ? "paused" : mode;
 }
 
+/** Existing native-stack slot: exact creation request, never an inferred remote identity. */
+export interface StackPublication {
+  request: { layers: NativeStackLayer[]; baseBranch: string };
+  disposition: "intent" | "observed" | "unknown" | "blocked";
+  number?: number;
+  effectId: string;
+  recordedAt: string;
+}
+export function observedStackNumber(
+  value: number | StackPublication | undefined,
+): number | undefined {
+  return typeof value === "number"
+    ? value
+    : value?.disposition === "observed"
+      ? value.number
+      : undefined;
+}
 export interface FactoryState {
   workflowRecipePin?: import("./workflow-recipes.js").WorkflowRecipePin;
   /** Original admission fingerprints survive amendments and discovered children. */
@@ -388,7 +409,7 @@ export interface FactoryState {
   prerequisitesDigest?: string;
   /** Immutable authenticated admission facts, bound to prerequisitesDigest. */
   prerequisites?: import("./contracts.js").PlanningPrerequisites;
-  schemaVersion: 7 | 9 | 11 | 13 | 15;
+  schemaVersion: 7 | 9 | 11 | 13 | 15 | 17;
   approvedPlaybookAdmission?: import("./contracts.js").ApprovedPlaybookAdmission;
   approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
   repository: string;
@@ -402,10 +423,21 @@ export interface FactoryState {
   /** The login that authored Factory's issues: its GitHub identity. */
   issueAuthor?: string;
   work: Record<string, WorkState>;
-  stackNumbers?: Record<string, number>;
+  stackNumbers?: Record<string, number | StackPublication>;
   stackMerges?: Record<
     string,
-    { topPullRequest: number; expectedHeadSha: string; uuid: string }
+    {
+      topPullRequest: number;
+      expectedHeadSha: string;
+      uuid?: string;
+      request?: {
+        layers: NativeStackLayer[];
+        baseBranch: string;
+        stackNumber: number;
+        submittedAt: string;
+        disposition: "intent" | "observed" | "blocked";
+      };
+    }
   >;
   integratedSha?: string;
   /**
@@ -434,8 +466,10 @@ export function assertStateWorkflowRecipe(state: ContinuationState): void {
   const pin = state.workflowRecipePin;
   const preparation = isPreparationState(state);
   const recipeFormat = preparation
-    ? state.schemaVersion === 16
-    : state.schemaVersion === 15;
+    ? state.schemaVersion === 16 ||
+      (state.schemaVersion === 18 && pin !== undefined)
+    : state.schemaVersion === 15 ||
+      (state.schemaVersion === 17 && pin !== undefined);
   if (preparation && Object.hasOwn(state, "workflowRecipeAdmission"))
     throw new Error(
       "Original recipe admission receipt belongs only to execution snapshots",
@@ -847,7 +881,8 @@ export function parseFactoryState(
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
-      state.schemaVersion !== 15) ||
+      state.schemaVersion !== 15 &&
+      state.schemaVersion !== 17) ||
     state.repository !== repository ||
     state.objective !== objective
   )
@@ -864,7 +899,8 @@ export function parseFactoryState(
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
-      state.schemaVersion !== 15
+      state.schemaVersion !== 15 &&
+      state.schemaVersion !== 17
     )
       throw new Error("Adaptive context requires execution schema version 9");
     assertPlanningLookupRecord(lookup);
@@ -943,7 +979,8 @@ export function parseFactoryState(
   if (
     state.workflowReflection !== undefined &&
     state.schemaVersion !== 13 &&
-    state.schemaVersion !== 15
+    state.schemaVersion !== 15 &&
+    state.schemaVersion !== 17
   )
     throw new Error(
       "Workflow reflection requires execution snapshot version 13",
@@ -959,7 +996,8 @@ export function parseFactoryState(
         state.schemaVersion !== 9 &&
         state.schemaVersion !== 11 &&
         state.schemaVersion !== 13 &&
-        state.schemaVersion !== 15
+        state.schemaVersion !== 15 &&
+        state.schemaVersion !== 17
       )
         throw new Error("Discovery requires execution schema version 9");
       assertDiscoverySpecification(item.discovery);
@@ -1049,7 +1087,8 @@ export function parseFactoryState(
       state.schemaVersion !== 9 &&
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
-      state.schemaVersion !== 15
+      state.schemaVersion !== 15 &&
+      state.schemaVersion !== 17
     )
       throw new Error(
         "Discovery start admissions require execution schema version 9",
@@ -1097,7 +1136,9 @@ export function parseFactoryState(
       "Adaptive execution lacks its retained context or discovery semantics",
     );
   if (
-    (state.schemaVersion === 13 || state.schemaVersion === 15) &&
+    (state.schemaVersion === 13 ||
+      state.schemaVersion === 15 ||
+      (state.schemaVersion === 17 && state.workflowRecipePin !== undefined)) &&
     lookup === undefined
   )
     throw new Error(
@@ -1197,6 +1238,13 @@ export function parseFactoryState(
       !Number.isSafeInteger(item.closedPullRequest)
     )
       throw new Error(`Work Item ${id} closedPullRequest must be an integer`);
+    if (
+      item.branchUpdateAdmission !== undefined &&
+      (state.schemaVersion !== 17 ||
+        item.branchUpdateFrom === undefined ||
+        !["blocked", "submitted"].includes(String(item.branchUpdateAdmission)))
+    )
+      throw new Error("Invalid checkpointed branch update admission");
     if (item.branchUpdateFrom !== undefined && !item.pullRequest)
       throw new Error(`Work Item ${id} branch update lacks a pull request`);
     if (
@@ -1612,6 +1660,57 @@ export function parseFactoryState(
         throw new Error(`Work Item ${id} execution identity is invalid`);
       if (execution.data !== undefined)
         jsonSafe(execution.data, `work.${id}.execution.data`);
+      if (execution.data !== undefined) {
+        const active = record(execution.data, `work.${id}.execution.data`);
+        if (
+          active.admissionBlockedAt !== undefined &&
+          (state.schemaVersion !== 17 ||
+            execution.provider !== "local" ||
+            active.phase !== "prepared" ||
+            Number.isNaN(
+              Date.parse(
+                string(
+                  active.admissionBlockedAt,
+                  "Local blocked admission time",
+                ),
+              ),
+            ))
+        )
+          throw new Error("Invalid local checkpoint admission disposition");
+        if (active.checkpointAdmission !== undefined) {
+          if (
+            state.schemaVersion !== 17 ||
+            !["openai-agents", "claude-managed-agents"].includes(
+              String(execution.provider),
+            )
+          )
+            throw new Error(
+              "Unsupported managed checkpoint admission metadata",
+            );
+          const admission = record(
+            active.checkpointAdmission,
+            "Managed checkpoint admission",
+          );
+          if (
+            Object.keys(admission).sort().join() !==
+              "at,boundary,knownNotDispatched,phase" ||
+            typeof admission.phase !== "string" ||
+            !admission.phase ||
+            !["before-effect", "settled", "explicit"].includes(
+              String(admission.boundary),
+            ) ||
+            typeof admission.knownNotDispatched !== "boolean" ||
+            admission.knownNotDispatched !==
+              (admission.boundary === "before-effect") ||
+            Number.isNaN(
+              Date.parse(
+                string(admission.at, "Managed checkpoint admission time"),
+              ),
+            )
+          )
+            throw new Error("Invalid managed checkpoint admission disposition");
+        }
+      }
       const interruptedStart =
         execution.provider === "local" &&
         JSON.stringify(
@@ -1747,7 +1846,36 @@ export function parseFactoryState(
             `Work Item ${id} lacks declared fresh-checkout readiness`,
           );
         }
-        const handle = record(active.handle, `work.${id}.harness`);
+        const prepared = active.phase === "prepared";
+        const handle = prepared
+          ? undefined
+          : record(active.handle, `work.${id}.harness`);
+        if (prepared) {
+          if (active.handle !== undefined)
+            throw new Error(
+              "Prepared execution cannot claim a spawned harness",
+            );
+          const payload = record(
+            active.preparedHarnessRequest,
+            `work.${id}.preparedHarnessRequest`,
+          );
+          const preparedItem = record(
+            payload.item,
+            `work.${id}.preparedHarnessRequest.item`,
+          );
+          if (
+            payload.worktree !== active.worktree ||
+            payload.attemptId !== execution.identity ||
+            preparedItem.id !== id ||
+            JSON.stringify(preparedItem.executionBinding) !==
+              JSON.stringify(acceptedItem.executionBinding) ||
+            JSON.stringify(preparedItem.executionProfile) !==
+              JSON.stringify(acceptedItem.executionProfile)
+          )
+            throw new Error(
+              "Prepared harness request differs from its admitted attempt",
+            );
+        }
         if (
           typeof active.worktree !== "string" ||
           typeof active.adapterIdentity !== "string" ||
@@ -1756,11 +1884,11 @@ export function parseFactoryState(
           (request.baseSha !== item.baseSha &&
             item.status !== "done" &&
             item.status !== "published") ||
-          typeof handle.identity !== "string" ||
-          !handle.identity
+          (!prepared &&
+            (typeof handle?.identity !== "string" || !handle.identity))
         )
           throw new Error(`Work Item ${id} active attempt handle is invalid`);
-        if (handle.data !== undefined)
+        if (handle?.data !== undefined)
           jsonSafe(handle.data, `work.${id}.harness.data`);
       }
     }
@@ -1783,9 +1911,68 @@ export function parseFactoryState(
   }
   if (state.stackNumbers !== undefined) {
     const numbers = record(state.stackNumbers, "stackNumbers");
-    for (const [unit, number] of Object.entries(numbers))
-      if (!unit || !Number.isSafeInteger(number) || Number(number) <= 0)
-        throw new Error("Native stack identity is invalid");
+    for (const [unit, value] of Object.entries(numbers)) {
+      if (!unit) throw new Error("Native stack identity is invalid");
+      if (typeof value === "number") {
+        if (!Number.isSafeInteger(value) || value <= 0)
+          throw new Error("Native stack identity is invalid");
+        continue;
+      }
+      if (state.schemaVersion !== 17)
+        throw new Error(
+          "Native stack creation requires checkpoint reader capability",
+        );
+      const publication = record(value, "Native stack publication");
+      if (
+        Object.keys(publication).some(
+          (key) =>
+            ![
+              "request",
+              "disposition",
+              "number",
+              "effectId",
+              "recordedAt",
+            ].includes(key),
+        ) ||
+        !["intent", "observed", "unknown", "blocked"].includes(
+          String(publication.disposition),
+        ) ||
+        typeof publication.effectId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(publication.effectId) ||
+        (publication.disposition === "observed"
+          ? !Number.isSafeInteger(publication.number) ||
+            Number(publication.number) < 1
+          : publication.number !== undefined) ||
+        Number.isNaN(
+          Date.parse(
+            string(publication.recordedAt, "Native stack publication time"),
+          ),
+        )
+      )
+        throw new Error("Native stack creation receipt is invalid");
+      const request = record(
+        publication.request,
+        "Native stack creation request",
+      );
+      if (
+        Object.keys(request).sort().join() !== "baseBranch,layers" ||
+        !Array.isArray(request.layers) ||
+        !request.layers.length
+      )
+        throw new Error("Native stack creation request is invalid");
+      string(request.baseBranch, "Native stack creation base branch");
+      for (const layer of request.layers) {
+        const entry = record(layer, "Native stack creation layer");
+        if (
+          Object.keys(entry).sort().join() !== "branch,headSha,pullRequest" ||
+          !Number.isSafeInteger(entry.pullRequest) ||
+          Number(entry.pullRequest) < 1
+        )
+          throw new Error("Native stack creation layer is invalid");
+        string(entry.branch, "Native stack creation branch");
+        sha(entry.headSha, "Native stack creation layer head");
+      }
+    }
   }
   if (state.stackMerges !== undefined) {
     const merges = record(state.stackMerges, "stackMerges");
@@ -1795,11 +1982,65 @@ export function parseFactoryState(
         !unit ||
         !Number.isSafeInteger(merge.topPullRequest) ||
         Number(merge.topPullRequest) <= 0 ||
-        typeof merge.uuid !== "string" ||
-        !merge.uuid
+        (merge.uuid !== undefined &&
+          (typeof merge.uuid !== "string" || !merge.uuid)) ||
+        (merge.uuid === undefined && merge.request === undefined)
       )
         throw new Error("Pending native merge identity is invalid");
       sha(merge.expectedHeadSha, "Pending native merge head");
+      if (merge.request !== undefined) {
+        if (state.schemaVersion !== 17)
+          throw new Error(
+            "Native merge intent requires checkpoint reader capability",
+          );
+        const request = record(merge.request, "Pending native merge request");
+        if (
+          Object.keys(request).sort().join() !==
+            "baseBranch,disposition,layers,stackNumber,submittedAt" ||
+          !Array.isArray(request.layers) ||
+          !request.layers.length ||
+          !Number.isSafeInteger(request.stackNumber) ||
+          Number(request.stackNumber) < 1 ||
+          !["intent", "observed", "blocked"].includes(
+            String(request.disposition),
+          ) ||
+          (merge.uuid === undefined &&
+            !["intent", "blocked"].includes(String(request.disposition))) ||
+          (merge.uuid !== undefined && request.disposition !== "observed")
+        )
+          throw new Error("Pending native merge request is invalid");
+        string(request.baseBranch, "Native merge base branch");
+        if (
+          Number.isNaN(
+            Date.parse(
+              string(request.submittedAt, "Native merge submission time"),
+            ),
+          )
+        )
+          throw new Error("Invalid native merge submission time");
+        for (const layer of request.layers) {
+          const entry = record(layer, "Native merge layer");
+          if (
+            Object.keys(entry).sort().join() !== "branch,headSha,pullRequest" ||
+            !Number.isSafeInteger(entry.pullRequest) ||
+            Number(entry.pullRequest) < 1
+          )
+            throw new Error("Pending native merge layer is invalid");
+          string(entry.branch, "Native merge branch");
+          sha(entry.headSha, "Native merge layer head");
+        }
+        const top = request.layers.at(-1) as {
+          pullRequest: number;
+          headSha: string;
+        };
+        if (
+          top.pullRequest !== merge.topPullRequest ||
+          top.headSha !== merge.expectedHeadSha
+        )
+          throw new Error(
+            "Native merge request differs from its exact top layer",
+          );
+      }
     }
   }
   if (state.finalValidation !== undefined) {

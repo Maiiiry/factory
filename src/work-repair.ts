@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import { awaitCheckpointAdmission } from "./recovery-checkpoint.js";
 import { createHash, randomUUID } from "node:crypto";
 import { blameDecision, cappedDiagnosis } from "./blame-decision.js";
 import {
@@ -1351,7 +1353,13 @@ export async function diagnoseWorkRepair(args: {
                 submitted: false,
                 rejected: [
                   ...(invocation.rejected ?? []),
-                  { id: invocation.id, response: structuredClone(response) },
+                  {
+                    id: invocation.id,
+                    response: structuredClone(response),
+                    ...(invocation.nativeReturns && {
+                      nativeReturns: structuredClone(invocation.nativeReturns),
+                    }),
+                  },
                 ],
               };
               save();
@@ -1369,6 +1377,51 @@ export async function diagnoseWorkRepair(args: {
               rejected,
               invocation: {
                 invocationId: invocation.id,
+                ...(state.schemaVersion === 17
+                  ? {
+                      beforeProviderAttempt: () =>
+                        awaitCheckpointAdmission(
+                          state.repository,
+                          "before-effect",
+                        ),
+                      retainNativeReturn: async (
+                        receipt: Parameters<
+                          NonNullable<
+                            import("./contracts.js").ModelInvocationContext["retainNativeReturn"]
+                          >
+                        >[0],
+                      ) => {
+                        if (
+                          !args.contentStore ||
+                          work.recovery?.diagnosisInvocation !== invocation
+                        )
+                          throw new Error(
+                            "Native diagnosis return lacks its current owned content store",
+                          );
+                        const bytes = Buffer.from(
+                          JSON.stringify({
+                            schemaVersion: 1,
+                            invocationId: invocation.id,
+                            phase: "diagnosis",
+                            ...receipt,
+                          }),
+                        );
+                        const ref = await args.contentStore.put(
+                          Readable.toWeb(
+                            Readable.from([bytes]),
+                          ) as ReadableStream<Uint8Array>,
+                          { mediaType: "application/json" },
+                        );
+                        invocation.nativeReturns ??= [];
+                        invocation.nativeReturns.push(ref);
+                        save();
+                        await awaitCheckpointAdmission(
+                          state.repository,
+                          "explicit",
+                        );
+                      },
+                    }
+                  : {}),
                 phase: "diagnosis",
                 ordinal: consumption(state).implementationRepairs,
                 observe: args.diagnostics?.modelObserver({

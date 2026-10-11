@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
+import type { ContentRef } from "./contracts.js";
 import type { AllowanceConsumption } from "./graph-amendments.js";
 import type { FactoryState, WorkState } from "./state.js";
 import { refuseUnknownFields } from "./unknown-fields.js";
@@ -239,7 +240,12 @@ export interface WorkRecovery {
     submitted: boolean;
     requestDigest?: string;
     response?: unknown;
-    rejected?: { id: string; response: unknown }[];
+    nativeReturns?: ContentRef[];
+    rejected?: {
+      id: string;
+      response: unknown;
+      nativeReturns?: ContentRef[];
+    }[];
   };
   failure?: FailureDisposition;
   correction?: RepairCorrection;
@@ -709,6 +715,22 @@ export function assertRepairLedger(
             ))))
     )
       throw new Error("Invalid retained diagnosis invocation");
+    for (const ref of [
+      ...(diagnosis?.nativeReturns ?? []),
+      ...(diagnosis?.rejected ?? []).flatMap(
+        (entry) => entry.nativeReturns ?? [],
+      ),
+    ]) {
+      if (
+        !ref ||
+        Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+        !/^[a-f0-9]{64}$/.test(ref.digest) ||
+        !Number.isSafeInteger(ref.bytes) ||
+        ref.bytes < 0 ||
+        ref.mediaType !== "application/json"
+      )
+        throw new Error("Invalid native diagnosis original reference");
+    }
     if (
       recovery.phase &&
       !["diagnosing", "ready", "stopped"].includes(recovery.phase)
@@ -779,6 +801,30 @@ export function assertRepairLedger(
       )
     )
       throw new Error("Invalid planning recovery disposition");
+    for (const receipt of [
+      ...(value.invocations ?? []),
+      ...value.history.flatMap((entry) => entry.invocations),
+    ]) {
+      if (
+        !receipt ||
+        typeof receipt.id !== "string" ||
+        !receipt.id ||
+        typeof receipt.phase !== "string" ||
+        !receipt.phase ||
+        (receipt.nativeReturns !== undefined &&
+          (!Array.isArray(receipt.nativeReturns) ||
+            receipt.nativeReturns.some(
+              (ref) =>
+                !ref ||
+                Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+                !/^[a-f0-9]{64}$/.test(ref.digest) ||
+                !Number.isSafeInteger(ref.bytes) ||
+                ref.bytes < 0 ||
+                ref.mediaType !== "application/json",
+            )))
+      )
+        throw new Error("Invalid original planning invocation receipt");
+    }
     // Each accepted planning correction was charged as its round.
     for (const round of value.history.keys())
       if (

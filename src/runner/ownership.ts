@@ -247,8 +247,14 @@ export async function cancelKnownWork(
         )
           ? agentSessionContinuation(state, "implementation", itemId, save)
           : undefined;
-        const context = executionContext(work, save, () =>
-          Boolean(state.cancelRequested),
+        const context = executionContext(
+          work,
+          save,
+          () => Boolean(state.cancelRequested),
+          undefined,
+          undefined,
+          state.repository,
+          state.schemaVersion === 17 ? true : undefined,
         );
         if (session)
           context.checkpointSession = (ref) => session.checkpoint(ref);

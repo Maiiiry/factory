@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import { awaitCheckpointAdmission } from "./recovery-checkpoint.js";
 import {
   readPinnedWorkflowRecipe,
   type WorkflowRecipeInput,
@@ -61,6 +63,8 @@ import type {
   WorkDiscovery,
   WorkGraph,
   ContentStore,
+  ContentRef,
+  ModelInvocationContext,
   WorkItem,
 } from "./contracts.js";
 import { linearDeliveryUnits } from "./delivery/plan.js";
@@ -116,6 +120,7 @@ export interface PendingAmendment {
     requestDigest?: string;
     adaptiveContextId?: string;
     response?: WorkGraph;
+    nativeReturns?: ContentRef[];
   };
   reviewInvocation?: {
     id: string;
@@ -123,7 +128,9 @@ export interface PendingAmendment {
     adaptiveContextId?: string;
     packet: import("./review-evidence.js").ReviewPacket;
     response?: Awaited<ReturnType<PlanningModel["reviewGraph"]>>;
+    nativeReturns?: ContentRef[];
   };
+  reviewRejectedNativeReturns?: ContentRef[];
   reviewRejectedResponses?: Awaited<ReturnType<PlanningModel["reviewGraph"]>>[];
   reviewDigest?: string;
   issueByItemId: Record<string, number>;
@@ -143,6 +150,9 @@ export interface GraphRevision {
   /** Deterministic derivation from the independently reviewed original envelope. */
   expansion?: import("./runner/expansion.js").GraphExpansionSettlement;
   reviewDigest?: string;
+  planningInvocation?: PendingAmendment["planningInvocation"];
+  reviewInvocation?: PendingAmendment["reviewInvocation"];
+  reviewRejectedNativeReturns?: ContentRef[];
   acceptedAt?: string;
 }
 export type AllowanceConsumption = {
@@ -228,6 +238,28 @@ export function assertGraphRevisions(state: FactoryState): void {
         packet.binding.itemId !== undefined
       )
         throw new Error("Amendment invocation lost its retained role context");
+    }
+  }
+  for (const original of [
+    ...(state.pendingAmendment ? [state.pendingAmendment] : []),
+    ...(state.rejectedAmendments ?? []),
+    ...(state.graphRevisions ?? []),
+  ]) {
+    for (const ref of [
+      ...(original.planningInvocation?.nativeReturns ?? []),
+      ...(original.reviewInvocation?.nativeReturns ?? []),
+      ...(original.reviewRejectedNativeReturns ?? []),
+    ]) {
+      if (
+        state.schemaVersion !== 17 ||
+        !ref ||
+        Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+        !/^[a-f0-9]{64}$/.test(ref.digest) ||
+        !Number.isSafeInteger(ref.bytes) ||
+        ref.bytes < 0 ||
+        ref.mediaType !== "application/json"
+      )
+        throw new Error("Invalid native amendment original reference");
     }
   }
   const revisions = state.graphRevisions;
@@ -404,7 +436,8 @@ function admitAdvancedAmendmentFormat(
   assertGraphExpansions(graph);
   if (
     (graph.conditions?.length || state.schemaVersion === 9) &&
-    state.schemaVersion !== 15
+    state.schemaVersion !== 15 &&
+    state.schemaVersion !== 17
   )
     state.schemaVersion = 13;
 }
@@ -792,6 +825,10 @@ export function applyPendingAmendment(
                       pending.reviewRejectedResponses.push(
                         structuredClone(response),
                       );
+                      pending.reviewRejectedNativeReturns ??= [];
+                      pending.reviewRejectedNativeReturns.push(
+                        ...(pending.reviewInvocation?.nativeReturns ?? []),
+                      );
                       delete pending.reviewInvocation;
                       args.save();
                     }
@@ -812,6 +849,48 @@ export function applyPendingAmendment(
   );
 }
 
+function amendmentNativeHooks(
+  args: { state: FactoryState; contentStore?: ContentStore; save: () => void },
+  owner: { id: string; nativeReturns?: ContentRef[] },
+  phase: ModelInvocationContext["phase"],
+): Pick<
+  ModelInvocationContext,
+  "beforeProviderAttempt" | "retainNativeReturn"
+> {
+  if (args.state.schemaVersion !== 17) return {};
+  return {
+    beforeProviderAttempt: () =>
+      awaitCheckpointAdmission(args.state.repository, "before-effect"),
+    retainNativeReturn: async (receipt) => {
+      if (
+        !args.contentStore ||
+        ![
+          args.state.pendingAmendment?.planningInvocation,
+          args.state.pendingAmendment?.reviewInvocation,
+        ].includes(owner)
+      )
+        throw new Error(
+          "Native amendment return lacks its current owned content store",
+        );
+      const bytes = Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          invocationId: owner.id,
+          phase,
+          ...receipt,
+        }),
+      );
+      const ref = await args.contentStore.put(
+        Readable.toWeb(Readable.from([bytes])) as ReadableStream<Uint8Array>,
+        { mediaType: "application/json" },
+      );
+      owner.nativeReturns ??= [];
+      owner.nativeReturns.push(ref);
+      args.save();
+      await awaitCheckpointAdmission(args.state.repository, "explicit");
+    },
+  };
+}
 /** One compile, review and projection pass from the last completed phase. */
 async function advanceAmendment(args: {
   state: FactoryState;
@@ -1079,6 +1158,11 @@ async function advanceAmendment(args: {
           [],
           [],
           {
+            ...amendmentNativeHooks(
+              args,
+              pending.planningInvocation,
+              "compile",
+            ),
             invocationId: pending.planningInvocation.id,
             phase: "compile",
             ordinal,
@@ -1215,6 +1299,11 @@ async function advanceAmendment(args: {
           ...packet,
           reviewPacket: evidence,
           invocation: {
+            ...amendmentNativeHooks(
+              args,
+              pending.reviewInvocation,
+              "graph-review",
+            ),
             invocationId: pending.reviewInvocation.id,
             phase: "graph-review",
             ordinal,
@@ -1260,6 +1349,7 @@ async function advanceAmendment(args: {
         (state.schemaVersion === 11 ||
           state.schemaVersion === 13 ||
           state.schemaVersion === 15 ||
+          state.schemaVersion === 17 ||
           pending.graph!.conditions?.length ||
           pending.graph!.expansions?.length) &&
         args.github.projectionMutationAdmission !== "controller-checkpoint-v1"
@@ -1278,6 +1368,7 @@ async function advanceAmendment(args: {
         ...(state.schemaVersion === 11 ||
         state.schemaVersion === 13 ||
         state.schemaVersion === 15 ||
+        state.schemaVersion === 17 ||
         pending.graph!.conditions?.length ||
         pending.graph!.expansions?.length
           ? {
@@ -1324,6 +1415,17 @@ async function advanceAmendment(args: {
       parentDigest: graphDigest(state.graph),
       proposal: proposalReceipt,
       reviewDigest: pending.reviewDigest!,
+      ...(pending.planningInvocation && {
+        planningInvocation: structuredClone(pending.planningInvocation),
+      }),
+      ...(pending.reviewInvocation && {
+        reviewInvocation: structuredClone(pending.reviewInvocation),
+      }),
+      ...(pending.reviewRejectedNativeReturns && {
+        reviewRejectedNativeReturns: structuredClone(
+          pending.reviewRejectedNativeReturns,
+        ),
+      }),
       acceptedAt: new Date().toISOString(),
     });
     const reattempt = reattemptedItem(state, pending.proposal);
@@ -1334,7 +1436,9 @@ async function advanceAmendment(args: {
         pending.graph!.items.find((item) => item.id === reattempt),
       );
     state.graph = pending.graph!;
-    if (state.workflowRecipePin) state.schemaVersion = 15;
+    if (state.schemaVersion === 17) {
+      /* Keep the checkpoint reader fence. */
+    } else if (state.workflowRecipePin) state.schemaVersion = 15;
     else if (
       state.graph.conditions?.length ||
       state.conditionFacts ||

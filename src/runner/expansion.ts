@@ -94,6 +94,7 @@ export function assertExpansionState(state: FactoryState): void {
     state.schemaVersion !== 11 &&
     state.schemaVersion !== 13 &&
     state.schemaVersion !== 15 &&
+    state.schemaVersion !== 17 &&
     (expansions !== undefined ||
       state.pendingExpansion !== undefined ||
       state.expansionHistory !== undefined)

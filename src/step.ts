@@ -61,6 +61,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { isCheckpointAdmissionFailure } from "./recovery-checkpoint.js";
 import * as time from "./clock.js";
 import {
   attachedFault,
@@ -69,6 +70,7 @@ import {
   type Fault,
   faultDetail,
   faultOf,
+  attachFault,
   parseRepeatKey,
   type RepeatRecord,
   StepFault,
@@ -585,10 +587,19 @@ async function repeat<T>(
       save();
       let result: R;
       try {
+        stopWaiting();
         result = await call();
       } catch (error) {
         write({ ...record(), inFlight: undefined });
         save();
+        if (isCheckpointAdmissionFailure(error) && error.knownNotDispatched)
+          throw attachFault(
+            error,
+            decision(
+              "Git checkpoint synchronization must settle before another effect",
+              error.message,
+            ),
+          );
         const fault = attachedFault(error);
         if (fault) paidFaults.add(fault);
         throw error;

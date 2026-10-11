@@ -5,6 +5,7 @@ import {
   retainStateMemory,
 } from "./repository-memory.js";
 import { randomUUID } from "node:crypto";
+import { markCheckpointDirty } from "./recovery-checkpoint.js";
 import {
   closeSync,
   existsSync,
@@ -86,6 +87,7 @@ export function writePreState(
     : undefined;
   if (!repeats && !record.wait) {
     rmSync(path, { force: true });
+    markCheckpointDirty(repository, { path, kind: "pre-state" });
     return;
   }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -101,6 +103,13 @@ export function writePreState(
     closeSync(fd);
   }
   renameSync(temporary, path);
+  const directory = openSync(dirname(path), "r");
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+  markCheckpointDirty(repository, { path, kind: "pre-state" });
 }
 
 /** The pre-state record, if one exists and is valid; status never fails on it. */
@@ -174,6 +183,7 @@ export function saveState(path: string, state: ContinuationState): void {
   } finally {
     closeSync(directory);
   }
+  markCheckpointDirty(state.repository, { path, kind: "continuation" });
 }
 
 const currentVersion = (value: unknown): boolean => {
@@ -188,7 +198,9 @@ const currentVersion = (value: unknown): boolean => {
     version === 13 ||
     version === 14 ||
     version === 15 ||
-    version === 16
+    version === 16 ||
+    version === 17 ||
+    version === 18
   );
 };
 
@@ -257,6 +269,20 @@ function parseContinuation(
     : parseExecution(value, repository, objective);
 }
 
+/** Authenticate historical bytes without importing their paths as live ownership. */
+export function parsePortableContinuation(
+  value: unknown,
+  repository: string,
+  objective: number,
+): ContinuationState {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Portable continuation must be an original snapshot");
+  const state = value as ContinuationState;
+  return isPreparationState(state)
+    ? parsePreparation(state, repository, objective)
+    : parseFactoryState(value, repository, objective);
+}
+
 function parsePreparation(
   value: PreparationState,
   repository: string,
@@ -270,7 +296,8 @@ function parsePreparation(
       value.schemaVersion !== 10 &&
       value.schemaVersion !== 12 &&
       value.schemaVersion !== 14 &&
-      value.schemaVersion !== 16
+      value.schemaVersion !== 16 &&
+      value.schemaVersion !== 18
     )
       throw new Error(
         "Adaptive context requires preparation schema version 10",
@@ -298,11 +325,13 @@ function parsePreparation(
       (value.schemaVersion === 16 && value.plan.schemaVersion !== 7) ||
       (conditional &&
         value.schemaVersion !== 14 &&
-        value.schemaVersion !== 16) ||
+        value.schemaVersion !== 16 &&
+        value.schemaVersion !== 18) ||
       (expanded &&
         value.schemaVersion !== 12 &&
         value.schemaVersion !== 14 &&
-        value.schemaVersion !== 16)
+        value.schemaVersion !== 16 &&
+        value.schemaVersion !== 18)
     )
       throw new Error(
         "Preparation plan schema differs from adaptive semantics",
@@ -326,7 +355,8 @@ function parsePreparation(
       value.schemaVersion !== 10 &&
       value.schemaVersion !== 12 &&
       value.schemaVersion !== 14 &&
-      value.schemaVersion !== 16) ||
+      value.schemaVersion !== 16 &&
+      value.schemaVersion !== 18) ||
     value.kind !== "preparing" ||
     value.repository !== repository ||
     value.objective !== objective ||
