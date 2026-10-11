@@ -1018,19 +1018,26 @@ export function withQueueControlVerification<T>(
   return withRecoveryCheckpointScope(input, async () => {
     const scope = scopes.getStore();
     if (!scope) throw new Error("Queue verifier has no admitted scope");
-    const options = settings(input.config);
-    if (!options) return task();
-    if (scope.verification) {
+    const assertCaptured = (owner: QueueVerificationContext) => {
+      const current = settings(input.config);
       if (
-        scope.verification.closed ||
-        scope.verification.quarantined ||
-        scope.verification.key !== verificationKey(input.config, options)
+        owner.closed ||
+        owner.quarantined ||
+        !current ||
+        owner.key !== verificationKey(input.config, current)
       )
         throw new Error(
           "Queue verifier is closed, uncertain or has a different admitted binding",
         );
-      return task();
+    };
+    if (scope.verification) {
+      assertCaptured(scope.verification);
+      const result = await task();
+      assertCaptured(scope.verification);
+      return result;
     }
+    const options = settings(input.config);
+    if (!options) return task();
     const verification: QueueVerificationContext = {
       key: verificationKey(input.config, options),
       serial: Promise.resolve(),
@@ -1044,6 +1051,7 @@ export function withQueueControlVerification<T>(
     let failed = false;
     try {
       result = await scopes.run({ ...scope, verification }, task);
+      assertCaptured(verification);
     } catch (error) {
       failed = true;
       failure = error;
