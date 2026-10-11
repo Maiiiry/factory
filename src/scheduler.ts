@@ -8,6 +8,25 @@ import { assertDiscoverySpecification } from "./discovery.js";
 import { expansionBlocksItem } from "./expansion-readiness.js";
 import type { WorkState } from "./state.js";
 
+/** Admission and restored snapshots share the same optional advisory hint shape. */
+export function assertWorkItemScheduling(value?: unknown): void {
+  if (value === undefined) return;
+  const hint = value as Record<string, unknown>;
+  if (
+    !hint ||
+    typeof hint !== "object" ||
+    Array.isArray(hint) ||
+    Object.keys(hint).sort().join() !== "estimatedDurationMs,reason" ||
+    !Number.isSafeInteger(hint.estimatedDurationMs) ||
+    Number(hint.estimatedDurationMs) <= 0 ||
+    typeof hint.reason !== "string" ||
+    !hint.reason.trim()
+  )
+    throw new Error(
+      "Work Item scheduling requires a positive advisory duration and reason",
+    );
+}
+
 /** Native item types must hold before proof, path, scheduler or review consumers. */
 export function assertWorkItemFields(
   value: unknown,
@@ -79,22 +98,7 @@ export function assertWorkItemFields(
     throw new Error("Work Item minimumAssetSets must be a nonnegative integer");
   if (item.priority !== undefined && !Number.isSafeInteger(item.priority))
     throw new Error("Work Item priority must be an integer");
-  if (item.scheduling !== undefined) {
-    const hint = item.scheduling as Record<string, unknown>;
-    if (
-      !hint ||
-      typeof hint !== "object" ||
-      Array.isArray(hint) ||
-      Object.keys(hint).sort().join() !== "estimatedDurationMs,reason" ||
-      !Number.isSafeInteger(hint.estimatedDurationMs) ||
-      Number(hint.estimatedDurationMs) <= 0 ||
-      typeof hint.reason !== "string" ||
-      !hint.reason.trim()
-    )
-      throw new Error(
-        "Work Item scheduling requires a positive advisory duration and reason",
-      );
-  }
+  assertWorkItemScheduling(item.scheduling);
   if (
     item.sourceAssets !== undefined &&
     (!Array.isArray(item.sourceAssets) ||
