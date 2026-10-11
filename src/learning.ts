@@ -38,6 +38,7 @@ import { operatorName } from "./operator.js";
 import { serviceLoginSecrets } from "./provider-credentials.js";
 import {
   awaitCheckpointAdmission,
+  hasPrivateCheckpointScope,
   markCheckpointDirty,
   withRecoveryCheckpointScope,
 } from "./recovery-checkpoint.js";
@@ -1034,6 +1035,7 @@ const LEARNING_ORIGINAL_KINDS = [
   "calls",
   "checkpoints",
   "submissions",
+  "returns",
 ] as const;
 export type LearningOriginalKind = (typeof LEARNING_ORIGINAL_KINDS)[number];
 export interface LearningOriginal {
@@ -1070,7 +1072,8 @@ export function decodeLearningOriginal(
   if (
     kind !== "calls" &&
     value.repository !== repository &&
-    kind !== "submissions"
+    kind !== "submissions" &&
+    kind !== "returns"
   )
     throw new Error("Learning original repository differs");
   if (kind === "episodes" || kind === "snapshots") {
@@ -1121,7 +1124,7 @@ export function decodeLearningOriginal(
     text(value.actor);
     text(value.at);
   }
-  if (kind === "calls" || kind === "submissions" || kind === "checkpoints") {
+  if (["calls", "submissions", "checkpoints", "returns"].includes(kind)) {
     proposalIdentity(value.invocationId);
     if (kind === "calls") {
       if (value.phase !== "dream" || !Array.isArray(value.observations))
@@ -1139,6 +1142,28 @@ export function decodeLearningOriginal(
       throw new Error("Dream checkpoint identity changed");
     if (kind !== "checkpoints") hash(value.sourceDigest);
     if (value.checkpointDigest !== undefined) hash(value.checkpointDigest);
+    if (kind === "returns") {
+      hash(value.checkpointDigest);
+      hash(value.configDigest);
+      const ref = record(value.responseRef);
+      hash(ref.digest);
+      if (
+        !Number.isSafeInteger(ref.bytes) ||
+        Number(ref.bytes) < 0 ||
+        ref.mediaType !== "text/plain" ||
+        Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+        !["literal-agent-text", "sdk-structured-value"].includes(
+          String(value.representation),
+        ) ||
+        !["completed", "failed", "interrupted"].includes(
+          String(value.terminal),
+        ) ||
+        value.phase !== "dream" ||
+        value.providerAttempt !== 1 ||
+        value.providerMaxAttempts !== 1
+      )
+        throw new Error("Invalid exact Dream native return original");
+    }
   }
   return { kind, value };
 }
@@ -1423,7 +1448,8 @@ export function validateLearningOriginals(
     }
     if (
       path.startsWith("learning/submissions/") ||
-      path.startsWith("learning/calls/")
+      path.startsWith("learning/calls/") ||
+      path.startsWith("learning/returns/")
     ) {
       const identity = path.slice(path.lastIndexOf("/") + 1, -5);
       const checkpointPath = `learning/checkpoints/${identity}.json`;
@@ -1433,7 +1459,11 @@ export function validateLearningOriginals(
         if (
           digest(checkpointPath) !== value.checkpointDigest ||
           checkpoint.invocationId !== value.invocationId ||
-          packet.digest !== value.sourceDigest
+          packet.digest !== value.sourceDigest ||
+          (path.startsWith("learning/returns/") &&
+            (value.configDigest !== checkpoint.configDigest ||
+              JSON.stringify(value.parent) !==
+                JSON.stringify(checkpoint.parent)))
         )
           throw new Error("Dream original receipt binding changed");
       }
@@ -1527,6 +1557,7 @@ export function learningPersistenceClosure(repository: string): {
     "calls",
     "checkpoints",
     "submissions",
+    "returns",
   ])
     for (const name of readdirSync(directory(repository, kind))
       .filter((name) => name.endsWith(".json") && !name.endsWith(".draft.json"))
@@ -2215,6 +2246,54 @@ async function dream(
     invocationId,
     phase: "dream",
     ordinal: 0,
+    ...(hasPrivateCheckpointScope()
+      ? {
+          retainNativeReturn: async (
+            receipt: Parameters<
+              NonNullable<ModelInvocationContext["retainNativeReturn"]>
+            >[0],
+          ) => {
+            const store = new LocalContentStore(
+              join(stateRoot(config.repository), "content"),
+            );
+            const responseRef = store.putBytes(Buffer.from(receipt.response), {
+              mediaType: "text/plain",
+            });
+            const { response: _response, ...metadata } = receipt;
+            const path = join(
+              directory(config.repository, "returns"),
+              `${id}.json`,
+            );
+            const raw = encoded({
+              schemaVersion: 1,
+              id,
+              invocationId,
+              phase: "dream",
+              checkpointDigest,
+              sourceDigest: learningDigest(sourcePacket),
+              configDigest: checkpoint.configDigest,
+              parent: checkpoint.parent,
+              responseRef,
+              providerAttempt: invocation.providerAttempt,
+              providerMaxAttempts: invocation.providerMaxAttempts,
+              ...metadata,
+            });
+            decodeLearningOriginal(
+              config.repository,
+              `learning/returns/${id}.json`,
+              Buffer.from(raw),
+            );
+            if (existsSync(path)) {
+              if (privateRead(path) !== raw)
+                throw new Error(
+                  "Dream native return differs from its immutable original",
+                );
+            } else append(path, raw, config.repository);
+            // The adapter may release its last owned copy only after verified durable acknowledgment.
+            await awaitCheckpointAdmission(config.repository, "explicit");
+          },
+        }
+      : {}),
     beforeProviderAttempt: async () => {
       if (
         invocation.providerAttempt !== 1 ||

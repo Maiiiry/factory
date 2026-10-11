@@ -331,6 +331,8 @@ export async function buildMemoryLearningClosure(
         for (const object of described.gitObjects)
           if (object.kind === "commit")
             gitObjects.push({ commitSha: object.sha, role: object.role });
+      } else if (kind === "returns") {
+        add(value.responseRef as ContentRef);
       } else if (kind === "checkpoints") {
         const checkpoint = value as unknown as DreamInputCheckpoint;
         validateDreamInputOriginal(
@@ -498,6 +500,7 @@ export async function installExactMemoryLearning(
     );
     if (kind === "snapshots")
       await verifyContinuationReferenceClosure(value, { readBytes: load });
+    else if (kind === "returns") await load(value.responseRef as ContentRef);
     else if (kind === "checkpoints") {
       const checkpoint = value as unknown as DreamInputCheckpoint;
       validateDreamInputOriginal(
