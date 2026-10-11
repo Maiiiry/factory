@@ -1018,10 +1018,13 @@ export function withQueueControlVerification<T>(
   return withRecoveryCheckpointScope(input, async () => {
     const scope = scopes.getStore();
     if (!scope) throw new Error("Queue verifier has no admitted scope");
-    const assertCaptured = (owner: QueueVerificationContext) => {
+    const assertCaptured = (
+      owner: QueueVerificationContext,
+      closing = false,
+    ) => {
       const current = settings(input.config);
       if (
-        owner.closed ||
+        (owner.closed && !closing) ||
         owner.quarantined ||
         !current ||
         owner.key !== verificationKey(input.config, current)
@@ -1070,6 +1073,7 @@ export function withQueueControlVerification<T>(
       verification.summaries.clear();
     }
     if (failed) throw failure;
+    assertCaptured(verification, true);
     return result as T;
   });
 }
