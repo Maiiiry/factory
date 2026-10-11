@@ -53,9 +53,17 @@ While awaiting an enabled decision, the already authorized service may keep a pa
 
 ## C. Existing Project Status projection
 
-An optional `githubManagement.projectStatus` explicitly names the target repository, existing Project node ID, Status field ID and option IDs for `planning`, `running`, `review`, `needs-human`, `stopped` and `accepted`, with `factoryManagedField: true`. The Project must belong to the repository owner and be writable with the existing credentials. The field must be named Status and be a single-select field; all configured options must exist, and the accepted option must differ from every other phase. The Objective must already have one nonarchived card in that Project. Factory never adds/deletes a card or changes another field.
+An optional `githubManagement.projectStatus` explicitly names the target repository, existing Project node ID, Status field ID and option IDs for `planning`, `running`, `review`, `needs-human`, `stopped` and `accepted`, with `factoryManagedField: true`. The Project must belong to the repository owner and be writable with the existing credentials. The field must be named Status and be a single-select field; all configured options must exist, and the accepted option must differ from every other phase. The Objective must already have one nonarchived card in that Project. This status projection never adds/deletes a card or changes another field.
 
 The opt-in designates that one field as Factory-managed. Concurrent human edits may be overwritten; this is not compare-and-swap protection. Factory binds the exact card, field, desired option and original observation in a durable intent before its sole mutation. Only that mutation's returned response settles it. A definitely not-sent request retains its original transport provenance and permits a later fresh intent; an ambiguous submitted update permanently fences that field. One later automatic read can show its observed option but never proves the old mutation completed or authorizes replay. Other workflow work and substantive acceptance continue. Local status exposes the retained requests, returned and later observed options, observation time and tracking failure separately. Accepted status requires actual accepted Objective closure, not merely completed workers.
+
+## D. Project queue authority
+
+`queue.project` separately binds an existing Project, dedicated TEXT metadata and NUMBER order fields, and an existing control card. The scheduling fields are distinct from the derived Status projection. Explicit queue/proposal actions can add Objective cards and write these scheduling fields; they do not change another field or delete cards.
+
+Issues retain definitions; Project supplies current membership, order and controls. Private Git checkpoints preserve immutable original admission, mutation and owner receipts. A current field value must match the original approved body and semantic configuration. Manual edits and ordinary roadmap cards grant no provider-spending authority. Complete authenticated Project reads are required; unavailable or ambiguous observations never fall back to a local queue.
+
+GitHub field updates supply no conditional-version input. Before dispatch, Factory claims the exact admission through independently acknowledged Git fast-forward publication. A competing or foreign unfinished claim holds execution. Original returned mutation receipts settle writes; later observations never confirm an unknown submission or permit replay. `queue sync` rereads current data without admitting or reordering work. Restoring receipts grants neither service activation nor foreign-resource cessation.
 
 ## Qualification and review
 
