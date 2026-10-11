@@ -2358,13 +2358,13 @@ export class LocalExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<void> {
     const settled = handle.data as Partial<Settled> | undefined;
-    // An attempt that ended has nothing left to stop.
+    // An ended attempt retains its original session receipt; cancellation must
+    // not allocate another unavailable turn after that receipt was released.
     if (
       settled?.result ||
       settled?.stopped !== undefined ||
       (handle.data as Active | undefined)?.rejectedCollection
     ) {
-      if (context?.cancelled()) this.unavailableSession(handle, context);
       return;
     }
     if (
