@@ -36,7 +36,7 @@ function fence(detail: string): Error {
 export function assertGraphProjectionIntents(state: ContinuationState): void {
   const intents = state.graphProjectionIntents;
   if (intents === undefined) return;
-  if (![11, 12, 13, 14, 15, 16, 17, 18].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16, 17, 18, 19, 20].includes(state.schemaVersion))
     throw new Error(
       "Bound graph projection requires expansion snapshot semantics",
     );
@@ -108,7 +108,7 @@ export function assertGraphProjectionIntents(state: ContinuationState): void {
         effect.admissionFailures !== undefined
       ) {
         if (
-          ![17, 18].includes(state.schemaVersion) ||
+          ![17, 18, 19, 20].includes(state.schemaVersion) ||
           (effect.admission !== undefined && effect.admission !== "blocked") ||
           !Array.isArray(effect.admissionFailures) ||
           !effect.admissionFailures.length ||
@@ -182,7 +182,7 @@ export function graphProjectionControl(
 ): NonNullable<GraphProjection["expansionControl"]> {
   assertGraphProjectionIntents(state);
   const digest = graphDigest(graph);
-  if (![11, 12, 13, 14, 15, 16, 17, 18].includes(state.schemaVersion))
+  if (![11, 12, 13, 14, 15, 16, 17, 18, 19, 20].includes(state.schemaVersion))
     throw fence("Expanded graph has no admitted projection semantics");
   state.graphProjectionIntents ??= {};
   let intent = state.graphProjectionIntents[digest];
@@ -249,7 +249,7 @@ export function graphProjectionControl(
         if (
           isCheckpointAdmissionFailure(error) &&
           error.knownNotDispatched &&
-          [17, 18].includes(state.schemaVersion)
+          [17, 18, 19, 20].includes(state.schemaVersion)
         ) {
           effect.admission = "blocked";
           effect.admissionFailures ??= [];

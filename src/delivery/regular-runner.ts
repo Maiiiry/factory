@@ -321,7 +321,7 @@ export async function runRegularGraph(args: {
       const head = await updateBehindBranch({
         github,
         repository: state.repository,
-        checkpointedEffects: state.schemaVersion === 17,
+        checkpointedEffects: [17, 19].includes(state.schemaVersion),
         work,
         save,
         identity: { number: published.pullRequest, branch },

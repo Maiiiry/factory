@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { objectiveComplete } from "./completion.js";
 import type { FactoryConfig } from "./config.js";
-import { factoryConfigDigest } from "./config.js";
 import type { GitHubGateway } from "./contracts.js";
 import { gitHubTransportOf } from "./github-client.js";
 import type { ProjectPhase } from "./github-project-state.js";
@@ -13,7 +12,11 @@ import {
 import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import type { ContinuationState } from "./state.js";
 import { isExecutionState, isPreparationState } from "./state.js";
-import { readContinuation } from "./state-store.js";
+import {
+  assertRestoredContinuationReady,
+  continuationConfigurationMatches,
+  readContinuation,
+} from "./state-store.js";
 
 /** Derived presentation only; a Project card never grants lifecycle authority. */
 export function projectPhase(state: ContinuationState): ProjectPhase {
@@ -54,13 +57,14 @@ async function projectGitHubProjectStatusUnscoped(args: {
   if (!config) return;
   const retained = readContinuation(args.config.repository, args.objective);
   if (!retained) return;
+  assertRestoredContinuationReady(retained, args.config);
   const live = () => {
     const state = args.current();
     if (
       !state ||
       state.runId !== retained.runId ||
       state.configDigest !== retained.configDigest ||
-      factoryConfigDigest(args.config) !== retained.configDigest
+      !continuationConfigurationMatches(retained, args.config)
     )
       throw new Error("Project projection snapshot or configuration changed");
     return state;

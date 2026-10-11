@@ -33,12 +33,16 @@ import {
   readConfig,
   stateRoot,
 } from "./config.js";
+import { objectiveComplete } from "./completion.js";
 import { requestControl } from "./coordinator-control.js";
+import { isExecutionState } from "./state.js";
 import { command, linuxProcessIdentity } from "./process.js";
 import {
+  assertRestoredContinuationReady,
+  assertRestoredInstallationDispatchReady,
+  continuationConfigurationMatches,
   readContinuation,
   readControllerOwner,
-  statePath,
 } from "./state-store.js";
 
 interface ServiceBinding {
@@ -451,13 +455,20 @@ export function checkServiceState(
   objective: number,
   configPath: string,
 ): void {
+  assertRestoredInstallationDispatchReady(config);
   const state = readContinuation(config.repository, objective);
-  if (state && state.configDigest !== factoryConfigDigest(config)) {
+  if (
+    state?.restoration &&
+    (state.cancelledAt || (isExecutionState(state) && objectiveComplete(state)))
+  )
+    return;
+  if (state && !continuationConfigurationMatches(state, config)) {
     const setup = setupCommand(configPath, requiredProviderCredentials(config));
     throw new Error(
-      `Objective ${objective} continuation was written with a different configuration. To continue it, restore that configuration at ${resolve(configPath)}, then run \`${setup}\`. To start fresh instead, run \`${supervisorCommand("uninstall", configPath)}\`, then \`rm -r ${word(dirname(statePath(config.repository, objective)))}\`, then \`${setup}\``,
+      `Objective ${objective} continuation has a different configuration binding. Preserve its records and restore the original configuration at ${resolve(configPath)}, then run \`${setup}\`; a moved checkout requires supported Git restoration and ownership reconciliation`,
     );
   }
+  if (state) assertRestoredContinuationReady(state, config);
 }
 function hasOwner(config: FactoryConfig): boolean {
   const owner = readControllerOwner(
@@ -472,6 +483,7 @@ export async function checkIntakeServiceState(
   config: FactoryConfig,
   configPath: string,
 ): Promise<IntakeAuthorization> {
+  assertRestoredInstallationDispatchReady(config);
   const intake = await readIntake(config);
   if (!intake?.watch)
     throw new Error(

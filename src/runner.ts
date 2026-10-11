@@ -101,7 +101,10 @@ import {
 } from "./state.js";
 import {
   acquireObjectiveLock,
+  assertRestoredContinuationReady,
+  assertRestoredInstallationDispatchReady,
   type ControllerLock,
+  continuationConfigurationMatches,
   installationLockPath,
   liveControllerOwner,
   objectiveLockPath,
@@ -133,25 +136,27 @@ function withGitHubDiagnostics<T>(
   objective: number,
   run: () => T,
 ): T {
+  let retained: ContinuationState | undefined;
+  try {
+    const candidate =
+      owners.get(ownerKey(config, objective))?.snapshot ??
+      readContinuation(config.repository, objective);
+    if (candidate && continuationConfigurationMatches(candidate, config))
+      retained = candidate;
+  } catch {
+    // Missing or unreadable context is unknown; normal lifecycle reads still decide.
+  }
   const diagnostics = new DiagnosticEmitter(
     config.repository,
     objective,
     configuredDiagnosticSecrets(config),
     config.capture,
-    factoryConfigDigest(config),
+    retained?.configDigest ?? factoryConfigDigest(config),
   );
-  let retainedRunId: string | undefined;
-  try {
-    retainedRunId = readContinuation(config.repository, objective)?.runId;
-  } catch {
-    // Missing or unreadable context is unknown; normal lifecycle reads still decide.
-  }
   return withGitHubTransportObserver(
     (transport) =>
       diagnostics.emit({
-        runId:
-          owners.get(ownerKey(config, objective))?.snapshot?.runId ??
-          retainedRunId,
+        runId: retained?.runId,
         operation: "github-transport",
         outcome: transport.outcome === "completed" ? "completed" : "failed",
         transport,
@@ -189,6 +194,7 @@ async function decideObjectiveUnscoped(
     throw new Error(
       `Objective #${objective} has no Factory state; run \`factory run --objective ${objective}\` first`,
     );
+  assertRestoredContinuationReady(state, config);
   if (isPreparationState(state)) {
     if (input.item || input.criterion)
       throw new Error(
@@ -269,6 +275,9 @@ async function controlObjectiveUnscoped(
   config: FactoryConfig,
   request: ControlRequest,
 ): Promise<unknown> {
+  const retained = readContinuation(config.repository, request.objective);
+  if (retained && request.action !== "status")
+    assertRestoredContinuationReady(retained, config);
   const reply = await requestControl(config.repository, request);
   if (reply.handled) return reply.result;
   if (
@@ -283,6 +292,7 @@ async function controlObjectiveUnscoped(
     const state = readContinuation(config.repository, request.objective);
     if (!state) throw new Error("Objective has no Factory state");
     if (request.action === "status") return state.coordinator;
+    assertRestoredContinuationReady(state, config);
     if (request.action === "propose-amendment") {
       // Every stop names this command, so it works while the Objective is
       // stopped: it records the pending amendment under the lock (the same
@@ -294,7 +304,7 @@ async function controlObjectiveUnscoped(
         throw new Error(
           "Only an in-scope amendment can be proposed while the Objective is stopped; a backlog discovery needs a running owner",
         );
-      if (state.configDigest !== factoryConfigDigest(config))
+      if (!continuationConfigurationMatches(state, config))
         throw new Error("Objective differs from this Factory installation");
       const result = submitAmendment(
         state,
@@ -436,7 +446,9 @@ async function runObjectiveOwned(
   let snapshot: ContinuationState | undefined;
   let queueClaim: QueueOwnerClaim | undefined;
   try {
+    assertRestoredInstallationDispatchReady(config);
     snapshot = readContinuation(config.repository, objective);
+    if (snapshot) assertRestoredContinuationReady(snapshot, config);
     queueClaim = await claimProjectQueueRun(
       config,
       services.github,
@@ -847,7 +859,7 @@ async function runObjectiveOwned(
               issue.body,
               current.baseSha,
               config.checkout,
-              factoryConfigDigest(config),
+              current.configDigest,
               true,
               current.capacity.concurrency,
             );
@@ -864,7 +876,7 @@ async function runObjectiveOwned(
                 answer: envelope.answer,
                 reason: envelope.reason,
               },
-              factoryConfigDigest(config),
+              current.configDigest,
             );
             // Pause/drain handlers may run during any await even under the same
             // installation lease. Recheck at the atomic consumption boundary.
@@ -1117,6 +1129,8 @@ async function cancelObjectiveOwned(
   github: GitHubGateway,
   planningModel?: PlanningModel,
 ): Promise<"requested" | "cancelled"> {
+  const retained = readContinuation(config.repository, objective);
+  if (retained) assertRestoredContinuationReady(retained, config);
   const control = await requestControl(config.repository, {
     objective,
     action: "cancel",
@@ -1135,6 +1149,7 @@ async function cancelObjectiveOwned(
   try {
     const continuation = readContinuation(config.repository, objective);
     if (!continuation) throw new Error("Objective has no Factory state");
+    assertRestoredContinuationReady(continuation, config);
     if (
       (isExecutionState(continuation) && objectiveComplete(continuation)) ||
       continuation.cancelledAt
@@ -1190,7 +1205,10 @@ async function cancelObjectiveOwned(
                 undefined,
                 undefined,
                 config.repository,
-                continuation.schemaVersion === 17 ? true : undefined,
+                continuation.schemaVersion === 17 ||
+                  continuation.schemaVersion === 19
+                  ? true
+                  : undefined,
               ),
             )
             .catch(() => undefined);
@@ -1238,6 +1256,7 @@ function retryStep(
       owners.get(ownerKey(config, objective))?.snapshot ??
       readContinuation(config.repository, objective);
     if (!state) throw new Error("Objective has no Factory state");
+    assertRestoredContinuationReady(state, config);
     // A failed or cancelled item's attempt is over: retry starts a new one.
     const work =
       itemId === undefined || !("work" in state)
@@ -1428,7 +1447,7 @@ export function repairWorkItem(
     if (
       !state ||
       state.finalValidation?.passed ||
-      state.configDigest !== factoryConfigDigest(config)
+      !continuationConfigurationMatches(state, config)
     )
       throw new Error("Objective is not available for diagnosed repair");
     if (
@@ -1475,7 +1494,7 @@ export function rereviewWorkItem(
       state.objectiveClosure === "complete"
     )
       throw new Error("Objective is not awaiting result re-review");
-    if (state.configDigest !== factoryConfigDigest(config))
+    if (!continuationConfigurationMatches(state, config))
       throw new Error(
         "Installation configuration changed before result re-review",
       );

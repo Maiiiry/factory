@@ -35,3 +35,7 @@ export {
   resolveAutonomy,
 } from "./repair-policy.js";
 export * from "./state.js";
+export {
+  restoreRecoveryCheckpoint,
+  reconcileRestoredContinuation,
+} from "./state-store.js";

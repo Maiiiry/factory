@@ -1215,7 +1215,7 @@ export async function runNativeGraph(args: {
       layer.headSha = await updateBehindBranch({
         github,
         repository: state.repository,
-        checkpointedEffects: state.schemaVersion === 17,
+        checkpointedEffects: [17, 19].includes(state.schemaVersion),
         work: state.work[unit.items[index]!.id]!,
         save,
         identity: { number: layer.pullRequest, branch: layer.branch },
@@ -1350,7 +1350,7 @@ export async function runNativeGraph(args: {
                 );
               return github.ensureNativeStack(layers, baseBranch, {
                 beforeRequest: async () => {
-                  if (state.schemaVersion !== 17) return;
+                  if (![17, 19].includes(state.schemaVersion)) return;
                   if (state.stackNumbers?.[unit.id])
                     throw new Error(
                       "Native stack creation is unresolved; read-only reconciliation must precede any replacement",
@@ -1439,7 +1439,7 @@ export async function runNativeGraph(args: {
                     {
                       resumeUuid: state.stackMerges?.[unit.id]?.uuid,
                       beforeRequest: async () => {
-                        if (state.schemaVersion !== 17) return;
+                        if (![17, 19].includes(state.schemaVersion)) return;
                         if (state.stackMerges?.[unit.id])
                           throw new Error(
                             "Native stack merge intent is unresolved; reconcile its exact request before replacement",

@@ -1169,7 +1169,7 @@ export function factoryConfigDigest(config: FactoryConfig): string {
   return createHash("sha256").update(JSON.stringify(bound)).digest("hex");
 }
 
-/** Portable queue approval retains semantic choices while excluding host layout and polling. */
+/** Queue approval and restore authority retain semantic choices without host layout or polling. */
 export function factoryAuthorityDigest(config: FactoryConfig): string {
   const { checkout: _checkout, queue, autonomy, ...declared } = config;
   const { pollSeconds: _pollSeconds, ...queueAuthority } = queue ?? {};

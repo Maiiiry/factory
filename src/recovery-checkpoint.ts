@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  factoryAuthorityDigest,
   factoryConfigDigest,
   stateRoot,
   type FactoryConfig,
@@ -32,7 +33,9 @@ import {
   subprocessAsync,
   takeGuard,
   UnsettledSubprocessError,
+  linuxProcessIdentity,
 } from "./process.js";
+import type { ControllerLock } from "./state-store.js";
 
 export interface GitPersistenceConfig {
   remote: string;
@@ -82,6 +85,40 @@ export interface RecoveryCheckpointManifest extends RecoveryCheckpointClosure {
   binding: RecoveryCheckpointBinding;
   createdAt: string;
   sequence: number;
+  /** Publisher authority; individual historical records retain their original bindings. */
+  authority?: RecoveryCheckpointAuthority;
+}
+export interface RecoveryCheckpointHostLayout {
+  checkout: string;
+  stateRoot: string;
+}
+export interface RecoveryCheckpointAuthority {
+  schemaVersion: 1;
+  authorityDigest: string;
+  configDigest: string;
+  hostLayout: RecoveryCheckpointHostLayout;
+}
+export interface VerifiedRecoveryCheckpoint {
+  manifest: RecoveryCheckpointManifest;
+  commitSha: string;
+  remoteTip: string;
+  payloadDigest: string;
+  manifestBytes: Uint8Array;
+  readVerifiedBlob(ref: ContentRef): Promise<Uint8Array>;
+}
+export interface RecoveryCheckpointRestoredBaseline {
+  schemaVersion: 1;
+  source: "verified-restoration";
+  commitSha: string;
+  payloadDigest: string;
+  closureDigest: string;
+  sequence: number;
+  at: string;
+  authority: RecoveryCheckpointAuthority;
+  localConfigDigest: string;
+  localHostLayout: RecoveryCheckpointHostLayout;
+  transportOutcome: "unavailable";
+  priorHold?: { kind: "needs-restore"; error?: string };
 }
 interface CheckpointAttempt {
   base?: string;
@@ -108,8 +145,9 @@ interface CheckpointJournal {
     sequence: number;
   };
   error?: string;
-  hold?: "conflict";
+  hold?: "conflict" | "needs-restore";
   retentionGaps?: CheckpointRetentionGap[];
+  restoredBaseline?: RecoveryCheckpointRestoredBaseline;
 }
 export interface CheckpointRetentionGap {
   kind: "accounting-receipt";
@@ -146,6 +184,7 @@ export interface RecoveryCheckpointStatus {
     | "acknowledged"
     | "unknown"
     | "conflict"
+    | "needs-restore"
     | "failed";
   pendingChanges: boolean;
   unsyncedSince?: string;
@@ -159,6 +198,7 @@ export interface RecoveryCheckpointStatus {
   scope?: GitPersistenceConfig["scope"];
   protectedContinuation: boolean;
   retentionGaps?: CheckpointRetentionGap[];
+  restoredBaseline?: RecoveryCheckpointRestoredBaseline;
 }
 export class CheckpointAdmissionFailure extends Error {
   knownNotDispatched: boolean;
@@ -186,6 +226,7 @@ export function markCheckpointEffectDispatched(
   error.knownNotDispatched = false;
 }
 class CheckpointConflict extends Error {}
+class CheckpointRestoreRequired extends Error {}
 export function isCheckpointAdmissionFailure(
   error: unknown,
 ): error is CheckpointAdmissionFailure {
@@ -267,6 +308,20 @@ function assertRef(ref: unknown): asserts ref is ContentRef {
   )
     throw new Error("Invalid checkpoint content reference");
 }
+function assertCheckpointRef(ref: unknown): asserts ref is string {
+  if (
+    typeof ref !== "string" ||
+    !/^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref) ||
+    ref.includes("..") ||
+    ref.includes("@{") ||
+    ref.endsWith("/") ||
+    ref.endsWith(".") ||
+    ref
+      .split("/")
+      .some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
+  )
+    throw new Error("Git persistence requires one literal branch ref");
+}
 export function assertGitPersistenceConfig(
   value: unknown,
 ): asserts value is GitPersistenceConfig {
@@ -297,18 +352,7 @@ export function assertGitPersistenceConfig(
     throw new Error(
       "Git persistence requires an explicit Git URL or absolute local destination",
     );
-  if (
-    typeof value.ref !== "string" ||
-    !/^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value.ref) ||
-    value.ref.includes("..") ||
-    value.ref.includes("@{") ||
-    value.ref.endsWith("/") ||
-    value.ref.endsWith(".") ||
-    value.ref
-      .split("/")
-      .some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
-  )
-    throw new Error("Git persistence requires one literal branch ref");
+  assertCheckpointRef(value.ref);
   if (
     !["private", "public"].includes(String(value.visibility)) ||
     !["private-history", "repository-knowledge"].includes(
@@ -344,6 +388,52 @@ function binding(
     visibility: options.visibility,
     scope: options.scope,
   };
+}
+function hostLayout(config: FactoryConfig): RecoveryCheckpointHostLayout {
+  return { checkout: config.checkout, stateRoot: stateRoot(config.repository) };
+}
+function checkpointAuthority(
+  config: FactoryConfig,
+): RecoveryCheckpointAuthority {
+  return {
+    schemaVersion: 1,
+    authorityDigest: factoryAuthorityDigest(config),
+    configDigest: factoryConfigDigest(config),
+    hostLayout: hostLayout(config),
+  };
+}
+function assertHostLayout(
+  value: unknown,
+): asserts value is RecoveryCheckpointHostLayout {
+  keys(value, ["checkout", "stateRoot"]);
+  if (
+    typeof value.checkout !== "string" ||
+    !isAbsolute(value.checkout) ||
+    typeof value.stateRoot !== "string" ||
+    !isAbsolute(value.stateRoot)
+  )
+    throw new Error(
+      "Checkpoint host layout must retain absolute original paths",
+    );
+}
+export function assertRecoveryCheckpointAuthority(
+  value: unknown,
+): asserts value is RecoveryCheckpointAuthority {
+  keys(value, [
+    "schemaVersion",
+    "authorityDigest",
+    "configDigest",
+    "hostLayout",
+  ]);
+  if (
+    value.schemaVersion !== 1 ||
+    typeof value.authorityDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.authorityDigest) ||
+    typeof value.configDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.configDigest)
+  )
+    throw new Error("Checkpoint publisher authority metadata is invalid");
+  assertHostLayout(value.hostLayout);
 }
 function paths(repository: string) {
   const root = join(stateRoot(repository), "recovery");
@@ -416,7 +506,14 @@ function journal(
       "changed",
       "attempts",
     ],
-    ["dirtySince", "lastAcknowledged", "error", "hold", "retentionGaps"],
+    [
+      "dirtySince",
+      "lastAcknowledged",
+      "error",
+      "hold",
+      "retentionGaps",
+      "restoredBaseline",
+    ],
   );
   if (
     value.schemaVersion !== 1 ||
@@ -494,13 +591,61 @@ function journal(
       identities.add(gap.path);
     }
   }
-  if (value.hold !== undefined && value.hold !== "conflict")
+  if (
+    value.hold !== undefined &&
+    !["conflict", "needs-restore"].includes(value.hold)
+  )
     throw new Error("Invalid checkpoint conflict hold");
   if (
     value.dirtySince !== undefined &&
     !Number.isFinite(Date.parse(value.dirtySince))
   )
     throw new Error("Invalid checkpoint loss window");
+  if (value.restoredBaseline !== undefined) {
+    const restored = value.restoredBaseline;
+    keys(
+      restored,
+      [
+        "schemaVersion",
+        "source",
+        "commitSha",
+        "payloadDigest",
+        "closureDigest",
+        "sequence",
+        "at",
+        "authority",
+        "localConfigDigest",
+        "localHostLayout",
+        "transportOutcome",
+      ],
+      ["priorHold"],
+    );
+    if (
+      restored.schemaVersion !== 1 ||
+      restored.source !== "verified-restoration" ||
+      restored.transportOutcome !== "unavailable" ||
+      !/^[a-f0-9]{40,64}$/.test(restored.commitSha) ||
+      !/^[a-f0-9]{64}$/.test(restored.payloadDigest) ||
+      !/^[a-f0-9]{64}$/.test(restored.closureDigest) ||
+      !/^[a-f0-9]{64}$/.test(restored.localConfigDigest) ||
+      !Number.isSafeInteger(restored.sequence) ||
+      restored.sequence < 0 ||
+      restored.sequence > value.sequence ||
+      !Number.isFinite(Date.parse(restored.at))
+    )
+      throw new Error("Invalid verified checkpoint restoration baseline");
+    assertRecoveryCheckpointAuthority(restored.authority);
+    assertHostLayout(restored.localHostLayout);
+    if (restored.priorHold !== undefined) {
+      keys(restored.priorHold, ["kind"], ["error"]);
+      if (
+        restored.priorHold.kind !== "needs-restore" ||
+        (restored.priorHold.error !== undefined &&
+          typeof restored.priorHold.error !== "string")
+      )
+        throw new Error("Invalid settled missing-baseline observation");
+    }
+  }
   if (value.lastAcknowledged) {
     keys(value.lastAcknowledged, [
       "commitSha",
@@ -514,12 +659,18 @@ function journal(
       !/^[a-f0-9]{64}$/.test(acknowledgement.payloadDigest) ||
       !Number.isFinite(Date.parse(acknowledgement.at)) ||
       acknowledgement.sequence !== value.acknowledgedSequence ||
-      !value.attempts.some(
-        (attempt) =>
-          attempt.status === "acknowledged" &&
-          attempt.candidate === acknowledgement.commitSha &&
-          attempt.payloadDigest === acknowledgement.payloadDigest &&
-          attempt.sequence === acknowledgement.sequence,
+      !(
+        value.attempts.some(
+          (attempt) =>
+            attempt.status === "acknowledged" &&
+            attempt.candidate === acknowledgement.commitSha &&
+            attempt.payloadDigest === acknowledgement.payloadDigest &&
+            attempt.sequence === acknowledgement.sequence,
+        ) ||
+        (value.restoredBaseline?.commitSha === acknowledgement.commitSha &&
+          value.restoredBaseline.payloadDigest ===
+            acknowledgement.payloadDigest &&
+          value.restoredBaseline.sequence === acknowledgement.sequence)
       )
     )
       throw new Error(
@@ -558,15 +709,17 @@ function status(
     enabled: true,
     durability: record.lastAcknowledged ? "verified-git" : "local-only",
     status:
-      record.hold === "conflict" || last?.status === "conflict"
-        ? "conflict"
-        : last && ["submitted", "prepared", "unknown"].includes(last.status)
-          ? "unknown"
-          : record.error || hasRetentionGap
-            ? "failed"
-            : pendingChanges
-              ? "pending"
-              : "acknowledged",
+      record.hold === "needs-restore"
+        ? "needs-restore"
+        : record.hold === "conflict" || last?.status === "conflict"
+          ? "conflict"
+          : last && ["submitted", "prepared", "unknown"].includes(last.status)
+            ? "unknown"
+            : record.error || hasRetentionGap
+              ? "failed"
+              : pendingChanges
+                ? "pending"
+                : "acknowledged",
     pendingChanges,
     ...(hasRetentionGap
       ? { retentionGaps: structuredClone(record.retentionGaps) }
@@ -581,6 +734,9 @@ function status(
     ...(record.dirtySince ? { unsyncedSince: record.dirtySince } : {}),
     ...(record.lastAcknowledged
       ? { lastAcknowledged: record.lastAcknowledged }
+      : {}),
+    ...(record.restoredBaseline
+      ? { restoredBaseline: structuredClone(record.restoredBaseline) }
       : {}),
     ...(last
       ? {
@@ -1001,7 +1157,7 @@ function initializeGit(directory: string, options: GitPersistenceConfig): void {
 function assertManifest(
   value: unknown,
   expected: RecoveryCheckpointBinding,
-  options: GitPersistenceConfig,
+  options: Pick<GitPersistenceConfig, "scope" | "maxBytes" | "maxFiles">,
 ): asserts value is RecoveryCheckpointManifest {
   keys(
     value,
@@ -1014,7 +1170,7 @@ function assertManifest(
       "contentRefs",
       "gaps",
     ],
-    ["gitObjects"],
+    ["gitObjects", "authority"],
   );
   if (
     value.schemaVersion !== 1 ||
@@ -1031,6 +1187,13 @@ function assertManifest(
     throw new Error(
       "Checkpoint manifest is incomplete or outside its admitted binding",
     );
+  if (value.authority !== undefined) {
+    if (options.scope !== "private-history")
+      throw new Error(
+        "Publisher host authority is private-history metadata only",
+      );
+    assertRecoveryCheckpointAuthority(value.authority);
+  }
   const pathsSeen = new Set<string>();
   for (const gap of value.gaps) {
     keys(gap, ["path", "reason", "availability"], ["required"]);
@@ -1102,6 +1265,51 @@ function assertManifest(
   )
     throw new Error("Complete checkpoint exceeds admitted file or byte bound");
 }
+/** Validates a retained manifest against an explicit binding and whole-closure bounds.
+ * Publisher metadata describes its original host; it does not authorize restoration.
+ */
+export function assertRecoveryCheckpointManifest(
+  value: unknown,
+  expectedBinding: RecoveryCheckpointBinding,
+  bounds: { maxBytes: number; maxFiles: number },
+): asserts value is RecoveryCheckpointManifest {
+  keys(expectedBinding, [
+    "repository",
+    "remoteDigest",
+    "ref",
+    "visibility",
+    "scope",
+  ]);
+  if (
+    typeof expectedBinding.repository !== "string" ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedBinding.repository) ||
+    expectedBinding.repository
+      .split("/")
+      .some((part) => part === "." || part === "..") ||
+    typeof expectedBinding.remoteDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(expectedBinding.remoteDigest) ||
+    !["private", "public"].includes(expectedBinding.visibility) ||
+    !["private-history", "repository-knowledge"].includes(
+      expectedBinding.scope,
+    ) ||
+    (expectedBinding.scope === "private-history" &&
+      expectedBinding.visibility !== "private")
+  )
+    throw new Error("Invalid recovery checkpoint binding");
+  assertCheckpointRef(expectedBinding.ref);
+  keys(bounds, ["maxBytes", "maxFiles"]);
+  if (
+    !Number.isSafeInteger(bounds.maxBytes) ||
+    bounds.maxBytes < 1 ||
+    !Number.isSafeInteger(bounds.maxFiles) ||
+    bounds.maxFiles < 1
+  )
+    throw new Error("Checkpoint bounds must be finite positive integers");
+  assertManifest(value, expectedBinding, {
+    ...bounds,
+    scope: expectedBinding.scope,
+  });
+}
 function allRefs(
   value: Pick<RecoveryCheckpointClosure, "files" | "contentRefs">,
 ): ContentRef[] {
@@ -1126,6 +1334,11 @@ function closureIdentity(value: RecoveryCheckpointClosure): string {
     gaps: ordered(value.gaps),
   });
 }
+export function recoveryCheckpointClosureDigest(
+  closure: RecoveryCheckpointClosure,
+): string {
+  return hash(closureIdentity(closure));
+}
 function readArchive(
   directory: string,
   commitSha: string,
@@ -1135,6 +1348,7 @@ function readArchive(
   manifest: RecoveryCheckpointManifest;
   blobs: Map<string, Buffer>;
   manifestBytes: number;
+  originalManifestBytes: Buffer;
   payloadDigest: string;
 } {
   const manifestBytes = git(directory, options, [
@@ -1189,6 +1403,7 @@ function readArchive(
     manifest,
     blobs,
     manifestBytes: manifestBytes.length,
+    originalManifestBytes: manifestBytes,
     payloadDigest: hash(manifestBytes),
   };
 }
@@ -1308,12 +1523,7 @@ async function freshArchive(
 export async function readVerifiedRecoveryCheckpoint(
   config: FactoryConfig,
   commitSha?: string,
-): Promise<{
-  manifest: RecoveryCheckpointManifest;
-  commitSha: string;
-  remoteTip: string;
-  readVerifiedBlob(ref: ContentRef): Promise<Uint8Array>;
-}> {
+): Promise<VerifiedRecoveryCheckpoint> {
   const options = settings(config);
   if (!options) throw new Error("Git persistence is not configured");
   if (commitSha !== undefined && !/^[a-f0-9]{40,64}$/.test(commitSha))
@@ -1324,6 +1534,8 @@ export async function readVerifiedRecoveryCheckpoint(
     manifest: archive.manifest,
     commitSha: archive.commitSha,
     remoteTip: archive.remoteTip,
+    payloadDigest: archive.payloadDigest,
+    manifestBytes: Uint8Array.from(archive.originalManifestBytes),
     async readVerifiedBlob(ref) {
       assertRef(ref);
       const bytes = archive.blobs.get(ref.digest);
@@ -1334,6 +1546,205 @@ export async function readVerifiedRecoveryCheckpoint(
       return Uint8Array.from(bytes);
     },
   };
+}
+async function assertInstallationLease(
+  repository: string,
+  lock: ControllerLock,
+): Promise<void> {
+  const { installationLockPath, readControllerOwner } = await import(
+    "./state-store.js"
+  );
+  const path = installationLockPath(repository);
+  const owner = readControllerOwner(path);
+  const processIdentity = linuxProcessIdentity(process.pid);
+  const held = fstatSync(lock.fd);
+  const current = lstatSync(path);
+  if (
+    !owner ||
+    !processIdentity ||
+    owner.token !== lock.token ||
+    owner.pid !== process.pid ||
+    owner.startTime !== processIdentity.startTime ||
+    !held.isFile() ||
+    held.ino !== current.ino ||
+    held.dev !== current.dev ||
+    current.uid !== process.getuid?.() ||
+    current.mode & 0o077 ||
+    realpathSync(path) !== resolve(path)
+  )
+    throw new Error(
+      "Checkpoint restoration requires the held exclusive installation lease",
+    );
+}
+/** Establishes only an archive parent; imported execution remains inspection/reconciliation. */
+export async function adoptRecoveryCheckpointBaseline(
+  config: FactoryConfig,
+  input: {
+    checkpoint: VerifiedRecoveryCheckpoint;
+    installedClosureDigest: string;
+    lock: ControllerLock;
+  },
+): Promise<RecoveryCheckpointStatus> {
+  return serializePublication(config.repository, async () => {
+    const options = settings(config);
+    if (!options || options.scope !== "private-history")
+      throw new CheckpointAdmissionFailure(
+        "Restored continuation requires an explicit private-history archive",
+        "explicit",
+      );
+    const p = paths(config.repository);
+    mkdirSync(p.root, { recursive: true, mode: 0o700 });
+    takeGuard(p.publicationGuard);
+    try {
+      await assertInstallationLease(config.repository, input.lock);
+      assertManifest(
+        input.checkpoint.manifest,
+        binding(config, options),
+        options,
+      );
+      const authority = input.checkpoint.manifest.authority;
+      if (
+        !authority ||
+        authority.authorityDigest !== factoryAuthorityDigest(config)
+      )
+        throw new Error(
+          "Checkpoint publisher authority is unavailable or differs; restoration remains inspection-only",
+        );
+      const closureDigest = recoveryCheckpointClosureDigest(
+        input.checkpoint.manifest,
+      );
+      if (
+        input.installedClosureDigest !== closureDigest ||
+        !/^[a-f0-9]{64}$/.test(input.checkpoint.payloadDigest) ||
+        hash(input.checkpoint.manifestBytes) !==
+          input.checkpoint.payloadDigest ||
+        !/^[a-f0-9]{40,64}$/.test(input.checkpoint.commitSha) ||
+        input.checkpoint.commitSha !== input.checkpoint.remoteTip
+      )
+        throw new Error(
+          "Historical or incomplete checkpoint cannot establish the current writer baseline",
+        );
+      await verifyDestination(config, options);
+      const verified = await freshArchive(
+        config,
+        options,
+        input.checkpoint.commitSha,
+      );
+      if (
+        verified.remoteTip !== input.checkpoint.commitSha ||
+        verified.payloadDigest !== input.checkpoint.payloadDigest ||
+        canonical(verified.manifest) !== canonical(input.checkpoint.manifest)
+      )
+        throw new Error(
+          "Archive head or original checkpoint changed before baseline adoption",
+        );
+      const store = new LocalContentStore(
+        join(stateRoot(config.repository), "content"),
+      );
+      store.readBytes({
+        digest: verified.payloadDigest,
+        bytes: verified.originalManifestBytes.length,
+        mediaType: "application/json",
+      });
+      for (const ref of allRefs(verified.manifest)) store.readBytes(ref);
+      await assertInstallationLease(config.repository, input.lock);
+      return status(
+        mutate(config, options, (record) => {
+          assertRetentionResolved(record);
+          const prior = record.restoredBaseline;
+          if (
+            prior?.commitSha === verified.commitSha &&
+            prior.payloadDigest === verified.payloadDigest &&
+            prior.closureDigest === closureDigest &&
+            prior.localConfigDigest === factoryConfigDigest(config) &&
+            canonical(prior.localHostLayout) === canonical(hostLayout(config))
+          ) {
+            if (
+              record.attempts.some(
+                (attempt) => attempt.status !== "acknowledged",
+              ) ||
+              record.hold ||
+              record.error ||
+              record.changed.some(
+                (entry) =>
+                  entry.path !== "archive/restoration-receipt" ||
+                  entry.kind !== "historical",
+              )
+            )
+              throw new Error(
+                "Existing checkpoint intents or outcomes remain held during repeated restoration",
+              );
+            return;
+          }
+          if (
+            record.attempts.length ||
+            record.lastAcknowledged ||
+            (record.hold && record.hold !== "needs-restore") ||
+            (record.error && record.hold !== "needs-restore") ||
+            record.sequence !== 0 ||
+            record.changed.length
+          )
+            throw new Error(
+              "Existing checkpoint intents or outcomes require reconciliation before restored baseline adoption",
+            );
+          const at = new Date().toISOString();
+          const sequence = verified.manifest.sequence;
+          if (!Number.isSafeInteger(sequence + 1))
+            throw new Error(
+              "Restored checkpoint sequence cannot retain a pending provenance epoch",
+            );
+          record.restoredBaseline = {
+            schemaVersion: 1,
+            source: "verified-restoration",
+            commitSha: verified.commitSha,
+            payloadDigest: verified.payloadDigest,
+            closureDigest,
+            sequence,
+            at,
+            authority: structuredClone(authority),
+            localConfigDigest: factoryConfigDigest(config),
+            localHostLayout: hostLayout(config),
+            transportOutcome: "unavailable",
+            ...(record.hold === "needs-restore"
+              ? {
+                  priorHold: {
+                    kind: "needs-restore",
+                    ...(record.error ? { error: record.error } : {}),
+                  },
+                }
+              : {}),
+          };
+          record.lastAcknowledged = {
+            commitSha: verified.commitSha,
+            payloadDigest: verified.payloadDigest,
+            at,
+            sequence,
+          };
+          record.acknowledgedSequence = sequence;
+          record.sequence = sequence + 1;
+          record.dirtySince = at;
+          record.changed = [
+            { path: "archive/restoration-receipt", kind: "historical" },
+          ];
+          if (record.hold === "needs-restore") {
+            delete record.hold;
+            delete record.error;
+          }
+        }),
+        options,
+      );
+    } catch (error) {
+      if (isCheckpointAdmissionFailure(error)) throw error;
+      throw new CheckpointAdmissionFailure(
+        error instanceof Error
+          ? error.message
+          : "Restored checkpoint baseline unavailable",
+        "explicit",
+      );
+    } finally {
+      releaseGuard(p.publicationGuard);
+    }
+  });
 }
 /** Logical reachable Git bytes; compression, remote allocation and caches are not measured. */
 export async function inspectRecoveryCheckpoint(
@@ -1413,7 +1824,22 @@ export async function synchronizeRecoveryCheckpoint(
     buildClosure?: () => Promise<RecoveryCheckpointClosure>;
   },
 ): Promise<RecoveryCheckpointStatus> {
-  const repository = config.repository;
+  return serializePublication(config.repository, async () => {
+    try {
+      return await publishCheckpoint(config, input);
+    } catch (error) {
+      if (isCheckpointAdmissionFailure(error)) throw error;
+      throw new CheckpointAdmissionFailure(
+        error instanceof Error ? error.message : "Checkpoint admission failed",
+        input.reason,
+      );
+    }
+  });
+}
+async function serializePublication<T>(
+  repository: string,
+  task: () => Promise<T>,
+): Promise<T> {
   const predecessor = publications.get(repository) ?? Promise.resolve();
   let release!: () => void;
   const completion = new Promise<void>((done) => {
@@ -1423,13 +1849,7 @@ export async function synchronizeRecoveryCheckpoint(
   publications.set(repository, tail);
   await predecessor;
   try {
-    return await publishCheckpoint(config, input);
-  } catch (error) {
-    if (isCheckpointAdmissionFailure(error)) throw error;
-    throw new CheckpointAdmissionFailure(
-      error instanceof Error ? error.message : "Checkpoint admission failed",
-      input.reason,
-    );
+    return await task();
   } finally {
     release();
     if (publications.get(repository) === tail) publications.delete(repository);
@@ -1483,6 +1903,10 @@ async function publishCheckpoint(
       )
         return status(record, options);
     }
+    if (record.hold === "needs-restore")
+      throw new CheckpointRestoreRequired(
+        "Existing archive requires verified latest restoration before publication",
+      );
     if (record.hold)
       throw new CheckpointConflict(
         "Checkpoint publication is held after an archive conflict; verified restoration is required",
@@ -1509,6 +1933,9 @@ async function publishCheckpoint(
       binding: binding(config, options),
       createdAt: new Date().toISOString(),
       sequence,
+      ...(options.scope === "private-history"
+        ? { authority: checkpointAuthority(config) }
+        : {}),
     };
     assertManifest(manifest, manifest.binding, options);
     const store = new LocalContentStore(
@@ -1558,10 +1985,18 @@ async function publishCheckpoint(
     initializeGit(p.git, options);
     const base = await remoteTip(p.git, options);
     if (base) {
-      if (!record.lastAcknowledged)
-        throw new CheckpointConflict(
+      if (!record.lastAcknowledged) {
+        const missingBaseline =
+          record.sequence === 0 &&
+          !record.attempts.length &&
+          !record.changed.length;
+        const Failure = missingBaseline
+          ? CheckpointRestoreRequired
+          : CheckpointConflict;
+        throw new Failure(
           "Existing archive has no locally acknowledged restored baseline; read-only restoration is required before publication",
         );
+      }
       if (base !== record.lastAcknowledged.commitSha)
         throw new CheckpointConflict(
           "Remote archive advanced outside the acknowledged writer; conflict requires inspection",
@@ -1695,13 +2130,22 @@ async function publishCheckpoint(
   } catch (error) {
     try {
       mutate(config, options, (record) => {
-        record.error =
-          error instanceof Error
-            ? error.message
-            : "Checkpoint synchronization failed";
+        if (
+          !(
+            error instanceof CheckpointRestoreRequired &&
+            record.hold === "needs-restore" &&
+            record.error
+          )
+        )
+          record.error =
+            error instanceof Error
+              ? error.message
+              : "Checkpoint synchronization failed";
         const attempt = record.attempts.at(-1);
         if (attempt?.status === "submitted") attempt.status = "unknown";
         if (error instanceof CheckpointConflict) record.hold = "conflict";
+        if (error instanceof CheckpointRestoreRequired)
+          record.hold = "needs-restore";
       });
     } catch {
       /* Original fence is preserved if even local status cannot be written. */

@@ -1,3 +1,5 @@
+import { LocalContentStore } from "./content/local.js";
+import { stateRoot } from "./config.js";
 import {
   assertWorkflowRecipePin,
   type WorkflowRecipePin,
@@ -528,6 +530,58 @@ export function agentSessionContinuation(
   return continuation;
 }
 
+/** Exact settled source receipts remain historical; they grant no destination adapter ownership. */
+export function restoredSessionIsHistorical(
+  state: ContinuationState,
+  ref: AgentSessionRef,
+): boolean {
+  if (
+    !state.restoration ||
+    state.restoration.status !== "reconciled" ||
+    !ref.currentTurn?.terminal ||
+    ref.currentTurn.resources !== "settled"
+  )
+    return false;
+  const store = new LocalContentStore(`${stateRoot(state.repository)}/content`);
+  const visited = new Set<string>();
+  let snapshot = state.restoration.original.snapshot;
+  while (!visited.has(snapshot.digest)) {
+    visited.add(snapshot.digest);
+    const original = JSON.parse(
+      store.readBytes(snapshot).toString("utf8"),
+    ) as ContinuationState;
+    if (
+      original.repository !== state.repository ||
+      original.objective !== state.objective ||
+      original.runId !== state.runId ||
+      original.configDigest !== state.configDigest
+    )
+      throw new Error("Foreign session original snapshot identity differs");
+    assertAgentSessions(original);
+    for (const prior of [
+      ...Object.values(original.agentSessions ?? {}),
+      ...(original.agentSessionHistory ?? []),
+    ]) {
+      if (
+        !prior.currentTurn?.terminal ||
+        prior.currentTurn.resources !== "settled"
+      )
+        continue;
+      const { status: priorStatus, ...priorReceipt } = prior;
+      const { status, ...receipt } = ref;
+      if (
+        (status === priorStatus ||
+          (priorStatus === "ready" && status === "unavailable")) &&
+        isDeepStrictEqual(priorReceipt, receipt)
+      )
+        return true;
+    }
+    if (!original.restoration) break;
+    snapshot = original.restoration.original.snapshot;
+  }
+  return false;
+}
+
 /** Release private adapter resources only through their owned disposal surface. */
 export async function releaseAgentSessions(
   state: ContinuationState,
@@ -546,7 +600,8 @@ export async function releaseAgentSessions(
   )
     throw new Error("Agent session disposal requires settled native resources");
   for (const [entryKey, ref] of Object.entries(state.agentSessions ?? {})) {
-    if (ref.status === "released") continue;
+    if (ref.status === "released" || restoredSessionIsHistorical(state, ref))
+      continue;
     const owner = ref.scope.role === "implementation" ? driver : model;
     if (!owner?.releaseSession)
       throw new Error(
@@ -557,7 +612,8 @@ export async function releaseAgentSessions(
     save();
   }
   for (const [index, ref] of (state.agentSessionHistory ?? []).entries()) {
-    if (ref.status === "released") continue;
+    if (ref.status === "released" || restoredSessionIsHistorical(state, ref))
+      continue;
     const owner = ref.scope.role === "implementation" ? driver : model;
     if (!owner?.releaseSession)
       throw new Error(

@@ -66,6 +66,8 @@ import {
 } from "../state.js";
 import {
   objectiveRoot,
+  assertRestoredContinuationReady,
+  continuationConfigurationMatches,
   readContinuation,
   saveState,
   statePath,
@@ -126,12 +128,14 @@ export async function runObjectivePass(
   const root = stateRoot(config.repository);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const path = statePath(config.repository, objective);
+  const restored = readContinuation(config.repository, objective);
+  if (restored) assertRestoredContinuationReady(restored, config);
   const diagnostics = new DiagnosticEmitter(
     config.repository,
     objective,
     configuredDiagnosticSecrets(config),
     config.capture,
-    factoryConfigDigest(config),
+    restored?.restoration ? restored.configDigest : factoryConfigDigest(config),
   );
   let stateDiagnostics: StateDiagnostics | undefined;
   const save = (state: FactoryState) => {
@@ -265,8 +269,11 @@ export async function runObjectivePass(
         ),
       );
     assertObjectiveCriteria(issue.body);
-    const installationConfigDigest = factoryConfigDigest(config);
     const continuation = readContinuation(config.repository, objective);
+    if (continuation) assertRestoredContinuationReady(continuation, config);
+    const installationConfigDigest = continuation?.restoration
+      ? continuation.configDigest
+      : factoryConfigDigest(config);
     owner.snapshot = continuation;
     checkRequiredEnvironment(config, continuation?.autonomy);
     if (owner.handoff && continuation?.coordinator) {
@@ -287,7 +294,7 @@ export async function runObjectivePass(
       if (
         !isExecutionState(state) ||
         state.repository !== config.repository ||
-        state.configDigest !== installationConfigDigest
+        !continuationConfigurationMatches(state, config)
       ) {
         throw new Error(
           // Cancel is refused once acceptance is sealed; the restored run reconciles.

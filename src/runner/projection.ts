@@ -106,7 +106,7 @@ export async function projectPreparedObjective(args: {
     );
   const graph = plan.graph;
   if (
-    [12, 14, 16, 18].includes(preparation.schemaVersion) &&
+    [12, 14, 16, 18, 20].includes(preparation.schemaVersion) &&
     github.projectionMutationAdmission !== "controller-checkpoint-v1"
   )
     throw new Error(
@@ -167,7 +167,7 @@ export async function projectPreparedObjective(args: {
       objectiveStep(preparation, "project", (context) =>
         github.projectGraph({
           graph,
-          ...([12, 14, 16, 18].includes(preparation.schemaVersion)
+          ...([12, 14, 16, 18, 20].includes(preparation.schemaVersion)
             ? {
                 expansionControl: graphProjectionControl(
                   preparation,
@@ -278,18 +278,23 @@ export function activateProjectedObjective(args: {
           workflowRecipeAdmission,
         }
       : {}),
+    ...(preparation.restoration
+      ? { restoration: structuredClone(preparation.restoration) }
+      : {}),
     schemaVersion:
-      preparation.schemaVersion === 18
-        ? 17
-        : preparation.schemaVersion === 16 || plan.schemaVersion === 7
-          ? 15
-          : preparation.schemaVersion === 14 || plan.schemaVersion === 6
-            ? 13
-            : preparation.schemaVersion === 12 || plan.schemaVersion === 5
-              ? 11
-              : preparation.schemaVersion === 10 || plan.schemaVersion === 4
-                ? 9
-                : 7,
+      preparation.schemaVersion === 20
+        ? 19
+        : [18, 20].includes(preparation.schemaVersion)
+          ? 17
+          : preparation.schemaVersion === 16 || plan.schemaVersion === 7
+            ? 15
+            : preparation.schemaVersion === 14 || plan.schemaVersion === 6
+              ? 13
+              : preparation.schemaVersion === 12 || plan.schemaVersion === 5
+                ? 11
+                : preparation.schemaVersion === 10 || plan.schemaVersion === 4
+                  ? 9
+                  : 7,
     ...(preparation.graphProjectionIntents
       ? {
           graphProjectionIntents: structuredClone(

@@ -30,6 +30,8 @@ factory status --objective N [--json]
 
 With a configured Project queue, `factory queue list` or `factory queue sync` reads current membership/order and authenticated approval receipts. Roadmap cards, progress/status fields and manual metadata edits are not execution consent. Preserve pause/drain, uncertain mutations, original limits and foreign ownership holds. Never import or delete a legacy `intake.json`, use an archived queue observation as current authority, or activate a restored service without the operator's request.
 
+For an approved fresh installation, `factory persistence restore` verifies Git records and rebuilds replicas without execution. Inspect restored Objective status, then use `factory persistence reconcile --objective N` only through its supported settlement checks. A remaining hold is a real recovery boundary: missing local PIDs, native homes and expired leases do not prove foreign cessation. Preserve original attempts, unknown effects and terminal records; never rewrite state or copy a credential-bearing harness home.
+
 Project-bound foreground runs require a current approved admission. When the operator has explicitly authorized the named Objective and it lacks an admission, use `factory queue add N` before `run`; this records that same consent without starting a service. Never automatically resume a paused/draining queue or clear an ownership hold. An inspection request grants no admission.
 
 The first line of `status` is the phase and a one-line summary. `Next:` is the exact command that answers it; run it only when the request covers it. Without `--objective`, status shows the service and the queue. Keep the same `--config PATH` for every command; emitted status commands retain an explicitly selected configuration.

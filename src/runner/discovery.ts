@@ -46,7 +46,7 @@ export function assertDiscoveryAdmission(
       state.schemaVersion !== 11 &&
       state.schemaVersion !== 13 &&
       state.schemaVersion !== 15 &&
-      state.schemaVersion !== 17) ||
+      ![17, 19].includes(state.schemaVersion)) ||
     !config.planningContext?.enabled ||
     !admitted ||
     !item.discovery ||
@@ -154,6 +154,7 @@ export async function runDiscoveryItem(args: {
         baseSha: work.baseSha!,
         attemptId,
         captureContext: {
+          configDigest: state.configDigest,
           objective: state.objective,
           runId: state.runId,
           attemptId: work.attempt,

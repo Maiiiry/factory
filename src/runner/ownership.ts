@@ -1,4 +1,3 @@
-import { isExecutionState, isPreparationState } from "../state.js";
 import { agentSessionContinuation } from "../agent-session.js";
 import { closeCancelledWorkItems } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
@@ -15,8 +14,10 @@ import { workerIdentity } from "../item-steps.js";
 import { linuxProcessIdentity, processGroupExists } from "../process.js";
 import { serviceLoginSecrets } from "../provider-credentials.js";
 import type { ContinuationState, FactoryState } from "../state.js";
+import { isExecutionState, isPreparationState } from "../state.js";
 import {
   acquireObjectiveLock,
+  assertRestoredContinuationReady,
   type ControllerLock,
   objectiveLockPath,
   readContinuation,
@@ -142,6 +143,7 @@ export function mutationState(
   if (isPreparationState(snapshot))
     throw new Error("Objective is still preparing");
   const state = snapshot ?? readState(config.repository, objective);
+  if (state) assertRestoredContinuationReady(state, config);
   return state;
 }
 export function mutationLock(
@@ -256,7 +258,9 @@ export async function cancelKnownWork(
           undefined,
           undefined,
           state.repository,
-          state.schemaVersion === 17 ? true : undefined,
+          state.schemaVersion === 17 || state.schemaVersion === 19
+            ? true
+            : undefined,
         );
         if (session)
           context.checkpointSession = (ref) => session.checkpoint(ref);

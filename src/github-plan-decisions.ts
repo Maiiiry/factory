@@ -1,5 +1,5 @@
 import type { FactoryConfig } from "./config.js";
-import { factoryConfigDigest } from "./config.js";
+import { continuationConfigurationMatches } from "./state-store.js";
 import type { PlanCandidate } from "./compiler.js";
 import { progressDigest } from "./github-progress-state.js";
 import type { PreparationState } from "./state.js";
@@ -60,7 +60,8 @@ export function phonePlanEligible(
   return (
     !!config.githubManagement?.decisions &&
     config.githubManagement.progress?.includeQuestions === true &&
-    state.configDigest === factoryConfigDigest(config) &&
+    continuationConfigurationMatches(state, config) &&
+    (!state.restoration || state.restoration.status === "reconciled") &&
     state.coordinator.mode === "running" &&
     Number.isFinite(Date.parse(state.coordinator.deadlineAt ?? "")) &&
     Date.parse(state.coordinator.deadlineAt!) > Date.now() &&

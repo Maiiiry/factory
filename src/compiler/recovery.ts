@@ -347,7 +347,7 @@ async function compilePlanAdmitted(
       );
     },
     ...(context.sessionState &&
-    [17, 18].includes(context.sessionState.schemaVersion)
+    [17, 18, 19, 20].includes(context.sessionState.schemaVersion)
       ? {
           retainNativeReturn: async (
             receipt: Parameters<

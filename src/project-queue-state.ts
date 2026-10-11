@@ -17,7 +17,6 @@ import { dirname, join } from "node:path";
 import {
   type FactoryConfig,
   factoryAuthorityDigest,
-  factoryConfigDigest,
   stateRoot,
 } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
@@ -42,6 +41,10 @@ import {
   readVerifiedRecoveryCheckpoint,
 } from "./recovery-checkpoint.js";
 import type { ContinuationState } from "./state.js";
+import {
+  assertRestoredContinuationReady,
+  continuationConfigurationMatches,
+} from "./state-store.js";
 
 export const queueDigest = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
@@ -842,7 +845,8 @@ export async function claimProjectQueueRun(
 ): Promise<QueueOwnerClaim | undefined> {
   if (!config.queue?.project) return;
   requireProjectQueueEffects(config);
-  if (snapshot && snapshot.configDigest !== factoryConfigDigest(config))
+  if (snapshot) assertRestoredContinuationReady(snapshot, config);
+  if (snapshot && !continuationConfigurationMatches(snapshot, config))
     throw new Error(
       "Existing execution configuration differs; use supported reconciliation without renewing admission or allowances",
     );

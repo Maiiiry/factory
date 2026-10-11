@@ -117,7 +117,9 @@ export async function executeItem(
       repository: state.repository,
       objective: state.objective,
       configDigest: state.configDigest,
-      ...(state.schemaVersion === 17 && { checkpointedEffects: true as const }),
+      ...([17, 19].includes(state.schemaVersion) && {
+        checkpointedEffects: true as const,
+      }),
     }),
     ...(args.session ? { checkpointSession: args.session.checkpoint } : {}),
   });

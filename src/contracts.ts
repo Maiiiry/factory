@@ -733,7 +733,12 @@ export interface ExecutionRequest {
   /** Controller-authenticated selector-bound observation supplied to discovery. */
   discovery?: { manifest: import("./discovery.js").DiscoveryOutputManifest };
   session?: AgentSessionRequest;
-  captureContext?: { objective: number; runId: string; attemptId?: string };
+  captureContext?: {
+    objective: number;
+    runId: string;
+    attemptId?: string;
+    configDigest?: string;
+  };
   item: WorkItem;
   baseSha: string;
   attemptId?: string;

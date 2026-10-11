@@ -311,6 +311,7 @@ export async function runWorker(
           }
         : {}),
       captureContext: {
+        configDigest: state.configDigest,
         objective: args.objective,
         runId: state.runId,
         attemptId: work.attempt,
