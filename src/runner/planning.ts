@@ -631,7 +631,7 @@ export async function prepareObjective(args: {
       capacity: resolveCapacity(config),
       issueByItemId: {},
       coordinator: {
-        mode: owner.handoff ? "draining" : "running",
+        mode: owner.handoff ? "draining" : (owner.initialMode ?? "running"),
         phase: "planning",
         phaseStartedAt: new Date().toISOString(),
         ...(owner.deadlineAt ? { deadlineAt: owner.deadlineAt } : {}),

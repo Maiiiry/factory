@@ -371,7 +371,7 @@ async function runObjectiveUnscoped(
     ownerLock?: ControllerLock;
     observeControl?: (
       handler: ((request: ControlRequest) => Promise<unknown>) | undefined,
-    ) => void;
+    ) => void | Promise<void>;
   } = {},
 ): Promise<ContinuationState> {
   if (
@@ -527,7 +527,9 @@ async function runObjectiveOwned(
   /** A handoff: stop at the next safe point and release ownership. */
   const releaseOwnership = () => {
     owner.handoff = true;
-    owner.pause.abort(new Error("Coordinator handoff requested"));
+    if (owner.snapshot)
+      owner.pause.abort(new Error("Coordinator handoff requested"));
+    else owner.initialMode = "draining";
   };
   const wait = async (observationDelay?: number) => {
     if (owner.handoff && owner.snapshot && canHandoff(owner.snapshot))
@@ -560,6 +562,13 @@ async function runObjectiveOwned(
   };
   owner.recordSnapshot = (state) => {
     if (queueClaim) bindProjectQueueRun(config, queueClaim, lock.token, state);
+    // A fresh claim needs its authentic model-free snapshot before cessation
+    // pauses the initial reads. Its saved mode already retains that request.
+    if (owner.initialMode) {
+      owner.pause.abort(new Error(`Coordinator ${owner.initialMode}`));
+      delete owner.initialMode;
+      synchronizeWorkItemPause(owner);
+    }
   };
   if (owner.snapshot) {
     try {
@@ -648,6 +657,13 @@ async function runObjectiveOwned(
       if (request.objective !== objective)
         throw new Error("Objective identity differs from owner");
       const state = owner.snapshot;
+      if (!state && ["pause", "drain", "handoff"].includes(request.action)) {
+        if (request.action === "handoff") releaseOwnership();
+        owner.initialMode =
+          owner.handoff || request.action !== "pause" ? "draining" : "paused";
+        wake();
+        return "requested";
+      }
       if (!state)
         throw new Error(
           "Owner is initializing; observe status before retrying",
@@ -755,11 +771,11 @@ async function runObjectiveOwned(
       controlTail = result.catch(() => undefined);
       return result;
     };
-    if (options.observeControl) options.observeControl(handle);
+    if (options.observeControl) await options.observeControl(handle);
     else
       server = await serveControl(config.repository, lock, handle, objective);
   } catch (error) {
-    options.observeControl?.(undefined);
+    await options.observeControl?.(undefined);
     if (deadlineTimer) clearTimeout(deadlineTimer);
     owners.delete(ownerKey(config, objective));
     if (!options.ownerLock) releaseControllerLock(lockPath, lock);
@@ -1104,7 +1120,7 @@ async function runObjectiveOwned(
     if (deadlineTimer) clearTimeout(deadlineTimer);
     process.off("SIGUSR1", cancel);
     process.off("SIGTERM", handoff);
-    options.observeControl?.(undefined);
+    await options.observeControl?.(undefined);
     if (server)
       await new Promise<void>((resolve) => server.close(() => resolve()));
     try {
