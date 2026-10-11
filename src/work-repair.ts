@@ -1419,6 +1419,7 @@ export async function diagnoseWorkRepair(args: {
                           state.repository,
                           "explicit",
                         );
+                        return "admission-complete" as const;
                       },
                     }
                   : {}),

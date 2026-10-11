@@ -18,6 +18,8 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
+import { admitNativeReturn } from "../dist/compiler/native-return.js";
+import { retainPlanningNativeReturn } from "../dist/compiler/recovery.js";
 import { linuxProcessIdentity } from "../dist/process.js";
 import { analyzeInteractions } from "../dist/analysis.js";
 import { captureAssetSets } from "../dist/media.js";
@@ -93,6 +95,7 @@ import {
   inspectRecoveryCheckpoint,
   readVerifiedRecoveryCheckpoint,
   synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointScope,
 } from "../dist/recovery-checkpoint.js";
 import { buildMemoryLearningClosure } from "../dist/repository-memory-transfer.js";
 import {
@@ -849,6 +852,87 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     firstCheckpoint.lastAcknowledged.commitSha,
   );
   assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  // Exercise the actual retention producer and adapter admission seam with a
+  // literal storage-contract payload. This is no provider call, dispatch receipt
+  // or semantic acceptance: the real store, saved owner and private Git ACK are
+  // the facts being verified.
+  const returnInvocation = randomUUID();
+  const returnRecord = {
+    phase: "submitted",
+    invocation: { id: returnInvocation, phase: "compile" },
+    invocations: [{ id: returnInvocation, phase: "compile" }],
+    history: [],
+  };
+  cancelled.planningRecovery = returnRecord;
+  const nativeOriginal = {
+    representation: "literal-agent-text",
+    response: observedSource.toString("utf8"),
+    terminal: "completed",
+  };
+  const publicationCount = () =>
+    Number(
+      execFileSync(
+        "git",
+        ["--git-dir", remote, "rev-list", "--count", config.gitPersistence.ref],
+        { encoding: "utf8" },
+      ).trim(),
+    );
+  const beforeReturnPublications = publicationCount();
+  let returnClosureBuilds = 0;
+  const buildReturnClosure = () => {
+    returnClosureBuilds++;
+    return buildClosure();
+  };
+  await withRecoveryCheckpointScope(
+    { config, buildClosure: buildReturnClosure },
+    () =>
+      admitNativeReturn(
+        (receipt) =>
+          retainPlanningNativeReturn(
+            {
+              record: returnRecord,
+              invocationId: returnInvocation,
+              phase: "compile",
+              repository,
+              store,
+              save: () => saveState(statePath(repository, 1), cancelled),
+            },
+            receipt,
+          ),
+        nativeOriginal,
+        repository,
+      ),
+  );
+  assert.equal(returnClosureBuilds, 1);
+  assert.equal(publicationCount(), beforeReturnPublications + 1);
+  const returnedArchive = await readVerifiedRecoveryCheckpoint(config);
+  const returnRef = returnRecord.invocations[0].nativeReturns[0];
+  assert.equal(
+    returnedArchive.manifest.contentRefs.some(
+      (ref) => ref.digest === returnRef.digest,
+    ),
+    true,
+  );
+  assert.deepEqual(
+    Buffer.from(await returnedArchive.readVerifiedBlob(returnRef)),
+    Buffer.from(
+      JSON.stringify({
+        schemaVersion: 1,
+        invocationId: returnInvocation,
+        phase: "compile",
+        ...nativeOriginal,
+      }),
+    ),
+  );
+  assert.equal(
+    gitPersistenceStatus(config).lastAcknowledged.sequence,
+    returnedArchive.manifest.sequence,
+  );
+  // Keep this storage-only fixture terminal before the later cancellation
+  // lineage workflow; its pending retention owner supplies no dispatched work.
+  returnRecord.phase = "stopped";
+  delete returnRecord.invocation;
+  saveState(statePath(repository, 1), cancelled);
   // This same real private Git workflow retains a claim, its first canonical
   // snapshot, and terminal cancellation originals. No adapter response or
   // admission receipt is invented: dispatch settlement authenticates those

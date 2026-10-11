@@ -2291,6 +2291,7 @@ async function dream(
             } else append(path, raw, config.repository);
             // The adapter may release its last owned copy only after verified durable acknowledgment.
             await awaitCheckpointAdmission(config.repository, "explicit");
+            return "admission-complete" as const;
           },
         }
       : {}),
