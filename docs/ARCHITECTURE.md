@@ -145,6 +145,8 @@ Storage producers have distinct retention contracts:
 
 Accounting records observe existing admissions; they neither schedule work nor drive recovery. Final seals bind an immutable subset of original accounting refs and coverage, so subsequent observations cannot rewrite historical totals. Whole-workflow billing and unobserved descendant inclusion stay unproven. Required accounting retention failures hold checkpoint acknowledgment until the exact originals authenticate; missing historical counters remain unknown. Local capture opt-in alone does not authorize archive payload retention. Explicit inspection reports materialized checkpoint bytes separately from reachable logical Git history, without claiming physical remote allocation or authorizing deletion.
 
+Rejected collection records the exact admitted attempt, original fault and permitted source, staging and media observations before checkout disposal. It grants no implementation acceptance or reuse authority. Encoded managed artifacts without complete decoded privacy admission retain their original digest and size as unavailable; individually admitted evidence remains recoverable. A missing original or unresolved resource still holds continuation.
+
 ## Execution, isolation and media
 
 Local workers operate in owned worktrees with private credential-free scratch homes and the configured network/secret policy. Toolchain visibility, commands and writes remain bounded by the approved attempt and ownership. Provider-specific APIs and credentials stay inside their adapters and outside target repositories.
