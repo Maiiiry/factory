@@ -696,7 +696,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         // The same settled Git handoff supplies an attributable material event.
         // Reflection adds no worker, graph change, acceptance or repair charge.
         const reflected = structuredClone(loaded);
-        reflected.schemaVersion = 9;
+        reflected.schemaVersion = 13;
         reflected.planningRecovery = structuredClone(adaptive.planningRecovery);
         const reflectedPath = join(root, "private-state", "reflection.json");
         const originalWork = structuredClone(reflected.work);
