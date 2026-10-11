@@ -1132,7 +1132,12 @@ async function generate(
 async function publish(
   config: FactoryConfig,
   args: string[],
-): Promise<number[]> {
+): Promise<{
+  objectives: number[];
+  bodyDigests: Record<string, string>;
+  proposalId: string;
+  approvalDigest: string;
+}> {
   const file = option(args, "file");
   const approval = option(args, "approve");
   if (
@@ -1395,7 +1400,17 @@ async function publish(
   journal.published = true;
   save(path, journal);
   await awaitCheckpointAdmission(config.repository, "settled");
-  return approved.map(({ id }) => journal.issues[id]!.number);
+  return {
+    objectives: approved.map(({ id }) => journal.issues[id]!.number),
+    bodyDigests: Object.fromEntries(
+      approved.map(({ id }) => {
+        const issue = journal.issues[id]!;
+        return [String(issue.number), hash(issue.body)];
+      }),
+    ),
+    proposalId: draft.proposalId,
+    approvalDigest: approval,
+  };
 }
 async function proposeCommand(
   config: FactoryConfig,
@@ -1416,7 +1431,7 @@ async function proposeCommand(
     throw new Error("Publication does not accept --output");
   mkdirSync(stateRoot(config.repository), { recursive: true, mode: 0o700 });
   const lock = acquireInstallationLock(config.repository);
-  let published: number[] | undefined;
+  let published: Awaited<ReturnType<typeof publish>> | undefined;
   try {
     if (option(args, "file")) published = await publish(config, args);
     else await generate(config, args, configuration);
@@ -1424,11 +1439,25 @@ async function proposeCommand(
     releaseControllerLock(installationLockPath(config.repository), lock);
   }
   if (published) {
+    const intake = composeIntake(config);
+    if (config.queue?.project)
+      for (const objective of published.objectives)
+        await intake.ensureProjectObjective(objective, {
+          kind: "proposal",
+          proposalId: published.proposalId,
+          approvalDigest: published.approvalDigest,
+          bodyDigest: published.bodyDigests[objective],
+        });
     if (args.includes("--enqueue"))
-      await composeIntake(config).enqueueIntake(published);
+      await intake.enqueueIntake(published.objectives, {
+        expectedBodyDigests: published.bodyDigests,
+      });
     console.log(
       JSON.stringify(
-        { objectives: published, queued: args.includes("--enqueue") },
+        {
+          objectives: published.objectives,
+          queued: args.includes("--enqueue"),
+        },
         null,
         2,
       ),

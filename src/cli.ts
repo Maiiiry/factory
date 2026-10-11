@@ -21,7 +21,7 @@ import {
   runDiagnosticsScorecardCommand,
 } from "./diagnostics-cli.js";
 import { compose, composeIntake, composePlanning } from "./index.js";
-import { type IntakeAuthorization, intakeControl } from "./intake.js";
+import type { IntakeAuthorization } from "./intake.js";
 import { runDreamCommand } from "./learning.js";
 import { operatorName } from "./operator.js";
 import { runProposeCommand } from "./proposals.js";
@@ -104,7 +104,7 @@ function help(): void {
       "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
       "  run --objective N [--deadline ISO_TIMESTAMP]",
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
-      "  queue add N [N ...] | list | remove N | pause | resume | drain",
+      "  queue add N [N ...] | list | sync | remove N | pause | resume | drain",
       "      The Objectives the background service runs, in order",
       "  supervisor start | stop [--disable] | upgrade --cli ABSOLUTE_INSTALLED_CLI | uninstall",
       "      Control the background service (stop drains and keeps state; --disable also stops it starting at login)",
@@ -187,10 +187,11 @@ async function queueCommand(args: string[], path: string): Promise<void> {
       );
     let record: unknown;
     for (const id of numbers)
-      record = await intakeControl(config, "dequeue", id);
+      record = await composeIntake(config).intakeControl("dequeue", id);
     console.log(JSON.stringify(record, null, 2));
   } else if (
     action === "list" ||
+    action === "sync" ||
     action === "pause" ||
     action === "resume" ||
     action === "drain"
@@ -199,14 +200,16 @@ async function queueCommand(args: string[], path: string): Promise<void> {
       throw new Error(`queue ${action} takes no Objective numbers`);
     console.log(
       JSON.stringify(
-        await intakeControl(config, action === "list" ? "status" : action),
+        await composeIntake(config).intakeControl(
+          action === "list" ? "status" : action,
+        ),
         null,
         2,
       ),
     );
   } else
     throw new Error(
-      `Unknown queue action ${action ?? "(none)"}; use add, list, remove, pause, resume or drain`,
+      `Unknown queue action ${action ?? "(none)"}; use add, list, sync, remove, pause, resume or drain`,
     );
 }
 
@@ -232,7 +235,7 @@ async function supervisorCommand(args: string[], path: string): Promise<void> {
         : [],
     );
     loadServiceLoginCredentials(config, loaded);
-    checkIntakeServiceState(config, path);
+    await checkIntakeServiceState(config, path);
     reportIntake(await compose(config, loaded).runIntake());
     return;
   }
@@ -260,8 +263,7 @@ async function supervisorCommand(args: string[], path: string): Promise<void> {
 async function serviceStatus(path: string, json: boolean): Promise<void> {
   const config = readConfig(path);
   const service = (await supervise("status", path)) as ServiceStatus["service"];
-  const queue = (await intakeControl(
-    config,
+  const queue = (await composeIntake(config).intakeControl(
     "status",
   )) as ServiceStatus["queue"];
   const objective = queue.activeObjective ?? queue.observation?.needsDecision;
