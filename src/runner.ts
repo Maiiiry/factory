@@ -360,11 +360,13 @@ async function runObjectiveUnscoped(
     (services.planningModel.providerAttemptAdmission !==
       "controller-checkpoint-v1" ||
       services.driver.effectAdmission !== "controller-checkpoint-v1" ||
+      services.github.effectAdmission !== "controller-checkpoint-v1" ||
+      services.delivery.effectAdmission !== "controller-checkpoint-v1" ||
       services.github.projectionMutationAdmission !==
         "controller-checkpoint-v1")
   )
     throw new Error(
-      "Git-backed continuation requires planning, execution and projection adapters that enforce checkpoint admission",
+      "Git-backed continuation requires planning, execution, delivery and GitHub adapters that enforce checkpoint admission",
     );
   const digest = factoryConfigDigest(config);
   const emitter = new DiagnosticEmitter(
