@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
+import {
+  readAdaptiveContextBytes,
+  type AdaptiveContextSelection,
+} from "../adaptive-context.js";
+import type { GraphExpansionInputPacket } from "../graph-expansion.js";
 import type { FactoryConfig } from "../config.js";
 import { assertDiscoveryContextScope } from "../compiler/context.js";
 import type {
   ContentStore,
+  ContentRef,
   ExecutionDriver,
   GitHubGateway,
   WorkItem,
 } from "../contracts.js";
+import type { DiscoveryOutputManifest } from "../discovery.js";
 import { closeWorkItem } from "../completion.js";
 import {
   authenticateDiscoveryOutput,
@@ -197,13 +204,76 @@ export async function runDiscoveryItem(args: {
 }
 
 /** Only declared direct dependency roles/fields reach the next worker conversation. */
+export interface SelectedDiscoveryInput {
+  producer: DiscoveryOutputManifest["producer"];
+  role: DiscoveryOutputManifest["role"];
+  schema: DiscoveryOutputManifest["schema"];
+  source: DiscoveryOutputManifest["source"];
+  status: DiscoveryOutputManifest["status"];
+  disposition: DiscoveryOutputManifest["disposition"];
+  body: ContentRef;
+  fields: string[];
+  entries: Record<string, unknown>[];
+  selectionScope?: {
+    kind: "materialized-batch";
+    receiptId: string;
+    paths: string[];
+    complete: boolean;
+  };
+  authority: string;
+}
+export function discoveryContextSelections(
+  inputs: SelectedDiscoveryInput[],
+): AdaptiveContextSelection[] {
+  return inputs.map((input) => ({
+    id: `discovery:${input.producer.itemId}:${input.body.digest}:${JSON.stringify(input.selectionScope?.paths ?? input.fields)}`,
+    kind: "discovery",
+    disposition: input.status === "complete" ? "current" : "incomplete",
+    required: true,
+    refs: [
+      input.body,
+      ...input.entries.flatMap((entry) =>
+        entry.contentRef ? [entry.contentRef as ContentRef] : [],
+      ),
+    ],
+  }));
+}
 export async function selectedDiscoveryInputs(args: {
   state: FactoryState;
   item: WorkItem;
   checkout: string;
   store: ContentStore;
-}): Promise<object[]> {
-  const selected: object[] = [];
+}): Promise<SelectedDiscoveryInput[]> {
+  const selected: SelectedDiscoveryInput[] = [];
+  const expansion = args.state.expansionHistory?.find((receipt) =>
+    receipt.childIds.includes(args.item.id),
+  );
+  let batch: string[] | undefined;
+  let batchProducer: string | undefined;
+  if (expansion) {
+    const bytes = await readAdaptiveContextBytes(
+      args.store,
+      expansion.inputPacketRef,
+    );
+    const packet = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    ) as GraphExpansionInputPacket;
+    const index = expansion.childIds.indexOf(args.item.id);
+    batch = packet.batches?.[index];
+    if (
+      packet.schemaVersion !== 1 ||
+      packet.runId !== args.state.runId ||
+      packet.parentGraphDigest !== expansion.parentGraphDigest ||
+      packet.envelope?.id !== expansion.envelopeId ||
+      expansion.inputPacketRef.digest !== expansion.materializationDigest ||
+      !batch?.length ||
+      JSON.stringify(batch) !== JSON.stringify(args.item.ownedPaths)
+    )
+      throw new Error(
+        "Selected discovery batch differs from retained expansion scope",
+      );
+    batchProducer = packet.envelope.input.producerItemId;
+  }
   for (const selection of args.item.discoveryInputs ?? []) {
     const producer = args.state.graph.items.find(
       (peer) => peer.id === selection.producerItemId,
@@ -228,18 +298,32 @@ export async function selectedDiscoveryInputs(args: {
       manifest,
       store: args.store,
     });
+    // Only an authenticated materialization may reduce a declared complete inventory.
+    // Ordinary declared consumers retain their full role/field contract.
+    const relevantBody =
+      batch && batchProducer === selection.producerItemId
+        ? {
+            ...body,
+            entries: body.entries.filter((entry) =>
+              batch!.includes(entry.path),
+            ),
+          }
+        : body;
+    if (
+      batch &&
+      batchProducer === selection.producerItemId &&
+      relevantBody.entries.length !== batch.length
+    )
+      throw new Error(
+        "Selected discovery batch lacks complete required entries",
+      );
     const entries: Record<string, unknown>[] = selectDiscoveryOutputFields(
-      body,
+      relevantBody,
       selection.fields,
     );
     if (selection.fields.includes("contentRef")) {
-      for (const [index, entry] of body.entries.entries()) {
-        await args.store.verify(entry.content);
-        const bytes = Buffer.from(
-          await new Response(
-            await args.store.open(entry.content),
-          ).arrayBuffer(),
-        );
+      for (const [index, entry] of relevantBody.entries.entries()) {
+        const bytes = await readAdaptiveContextBytes(args.store, entry.content);
         // Full retained bytes accompany selected refs; summaries and pointers alone supply no source body.
         entries[index]!.contentBody = {
           encoding: "base64",
@@ -255,6 +339,16 @@ export async function selectedDiscoveryInputs(args: {
       status: manifest.status,
       disposition: manifest.disposition,
       body: manifest.body,
+      ...(batch && batchProducer === selection.producerItemId
+        ? {
+            selectionScope: {
+              kind: "materialized-batch",
+              receiptId: expansion!.id,
+              paths: batch,
+              complete: true,
+            },
+          }
+        : {}),
       fields: selection.fields,
       entries,
       authority:

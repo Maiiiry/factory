@@ -19,7 +19,16 @@ import { cancelledFault, faultOf, workFault } from "./fault.js";
 import { repeatKey, StepPaused, step } from "./step.js";
 import type { FactoryState } from "./state.js";
 import { agentSessionContinuation } from "./agent-session.js";
-import { reviewObjectiveKnowledge } from "./objective-knowledge.js";
+import {
+  completeObjectiveKnowledge,
+  reviewObjectiveKnowledge,
+} from "./objective-knowledge.js";
+import { buildAdaptiveContext } from "./adaptive-context.js";
+import {
+  discoveryContextSelections,
+  selectedDiscoveryInputs,
+} from "./runner/discovery.js";
+import { createHash } from "node:crypto";
 import {
   type ReviewOutcome,
   reviewAcceptance,
@@ -285,22 +294,67 @@ export function reviewItem(
     (ctx) => {
       if (stopped(args)) throw cancelledFault();
       const previousInvalid = ctx.previousInvalid();
-      const ask = () =>
-        ctx.paid(() => {
-          const request = args.review({
-            ...(previousInvalid ? { previousInvalid } : {}),
-            onInvalid: (detail) => ctx.invalid(detail),
+      const ask = async () => {
+        const request = args.review({
+          ...(previousInvalid ? { previousInvalid } : {}),
+          onInvalid: (detail) => ctx.invalid(detail),
+        });
+        let adaptive: Awaited<ReturnType<typeof buildAdaptiveContext>>;
+        if (args.state.planningRecovery?.contextLookup?.packet) {
+          if (!request.contentStore)
+            throw new Error(
+              "Adaptive review requires its retained ContentStore",
+            );
+          const discoveryInputs = await selectedDiscoveryInputs({
+            state: args.state,
+            item: args.item,
+            checkout: request.checkout,
+            store: request.contentStore,
           });
-          return reviewAcceptance({
+          const selected = discoveryContextSelections(discoveryInputs);
+          const knowledge = await completeObjectiveKnowledge({
+            state: args.state,
+            item: args.item,
+            checkout: request.checkout,
+            baseSha: request.commit,
+            store: request.contentStore,
+            review: "result",
+            suppliedDigests: [
+              ...selected.flatMap((entry) =>
+                entry.refs.map((ref) => ref.digest),
+              ),
+              ...request.sources.map((source) =>
+                createHash("sha256").update(source.content).digest("hex"),
+              ),
+            ],
+          });
+          adaptive = await buildAdaptiveContext({
+            state: args.state,
+            role: "result-review",
+            item: args.item,
+            checkout: request.checkout,
+            baseSha: request.commit,
+            store: request.contentStore,
+            sources: request.sources,
+            required: { knowledge: knowledge.view, discoveryInputs },
+            requiredSelections: [...selected, ...knowledge.selections],
+            save: args.save,
+          });
+        }
+        return ctx.paid(() =>
+          reviewAcceptance({
             ...request,
+            ...(adaptive ? { adaptiveContext: adaptive.packet } : {}),
             evidenceSources: [
               ...(request.evidenceSources ?? []),
-              ...reviewObjectiveKnowledge(
-                args.state,
-                args.item.id,
-                request.checkout,
-                request.commit,
-              ),
+              ...(adaptive
+                ? [adaptive.evidence]
+                : reviewObjectiveKnowledge(
+                    args.state,
+                    args.item.id,
+                    request.checkout,
+                    request.commit,
+                  )),
             ],
             session: agentSessionContinuation(
               args.state,
@@ -308,8 +362,9 @@ export function reviewItem(
               args.item.id,
               args.save,
             ),
-          });
-        });
+          }),
+        );
+      };
       return args.diagnostics
         ? args.diagnostics.span(
             {

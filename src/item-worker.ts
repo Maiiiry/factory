@@ -5,6 +5,9 @@
 
 import { isDeepStrictEqual } from "node:util";
 import { agentSessionContinuation } from "./agent-session.js";
+import { buildAdaptiveContext } from "./adaptive-context.js";
+import { adaptiveWorkflowEnabled } from "./adaptive-workflow.js";
+import { createHash } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
 import type {
   ContentStore,
@@ -24,6 +27,7 @@ import { executeItem } from "./item-steps.js";
 import { selectedInputsForItem, validationLfsMembersForItem } from "./media.js";
 import {
   objectiveKnowledgeView,
+  completeObjectiveKnowledge,
   publishObjectiveKnowledge,
 } from "./objective-knowledge.js";
 import { packageManagerUpdate } from "./package-manager-update.js";
@@ -40,7 +44,10 @@ import {
 } from "./repair-policy.js";
 import type { FactoryState } from "./state.js";
 import { workspacePackageAdditions } from "./workspace-membership.js";
-import { selectedDiscoveryInputs } from "./runner/discovery.js";
+import {
+  discoveryContextSelections,
+  selectedDiscoveryInputs,
+} from "./runner/discovery.js";
 
 interface ItemWorker {
   state: FactoryState;
@@ -87,6 +94,11 @@ export function workerAttemptItem(
   )
     throw new Error("Worker planned peer context differs from accepted graph");
   const attempted = attemptItem(item, state.work[item.id]?.recovery);
+  if (knowledge && "adaptiveContext" in knowledge)
+    return {
+      ...attempted,
+      brief: `${attempted.brief}\n\nController selected role context (original source, ownership and acceptance authority remains in the Work Item):\n${JSON.stringify(knowledge.adaptiveContext)}`,
+    };
   const context = {
     objective: state.objective,
     acceptedGraphDigest: graphDigest(state.graph),
@@ -153,20 +165,71 @@ export async function runWorker(
   // A reattached worker keeps the coding slot it holds while it runs remotely.
   if (work.phaseReservation !== "coding")
     await phases.reserve(item.id, "coding");
-  const attemptedItem = workerAttemptItem(state, item, baseSha, {
-    knowledge: objectiveKnowledgeView(
-      state,
-      item,
-      args.config.checkout,
-      baseSha,
-    ),
-    discoveryInputs: await selectedDiscoveryInputs({
-      state,
-      item,
-      checkout: args.config.checkout,
-      store: args.store,
-    }),
+  const discoveryInputs = await selectedDiscoveryInputs({
+    state,
+    item,
+    checkout: args.config.checkout,
+    store: args.store,
   });
+  const discoverySelections = discoveryContextSelections(discoveryInputs);
+  const adaptive = Boolean(state.planningRecovery?.contextLookup?.packet);
+  if (adaptive && (!work.attempt || work.executionBaseSha !== baseSha))
+    throw new Error(
+      "Adaptive dispatch lacks its recorded exact attempt and execution base",
+    );
+  const knowledge = adaptive
+    ? await completeObjectiveKnowledge({
+        state,
+        item,
+        checkout: args.config.checkout,
+        baseSha,
+        store: args.store,
+        suppliedDigests: [
+          ...discoverySelections.flatMap((selection) =>
+            selection.refs.map((ref) => ref.digest),
+          ),
+          ...(item.inputSources ?? []).map((source) =>
+            createHash("sha256").update(source.content).digest("hex"),
+          ),
+        ],
+      })
+    : undefined;
+  const context = await buildAdaptiveContext({
+    state,
+    role: "dispatch",
+    item,
+    baseSha,
+    checkout: args.config.checkout,
+    store: args.store,
+    config: args.config,
+    sources: item.inputSources,
+    required: { knowledge: knowledge?.view ?? {}, discoveryInputs },
+    requiredSelections: [
+      ...discoverySelections,
+      ...(knowledge?.selections ?? []),
+    ],
+    save: args.save,
+  });
+  if (context) {
+    work.adaptiveContextId = context.packet.id;
+    args.save();
+  }
+  const attemptedItem = workerAttemptItem(
+    state,
+    item,
+    baseSha,
+    context
+      ? { adaptiveContext: context.payload }
+      : {
+          knowledge: objectiveKnowledgeView(
+            state,
+            item,
+            args.config.checkout,
+            baseSha,
+          ),
+          discoveryInputs,
+        },
+  );
   const session = args.driver.sessionCapabilities?.resumeRoles.includes(
     "implementation",
   )
@@ -189,6 +252,10 @@ export async function runWorker(
     diagnostics: args.diagnostics,
     ...(session ? { session } : {}),
     request: (attemptId) => ({
+      ...(context ? { adaptiveContext: context.packet } : {}),
+      ...(adaptiveWorkflowEnabled(args.objectiveBody ?? "")
+        ? { childAgents: "disabled" as const }
+        : {}),
       ...(session
         ? {
             session: {
