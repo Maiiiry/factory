@@ -40,7 +40,10 @@ import { controlObjective, selectAssetSetFromCli } from "./runner.js";
 import { setupTarget } from "./setup.js";
 import type { ContinuationState } from "./state.js";
 import {
+  continuationConfigurationMatches,
   installationLockPath,
+  reconcileRestoredContinuation,
+  restoreRecoveryCheckpoint,
   liveControllerOwner,
   objectiveLockPath,
   readContinuation,
@@ -100,7 +103,8 @@ function help(): void {
       "      Collect terminal experience, propose a compact playbook, then explicitly approve its exact draft before advisory use",
       "  recipe --file ABSOLUTE_OBJECTIVE",
       "      Preview a pinned workflow recipe against the current checkout without model calls or admission",
-      "  persistence status | sync | inspect",
+      "  persistence status | sync | inspect | restore [--checkpoint SHA]",
+      "  persistence reconcile --objective N",
       "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
       "  run --objective N [--deadline ISO_TIMESTAMP]",
       "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
@@ -211,6 +215,57 @@ async function queueCommand(args: string[], path: string): Promise<void> {
     throw new Error(
       `Unknown queue action ${action ?? "(none)"}; use add, list, sync, remove, pause, resume or drain`,
     );
+}
+
+/** Model-free Git restore and inspection never activate a provider or service. */
+async function persistenceCommand(args: string[], path: string): Promise<void> {
+  const words: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (["--config", "--checkpoint", "--objective"].includes(argument)) {
+      const value = args[++index];
+      if (!value || value.startsWith("--"))
+        throw new Error(`${argument} requires a value`);
+    } else words.push(argument);
+  }
+  const [action, ...rest] = words;
+  if (
+    rest.length ||
+    !["status", "sync", "inspect", "restore", "reconcile"].includes(
+      action ?? "",
+    )
+  )
+    throw new Error(
+      "Use factory persistence status | sync | inspect | restore [--checkpoint SHA] | reconcile --objective N",
+    );
+  const checkpoint = option(args, "checkpoint");
+  const objectiveValue = option(args, "objective");
+  if (checkpoint !== undefined && action !== "restore")
+    throw new Error("--checkpoint belongs to persistence restore");
+  if (objectiveValue !== undefined && action !== "reconcile")
+    throw new Error("--objective belongs to persistence reconcile");
+  if (checkpoint !== undefined && !/^[a-f0-9]{40,64}$/.test(checkpoint))
+    throw new Error("--checkpoint requires an exact Git commit SHA");
+  const config = readConfig(path);
+  let result: unknown;
+  if (action === "restore")
+    result = await restoreRecoveryCheckpoint({ config, checkpoint });
+  else if (action === "reconcile") {
+    if (objectiveValue === undefined)
+      throw new Error("persistence reconcile requires --objective N");
+    const [objective] = objectiveNumbers([objectiveValue]);
+    result = await reconcileRestoredContinuation({
+      config,
+      objective: objective!,
+    });
+  } else if (action === "status") result = gitPersistenceStatus(config);
+  else if (action === "inspect")
+    result = await inspectRecoveryCheckpoint(config);
+  else
+    result = await synchronizeRecoveryCheckpoint(config, {
+      reason: "explicit",
+    });
+  console.log(JSON.stringify(result, null, 2));
 }
 
 /** `factory supervisor`: control the background service `setup --background` installed. */
@@ -355,20 +410,7 @@ async function dispatchMain(): Promise<void> {
   if (command === "dream") return runDreamCommand(readConfig(path), args, path);
   if (command === "recipe")
     return runWorkflowRecipePreview(readConfig(path), args);
-  if (command === "persistence") {
-    const [action, ...rest] = queueWords(args);
-    if (rest.length || !["status", "sync", "inspect"].includes(action ?? ""))
-      throw new Error("Use factory persistence status | sync | inspect");
-    const config = readConfig(path);
-    const result =
-      action === "status"
-        ? gitPersistenceStatus(config)
-        : action === "inspect"
-          ? await inspectRecoveryCheckpoint(config)
-          : await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
+  if (command === "persistence") return persistenceCommand(args, path);
   if (command === "queue") return queueCommand(args, path);
   if (command === "supervisor") return supervisorCommand(args, path);
   if (command === "status" && option(args, "objective") === undefined)
@@ -575,6 +617,8 @@ function statusDocument(
     .filter((value): value is string => Boolean(value));
   const continuation = readContinuation(config.repository, objective);
   const currentConfigDigest = factoryConfigDigest(config);
+  const configurationMatches =
+    !continuation || continuationConfigurationMatches(continuation, config);
   const document = continuationStatusDocument(
     continuation,
     config.repository,
@@ -584,23 +628,39 @@ function statusDocument(
     continuation?.capacity.concurrency,
     controllerActive(config.repository, objective),
     continuation ? undefined : readPreState(config.repository, objective),
-    currentConfigDigest,
+    continuation && configurationMatches
+      ? continuation.configDigest
+      : currentConfigDigest,
     {
       ...guidanceContext,
-      requiredSecretNames:
-        !continuation || continuation.configDigest === currentConfigDigest
-          ? requiredSecretNames
-          : [],
+      requiredSecretNames: configurationMatches ? requiredSecretNames : [],
       configuration,
     },
   );
+  if (continuation?.restoration?.status === "held") {
+    const terminal =
+      document.state === "complete" || document.state === "cancelled";
+    document.summary = terminal
+      ? "Restored terminal history; the original outcome remains unchanged"
+      : "Restored records require ownership reconciliation";
+    document.nextAction = terminal
+      ? null
+      : {
+          command: `factory persistence reconcile --objective ${objective}`,
+          reason: continuation.restoration.reason,
+        };
+  }
   if (document.nextAction)
     document.nextAction.command = configurationCommand(
       document.nextAction.command,
       configuration,
     );
   return {
-    document: { ...document, durability: gitPersistenceStatus(config) },
+    document: {
+      ...document,
+      restoration: continuation?.restoration ?? null,
+      durability: gitPersistenceStatus(config),
+    },
     secrets,
   };
 }

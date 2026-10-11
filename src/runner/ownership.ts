@@ -17,6 +17,7 @@ import { serviceLoginSecrets } from "../provider-credentials.js";
 import type { ContinuationState, FactoryState } from "../state.js";
 import {
   acquireObjectiveLock,
+  assertRestoredContinuationReady,
   type ControllerLock,
   objectiveLockPath,
   readContinuation,
@@ -142,6 +143,7 @@ export function mutationState(
   if (isPreparationState(snapshot))
     throw new Error("Objective is still preparing");
   const state = snapshot ?? readState(config.repository, objective);
+  if (state) assertRestoredContinuationReady(state, config);
   return state;
 }
 export function mutationLock(

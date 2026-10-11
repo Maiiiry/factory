@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { FactoryConfig } from "./config.js";
-import { factoryConfigDigest } from "./config.js";
 import type { GitHubGateway } from "./contracts.js";
 import {
   continuationStatusDocument,
@@ -20,7 +19,11 @@ import {
 import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import type { ContinuationState } from "./state.js";
 import { isExecutionState, isPreparationState } from "./state.js";
-import { readContinuation } from "./state-store.js";
+import {
+  assertRestoredContinuationReady,
+  continuationConfigurationMatches,
+  readContinuation,
+} from "./state-store.js";
 
 /** Controlled checkpoint projection; no diagnostics are used as recovery input. */
 async function projectGitHubProgressUnscoped(args: {
@@ -37,13 +40,14 @@ async function projectGitHubProgressUnscoped(args: {
   if (!config.githubManagement?.progress) return;
   const retained = readContinuation(config.repository, objective);
   if (!retained) return;
+  assertRestoredContinuationReady(retained, args.config);
   const live = () => {
     const state = current();
     if (
       !state ||
       state.runId !== retained.runId ||
       state.configDigest !== retained.configDigest ||
-      factoryConfigDigest(config) !== retained.configDigest
+      !continuationConfigurationMatches(retained, config)
     )
       throw new Error("GitHub progress snapshot or configuration changed");
     return state;
@@ -58,7 +62,7 @@ async function projectGitHubProgressUnscoped(args: {
     retained.capacity.concurrency,
     args.active,
     undefined,
-    factoryConfigDigest(config),
+    retained.configDigest,
   );
   const view = {
     ...snapshot,

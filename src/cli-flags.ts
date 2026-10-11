@@ -46,7 +46,7 @@ const commandFlags: Record<string, string[]> = {
     "objective",
   ],
   recipe: ["file"],
-  persistence: [],
+  persistence: ["checkpoint", "objective"],
   run: ["objective", "deadline"],
   queue: [],
   supervisor: ["cli", "disable", "service-credential"],
@@ -103,7 +103,7 @@ const derivedFlags: Record<string, string> = {
   plan: "the plan digest is read from the Objective's state",
   tree: "the tree is read from the Objective's state",
   "poll-seconds": "set queue.pollSeconds in the configuration",
-  "priority-label": "the queue runs Objectives in the order they were added",
+  "priority-label": "queue order comes from the bound Project scheduling field",
   watch: "factory setup --background starts the service that watches the queue",
   intake: "factory setup --background installs the service",
 };
