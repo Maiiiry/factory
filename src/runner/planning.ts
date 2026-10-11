@@ -639,6 +639,7 @@ export async function prepareObjective(args: {
     };
     owner.snapshot = preparation;
     saveState(path, preparation);
+    owner.recordSnapshot?.(preparation);
   }
   // The plan's own inputs. Status checks the configuration live, so
   // restoring it clears the stop without a run.

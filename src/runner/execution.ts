@@ -94,13 +94,17 @@ import { assertDiscoveryAdmission } from "./discovery.js";
 
 /** Publish the execution snapshot before yielding to live owner control. */
 export function checkpointExecutionState(
-  owner: Pick<LocalOwner, "snapshot" | "pause" | "workPause" | "handoff">,
+  owner: Pick<
+    LocalOwner,
+    "snapshot" | "pause" | "workPause" | "handoff" | "recordSnapshot"
+  >,
   path: string,
   state: FactoryState,
 ): void {
   owner.snapshot = state;
   synchronizeWorkItemPause(owner);
   saveState(path, state);
+  owner.recordSnapshot?.(state);
 }
 
 /** Draining finishes admitted work; a plain pause still stops its next step. */

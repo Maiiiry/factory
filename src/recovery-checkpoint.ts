@@ -105,6 +105,27 @@ export interface VerifiedRecoveryCheckpoint {
   payloadDigest: string;
   manifestBytes: Uint8Array;
   readVerifiedBlob(ref: ContentRef): Promise<Uint8Array>;
+  /** Exact first-dispatch ancestry, requested only by supported cancellation. */
+  queueOwnerLineage?: VerifiedQueueOwnerLineage;
+}
+export interface QueueCheckpointWitness {
+  commitSha: string;
+  manifest: ContentRef;
+}
+export interface VerifiedQueueOwnerLineage {
+  checkpoints: {
+    before: QueueCheckpointWitness;
+    claimed: QueueCheckpointWitness;
+    initial: QueueCheckpointWitness;
+  };
+  originalClaim: ContentRef;
+  initialSnapshot: ContentRef;
+  bodies: { ref: ContentRef; bytes: Uint8Array }[];
+}
+export interface QueueOwnerLineageRequest {
+  objective: number;
+  claimId: string;
+  runId: string;
 }
 export interface RecoveryCheckpointRestoredBaseline {
   schemaVersion: 1;
@@ -1461,11 +1482,229 @@ async function inspectReachableHistory(
     };
   }
 }
+/** Fixed private queue/continuation paths; this is not a general history index. */
+function queueOwnerLineage(
+  directory: string,
+  options: GitPersistenceConfig,
+  config: FactoryConfig,
+  tip: string,
+  request: QueueOwnerLineageRequest,
+): VerifiedQueueOwnerLineage {
+  if (
+    options.scope !== "private-history" ||
+    !Number.isSafeInteger(request.objective) ||
+    request.objective < 1 ||
+    !/^[a-f0-9-]{36}$/.test(request.claimId) ||
+    !request.runId
+  )
+    throw new Error("Invalid queue cancellation lineage request");
+  const commits = git(directory, options, [
+    "rev-list",
+    "--first-parent",
+    "--reverse",
+    tip,
+  ])
+    .toString("utf8")
+    .trim()
+    .split("\n");
+  if (
+    commits.length > options.maxFiles ||
+    commits.some((sha) => !/^[a-f0-9]{40,64}$/.test(sha))
+  )
+    throw new Error(
+      "Queue cancellation lineage exceeds admitted history bounds",
+    );
+  const batch = git(
+    directory,
+    options,
+    ["cat-file", "--batch"],
+    `${commits.map((sha) => `${sha}:checkpoint.json`).join("\n")}\n`,
+  );
+  const bodies = new Map<string, { ref: ContentRef; bytes: Uint8Array }>();
+  const body = (commit: string, ref: ContentRef) => {
+    const retained = bodies.get(ref.digest);
+    if (retained) {
+      if (
+        retained.ref.bytes !== ref.bytes ||
+        retained.ref.mediaType !== ref.mediaType
+      )
+        throw new Error("Queue lineage reference binding differs");
+      return Buffer.from(retained.bytes);
+    }
+    const bytes = git(directory, options, [
+      "show",
+      `${commit}:blobs/${ref.digest}`,
+    ]);
+    if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+      throw new Error("Queue lineage original failed exact verification");
+    bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
+    if (
+      [...bodies.values()].reduce(
+        (total, entry) => total + entry.ref.bytes,
+        batch.length,
+      ) > options.maxBytes
+    )
+      throw new Error("Queue lineage originals exceed admitted byte bounds");
+    return bytes;
+  };
+  const claimPath = `project-queue-history/${request.claimId}.json`;
+  const statePaths = [
+    `objectives/${request.objective}/state.json`,
+    `objectives/${request.objective}/pre-state.json`,
+  ];
+  let offset = 0;
+  let before: QueueCheckpointWitness | undefined;
+  let claimed: QueueCheckpointWitness | undefined;
+  let initial: QueueCheckpointWitness | undefined;
+  let originalClaim: ContentRef | undefined;
+  let initialSnapshot: ContentRef | undefined;
+  let priorSequence = -1;
+  let priorManifestDigest: string | undefined;
+  for (const commit of commits) {
+    const end = batch.indexOf(10, offset);
+    const header = batch.subarray(offset, end).toString("utf8");
+    const match = /^([a-f0-9]{40,64}) blob ([0-9]+)$/.exec(header);
+    const size = match ? Number(match[2]) : Number.NaN;
+    if (
+      end < offset ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      end + 1 + size >= batch.length
+    )
+      throw new Error("Queue lineage manifest transport is incomplete");
+    const bytes = batch.subarray(end + 1, end + 1 + size);
+    offset = end + 2 + size;
+    const manifest = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
+    assertManifest(manifest, binding(config, options), options);
+    if (
+      canonical(manifest) !== bytes.toString("utf8") ||
+      manifest.sequence < priorSequence ||
+      (manifest.sequence === priorSequence &&
+        hash(bytes) !== priorManifestDigest)
+    )
+      throw new Error("Queue lineage manifest ancestry is ambiguous");
+    priorSequence = manifest.sequence;
+    priorManifestDigest = hash(bytes);
+    const ref: ContentRef = {
+      digest: hash(bytes),
+      bytes: bytes.length,
+      mediaType: "application/json",
+    };
+    const witness = { commitSha: commit, manifest: ref };
+    const claim = manifest.files.find((file) => file.path === claimPath);
+    const states = manifest.files.filter((file) =>
+      statePaths.includes(file.path),
+    );
+    for (const file of manifest.files.filter((file) =>
+      /^project-queue-history\/[a-f0-9-]{36}\.json$/.test(file.path),
+    )) {
+      const record = JSON.parse(body(commit, file.ref).toString("utf8"));
+      if (
+        record.kind === "project-queue-owner" &&
+        record.objective === request.objective &&
+        record.id !== request.claimId
+      )
+        throw new Error(
+          "Competing Project claims make first-run lineage ambiguous",
+        );
+    }
+    if (!claim) {
+      if (claimed || states.length)
+        throw new Error("Queue claim/run lineage was removed or replaced");
+      before = witness;
+      continue;
+    }
+    if (claim.kind !== "historical" || claim.visibility !== "private")
+      throw new Error("Queue lineage claim has invalid scope");
+    if (!claimed) {
+      if (!before)
+        throw new Error(
+          "Queue lineage has no authenticated pre-claim checkpoint",
+        );
+      claimed = witness;
+      originalClaim = claim.ref;
+      bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
+    }
+    // Settlement may later extend this exact original claim, but its original
+    // admission, token and deadline must remain literal throughout the chain.
+    const original = JSON.parse(
+      body(claimed.commitSha, originalClaim!).toString("utf8"),
+    );
+    const current = JSON.parse(body(commit, claim.ref).toString("utf8"));
+    const {
+      settled: ignoredSettlement,
+      runBinding: ignoredBinding,
+      ...currentBinding
+    } = current;
+    const {
+      settled: ignoredOriginalSettlement,
+      runBinding: ignoredOriginalBinding,
+      ...originalBinding
+    } = original;
+    if (canonical(currentBinding) !== canonical(originalBinding))
+      throw new Error("Original queue claim changed within its lineage");
+    if (states.length > 1)
+      throw new Error("Competing initial continuation files are ambiguous");
+    if (!states.length) {
+      if (initial) throw new Error("Original queue continuation was removed");
+      continue;
+    }
+    const state = states[0]!;
+    if (state.kind !== "continuation" || state.visibility !== "private")
+      throw new Error("Queue initial continuation has an unsupported scope");
+    const snapshot = JSON.parse(body(commit, state.ref).toString("utf8"));
+    if (
+      snapshot.runId !== request.runId ||
+      snapshot.objective !== request.objective ||
+      snapshot.repository !== config.repository
+    )
+      throw new Error("Queue first-run continuation was replaced");
+    if (!initial) {
+      initial = witness;
+      initialSnapshot = state.ref;
+      bodies.set(ref.digest, { ref, bytes: Uint8Array.from(bytes) });
+    }
+  }
+  if (
+    offset !== batch.length ||
+    !before ||
+    !claimed ||
+    !initial ||
+    !originalClaim ||
+    !initialSnapshot
+  )
+    throw new Error("Authenticated first-run queue lineage is unavailable");
+  // Keep only selected witnesses and originals, not an additional journal.
+  const beforeBytes = git(directory, options, [
+    "show",
+    `${before.commitSha}:checkpoint.json`,
+  ]);
+  bodies.set(before.manifest.digest, {
+    ref: before.manifest,
+    bytes: Uint8Array.from(beforeBytes),
+  });
+  const selected = [
+    before.manifest,
+    claimed.manifest,
+    initial.manifest,
+    originalClaim,
+    initialSnapshot,
+  ];
+  return {
+    checkpoints: { before, claimed, initial },
+    originalClaim,
+    initialSnapshot,
+    bodies: selected.map((ref) => bodies.get(ref.digest)!),
+  };
+}
 async function freshArchive(
   config: FactoryConfig,
   options: GitPersistenceConfig,
   expectedCommit?: string,
   inspectHistory = false,
+  lineageRequest?: QueueOwnerLineageRequest,
 ) {
   const directory = join(
     paths(config.repository).root,
@@ -1501,8 +1740,41 @@ async function freshArchive(
       commitSha: commit,
       remoteTip: tip,
     };
+    let lineage = lineageRequest
+      ? queueOwnerLineage(directory, options, config, tip, lineageRequest)
+      : undefined;
+    // Retained cancellation witnesses must still be actual ancestor packets,
+    // rather than manually shaped manifest text in the current body store.
+    for (const file of archive.manifest.files.filter((file) =>
+      /^project-queue-history\/[a-f0-9-]{36}\.json$/.test(file.path),
+    )) {
+      const record = JSON.parse(
+        archive.blobs.get(file.ref.digest)!.toString("utf8"),
+      );
+      const proof =
+        record.kind === "project-queue-owner"
+          ? record.settled?.cancellation
+          : undefined;
+      if (proof?.lineage?.kind !== "verified-first-run") continue;
+      const verified = queueOwnerLineage(directory, options, config, tip, {
+        objective: record.objective,
+        claimId: record.id,
+        runId: record.settled.runId,
+      });
+      if (
+        canonical(verified.checkpoints) !==
+          canonical(proof.lineage.checkpoints) ||
+        canonical(verified.originalClaim) !== canonical(proof.originalClaim) ||
+        canonical(verified.initialSnapshot) !== canonical(proof.initialSnapshot)
+      )
+        throw new Error(
+          "Retained queue cancellation lineage differs from actual Git ancestry",
+        );
+      if (lineageRequest?.claimId === record.id) lineage = verified;
+    }
     return {
       ...archive,
+      ...(lineage ? { queueOwnerLineage: lineage } : {}),
       ...(inspectHistory
         ? {
             reachableHistory: await inspectReachableHistory(
@@ -1523,19 +1795,29 @@ async function freshArchive(
 export async function readVerifiedRecoveryCheckpoint(
   config: FactoryConfig,
   commitSha?: string,
+  lineageRequest?: QueueOwnerLineageRequest,
 ): Promise<VerifiedRecoveryCheckpoint> {
   const options = settings(config);
   if (!options) throw new Error("Git persistence is not configured");
   if (commitSha !== undefined && !/^[a-f0-9]{40,64}$/.test(commitSha))
     throw new Error("Invalid requested checkpoint commit");
   await verifyDestination(config, options);
-  const archive = await freshArchive(config, options, commitSha);
+  const archive = await freshArchive(
+    config,
+    options,
+    commitSha,
+    false,
+    lineageRequest,
+  );
   return {
     manifest: archive.manifest,
     commitSha: archive.commitSha,
     remoteTip: archive.remoteTip,
     payloadDigest: archive.payloadDigest,
     manifestBytes: Uint8Array.from(archive.originalManifestBytes),
+    ...(archive.queueOwnerLineage
+      ? { queueOwnerLineage: archive.queueOwnerLineage }
+      : {}),
     async readVerifiedBlob(ref) {
       assertRef(ref);
       const bytes = archive.blobs.get(ref.digest);

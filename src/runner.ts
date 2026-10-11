@@ -56,6 +56,8 @@ import {
 import {
   assertProjectQueueRunLive,
   claimProjectQueueRun,
+  bindProjectQueueRun,
+  settleCancelledProjectQueueRun,
   type QueueOwnerClaim,
   settleProjectQueueRun,
 } from "./project-queue-state.js";
@@ -551,9 +553,23 @@ async function runObjectiveOwned(
   owner.waitForWake = wait;
   const persist = () => {
     synchronizeWorkItemPause(owner);
-    if (owner.snapshot)
+    if (owner.snapshot) {
       saveState(statePath(config.repository, objective), owner.snapshot);
+      owner.recordSnapshot?.(owner.snapshot);
+    }
   };
+  owner.recordSnapshot = (state) => {
+    if (queueClaim) bindProjectQueueRun(config, queueClaim, lock.token, state);
+  };
+  if (owner.snapshot) {
+    try {
+      persist();
+    } catch (error) {
+      owners.delete(ownerKey(config, objective));
+      if (!options.ownerLock) releaseControllerLock(lockPath, lock);
+      throw error;
+    }
+  }
   const cancel = (): void => {
     if (!owner.snapshot) return;
     if (isExecutionState(owner.snapshot) && owner.snapshot.finalAcceptance) {
@@ -1096,13 +1112,24 @@ async function runObjectiveOwned(
       await progressTask;
       await projectProgress();
       observeRetrospective(config, objective);
-      if (queueClaim && owner.snapshot && canHandoff(owner.snapshot))
-        await settleProjectQueueRun(
-          config,
-          queueClaim,
-          lock.token,
-          owner.snapshot.runId,
-        );
+      if (queueClaim && owner.snapshot && canHandoff(owner.snapshot)) {
+        if (owner.snapshot.cancelledAt) {
+          await cancelKnownWork(owner.snapshot, services.driver, persist, true);
+          await releaseAgentSessions(
+            owner.snapshot,
+            services.driver,
+            services.planningModel,
+            persist,
+          );
+          await settleCancelledProjectQueueRun(config, owner.snapshot, lock);
+        } else
+          await settleProjectQueueRun(
+            config,
+            queueClaim,
+            lock.token,
+            owner.snapshot.runId,
+          );
+      }
     } finally {
       owners.delete(ownerKey(config, objective));
       if (!options.ownerLock) releaseControllerLock(lockPath, lock);
@@ -1150,10 +1177,7 @@ async function cancelObjectiveOwned(
     const continuation = readContinuation(config.repository, objective);
     if (!continuation) throw new Error("Objective has no Factory state");
     assertRestoredContinuationReady(continuation, config);
-    if (
-      (isExecutionState(continuation) && objectiveComplete(continuation)) ||
-      continuation.cancelledAt
-    ) {
+    if (isExecutionState(continuation) && objectiveComplete(continuation)) {
       await releaseAgentSessions(continuation, driver, planningModel, () =>
         saveState(statePath(config.repository, objective), continuation),
       );
@@ -1163,6 +1187,22 @@ async function cancelObjectiveOwned(
       throw new Error(
         "Acceptance is sealed; resume to reconcile Objective closure",
       );
+    if (continuation.cancelledAt) {
+      if (config.queue?.project)
+        await cancelKnownWork(
+          continuation,
+          driver,
+          () =>
+            saveState(statePath(config.repository, objective), continuation),
+          true,
+        );
+      await releaseAgentSessions(continuation, driver, planningModel, () =>
+        saveState(statePath(config.repository, objective), continuation),
+      );
+      saveState(statePath(config.repository, objective), continuation);
+      await settleCancelledProjectQueueRun(config, continuation, lockHandle);
+      return "cancelled";
+    }
     continuation.cancelRequested = true;
     saveState(statePath(config.repository, objective), continuation);
     try {
@@ -1227,6 +1267,15 @@ async function cancelObjectiveOwned(
     continuation.cancelledAt = new Date().toISOString();
     clearAllRepeats(continuation);
     saveState(statePath(config.repository, objective), continuation);
+    // Reconcile retained historical attempts as well as the active attempt.
+    if (config.queue?.project)
+      await cancelKnownWork(
+        continuation,
+        driver,
+        () => saveState(statePath(config.repository, objective), continuation),
+        true,
+      );
+    await settleCancelledProjectQueueRun(config, continuation, lockHandle);
     const state = continuation;
     new DiagnosticEmitter(config.repository, objective).emit({
       runId: state.runId,

@@ -115,6 +115,8 @@ export interface LocalOwner {
   woken: () => Promise<void>;
   /** The pass's observing save: emits each item's state change, terminal ones included. */
   save?: (state: FactoryState) => void;
+  /** Bind the literal first canonical snapshot to the admitted Project claim. */
+  recordSnapshot?: (state: ContinuationState) => void;
 }
 /** Update the admitted-work signal from the coordinator's guarded mode. */
 export function synchronizeWorkItemPause(
@@ -233,54 +235,79 @@ export async function cancelKnownWork(
   state: ContinuationState,
   driver: ExecutionDriver,
   save: () => void,
+  verifyRetained = false,
 ): Promise<void> {
   const errors: string[] = [];
   const tasks: (() => Promise<void>)[] = [];
   if (isExecutionState(state))
-    for (const [itemId, work] of Object.entries(state.work)) {
-      if (
-        work.step !== "execute" ||
-        work.status === "done" ||
-        work.status === "cancelled"
-      )
-        continue;
-      if (!work.execution && !work.attempt) continue;
-      tasks.push(async () => {
-        const session = driver.sessionCapabilities?.resumeRoles.includes(
-          "implementation",
-        )
-          ? agentSessionContinuation(state, "implementation", itemId, save)
-          : undefined;
-        const context = executionContext(
-          work,
-          save,
-          () => Boolean(state.cancelRequested),
-          undefined,
-          undefined,
-          state.repository,
-          state.schemaVersion === 17 || state.schemaVersion === 19
-            ? true
-            : undefined,
-        );
-        if (session)
-          context.checkpointSession = (ref) => session.checkpoint(ref);
-        const stoppedIdentity =
-          work.execution?.identity ?? workerIdentity(work);
-        if (work.execution)
-          await driver.cancel(structuredClone(work.execution), context);
-        else {
-          // An attempt saved before its start was recorded: stop whatever
-          // it started under its recorded identity before settling its session.
-          await driver.cancelUnrecorded(workerIdentity(work), context);
-        }
-        // Cessation is authenticated by the driver's cancellation contract.
-        // Never promote an interrupted turn into a ready conversation.
+    for (const [itemId, current] of Object.entries(state.work)) {
+      for (const work of verifyRetained
+        ? [
+            current,
+            ...(current.recovery?.history ?? []).map((entry) => entry.work),
+          ]
+        : [current]) {
         if (
-          session?.retained?.status === "in-flight" &&
-          session.retained.executionIdentity === stoppedIdentity
+          !verifyRetained &&
+          (work.step !== "execute" ||
+            work.status === "done" ||
+            work.status === "cancelled")
         )
-          session.checkpoint({ ...session.retained, status: "unavailable" });
-      });
+          continue;
+        if (!work.execution && !work.attempt) continue;
+        tasks.push(async () => {
+          const session =
+            work === current &&
+            driver.sessionCapabilities?.resumeRoles.includes("implementation")
+              ? agentSessionContinuation(state, "implementation", itemId, save)
+              : undefined;
+          const context = executionContext(
+            work,
+            save,
+            () => Boolean(state.cancelRequested),
+            undefined,
+            undefined,
+            state.repository,
+            state.schemaVersion === 17 || state.schemaVersion === 19
+              ? true
+              : undefined,
+          );
+          if (session)
+            context.checkpointSession = (ref) => session.checkpoint(ref);
+          const stoppedIdentity =
+            work.execution?.identity ?? workerIdentity(work);
+          if (work.execution) {
+            await driver.cancel(structuredClone(work.execution), context);
+            if (verifyRetained) {
+              const data = work.execution.data as
+                | Record<string, unknown>
+                | undefined;
+              if (
+                !data?.result &&
+                !data?.rejectedCollection &&
+                data?.stopped === undefined
+              )
+                // Collection may report cancellation as a failure while retaining
+                // the driver's authenticated cessation receipt. The terminal
+                // ownership check below still refuses an absent receipt.
+                await driver
+                  .collect(structuredClone(work.execution), context)
+                  .catch(() => undefined);
+            }
+          } else {
+            // An attempt saved before its start was recorded: stop whatever
+            // it started under its recorded identity before settling its session.
+            await driver.cancelUnrecorded(workerIdentity(work), context);
+          }
+          // Cessation is authenticated by the driver's cancellation contract.
+          // Never promote an interrupted turn into a ready conversation.
+          if (
+            session?.retained?.status === "in-flight" &&
+            session.retained.executionIdentity === stoppedIdentity
+          )
+            session.checkpoint({ ...session.retained, status: "unavailable" });
+        });
+      }
     }
   tasks.push(() => cancelRecordedSubprocesses(state));
   for (const result of await Promise.allSettled(tasks.map((task) => task())))
