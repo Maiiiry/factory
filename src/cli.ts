@@ -31,6 +31,13 @@ import {
 } from "./provider-credentials.js";
 import { checkReadiness } from "./readiness.js";
 import {
+  gitPersistenceStatus,
+  inspectRecoveryCheckpoint,
+  synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointOperation,
+} from "./recovery-checkpoint.js";
+import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import {
   AwaitingBeforeState,
   awaitingOutcome,
   intakeExitCode,
@@ -42,12 +49,12 @@ import type { ContinuationState } from "./state.js";
 import {
   continuationConfigurationMatches,
   installationLockPath,
-  reconcileRestoredContinuation,
-  restoreRecoveryCheckpoint,
   liveControllerOwner,
   objectiveLockPath,
   readContinuation,
   readPreState,
+  reconcileRestoredContinuation,
+  restoreRecoveryCheckpoint,
 } from "./state-store.js";
 import {
   configurationCommand,
@@ -56,13 +63,6 @@ import {
 } from "./status-summary.js";
 import { checkIntakeServiceState, supervise } from "./supervision.js";
 import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
-import {
-  gitPersistenceStatus,
-  inspectRecoveryCheckpoint,
-  synchronizeRecoveryCheckpoint,
-  withRecoveryCheckpointScope,
-} from "./recovery-checkpoint.js";
-import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 
 /** Whether a live controller owns this Objective; null when a lock is unreadable. */
 function controllerActive(
@@ -719,7 +719,7 @@ async function main(): Promise<void> {
   if (!command || !mutating.has(command)) return dispatchMain();
   assertKnownFlags(command, args);
   const config = readConfig(option(args, "config") ?? configPath());
-  await withRecoveryCheckpointScope(
+  await withRecoveryCheckpointOperation(
     {
       config,
       buildClosure: () =>
@@ -728,18 +728,16 @@ async function main(): Promise<void> {
           scope: config.gitPersistence?.scope ?? "private-history",
         }),
     },
-    async () => {
-      try {
-        await dispatchMain();
-      } catch (error) {
-        try {
-          await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
-        } catch {
-          // The durability journal retains this failure alongside the original error.
-        }
-        throw error;
-      }
-      await synchronizeRecoveryCheckpoint(config, { reason: "explicit" });
+    dispatchMain,
+    {
+      // These paths only print the application result after its full terminal
+      // barrier. Other commands/custom operations retain their own full sync.
+      queueControlVerification:
+        command === "queue" &&
+        ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),
+      forwardCompletedBarrier:
+        command === "queue" &&
+        ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),
     },
   );
 }

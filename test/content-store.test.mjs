@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { deflateSync } from "node:zlib";
 import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
 import { admitNativeReturn } from "../dist/compiler/native-return.js";
@@ -97,6 +98,7 @@ import {
   readRecoveryCheckpointBodies,
   writeRecoveryCheckpointBodies,
   synchronizeRecoveryCheckpoint,
+  withRecoveryCheckpointOperation,
   withRecoveryCheckpointScope,
 } from "../dist/recovery-checkpoint.js";
 import { buildMemoryLearningClosure } from "../dist/repository-memory-transfer.js";
@@ -899,6 +901,49 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     firstCheckpoint.lastAcknowledged.commitSha,
   );
   assert.deepEqual(readFileSync(join(checkout, "api.md")), source);
+  // The CLI's forwarding scope reuses the actual producer's completed Git
+  // barrier. A later atomic snapshot save invalidates that exact completion.
+  let operationClosureBuilds = 0;
+  const operationInput = {
+    config,
+    buildClosure: () => {
+      operationClosureBuilds++;
+      return buildClosure();
+    },
+  };
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    () =>
+      withRecoveryCheckpointOperation(operationInput, async () =>
+        gitPersistenceStatus(config),
+      ),
+    { forwardCompletedBarrier: true },
+  );
+  assert.equal(operationClosureBuilds, 1);
+  assert.equal(
+    gitPersistenceStatus(config).lastAcknowledged.commitSha,
+    unchangedCheckpoint.lastAcknowledged.commitSha,
+  );
+  operationClosureBuilds = 0;
+  const beforeLaterSave = gitPersistenceStatus(config).lastAcknowledged;
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    async () => {
+      await withRecoveryCheckpointOperation(operationInput, async () =>
+        gitPersistenceStatus(config),
+      );
+      saveState(statePath(repository, 1), cancelled);
+    },
+    { forwardCompletedBarrier: true },
+  );
+  assert.equal(operationClosureBuilds, 2);
+  const afterLaterSave = gitPersistenceStatus(config).lastAcknowledged;
+  assert.equal(afterLaterSave.sequence > beforeLaterSave.sequence, true);
+  assert.notEqual(afterLaterSave.commitSha, beforeLaterSave.commitSha);
+  assert.deepEqual(
+    readContinuation(repository, 1).planningRecovery,
+    cancelled.planningRecovery,
+  );
   // Exercise the actual retention producer and adapter admission seam with a
   // literal storage-contract payload. This is no provider call, dispatch receipt
   // or semantic acceptance: the real store, saved owner and private Git ACK are
@@ -1369,6 +1414,114 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     firstCheckpoint.lastAcknowledged.commitSha,
     secondCheckpoint.lastAcknowledged.commitSha,
   ]);
+  // The finite queue scope owns one remote-only verifier. Concurrent reads
+  // serialize its fresh fetch/strict object check, with full lineage each time.
+  const verifierDirectories = () =>
+    readdirSync(join(state, "recovery"))
+      .filter((name) => /^verify-.*\.git$/.test(name))
+      .sort();
+  assert.deepEqual(verifierDirectories(), []);
+  let firstVerifier;
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    async () => {
+      const [left, right] = await Promise.all([
+        readVerifiedRecoveryCheckpoint(config),
+        readVerifiedRecoveryCheckpoint(config),
+      ]);
+      assert.equal(left.commitSha, right.commitSha);
+      assert.deepEqual(verifierDirectories().length, 1);
+      firstVerifier = verifierDirectories()[0];
+      const directory = join(state, "recovery", firstVerifier);
+      const originalCommit = execFileSync("git", [
+        "--git-dir",
+        directory,
+        "cat-file",
+        "commit",
+        left.commitSha,
+      ]);
+      const corruptPath = join(
+        directory,
+        "objects",
+        left.commitSha.slice(0, 2),
+        left.commitSha.slice(2),
+      );
+      mkdirSync(join(directory, "objects", left.commitSha.slice(0, 2)), {
+        recursive: true,
+      });
+      // A valid compressed object under the wrong OID must not become trusted
+      // merely because its repository was authenticated on the preceding read.
+      const changedCommit = Buffer.from(originalCommit);
+      changedCommit[changedCommit.length - 2] ^= 1;
+      writeFileSync(
+        corruptPath,
+        deflateSync(
+          Buffer.concat([
+            Buffer.from(`commit ${changedCommit.length}\0`),
+            changedCommit,
+          ]),
+        ),
+      );
+      try {
+        await assert.rejects(
+          readVerifiedRecoveryCheckpoint(config),
+          /Git archive transport command failed|Command failed/,
+        );
+      } finally {
+        rmSync(corruptPath, { force: true });
+      }
+      const restoredRead = await readVerifiedRecoveryCheckpoint(config);
+      assert.equal(restoredRead.commitSha, left.commitSha);
+      left.manifest.files.length = 0;
+      assert.equal(restoredRead.manifest.files.length > 0, true);
+      await assert.rejects(
+        readVerifiedRecoveryCheckpoint({
+          ...config,
+          gitPersistence: {
+            ...config.gitPersistence,
+            maxFiles: config.gitPersistence.maxFiles - 1,
+          },
+        }),
+        /different admitted binding/,
+      );
+      await assert.rejects(
+        async () =>
+          withRecoveryCheckpointOperation(
+            {
+              ...operationInput,
+              config: { ...config, pollSeconds: (config.pollSeconds ?? 1) + 1 },
+            },
+            async () => readVerifiedRecoveryCheckpoint(config),
+          ),
+        /scope.*different|scope.*match|different.*configuration|Nested checkpoint/,
+      );
+      saveState(statePath(repository, 1), cancelled);
+      await synchronizeRecoveryCheckpoint(config, {
+        reason: "explicit",
+        buildClosure,
+      });
+      const advanced = await readVerifiedRecoveryCheckpoint(config);
+      assert.notEqual(advanced.commitSha, restoredRead.commitSha);
+      assert.equal(verifierDirectories().length, 1);
+    },
+    { queueControlVerification: true },
+  );
+  assert.deepEqual(verifierDirectories(), []);
+  await withRecoveryCheckpointOperation(
+    operationInput,
+    async () => {
+      await readVerifiedRecoveryCheckpoint(config);
+      assert.equal(verifierDirectories().length, 1);
+      assert.notEqual(verifierDirectories()[0], firstVerifier);
+    },
+    { queueControlVerification: true },
+  );
+  assert.deepEqual(verifierDirectories(), []);
+  // Non-opted long-running scopes keep the original per-read disposable path.
+  await withRecoveryCheckpointScope(operationInput, async () => {
+    await readVerifiedRecoveryCheckpoint(config);
+    assert.deepEqual(verifierDirectories(), []);
+  });
   // A real receiving Git process updates the ref, then outlives the bounded
   // client wait. Reconciliation observes that exact publication without replay.
   const received = join(root, "received.txt");
