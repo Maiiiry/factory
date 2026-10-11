@@ -13,6 +13,12 @@ import {
 import { attachFault, decision } from "./fault.js";
 import { step } from "./step.js";
 import {
+  type AccountingSeal,
+  assertAccountingSeal,
+  assertAccountingSealBinding,
+  buildAccountingSeal,
+} from "./accounting.js";
+import {
   deliveredHead,
   deliveryEarlierHeads,
 } from "./delivery/branch-update.js";
@@ -27,7 +33,14 @@ export interface FinalAcceptance {
   commit: string;
   tree: string;
   evidenceDigest: string;
-  usage: { availability: "unavailable"; runId: string; source: "diagnostics" };
+  usage:
+    | { availability: "unavailable"; runId: string; source: "diagnostics" }
+    | {
+        availability: "observed" | "unavailable";
+        runId: string;
+        source: "durable-accounting";
+        accounting: AccountingSeal;
+      };
   resources: "owned-attempts-settled; controller-processes-stopped; evidence-retained";
 }
 
@@ -171,7 +184,10 @@ export function assertTerminalEligibility(state: FactoryState): void {
   assertCompletedCoverage(state);
 }
 
-export function assertFinalAcceptance(state: FactoryState): void {
+export function assertFinalAcceptance(
+  state: FactoryState,
+  options: { verifyAccountingBodies?: boolean } = {},
+): void {
   const seal = state.finalAcceptance;
   if (!seal) return; // Historical snapshots remain readable without invented evidence.
   assertTerminalEligibility(state);
@@ -187,15 +203,38 @@ export function assertFinalAcceptance(state: FactoryState): void {
     seal.commit !== candidate.commitSha ||
     seal.tree !== state.finalValidation?.treeSha ||
     seal.evidenceDigest !== evidenceDigest(state) ||
-    seal.usage?.availability !== "unavailable" ||
-    seal.usage.runId !== state.runId ||
-    seal.usage.source !== "diagnostics" ||
+    seal.usage?.runId !== state.runId ||
     seal.resources !==
       "owned-attempts-settled; controller-processes-stopped; evidence-retained"
   )
     throw new Error(
       "Final acceptance binding differs from its sealed candidate or evidence",
     );
+  if (seal.usage.source === "diagnostics") {
+    if (seal.usage.availability !== "unavailable")
+      throw new Error("Historical diagnostic accounting remains unavailable");
+  } else if (seal.usage.source === "durable-accounting") {
+    assertAccountingSealBinding(
+      state.repository,
+      state.objective,
+      state.runId,
+      seal.usage.accounting,
+    );
+    if (
+      seal.usage.availability !==
+      (seal.usage.accounting.records.length ? "observed" : "unavailable")
+    )
+      throw new Error(
+        "Final accounting availability differs from its originals",
+      );
+    if (options.verifyAccountingBodies !== false)
+      assertAccountingSeal(
+        state.repository,
+        state.objective,
+        state.runId,
+        seal.usage.accounting,
+      );
+  } else throw new Error("Final accounting source is invalid");
 }
 
 export function sealFinalAcceptance(state: FactoryState): void {
@@ -204,6 +243,23 @@ export function sealFinalAcceptance(state: FactoryState): void {
     assertFinalAcceptance(state);
     return;
   }
+  const accounting = buildAccountingSeal(
+    state.repository,
+    state.objective,
+    state.runId,
+    Object.values(state.work).flatMap((work) =>
+      [
+        work,
+        ...(work.recovery?.history ?? []).map((entry) => entry.work),
+      ].flatMap((attempt) => (attempt.attempt ? [attempt.attempt] : [])),
+    ),
+  );
+  assertAccountingSeal(
+    state.repository,
+    state.objective,
+    state.runId,
+    accounting,
+  );
   state.finalAcceptance = {
     candidateBasis: objectiveCandidate(state)!.basis,
     sealedAt: new Date().toISOString(),
@@ -212,11 +268,12 @@ export function sealFinalAcceptance(state: FactoryState): void {
     commit: objectiveCandidate(state)!.commitSha,
     tree: state.finalValidation!.treeSha,
     evidenceDigest: evidenceDigest(state),
-    // Diagnostic accounting is observational; no complete total is invented here.
+    // Observed categories and missing coverage remain separate from acceptance.
     usage: {
-      availability: "unavailable",
+      availability: accounting.records.length ? "observed" : "unavailable",
       runId: state.runId,
-      source: "diagnostics",
+      source: "durable-accounting",
+      accounting,
     },
     resources:
       "owned-attempts-settled; controller-processes-stopped; evidence-retained",

@@ -1643,7 +1643,7 @@ export function parseFactoryState(
           )
             throw new Error("AssetSet relationships are invalid");
         }
-        if (set.capture !== undefined)
+        if (set.capture !== undefined || set.manifestRef !== undefined)
           assertAssetCaptureReceipt(set as unknown as CapturedAssetSet);
       }
     }
@@ -2184,6 +2184,7 @@ export function parseFactoryState(
     }
   }
   if (validated.finalValidation?.passed) assertCompletedCoverage(validated);
-  assertFinalAcceptance(validated);
+  // Portable metadata decoding precedes verified content hydration.
+  assertFinalAcceptance(validated, { verifyAccountingBodies: false });
   return validated;
 }
