@@ -350,7 +350,7 @@ export function agentSessionContinuation(
     : undefined;
   const entryKey = key(scope);
   if (
-    role === "implementation" &&
+    role !== "planning" &&
     [
       ...Object.entries(state.agentSessions ?? {})
         .filter(([existingKey]) => existingKey !== entryKey)
@@ -365,7 +365,7 @@ export function agentSessionContinuation(
     )
   )
     throw new Error(
-      "Work Item has unsettled agent ownership in another graph scope",
+      "Role has unsettled agent ownership in another graph scope",
     );
   const retained = state.agentSessions?.[entryKey];
   let previous = JSON.stringify(retained);
