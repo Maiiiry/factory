@@ -133,6 +133,8 @@ Checkpoint closure traverses validated state and learning schemas, never arbitra
 
 Normal Git commits retain immutable predecessors. Publication never force pushes; ambiguous transport holds the exact attempted identities for read reconciliation. Acknowledgement verifies independently fetched bytes rather than a branch name or digest alone. With private-history configured, static and adaptive Objectives use the same storage boundary. Repository-knowledge archives exclude operational continuation. Host rebinding and queue admission remain separate lifecycle responsibilities; archive observations grant neither.
 
+The Project queue reads current membership, order and controls from its explicit GitHub binding. Private checkpoints retain original operation and owner receipts, never a pending-ID list or current queue copy. Admission binds the exact Issue body and host-independent semantic configuration; execution keeps its original configuration and allowance bindings. Queue and Project-bound foreground dispatch share independently acknowledged Git fast-forward ownership claims. Project field writes have no conditional-version protection and settle only from their validated original responses. Versioned queue IPC refuses legacy mutation handlers. Local queue files remain ignored historical bytes, and uncertain foreign ownership cannot become a fresh run.
+
 Storage producers have distinct retention contracts:
 
 | Records                                                                   | Durable source with private-history                                                                                      | Disposable replicas or exclusions                                                                         |
