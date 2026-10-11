@@ -125,6 +125,14 @@ Final acceptance checks graph coverage, the integrated candidate and the current
 
 See [stopping and recovery](USER-GUIDE.md#stopping-and-recovery) for the operator commands. Their implementation and status output are the authority for the next supported action.
 
+### Git durability boundary
+
+The existing atomic snapshot remains the lifecycle authority. Synchronous local saves mark checkpoint data dirty; awaited effect admission publishes the exact intent and charged allowances before external dispatch. A separate transport receipt records the observed archive base, attempted candidate, independently verified acknowledgement and pending loss window. It supplies durability facts, not a second queue, scheduler or external-effect outcome. Private archive binding is explicit and destination visibility is verified before private body publication.
+
+Checkpoint closure traverses validated state and learning schemas, never arbitrary objects that resemble content references. Complete original learning proposals, reviewed drafts, decisions and Dream input checkpoints accompany exact memory bindings; import does not deduplicate them into new observations. Required bodies and unavailable historical data retain their actual disposition. Exact source/result Git objects are preserved where the target has not independently retained them. Native homes, credentials and foreign live-control material are excluded.
+
+Normal Git commits retain immutable predecessors. Publication never force pushes; ambiguous transport holds the exact attempted identities for read reconciliation. Acknowledgement verifies independently fetched bytes rather than a branch name or digest alone. With private-history configured, static and adaptive Objectives use the same storage boundary. Repository-knowledge archives exclude operational continuation. Host rebinding and queue admission remain separate lifecycle responsibilities; archive observations grant neither.
+
 ## Execution, isolation and media
 
 Local workers operate in owned worktrees with private credential-free scratch homes and the configured network/secret policy. Toolchain visibility, commands and writes remain bounded by the approved attempt and ownership. Provider-specific APIs and credentials stay inside their adapters and outside target repositories.
@@ -158,11 +166,3 @@ Managed execution uses the same contracts but remains separate from claims of li
 CI builds Factory and runs a small real integration suite over Git, processes, disk, scanner and the offline packed CLI. It uses no fake providers or model responses. Real provider/GitHub acceptance belongs to the approved milestone's substantive outcomes.
 
 The [release procedure](RELEASING.md) verifies synchronized versions, exact artifacts and provenance, and protects immutable release tags. Issues, pull requests, Git history and GitHub release notes record changes; this file is not a fix log.
-
-### Git durability boundary
-
-The existing atomic snapshot remains the lifecycle authority. Synchronous local saves mark checkpoint data dirty; awaited effect admission publishes the exact intent and charged allowances before external dispatch. A separate transport receipt records the observed archive base, attempted candidate, independently verified acknowledgement and pending loss window. It supplies durability facts, not a second queue, scheduler or external-effect outcome. Private archive binding is explicit and destination visibility is verified before private body publication.
-
-Checkpoint closure traverses validated state and learning schemas, never arbitrary objects that resemble content references. Complete original learning proposals, reviewed drafts, decisions and Dream input checkpoints accompany exact memory bindings; import does not deduplicate them into new observations. Required bodies and unavailable historical data retain their actual disposition. Exact source/result Git objects are preserved where the target has not independently retained them. Native homes, credentials and foreign live-control material are excluded.
-
-Normal Git commits retain immutable predecessors. Publication never force pushes; ambiguous transport holds the exact attempted identities for read reconciliation. Acknowledgement verifies independently fetched bytes rather than a branch name or digest alone. With private-history configured, static and adaptive Objectives use the same storage boundary. Repository-knowledge archives exclude operational continuation. Host rebinding and queue admission remain separate lifecycle responsibilities; archive observations grant neither.
