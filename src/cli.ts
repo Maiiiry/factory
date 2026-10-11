@@ -732,6 +732,9 @@ async function main(): Promise<void> {
     {
       // These paths only print the application result after its full terminal
       // barrier. Other commands/custom operations retain their own full sync.
+      queueControlVerification:
+        command === "queue" &&
+        ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),
       forwardCompletedBarrier:
         command === "queue" &&
         ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),

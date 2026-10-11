@@ -89,8 +89,13 @@ function checkpointOperations(config: FactoryConfig) {
   };
   return {
     local: <T>(task: () => T): T => withRecoveryCheckpointScope(input, task),
-    async: <T>(task: () => Promise<T>): Promise<T> =>
-      withRecoveryCheckpointOperation(input, task),
+    async: <T>(
+      task: () => Promise<T>,
+      queueControlVerification = false,
+    ): Promise<T> =>
+      withRecoveryCheckpointOperation(input, task, {
+        queueControlVerification,
+      }),
   };
 }
 
@@ -262,8 +267,9 @@ export function createApplication(
     intakeControl: (action, objective) =>
       action === "status" || action === "sync"
         ? intakeControl(config, action, objective, services.github)
-        : checkpoint.async(() =>
-            intakeControl(config, action, objective, services.github),
+        : checkpoint.async(
+            () => intakeControl(config, action, objective, services.github),
+            ["pause", "resume", "drain"].includes(action),
           ),
     watchIntake: () =>
       checkpoint.async(() => watchIntake(config, services.github)),
@@ -360,8 +366,9 @@ export function composeIntake(
     intakeControl: (action, objective) =>
       action === "status" || action === "sync"
         ? intakeControl(config, action, objective, github)
-        : checkpoint.async(() =>
-            intakeControl(config, action, objective, github),
+        : checkpoint.async(
+            () => intakeControl(config, action, objective, github),
+            ["pause", "resume", "drain"].includes(action),
           ),
     watchIntake: () => checkpoint.async(() => watchIntake(config, github)),
     ensureProjectObjective: (objective, provenance) =>

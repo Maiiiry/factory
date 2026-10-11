@@ -39,6 +39,7 @@ import {
 import {
   awaitCheckpointAdmission,
   withRecoveryCheckpointScope,
+  withQueueControlVerification,
 } from "./recovery-checkpoint.js";
 import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
 import { checkRequiredEnvironment } from "./repair-policy.js";
@@ -539,6 +540,23 @@ export async function watchIntake(
   });
 }
 async function applyControl(
+  config: FactoryConfig,
+  github: GitHubGateway,
+  action: string,
+  objective?: number,
+): Promise<IntakeAuthorization> {
+  const task = () => applyControlOwned(config, github, action, objective);
+  return ["pause", "resume", "drain"].includes(action)
+    ? withQueueControlVerification(
+        {
+          config,
+          buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+        },
+        task,
+      )
+    : task();
+}
+async function applyControlOwned(
   config: FactoryConfig,
   github: GitHubGateway,
   action: string,
