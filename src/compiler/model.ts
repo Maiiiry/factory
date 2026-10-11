@@ -33,6 +33,7 @@ import {
   ProviderTurnElapsedTimeoutError,
   ProviderTurnTimeoutError,
 } from "../provider-turn.js";
+import { isCheckpointAdmissionFailure } from "../recovery-checkpoint.js";
 import {
   type ReviewBodyFile,
   type ReviewPacket,
@@ -858,6 +859,15 @@ export class StructuredPlanningModel implements PlanningModel {
       });
       return parsed;
     } catch (error) {
+      if (isCheckpointAdmissionFailure(error))
+        throw attachFault(
+          error,
+          decision(
+            error.knownNotDispatched
+              ? "Recovery checkpoint admission failed before dispatch. Preserve the exact invocation and consumed accounting until durable checkpoint admission is restored."
+              : "Recovery checkpoint retention is unavailable after the native boundary. Preserve the authenticated return, owned resources and consumed accounting until its exact originals are durably acknowledged.",
+          ),
+        );
       const failureClass = invalidStructuredOutput
         ? "structured-output-parse"
         : (turn.failureClass ?? providerFailureClass(error));
