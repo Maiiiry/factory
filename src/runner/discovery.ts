@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FactoryConfig } from "../config.js";
+import { assertDiscoveryContextScope } from "../compiler/context.js";
 import type {
   ContentStore,
   ExecutionDriver,
@@ -28,6 +29,10 @@ export function assertDiscoveryAdmission(
   item: WorkItem,
 ): void {
   if (item.kind !== "discovery") return;
+  assertDiscoveryContextScope(
+    { ...state.graph, items: [item] },
+    state.planningRecovery?.contextLookup?.packet,
+  );
   const admitted = config.planningContext?.selectors;
   if (
     state.schemaVersion !== 9 ||

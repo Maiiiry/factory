@@ -721,7 +721,7 @@ export async function runRegularGraph(args: {
       // A wrong result is repaired, published or not: the next attempt
       // republishes the same branch with a lease.
       const isolated = recordWorkFailure(state, item.id, error);
-      if (isolated && !stopped()) {
+      if (isolated && item.kind !== "discovery" && !stopped()) {
         phases.release(item.id);
         save();
         await phases.reserve(item.id, "review");

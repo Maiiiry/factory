@@ -335,7 +335,7 @@ export async function runNativeGraph(args: {
           else delete work.authentication;
           if (work.step === "execute") await stopWorker(item);
           const isolated = recordWorkFailure(state, item.id, error);
-          if (isolated && !stopped()) {
+          if (isolated && item.kind !== "discovery" && !stopped()) {
             await diagnose(item);
             return;
           }
@@ -506,7 +506,7 @@ export async function runNativeGraph(args: {
         // same configured policy as coding results, before the unit stops.
         const isolated = recordWorkFailure(state, item.id, error);
         save();
-        if (isolated && !stopped()) {
+        if (isolated && item.kind !== "discovery" && !stopped()) {
           await diagnose(item);
           return settlePrepared();
         }
@@ -875,7 +875,7 @@ export async function runNativeGraph(args: {
           // A wrong result is repaired, published or not: the next attempt
           // republishes the same branch with a lease.
           const isolated = recordWorkFailure(state, item.id, error);
-          if (isolated && !stopped()) {
+          if (isolated && item.kind !== "discovery" && !stopped()) {
             await diagnose(item);
             return;
           }
