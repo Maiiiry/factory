@@ -38,6 +38,8 @@ import {
 import { workspacePackageAdditions } from "../workspace-membership.js";
 import type { ObjectiveStep } from "./ownership.js";
 import { assertDiscoveryAdmission } from "./discovery.js";
+import { authenticateExpansionInputs } from "./expansion.js";
+import { assertExpansionsSettled } from "../expansion-readiness.js";
 
 /** Heads others push during final validation that Factory follows before asking. */
 const FOLLOWED_HEAD_LIMIT = 3;
@@ -97,6 +99,11 @@ export async function finalizeObjective(args: {
     )
   )
     return state;
+  stopIfCancelled();
+  assertExpansionsSettled(
+    graph,
+    await authenticateExpansionInputs({ state, config, contentStore }),
+  );
   stopIfCancelled();
   // A loaded manifest is shape-checked state, not proof that its retained bodies remain available.
   for (const item of graph.items.filter((item) => item.kind === "discovery")) {
