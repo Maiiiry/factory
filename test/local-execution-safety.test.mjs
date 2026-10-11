@@ -212,6 +212,38 @@ test("read-only discovery authenticates a pinned Git inventory and retains compl
       }),
       /binding differs/,
     );
+    git(
+      checkout,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${baseSha},vendor/library`,
+    );
+    git(
+      checkout,
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-m",
+      "tracked submodule boundary",
+    );
+    const submoduleSpec = { ...specification, selectors: ["vendor/"] };
+    const unreadable = await discoverRepository({
+      ...request,
+      baseSha: git(checkout, "rev-parse", "HEAD"),
+      specification: submoduleSpec,
+    });
+    assert.equal(unreadable.status, "unreadable");
+    assert.equal(unreadable.selectedEntries, 1);
+    const unreadableBody = await authenticateDiscoveryOutput({
+      ...request,
+      specification: submoduleSpec,
+      manifest: unreadable,
+    });
+    assert.deepEqual(unreadableBody.entries, []);
+    assert.equal(unreadableBody.failures[0].path, "vendor/library");
     rmSync(checkout, { recursive: true });
     const retained = await readDiscoveryBody(store, manifest.body);
     for (const entry of retained.entries) await store.verify(entry.content);
