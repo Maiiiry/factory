@@ -443,6 +443,7 @@ export function derivePrerequisiteGuidance(
       const current = state.work[item.id]!;
       const execution = object(current.execution?.data);
       const result = object(execution?.result);
+      const request = object(execution?.request);
       const readinessReceipt = object(execution?.environmentReadiness);
       if (readinessReceipt)
         historicalEvidence.push({
@@ -452,6 +453,16 @@ export function derivePrerequisiteGuidance(
         });
       if (
         result &&
+        current.execution &&
+        ["local", "claude-managed-agents", "openai-agents"].includes(
+          current.execution.provider,
+        ) &&
+        request?.attemptId === current.attempt &&
+        object(request.item)?.id === item.id &&
+        typeof result.treeSha === "string" &&
+        /^[a-f0-9]{40}$/.test(result.treeSha) &&
+        typeof result.changeRef === "string" &&
+        /^[a-f0-9]{40}$/.test(result.changeRef) &&
         !current.treeSha &&
         !["done", "failed", "cancelled", "skipped"].includes(current.status)
       ) {
