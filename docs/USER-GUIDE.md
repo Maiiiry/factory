@@ -333,7 +333,7 @@ For an approved migration or cross-cutting fix whose file inventory is unknown, 
 
 Integration waits for authenticated expansion and every required child. A complete empty inventory creates no children and still requires the original acceptance proof. Partial or unreadable inputs, unknown semantic classifications and exhausted expansion bounds remain visible stops; scope changes use the existing amendment or human-decision paths. One immutable input materializes each envelope; changing that input requires an explicit successor or revalidation. Restarts retain the same child identities and input packets, and uncertain GitHub writes are reconciled without being submitted again.
 
-Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. Recipes and portable memory export remain deferred.
+Library GitHub gateways supporting expansion must declare and enforce `projectionMutationAdmission: "controller-checkpoint-v1"`; unsupported gateways refuse before projection. Portable Git-backed memory recovery is tracked separately; see [workflow recipes](#workflow-recipes) for reusable pinned shapes.
 
 Adaptive workers automatically receive the relevant retained memory, verified human decisions, settled interface bodies and selected discovery entries for their batch. Role packets are retained before calls and authenticated on restart. Required source and acceptance inputs remain complete even when the advisory-memory allowance is exhausted; optional historical material stays an attributed lead. Already supplied content is reused rather than copied or requested again. Native session compaction remains the harness's responsibility.
 
