@@ -726,6 +726,8 @@ export interface PlanningModel {
 }
 
 export interface ExecutionRequest {
+  /** Current admitted graph recipients; models select indices, never identities. */
+  handoffPeers?: { id: string; title: string }[];
   /** Authenticated role input; preserves source, command and effect authority. */
   adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** Controller-required native child prohibition; never a copied parent allowance. */
@@ -911,6 +913,8 @@ export interface ExecutionDriver {
 }
 
 export interface HarnessRequest {
+  /** Controller-supplied peer choices, scoped to this exact execution request. */
+  handoffPeers?: { id: string; title: string }[];
   /** Authenticated role input; preserves source, command and effect authority. */
   adaptiveContext?: import("./adaptive-context.js").AdaptiveContextPacket;
   /** Explicit attempt policy; absence preserves the configured static workflow. */

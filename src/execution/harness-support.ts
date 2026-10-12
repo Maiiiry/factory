@@ -23,7 +23,10 @@ import type {
 import type { DiscoveryBody, DiscoveryOutputManifest } from "../discovery.js";
 import { networkFailure } from "../fault.js";
 import { parseProducedAssetSets } from "../media.js";
-import { parseWorkHandoffNotes } from "../objective-knowledge.js";
+import {
+  decodeWorkHandoffNotes,
+  workHandoffSchema,
+} from "../objective-knowledge.js";
 import { packageManagerInstructions } from "../package-manager-update.js";
 import { renderPrompt } from "../prompt-bytes.js";
 import {
@@ -292,7 +295,11 @@ export function renderWorkItemPrompt(request: HarnessRequest) {
       ? "Factory schedules independent Work Items through its admitted DAG. Native child agents are disabled for this attempt; complete the assigned batch directly under its recorded ownership and allowances. A hierarchy or planned peer grants no additional controller or child budget."
       : "For substantial independent components, parallelize with supported sub-agents using available tool slots. Partition accepted write ownership among yourself and children so no concurrent writers share a path; supply each child its complete relevant pinned inputs, settled contracts, exact checks and constraints. Continue your independent owned work. Keep children on this invocation's inherited provider, model, reasoning effort, permissions and resource limits; do not request role, model or effort overrides. If supported delegation is unavailable, finish directly. Await explicit child completion before reading its mutable outputs for integration, then integrate and verify before finishing.";
   const executionInstructions = `\n\nFinish small cohesive work directly. Before the first file read, derive the complete required read set from the goal, acceptance, brief, owned paths, exact validation and supplied source sections. Distinguish authoritative bodies already supplied below from omitted relevant repository instructions, baseline/tooling bodies and current integrated dependency implementations. Use supplied bodies first without rereading solely to obtain the same pinned section. Batch complete reads of missing contents within the tool's outer output budget; an inner command limit does not enlarge it. Check results for truncation and retrieve only missing spans. Read current candidate/dependency files when needed for semantics or when supplied sections do not cover the required body. Any permitted ancestor-instruction search must advance to a distinct parent and stop at the filesystem root or the harness's instruction-search boundary. Missing, oversized, unreadable or truncated content remains missing evidence. After necessary model decisions, combine authorized owned edits with declared checks where permitted, preserving literal commands, quoting, exit gating and prerequisite order; independent operations may be batched, dependent operations remain ordered. When displaying or wrapping a tool result, preserve its actual completion/running status and any supplied continuation identity, not only output text. Resume or inspect active verification through that tool's supported continuation surface before starting another copy against the same mutable checkout, and await settlement before conflicting edits. After a check fails, use the cheapest applicable diagnostic already permitted by the accepted sources, repository instructions and available tools before repeating a longer suite; do not invent commands, tool fields or permissions. Once corrected, run every exact required validation command; a targeted diagnostic does not replace it. Do not add a scratch digest snapshot solely to duplicate the controller baseline audit; preserve source-required evidence and temporary files used by approved commands. ${delegationInstructions} This request grants no additional authority.`;
-  const handoffInstructions = `\n\nYou may leave compact advisory notes for relevant Objective peers. Write any such notes to .factory-handoff.json at the CURRENT checkout root, exactly ${JSON.stringify(join(request.worktree, ".factory-handoff.json"))}. This file is an allowed private staging exception even when absent from Owned paths. The collector reads only that checkout-root path. The controller scans it, binds note and source identities, and excludes it from Git commits and public delivery. "Private" describes its retention and delivery rules; create this staging file inside the checkout. Use this declaration: {"notes":[{"kind":"interface" or "pitfall" or "hypothesis","summary":"specific learning and its uncertainty","paths":["literal repository file"],"consumers":["accepted Work Item ID"]}]}. Use at most 16 notes, 1024 characters per summary and 8 files per note. Refer to actual repository files; omit transcripts, credentials, personal data and raw logs. Mark unverified ideas as hypothesis. Notes do not settle contracts, add ownership or replace source requirements or independent acceptance. The controller authenticates producer/result identities and available source bytes; your summary remains an advisory claim. Do not commit this file or perform controller operations.`;
+  const peers = request.handoffPeers ?? [];
+  const peerInstructions = peers.length
+    ? `Choose consumerIndices only from these current admitted peer choices: ${JSON.stringify(peers.map(({ title }, peerIndex) => ({ peerIndex, title })))}.`
+    : "No peer recipients are supplied. Omit peer-targeted handoff notes; consumerIndices must be [].";
+  const handoffInstructions = `\n\nYou may leave compact advisory repository learnings in .factory-handoff.json at the CURRENT checkout root, exactly ${JSON.stringify(join(request.worktree, ".factory-handoff.json"))}. This is an allowed private staging exception even when absent from Owned paths. The collector reads only that checkout-root path. The collector scans the file, binds source identities, and excludes it from Git commits and public delivery. ${peerInstructions} An empty consumerIndices list retains untargeted own/dependency/path-relevant and final Objective learning; it grants no new authority. Use this exact manifest JSON schema: ${JSON.stringify(workHandoffSchema(peers.length))}. Refer to actual literal repository files; the decoder still rejects invalid paths, including directories, .git and private staging paths. Keep each note within its path/count/summary limits. Omit transcripts, credentials, personal data and raw logs. Mark unverified ideas as hypothesis. Notes do not settle contracts, add ownership or replace source requirements or independent acceptance. Do not commit this file or perform controller operations.`;
   const transitionInstructions = `\n\nWhen implementing source-required asynchronous or UI lifecycle flows, trace which current intent owns results, errors, derived metadata and cleanup. Check what remains after an intent change or failure, and whether a late completion can affect newer state. Use accepted validation and authorized tools to verify materially interacting transitions as well as isolated paths, within owned scope; this guidance adds no acceptance requirements, commands or permissions.`;
   return renderPrompt([
     [
@@ -359,6 +366,7 @@ export function readProducedAssets(
 /** All native and managed workers use the same optional, bounded declaration. */
 export function readWorkHandoff(
   worktree: string,
+  peers: readonly { id: string; title: string }[] = [],
 ): WorkHandoffNote[] | undefined {
   const manifest = join(worktree, ".factory-handoff.json");
   const stat = lstatSync(manifest, { throwIfNoEntry: false });
@@ -366,5 +374,8 @@ export function readWorkHandoff(
   if (!stat.isFile() || realpathSync(manifest) !== resolve(manifest))
     throw new Error("Handoff manifest must be a regular private staging file");
   if (stat.size > 64 * 1024) throw new Error("Handoff manifest exceeds 64 KiB");
-  return parseWorkHandoffNotes(JSON.parse(readFileSync(manifest, "utf8")));
+  return decodeWorkHandoffNotes(
+    JSON.parse(readFileSync(manifest, "utf8")),
+    peers,
+  );
 }

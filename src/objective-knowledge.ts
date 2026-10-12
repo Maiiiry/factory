@@ -113,6 +113,110 @@ export function parseWorkHandoffNotes(value: unknown): WorkHandoffNote[] {
   });
 }
 
+/** Models choose recipients; the controller owns their identities. */
+export function workHandoffSchema(peerCount: number): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["notes"],
+    properties: {
+      notes: {
+        type: "array",
+        maxItems: 16,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["kind", "summary", "paths", "consumerIndices"],
+          properties: {
+            kind: {
+              type: "string",
+              enum: ["interface", "pitfall", "hypothesis"],
+            },
+            summary: { type: "string", minLength: 1, maxLength: 1024 },
+            paths: {
+              type: "array",
+              maxItems: 8,
+              uniqueItems: true,
+              items: { type: "string", minLength: 1, maxLength: 512 },
+            },
+            consumerIndices: {
+              type: "array",
+              maxItems: peerCount === 0 ? 0 : 16,
+              uniqueItems: true,
+              items: {
+                type: "integer",
+                minimum: 0,
+                ...(peerCount > 0 ? { maximum: peerCount - 1 } : {}),
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+/** Decode only the indexed declaration; never repair a rejected response. */
+export function decodeWorkHandoffNotes(
+  value: unknown,
+  peers: readonly { id: string; title: string }[] = [],
+): WorkHandoffNote[] {
+  if (
+    !peers.every(
+      (peer) =>
+        typeof peer.id === "string" &&
+        peer.id.length > 0 &&
+        peer.id.length <= 128 &&
+        !peer.id.includes("\0") &&
+        typeof peer.title === "string",
+    ) ||
+    new Set(peers.map((peer) => peer.id)).size !== peers.length
+  )
+    throw new Error("Handoff peer catalog differs from its admitted graph");
+  const declaration = value as { notes?: unknown } | null;
+  if (
+    !declaration ||
+    typeof declaration !== "object" ||
+    Array.isArray(declaration) ||
+    Object.keys(declaration).some((key) => key !== "notes") ||
+    !Array.isArray(declaration.notes) ||
+    declaration.notes.length > 16
+  )
+    throw new Error("Handoff must be an object with at most 16 notes");
+  const notes = declaration.notes.map((raw) => {
+    if (
+      !raw ||
+      typeof raw !== "object" ||
+      Array.isArray(raw) ||
+      Object.keys(raw).some(
+        (key) => !["kind", "summary", "paths", "consumerIndices"].includes(key),
+      )
+    )
+      throw new Error("Handoff note differs from the indexed declaration");
+    const note = raw as Record<string, unknown>,
+      indices = note.consumerIndices;
+    if (
+      !Array.isArray(indices) ||
+      indices.length > 16 ||
+      new Set(indices).size !== indices.length ||
+      !indices.every(
+        (index) =>
+          Number.isSafeInteger(index) && index >= 0 && index < peers.length,
+      )
+    )
+      throw new Error(
+        "Handoff consumer index is absent from the admitted graph",
+      );
+    return {
+      kind: note.kind,
+      summary: note.summary,
+      paths: note.paths,
+      consumers: indices.map((index) => peers[index]!.id),
+    };
+  });
+  return parseWorkHandoffNotes({ notes });
+}
+
 function body(
   record:
     | Omit<ObjectiveKnowledgeRecord, "recordRef">
