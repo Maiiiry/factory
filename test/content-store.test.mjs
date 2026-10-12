@@ -23,7 +23,12 @@ import test from "node:test";
 import { LocalContentStore } from "../dist/content/local.js";
 import { admitNativeReturn } from "../dist/compiler/native-return.js";
 import { retainPlanningNativeReturn } from "../dist/compiler/recovery.js";
-import { linuxProcessIdentity } from "../dist/process.js";
+import {
+  linuxProcessIdentity,
+  withProcessCancellation,
+  currentProcessSignal,
+} from "../dist/process.js";
+import { withGitHubRequestBudget } from "../dist/github-client.js";
 import { analyzeInteractions } from "../dist/analysis.js";
 import { captureAssetSets } from "../dist/media.js";
 import {
@@ -873,10 +878,21 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       closure.files.some((file) => file.path.startsWith(`learning/${kind}/`)),
       true,
     );
-  const firstCheckpoint = await synchronizeRecoveryCheckpoint(config, {
-    reason: "explicit",
-    buildClosure,
-  });
+  const actualOwner = new AbortController();
+  const firstCheckpoint = await withProcessCancellation(
+    actualOwner.signal,
+    async () => {
+      const acknowledged = await withGitHubRequestBudget(1, () =>
+        synchronizeRecoveryCheckpoint(config, {
+          reason: "explicit",
+          buildClosure,
+        }),
+      );
+      assert.equal(currentProcessSignal(), actualOwner.signal);
+      assert.equal(actualOwner.signal.aborted, false);
+      return acknowledged;
+    },
+  );
   assert.equal(firstCheckpoint.status, "acknowledged");
   const firstInspection = await inspectRecoveryCheckpoint(config);
   const uniqueBodies = new Map(
@@ -1484,6 +1500,92 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         runId: randomUUID(),
       }),
     /cannot change/,
+  );
+  // Actual module-bound originals also authenticate a nonterminal stopped handoff.
+  // No provider result or remote admission is invented; installed reconciliation
+  // separately authenticates those operational facts before it can write a claim.
+  boundInitial.coordinator.phase = "waiting";
+  boundInitial.planningRecovery = { phase: "stopped", history: [] };
+  saveState(statePath(repository, 3), boundInitial);
+  const stoppedBytes = readFileSync(statePath(repository, 3));
+  const handoffClaim = structuredClone(boundClaim);
+  handoffClaim.settled = {
+    at: new Date().toISOString(),
+    runId: boundInitial.runId,
+    disposition: "quiescent",
+    handoff: {
+      schemaVersion: 1,
+      originalClaim: store.putBytes(
+        readFileSync(join(claimDirectory, `${boundClaim.id}.json`)),
+        { mediaType: "application/json" },
+      ),
+      stoppedSnapshot: store.putBytes(stoppedBytes, {
+        mediaType: "application/json",
+      }),
+      configDigest: boundInitial.configDigest,
+      owner: {
+        pid: process.pid,
+        startTime: linuxProcessIdentity(process.pid).startTime,
+        tokenDigest: learningDigest("recovery-owner"),
+      },
+    },
+  };
+  const handoffReferences = await authenticateQueueOwnerReferences(
+    handoffClaim,
+    (reference) => store.readBytes(reference),
+  );
+  assert.ok(
+    handoffReferences.some(
+      (reference) =>
+        reference.digest === bindingOriginal.initialSnapshot.digest,
+    ),
+  );
+  assert.ok(
+    handoffReferences.some(
+      (reference) =>
+        reference.digest ===
+        handoffClaim.settled.handoff.stoppedSnapshot.digest,
+    ),
+  );
+  assert.deepEqual(readFileSync(statePath(repository, 3)), stoppedBytes);
+  const foreignHandoff = structuredClone(handoffClaim);
+  foreignHandoff.ownerTokenDigest = learningDigest("different-original-owner");
+  await assert.rejects(
+    authenticateQueueOwnerReferences(foreignHandoff, (reference) =>
+      store.readBytes(reference),
+    ),
+    /original producer-bound/,
+  );
+  const unresolvedStopped = structuredClone(boundInitial);
+  unresolvedStopped.planningRecovery.invocations = [
+    { id: randomUUID(), phase: "compile" },
+  ];
+  const unresolvedHandoff = structuredClone(handoffClaim);
+  unresolvedHandoff.settled.handoff.stoppedSnapshot = store.putBytes(
+    Buffer.from(JSON.stringify(unresolvedStopped)),
+    { mediaType: "application/json" },
+  );
+  await assert.rejects(
+    authenticateQueueOwnerReferences(unresolvedHandoff, (reference) =>
+      store.readBytes(reference),
+    ),
+    /unresolved retained planning invocation/,
+  );
+  const missingCurrent = structuredClone(boundInitial);
+  missingCurrent.planningRecovery.invocation = {
+    id: randomUUID(),
+    phase: "diagnosis",
+  };
+  const missingCurrentHandoff = structuredClone(handoffClaim);
+  missingCurrentHandoff.settled.handoff.stoppedSnapshot = store.putBytes(
+    Buffer.from(JSON.stringify(missingCurrent)),
+    { mediaType: "application/json" },
+  );
+  await assert.rejects(
+    authenticateQueueOwnerReferences(missingCurrentHandoff, (reference) =>
+      store.readBytes(reference),
+    ),
+    /unresolved retained planning invocation/,
   );
   boundInitial.cancelRequested = true;
   boundInitial.cancelledAt = new Date().toISOString();

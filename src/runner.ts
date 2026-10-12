@@ -31,7 +31,10 @@ import {
 import { executionContext } from "./execution/checkpoint.js";
 import { assertFailedValidationRecord } from "./failed-validation.js";
 import { cancelledFault } from "./fault.js";
-import { withGitHubTransportObserver } from "./github-client.js";
+import {
+  withGitHubRequestBudget,
+  withGitHubTransportObserver,
+} from "./github-client.js";
 import {
   matchesPlanDecision,
   phonePlanEligible,
@@ -49,6 +52,8 @@ import { approvedPlaybook, observeRetrospective } from "./learning.js";
 import { assetSelectionDigest } from "./media.js";
 import { operatorName } from "./operator.js";
 import {
+  currentProcessDeadlineAt,
+  currentProcessSignal,
   linuxProcessIdentity,
   pinnedGit,
   withProcessCancellation,
@@ -60,6 +65,7 @@ import {
   settleCancelledProjectQueueRun,
   type QueueOwnerClaim,
   settleProjectQueueRun,
+  settleStoppedProjectQueueRun,
 } from "./project-queue-state.js";
 import { objectiveCandidate } from "./qa.js";
 import {
@@ -283,9 +289,14 @@ async function controlObjectiveUnscoped(
   const reply = await requestControl(config.repository, request);
   if (reply.handled) return reply.result;
   if (
-    !["pause", "drain", "resume", "status", "propose-amendment"].includes(
-      request.action,
-    )
+    ![
+      "pause",
+      "drain",
+      "resume",
+      "status",
+      "propose-amendment",
+      "handoff",
+    ].includes(request.action)
   )
     throw new Error("No active coordinator owns this Objective");
   const lockPath = objectiveLockPath(config.repository, request.objective);
@@ -295,6 +306,10 @@ async function controlObjectiveUnscoped(
     if (!state) throw new Error("Objective has no Factory state");
     if (request.action === "status") return state.coordinator;
     assertRestoredContinuationReady(state, config);
+    if (request.action === "handoff") {
+      await settleStoppedProjectQueueRun(config, state, lock);
+      return { handedOff: true, runId: state.runId, projectClaim: "quiescent" };
+    }
     if (request.action === "propose-amendment") {
       // Every stop names this command, so it works while the Objective is
       // stopped: it records the pending amendment under the lock (the same
@@ -798,26 +813,40 @@ async function runObjectiveOwned(
       return Promise.reject(progressAdmissionFailure);
     if (!config.githubManagement) return Promise.resolve();
     if (progressTask) return progressTask;
+    const parentSignal = currentProcessSignal();
+    const deadlines = [owner.deadlineAt, currentProcessDeadlineAt()].filter(
+      (value): value is string => value !== undefined,
+    );
     progressTask = withProcessCancellation(
-      AbortSignal.timeout(30_000),
-      async () => {
-        await projectGitHubProjectStatus({
-          config,
-          objective,
-          github: services.github,
-          current: () => owner.snapshot,
-          save: persist,
-        });
-        await projectGitHubProgress({
-          config,
-          objective,
-          github: services.github,
-          current: () => owner.snapshot,
-          save: persist,
-          active: true,
-          secrets: configuredDiagnosticSecrets(config),
-        });
-      },
+      AbortSignal.any([
+        owner.abort.signal,
+        ...(parentSignal ? [parentSignal] : []),
+      ]),
+      () =>
+        withGitHubRequestBudget(30_000, async () => {
+          await projectGitHubProjectStatus({
+            config,
+            objective,
+            github: services.github,
+            current: () => owner.snapshot,
+            save: persist,
+          });
+          await projectGitHubProgress({
+            config,
+            objective,
+            github: services.github,
+            current: () => owner.snapshot,
+            save: persist,
+            active: true,
+            secrets: configuredDiagnosticSecrets(config),
+          });
+        }),
+      undefined,
+      deadlines.length
+        ? deadlines.reduce((first, next) =>
+            Date.parse(next) < Date.parse(first) ? next : first,
+          )
+        : undefined,
     )
       .catch((error: unknown) => {
         if (isCheckpointAdmissionFailure(error)) throw error;
@@ -960,197 +989,248 @@ async function runObjectiveOwned(
       return false;
     }
   };
+  let runResult: ContinuationState | undefined;
+  let runFailed = false;
+  let runFailure: unknown;
+  const finalizationErrors: unknown[] = [];
   try {
-    for (;;) {
-      const state = owner.snapshot;
-      if (state?.cancelRequested) {
-        cancel();
-        await owner.cancellation;
-        await closeCancelledIssues(state, services.github, persist);
-        if (!state.coordinator?.cancelError) {
-          await releaseAgentSessions(
-            state,
-            services.driver,
-            services.planningModel,
-            persist,
-          );
-          const alreadyCancelled = !!state.cancelledAt;
-          state.cancelledAt = new Date().toISOString();
-          clearAllRepeats(state);
-          if (isExecutionState(state)) {
-            for (const work of Object.values(state.work))
-              if (work.status === "pending" || work.status === "running")
-                work.status = "cancelled";
-            if (owner.save) owner.save(state);
-            else persist();
-          } else persist();
-          if (!alreadyCancelled)
-            new DiagnosticEmitter(config.repository, objective).emit({
-              runId: state.runId,
-              operation: "objective-cancel",
-              outcome: "completed",
-            });
+    runResult = await (async () => {
+      for (;;) {
+        const state = owner.snapshot;
+        if (state?.cancelRequested) {
+          cancel();
+          await owner.cancellation;
+          await closeCancelledIssues(state, services.github, persist);
+          if (!state.coordinator?.cancelError) {
+            await releaseAgentSessions(
+              state,
+              services.driver,
+              services.planningModel,
+              persist,
+            );
+            const alreadyCancelled = !!state.cancelledAt;
+            state.cancelledAt = new Date().toISOString();
+            clearAllRepeats(state);
+            if (isExecutionState(state)) {
+              for (const work of Object.values(state.work))
+                if (work.status === "pending" || work.status === "running")
+                  work.status = "cancelled";
+              if (owner.save) owner.save(state);
+              else persist();
+            } else persist();
+            if (!alreadyCancelled)
+              new DiagnosticEmitter(config.repository, objective).emit({
+                runId: state.runId,
+                operation: "objective-cancel",
+                outcome: "completed",
+              });
+          }
+          throw cancelledFault("Objective cancellation requested");
         }
-        throw cancelledFault("Objective cancellation requested");
-      }
-      if (
-        state?.coordinator?.mode !== "running" &&
-        state?.coordinator &&
-        !(
-          isExecutionState(state) &&
-          Object.values(state.work).some(
-            (work) => work.status === "running" || work.status === "published",
+        if (
+          state?.coordinator?.mode !== "running" &&
+          state?.coordinator &&
+          !(
+            isExecutionState(state) &&
+            Object.values(state.work).some(
+              (work) =>
+                work.status === "running" || work.status === "published",
+            )
+          )
+        ) {
+          await wait();
+          continue;
+        }
+        if (isPreparationState(state) && phonePlanEligible(config, state)) {
+          await projectProgress();
+          if (await observePhoneDecision()) continue;
+          await wait(30_000);
+          continue;
+        }
+        const result = await withProcessCancellation(
+          owner.abort.signal,
+          () => runObjectivePass(config, objective, services, owner),
+          (process, settled) => {
+            const disposition = owner.snapshot?.coordinator;
+            if (!disposition) return;
+            disposition.processes ??= [];
+            disposition.processes = disposition.processes.filter(
+              (entry) =>
+                entry.pid !== process.pid ||
+                entry.startTime !== process.startTime,
+            );
+            if (!settled) disposition.processes.push(process);
+            persist();
+          },
+          owner.deadlineAt,
+        ).catch((error: unknown) => {
+          const current = owner.snapshot;
+          // A pass stopped by the cancel request (a step answers `cancelled`):
+          // the loop records the cancellation.
+          if (current?.cancelRequested && !owner.handoff) return undefined;
+          // Planning stops at a pause or drain; the owner keeps serving control until resume.
+          if (
+            isPreparationState(current) &&
+            current.coordinator.mode !== "running" &&
+            !current.cancelRequested &&
+            !owner.handoff
+          )
+            return undefined;
+          throw error;
+        });
+        if (!result) continue;
+        owner.snapshot = result;
+        // A pass that stopped for the cancel request: the loop records it.
+        if (result.cancelRequested && !owner.handoff) continue;
+        if (isPreparationState(result) && phonePlanEligible(config, result)) {
+          continue;
+        }
+        // A preparation comes back only when its plan needs a human decision.
+        if (
+          isPreparationState(result) ||
+          objectiveComplete(result) ||
+          result.cancelledAt
+        ) {
+          if (
+            isExecutionState(result) &&
+            (objectiveComplete(result) || result.cancelledAt)
+          )
+            await releaseAgentSessions(
+              result,
+              services.driver,
+              services.planningModel,
+              persist,
+            );
+          return result;
+        }
+        if (
+          result.coordinator?.mode === "running" &&
+          (amendmentBlocksDispatch(result) || graphExpansionPending(result)) &&
+          result.pendingAmendment?.phase !== "rejected" &&
+          !hasReadinessWait(result) &&
+          !awaitsOperator(result.wait)
+        )
+          continue;
+        if (
+          result.coordinator?.mode === "running" &&
+          Object.values(result.work).some(
+            (work) =>
+              work.recovery?.phase === "ready" &&
+              (work.status === "pending" || work.status === "running"),
           )
         )
-      ) {
-        await wait();
-        continue;
+          continue;
+        result.coordinator!.phase = "waiting";
+        const stoppedRepair = Object.entries(result.work).find(
+          ([, work]) =>
+            (work.recovery?.phase === "stopped" ||
+              work.recovery?.phase === "diagnosing") &&
+            ["failed", "waiting"].includes(work.status),
+        );
+        // A step's question or configuration fix names what to answer: the
+        // Objective's own wait first, then a Work Item's.
+        const asked = Object.entries(result.work).find(([, work]) =>
+          awaitsOperator(work.wait),
+        );
+        result.coordinator!.waitReason = result.wait
+          ? `${result.wait.detail}${result.wait.fix ? `. ${result.wait.fix}` : ""}`
+          : result.coordinator!.mode === "draining"
+            ? "Drained; no owned attempts remain"
+            : stoppedRepair
+              ? `Work Item ${stoppedRepair[0]}: ${stoppedRepair[1].recovery!.failure?.decision ?? "Inspect the retained recovery failure"}`
+              : asked
+                ? `Work Item ${asked[0]}: ${asked[1].wait!.detail}${asked[1].wait!.fix ? `. ${asked[1].wait!.fix}` : ""}`
+                : hasReadinessWait(result)
+                  ? "Awaiting exact published checks or target protection readiness"
+                  : "Awaiting exact candidate decision or resume";
+        persist();
+        // Nothing automatic remains: the Objective needs a human decision.
+        if (result.coordinator?.mode === "running" && !hasReadinessWait(result))
+          return result;
+        // Read-only observations use the same owner and GitHub rate gate. No model work while idle.
+        await wait(result.coordinator?.mode === "running" ? 5_000 : undefined);
       }
-      if (isPreparationState(state) && phonePlanEligible(config, state)) {
-        await projectProgress();
-        if (await observePhoneDecision()) continue;
-        await wait(30_000);
-        continue;
-      }
-      const result = await withProcessCancellation(
-        owner.abort.signal,
-        () => runObjectivePass(config, objective, services, owner),
-        (process, settled) => {
-          const disposition = owner.snapshot?.coordinator;
-          if (!disposition) return;
-          disposition.processes ??= [];
-          disposition.processes = disposition.processes.filter(
-            (entry) =>
-              entry.pid !== process.pid ||
-              entry.startTime !== process.startTime,
-          );
-          if (!settled) disposition.processes.push(process);
-          persist();
-        },
-        owner.deadlineAt,
-      ).catch((error: unknown) => {
-        const current = owner.snapshot;
-        // A pass stopped by the cancel request (a step answers `cancelled`):
-        // the loop records the cancellation.
-        if (current?.cancelRequested && !owner.handoff) return undefined;
-        // Planning stops at a pause or drain; the owner keeps serving control until resume.
-        if (
-          isPreparationState(current) &&
-          current.coordinator.mode !== "running" &&
-          !current.cancelRequested &&
-          !owner.handoff
-        )
-          return undefined;
-        throw error;
-      });
-      if (!result) continue;
-      owner.snapshot = result;
-      // A pass that stopped for the cancel request: the loop records it.
-      if (result.cancelRequested && !owner.handoff) continue;
-      if (isPreparationState(result) && phonePlanEligible(config, result)) {
-        continue;
-      }
-      // A preparation comes back only when its plan needs a human decision.
-      if (
-        isPreparationState(result) ||
-        objectiveComplete(result) ||
-        result.cancelledAt
-      ) {
-        if (
-          isExecutionState(result) &&
-          (objectiveComplete(result) || result.cancelledAt)
-        )
-          await releaseAgentSessions(
-            result,
-            services.driver,
-            services.planningModel,
-            persist,
-          );
-        return result;
-      }
-      if (
-        result.coordinator?.mode === "running" &&
-        (amendmentBlocksDispatch(result) || graphExpansionPending(result)) &&
-        result.pendingAmendment?.phase !== "rejected" &&
-        !hasReadinessWait(result) &&
-        !awaitsOperator(result.wait)
-      )
-        continue;
-      if (
-        result.coordinator?.mode === "running" &&
-        Object.values(result.work).some(
-          (work) =>
-            work.recovery?.phase === "ready" &&
-            (work.status === "pending" || work.status === "running"),
-        )
-      )
-        continue;
-      result.coordinator!.phase = "waiting";
-      const stoppedRepair = Object.entries(result.work).find(
-        ([, work]) =>
-          (work.recovery?.phase === "stopped" ||
-            work.recovery?.phase === "diagnosing") &&
-          ["failed", "waiting"].includes(work.status),
-      );
-      // A step's question or configuration fix names what to answer: the
-      // Objective's own wait first, then a Work Item's.
-      const asked = Object.entries(result.work).find(([, work]) =>
-        awaitsOperator(work.wait),
-      );
-      result.coordinator!.waitReason = result.wait
-        ? `${result.wait.detail}${result.wait.fix ? `. ${result.wait.fix}` : ""}`
-        : result.coordinator!.mode === "draining"
-          ? "Drained; no owned attempts remain"
-          : stoppedRepair
-            ? `Work Item ${stoppedRepair[0]}: ${stoppedRepair[1].recovery!.failure?.decision ?? "Inspect the retained recovery failure"}`
-            : asked
-              ? `Work Item ${asked[0]}: ${asked[1].wait!.detail}${asked[1].wait!.fix ? `. ${asked[1].wait!.fix}` : ""}`
-              : hasReadinessWait(result)
-                ? "Awaiting exact published checks or target protection readiness"
-                : "Awaiting exact candidate decision or resume";
-      persist();
-      // Nothing automatic remains: the Objective needs a human decision.
-      if (result.coordinator?.mode === "running" && !hasReadinessWait(result))
-        return result;
-      // Read-only observations use the same owner and GitHub rate gate. No model work while idle.
-      await wait(result.coordinator?.mode === "running" ? 5_000 : undefined);
-    }
+    })();
+  } catch (error) {
+    runFailed = true;
+    runFailure = error;
   } finally {
     if (progressTimer) clearInterval(progressTimer);
     if (deadlineTimer) clearTimeout(deadlineTimer);
     process.off("SIGUSR1", cancel);
     process.off("SIGTERM", handoff);
-    await options.observeControl?.(undefined);
-    if (server)
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+    let controlReleased = false;
     try {
-      await controlTail;
-      await progressTask;
-      await projectProgress();
-      observeRetrospective(config, objective);
-      if (queueClaim && owner.snapshot && canHandoff(owner.snapshot)) {
-        if (owner.snapshot.cancelledAt) {
-          await cancelKnownWork(owner.snapshot, services.driver, persist, true);
-          await releaseAgentSessions(
-            owner.snapshot,
-            services.driver,
-            services.planningModel,
-            persist,
-          );
-          await settleCancelledProjectQueueRun(config, owner.snapshot, lock);
-        } else
-          await settleProjectQueueRun(
-            config,
-            queueClaim,
-            lock.token,
-            owner.snapshot.runId,
-          );
+      try {
+        await options.observeControl?.(undefined);
+        if (server)
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        controlReleased = true;
+      } catch (error) {
+        finalizationErrors.push(error);
+      }
+      // Await original work even after one promise fails; never replay a failed projection.
+      for (const task of [controlTail, progressTask]) {
+        try {
+          await task;
+        } catch (error) {
+          finalizationErrors.push(error);
+        }
+      }
+      if (!finalizationErrors.length) {
+        try {
+          await projectProgress();
+          observeRetrospective(config, objective);
+        } catch (error) {
+          finalizationErrors.push(error);
+        }
+      }
+      try {
+        if (
+          controlReleased &&
+          queueClaim &&
+          owner.snapshot &&
+          canHandoff(owner.snapshot)
+        ) {
+          if (owner.snapshot.cancelledAt) {
+            await cancelKnownWork(
+              owner.snapshot,
+              services.driver,
+              persist,
+              true,
+            );
+            await releaseAgentSessions(
+              owner.snapshot,
+              services.driver,
+              services.planningModel,
+              persist,
+            );
+            await settleCancelledProjectQueueRun(config, owner.snapshot, lock);
+          } else
+            await settleProjectQueueRun(
+              config,
+              queueClaim,
+              lock.token,
+              owner.snapshot.runId,
+            );
+        }
+      } catch (error) {
+        finalizationErrors.push(error);
       }
     } finally {
       owners.delete(ownerKey(config, objective));
       if (!options.ownerLock) releaseControllerLock(lockPath, lock);
     }
   }
+  const errors = [...(runFailed ? [runFailure] : []), ...finalizationErrors];
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1)
+    throw new AggregateError(
+      errors,
+      "Controller execution/finalization and Project claim settlement failed",
+      { cause: errors[0] },
+    );
+  return runResult!;
 }
 
 async function cancelObjectiveUnscoped(
