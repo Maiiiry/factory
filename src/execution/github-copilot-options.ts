@@ -35,6 +35,45 @@ function permissionHandler(input: GitHubCopilotWorkerInput): PermissionHandler {
   };
 }
 
+/** SDK 1.0.13 exposes the configured grep file-search capability as rg. */
+export function canonicalCopilotTools(tools: readonly string[]): string[] {
+  return tools.map((name) => (name === "grep" ? "rg" : name));
+}
+
+/** The native model may select editing tools, but cannot widen the ceiling. */
+export function assertCopilotToolPolicy(
+  input: GitHubCopilotWorkerInput,
+  names: readonly string[] | undefined,
+): void {
+  const allowed = new Set(canonicalCopilotTools(input.config.availableTools));
+  if (
+    !names?.length ||
+    new Set(names).size !== names.length ||
+    names.some((name) => !allowed.has(name))
+  )
+    throw new Error(
+      `Copilot effective tool policy does not match the current Work Item: allowed ${JSON.stringify([...allowed].sort())}; observed ${JSON.stringify(names ?? null)}`,
+    );
+  const offered = new Set(names);
+  if (
+    input.config.permissionKinds.includes("read") &&
+    !["view", "rg", "glob"].some((name) => offered.has(name))
+  )
+    throw new Error(
+      "Copilot effective tool policy lacks required file reading",
+    );
+  if (
+    input.config.permissionKinds.includes("write") &&
+    (!input.request.item.kind || input.request.item.kind === "work") &&
+    !input.request.discovery &&
+    input.request.item.ownedPaths.length &&
+    !["create", "edit", "apply_patch"].some((name) => offered.has(name))
+  )
+    throw new Error(
+      "Copilot effective tool policy lacks required file editing",
+    );
+}
+
 export function githubCopilotClientOptions(
   input: GitHubCopilotWorkerInput,
   environment: NodeJS.ProcessEnv,
@@ -71,7 +110,9 @@ export function githubCopilotSessionOptions(
       content:
         "You are an implementation worker controlled by Clockgrove Factory. Work only in the supplied current working directory and only on paths owned by the Work Item. Do not commit, push, publish, open or edit issues or pull requests, access GitHub tools, deploy, or change the current Git HEAD. Earlier conversation and tool results are advisory history; the current Work Item, working directory, owned paths and permissions are authoritative. Recheck changed files before relying on historical reads. Return a concise description and stop when complete or safely blocked.",
     },
-    availableTools: [...input.config.availableTools],
+    availableTools: canonicalCopilotTools(input.config.availableTools).map(
+      (name) => `builtin:${name}`,
+    ),
     enableConfigDiscovery: false,
     enableExperimentalMode: false,
     skipCustomInstructions: true,

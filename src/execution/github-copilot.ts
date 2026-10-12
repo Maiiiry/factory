@@ -60,7 +60,7 @@ export interface GitHubCopilotWorkerInput {
   config: GitHubCopilotSdkConfig;
   providerTurnIdleTimeoutMs?: number;
   session?: CopilotWorkerSession;
-  action?: "release";
+  action?: "release" | "release-unavailable";
 }
 
 const copilotAuthenticationEnvironment = [
@@ -126,9 +126,7 @@ export function githubCopilotWorkerEnvironment(
 
 export class GitHubCopilotSdkHarness implements AgentHarness {
   readonly sessionAdapter = COPILOT_SESSION_ADAPTER;
-  // Retention plumbing remains available for owned receipts, but new work stays
-  // fresh until native account, installed restart and workspace binding qualify it.
-  readonly sessionCapabilities = undefined;
+  readonly sessionCapabilities = { resumeRoles: ["implementation"] } as const;
   readonly capabilities = {
     childAgents: "disabled",
     protocolVersion: 1,
@@ -382,7 +380,10 @@ export class GitHubCopilotSdkHarness implements AgentHarness {
         ),
         input: {
           ...input,
-          action: "release",
+          action:
+            session.status === "unavailable"
+              ? "release-unavailable"
+              : "release",
           session: { ...input.session, resume: true },
         },
         env: githubCopilotWorkerEnvironment(join(this.root, "empty-gh-config")),
