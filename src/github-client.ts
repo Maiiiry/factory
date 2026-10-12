@@ -45,7 +45,21 @@ export interface GitHubTransportObservation {
 const transportObserver = new AsyncLocalStorage<
   (observation: GitHubTransportObservation) => void
 >();
+const requestBudgets = new AsyncLocalStorage<number>();
 const TRANSPORT = Symbol("github-transport-observation");
+
+/** Bound HTTP only; preparation and mandatory retention keep their owner budget. */
+export function withGitHubRequestBudget<T>(
+  milliseconds: number,
+  run: () => T,
+): T {
+  if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0)
+    throw new Error("GitHub request budget must be a positive safe integer");
+  return requestBudgets.run(
+    Math.min(milliseconds, requestBudgets.getStore() ?? milliseconds),
+    run,
+  );
+}
 
 /** Scoped to one controller operation, including concurrent calls; never a global subscriber. */
 export function withGitHubTransportObserver<T>(
@@ -833,6 +847,7 @@ export class GitHubClient {
     readOnly: boolean,
   ): Promise<T> {
     const signal = currentProcessSignal();
+    let requestSignal = signal;
     let transport: GitHubTransportObservation = {
       method: method as GitHubTransportObservation["method"],
       operation: readOnly ? "read" : "mutation",
@@ -889,6 +904,15 @@ export class GitHubClient {
           transient(`GitHub rate limit until ${until}`, false, until),
         );
       }
+      // Queue and credential preparation use the original owner cancellation.
+      // Start the request clock only when handing this request to Octokit.
+      if (signal?.aborted) throw cancelled();
+      const budget = requestBudgets.getStore();
+      if (budget !== undefined)
+        requestSignal = AbortSignal.any([
+          ...(signal ? [signal] : []),
+          AbortSignal.timeout(budget),
+        ]);
       try {
         transport.dispatch = "sent";
         const response = await client.request(`${method} /${route}`, {
@@ -898,7 +922,7 @@ export class GitHubClient {
             "x-github-api-version": "2026-03-10",
             ...(observation?.etag ? { "if-none-match": observation.etag } : {}),
           },
-          request: { signal },
+          request: { signal: requestSignal },
         });
         transport = {
           ...transport,
@@ -929,10 +953,19 @@ export class GitHubClient {
             data?: unknown;
           };
         };
+        const failure = transportFailure(cause, requestSignal);
+        if (
+          requestSignal?.aborted &&
+          transportFailure(requestSignal.reason, requestSignal).timeout === true
+        ) {
+          failure.timeout = true;
+          if (["unknown", "cancelled"].includes(failure.category))
+            failure.category = "timeout";
+        }
         transport = {
           ...transport,
           ...responseFacts(error.response),
-          ...transportFailure(cause, signal),
+          ...failure,
         };
         if (transport.status !== null && transport.category === "unknown")
           transport.category = "http";
@@ -952,7 +985,7 @@ export class GitHubClient {
         // A mutation may have reached GitHub even when its response was lost.
         if (
           !readOnly &&
-          (!error.status || error.status >= 500 || signal?.aborted)
+          (!error.status || error.status >= 500 || requestSignal?.aborted)
         )
           throw attachFault(
             new Error(`GitHub ${method} outcome unknown`),

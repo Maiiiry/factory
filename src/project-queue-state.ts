@@ -55,7 +55,7 @@ import {
   type ControllerLock,
 } from "./state-store.js";
 import { canHandoff } from "./runner/ownership.js";
-import { isExecutionState } from "./state.js";
+import { isExecutionState, isPreparationState } from "./state.js";
 import { linuxProcessIdentity } from "./process.js";
 
 export const queueDigest = (value: string): string =>
@@ -166,8 +166,49 @@ export interface QueueOwnerClaim {
     runId?: string;
     disposition: "quiescent";
     cancellation?: QueueCancellationProof;
+    handoff?: QueueStoppedHandoffProof;
   };
 }
+/** A new recovery owner proves only local cessation of the original stopped planning run. */
+export interface QueueStoppedHandoffProof {
+  schemaVersion: 1;
+  originalClaim: ContentRef;
+  stoppedSnapshot: ContentRef;
+  configDigest: string;
+  owner: { pid: number; startTime: string; tokenDigest: string };
+}
+function assertStoppedClaimState(state: ContinuationState): void {
+  if (
+    !isPreparationState(state) ||
+    state.cancelRequested ||
+    state.cancelledAt ||
+    state.planningRecovery?.phase !== "stopped" ||
+    !canHandoff(state) ||
+    restoredContinuationOwnershipHold(state)
+  )
+    throw new Error(
+      "Project handoff requires the original nonterminal stopped planning run and settled native resources",
+    );
+  const recovery = state.planningRecovery;
+  const receipts = [
+    ...(recovery.invocations ?? []),
+    ...recovery.history.flatMap((entry) => entry.invocations),
+  ];
+  if (
+    receipts.some((receipt) => !receipt.resultDigest) ||
+    (recovery.invocation &&
+      !receipts.some(
+        (receipt) =>
+          receipt.id === recovery.invocation!.id &&
+          receipt.phase === recovery.invocation!.phase &&
+          receipt.resultDigest,
+      ))
+  )
+    throw new Error(
+      "Stopped Project handoff has an unresolved retained planning invocation",
+    );
+}
+
 export interface QueueCancellationProof {
   schemaVersion: 1;
   originalClaim: ContentRef;
@@ -282,13 +323,40 @@ export function parseQueueRecord(
     }
     if (row.settled !== undefined) {
       const settled = object(row.settled);
-      only(settled, ["at", "runId", "disposition", "cancellation"]);
+      only(settled, ["at", "runId", "disposition", "cancellation", "handoff"]);
       if (
         !date(settled.at) ||
         settled.disposition !== "quiescent" ||
         (settled.runId !== undefined && !uuid(settled.runId))
       )
         throw new Error("Invalid Project queue owner settlement");
+      if (settled.handoff !== undefined) {
+        const proof = object(settled.handoff);
+        only(proof, [
+          "schemaVersion",
+          "originalClaim",
+          "stoppedSnapshot",
+          "configDigest",
+          "owner",
+        ]);
+        const owner = object(proof.owner);
+        only(owner, ["pid", "startTime", "tokenDigest"]);
+        if (
+          settled.cancellation !== undefined ||
+          !row.runBinding ||
+          proof.schemaVersion !== 1 ||
+          !uuid(settled.runId) ||
+          !ref(proof.originalClaim) ||
+          !ref(proof.stoppedSnapshot) ||
+          !digest(proof.configDigest) ||
+          !Number.isSafeInteger(owner.pid) ||
+          Number(owner.pid) < 1 ||
+          typeof owner.startTime !== "string" ||
+          !owner.startTime ||
+          !digest(owner.tokenDigest)
+        )
+          throw new Error("Invalid attributable stopped Project handoff proof");
+      }
       if (settled.cancellation !== undefined) {
         const proof = object(settled.cancellation);
         only(proof, [
@@ -599,6 +667,11 @@ function queueOwnerReferences(record: QueueOwnerClaim): ContentRef[] {
         ),
       );
   }
+  if (record.settled?.handoff)
+    refs.push(
+      record.settled.handoff.originalClaim,
+      record.settled.handoff.stoppedSnapshot,
+    );
   const distinct = new Map<string, ContentRef>();
   for (const reference of refs) {
     const previous = distinct.get(reference.digest);
@@ -646,6 +719,37 @@ function assertQueueOwnerReferenceBodies(
       snapshot(record.runBinding.initialSnapshot),
       record.runBinding.runId,
     );
+  if (record.settled?.handoff) {
+    const proof = record.settled.handoff;
+    const original = parseQueueRecord(
+      bytes(proof.originalClaim),
+      record.repository,
+      record.id,
+    );
+    const { settled: _settled, ...binding } = record;
+    if (
+      original.kind !== "project-queue-owner" ||
+      original.settled ||
+      !original.runBinding ||
+      JSON.stringify(binding) !== JSON.stringify(original) ||
+      original.runBinding.runId !== record.settled.runId
+    )
+      throw new Error(
+        "Stopped handoff differs from its original producer-bound Project claim",
+      );
+    const initial = snapshot(original.runBinding.initialSnapshot);
+    const stopped = snapshot(proof.stoppedSnapshot);
+    matches(initial, original.runBinding.runId);
+    matches(stopped, original.runBinding.runId);
+    if (
+      initial.configDigest !== proof.configDigest ||
+      stopped.configDigest !== proof.configDigest
+    )
+      throw new Error(
+        "Stopped handoff configuration differs from its original run",
+      );
+    assertStoppedClaimState(stopped);
+  }
   const proof = record.settled?.cancellation;
   if (proof) {
     const original = parseQueueRecord(
@@ -1387,6 +1491,168 @@ export function bindProjectQueueRun(
     initialSnapshot: store.putBytes(bytes, { mediaType: "application/json" }),
   };
   save(claim);
+}
+
+/** Neutral stopped-owner handoff; never cancels, resumes or retries the original run. */
+export async function settleStoppedProjectQueueRun(
+  config: FactoryConfig,
+  state: ContinuationState,
+  lock: ControllerLock,
+): Promise<void> {
+  requireProjectQueueEffects(config);
+  assertStoppedClaimState(state);
+  if (
+    state.repository !== config.repository ||
+    !continuationConfigurationMatches(state, config)
+  )
+    throw new Error("Stopped Project handoff configuration differs");
+  const lockPath = objectiveLockPath(config.repository, state.objective);
+  const assertOwner = () => {
+    const identity = linuxProcessIdentity(process.pid);
+    const owner = readControllerOwner(lockPath);
+    if (
+      !identity ||
+      !owner ||
+      owner.token !== lock.token ||
+      owner.pid !== process.pid ||
+      owner.startTime !== identity.startTime ||
+      owner.objective !== state.objective
+    )
+      throw new Error(
+        "Stopped Project handoff requires its actual exclusive recovery owner",
+      );
+    return owner;
+  };
+  assertOwner();
+  await awaitCheckpointAdmission(config.repository, "explicit");
+  const history = await readQueueHistory(config);
+  if (
+    history.some(
+      (record) =>
+        record.kind === "project-queue-operation" && !record.completed,
+    )
+  )
+    throw new Error(
+      "Stopped Project handoff cannot settle an unfinished queue mutation",
+    );
+  const pending = history.filter(
+    (record): record is QueueOwnerClaim =>
+      record.kind === "project-queue-owner" && !record.settled,
+  );
+  if (!pending.length) return;
+  if (pending.length !== 1 || pending[0]!.objective !== state.objective)
+    throw new Error("Stopped Project handoff has competing unfinished claims");
+  const claim = pending[0]!;
+  const admission = history.find(
+    (record): record is QueueOperation =>
+      record.kind === "project-queue-operation" &&
+      record.id === claim.receiptId,
+  );
+  const metadata = admission?.metadata
+    ? parseQueueMetadata(admission.metadata)
+    : undefined;
+  const effect = admission?.effects.at(-1);
+  if (
+    !claim.runBinding ||
+    claim.runBinding.runId !== state.runId ||
+    claim.authorityDigest !== factoryAuthorityDigest(config) ||
+    claim.bodyDigest !== state.objectiveBodyDigest ||
+    claim.deadlineAt !== (state.coordinator?.deadlineAt ?? null) ||
+    !admission?.completed ||
+    admission.action !== "admit" ||
+    admission.objective !== state.objective ||
+    admission.bodyDigest !== claim.bodyDigest ||
+    admission.authorityDigest !== claim.authorityDigest ||
+    JSON.stringify(admission.binding) !==
+      JSON.stringify(config.queue?.project) ||
+    metadata?.kind !== "admission" ||
+    metadata.state !== "queued" ||
+    metadata.admissionId !== claim.admissionId ||
+    metadata.receiptId !== claim.receiptId ||
+    effect?.intent.action !== "set-metadata" ||
+    effect.intent.metadata !== admission.metadata ||
+    effect.receipt?.kind !== "response" ||
+    !effect.original
+  )
+    throw new Error(
+      "Stopped handoff differs from its original authenticated Project admission",
+    );
+  const archive = await readVerifiedRecoveryCheckpoint(config);
+  const snapshotFile = archive.manifest.files.find(
+    (file) => file.path === `objectives/${state.objective}/state.json`,
+  );
+  const claimFile = archive.manifest.files.find(
+    (file) => file.path === `project-queue-history/${claim.id}.json`,
+  );
+  if (!snapshotFile || !claimFile)
+    throw new Error("Stopped handoff exact archived originals are unavailable");
+  const store = new LocalContentStore(
+    join(stateRoot(config.repository), "content"),
+  );
+  for (const reference of [
+    snapshotFile.ref,
+    claimFile.ref,
+    claim.runBinding.initialSnapshot,
+  ])
+    retainProjectQueueOriginal(
+      store,
+      reference,
+      await archive.readVerifiedBlob(reference),
+    );
+  const snapshotBytes = store.readBytes(snapshotFile.ref);
+  const originalClaimBytes = store.readBytes(claimFile.ref);
+  const currentClaimPath = join(
+    stateRoot(config.repository),
+    "project-queue-history",
+    `${claim.id}.json`,
+  );
+  const owner = assertOwner();
+  if (
+    !Buffer.from(snapshotBytes).equals(
+      readFileSync(statePath(config.repository, state.objective)),
+    ) ||
+    !Buffer.from(originalClaimBytes).equals(privateBytes(currentClaimPath)) ||
+    JSON.stringify(
+      parsePortableContinuation(
+        JSON.parse(Buffer.from(snapshotBytes).toString("utf8")),
+        config.repository,
+        state.objective,
+      ),
+    ) !== JSON.stringify(state)
+  )
+    throw new Error(
+      "Stopped handoff claim or continuation changed during authentication",
+    );
+  claim.settled = {
+    at: new Date().toISOString(),
+    runId: state.runId,
+    disposition: "quiescent",
+    handoff: {
+      schemaVersion: 1,
+      originalClaim: claimFile.ref,
+      stoppedSnapshot: snapshotFile.ref,
+      configDigest: state.configDigest,
+      owner: {
+        pid: owner.pid,
+        startTime: owner.startTime,
+        tokenDigest: queueDigest(owner.token),
+      },
+    },
+  };
+  await authenticateQueueOwnerReferences(claim, (reference) =>
+    store.readBytes(reference),
+  );
+  // Reference authentication above is asynchronous; authenticate the exclusive originals again.
+  assertOwner();
+  if (
+    !Buffer.from(snapshotBytes).equals(
+      readFileSync(statePath(config.repository, state.objective)),
+    ) ||
+    !Buffer.from(originalClaimBytes).equals(privateBytes(currentClaimPath))
+  )
+    throw new Error("Stopped handoff originals changed before settlement");
+  save(claim);
+  await awaitCheckpointAdmission(config.repository, "explicit");
 }
 
 /** Cancellation settles only the authenticated claim for this terminal run. */
