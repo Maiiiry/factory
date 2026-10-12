@@ -64,6 +64,8 @@ import {
   authenticateDiscoveryOutput,
   discoverRepository,
 } from "../dist/discovery.js";
+import { CopilotUsage } from "../dist/execution/github-copilot-usage.js";
+import { WorkerInteractionCapture } from "../dist/execution/interaction-capture.js";
 import { withGitHubRequestBudget } from "../dist/github-client.js";
 import { graphDigest } from "../dist/graph-amendments.js";
 import { materializeGraphExpansion } from "../dist/graph-expansion.js";
@@ -5231,4 +5233,109 @@ test("memory source admission precedes same-Objective relevance and binary bodie
     }).record.sources[0].retrievedAt,
     reference.record.sources[0].retrievedAt,
   );
+});
+
+test("Copilot usage deduplicates concrete calls without tracing-ID authority", () => {
+  // Pinned SDK contract cases, not a remote provider or live qualification.
+  const event = (id, apiCallId, providerCallId, outputTokens) => ({
+    type: "assistant.usage",
+    id,
+    data: {
+      apiCallId,
+      providerCallId,
+      inputTokens: 20,
+      outputTokens,
+      cacheReadTokens: 4,
+      cacheWriteTokens: 8,
+      reasoningTokens: 2,
+    },
+  });
+  const first = event("usage-a", "completion-a", "shared-trace", 3);
+  const second = event("usage-b", "completion-b", "shared-trace", 5);
+  const usage = new CopilotUsage([]);
+  assert.ok(usage.observe(first, "session"));
+  assert.ok(usage.observe(second, "session"));
+  assert.equal(usage.observe(first, "session"), undefined);
+  assert.deepEqual(usage.totals(), {
+    cachedInputTokens: 8,
+    cacheWriteInputTokens: 16,
+    outputTokens: 8,
+    reasoningOutputTokens: 4,
+  });
+  const resumed = new CopilotUsage([]);
+  resumed.excludeHistory([first], "session");
+  assert.equal(resumed.observe(first, "session"), undefined);
+  assert.ok(resumed.observe(second, "session"));
+  assert.equal(resumed.totals().outputTokens, 5);
+});
+
+test("Copilot conflicting usage stays private evidence without accounted counters", () => {
+  const repository = `fixture/copilot-usage-${randomUUID()}`;
+  const invocationId = randomUUID();
+  const progress = join(
+    mkdtempSync(join(tmpdir(), "factory-copilot-usage-")),
+    "progress.ndjson",
+  );
+  const request = {
+    capture: {
+      context: {
+        repository,
+        objective: 1,
+        runId: "local-contract-check",
+        invocationId,
+        providerAttempt: 1,
+        phase: "implementation",
+        adapter: "@github/copilot-sdk@1.0.13",
+        configured: { provider: "github-copilot", model: "not-invoked" },
+      },
+      policy: { enabled: true, maxBytesPerInvocation: 4096 },
+    },
+  };
+  const capture = new WorkerInteractionCapture(request, progress, []);
+  const usage = new CopilotUsage([]);
+  const first = {
+    type: "assistant.usage",
+    id: "original-event",
+    data: {
+      apiCallId: "same-completion",
+      providerCallId: "tracing-only",
+      inputTokens: 20,
+      outputTokens: 3,
+      cacheReadTokens: 4,
+      cacheWriteTokens: 8,
+      reasoningTokens: 2,
+    },
+  };
+  const conflicting = {
+    ...first,
+    id: "new-event",
+    data: { ...first.data, outputTokens: 5 },
+  };
+  capture.copilot(first, "session", usage.observe(first, "session"));
+  const observed = usage.observe(conflicting, "session");
+  assert.equal(observed.ambiguityReason, "conflicting-counters");
+  assert.deepEqual(observed.conflictingIdentityKinds, ["api"]);
+  assert.deepEqual(observed.normalizedUsage, {});
+  assert.deepEqual(usage.totals(), {});
+  capture.copilot(conflicting, "session", observed);
+  capture.copilot(
+    conflicting,
+    "session",
+    usage.observe(conflicting, "session"),
+  );
+  const records = readAccountingRecords(repository, 1).map(
+    (record) => record.capture,
+  );
+  assert.equal(records.length, 2);
+  const diagnostic = records.find((record) => record.usage.ambiguityReason);
+  assert.equal(diagnostic.usage.providerEventId, "new-event");
+  assert.equal(diagnostic.usage.apiCallId, "same-completion");
+  assert.equal(diagnostic.usage.providerCallId, "tracing-only");
+  assert.deepEqual(diagnostic.usage.conflictingIdentityKinds, ["api"]);
+  const { apiCallId, providerCallId, ...rawCounters } = conflicting.data;
+  assert.deepEqual(diagnostic.usage.raw, rawCounters);
+  assert.deepEqual(diagnostic.usage.normalized, {});
+  assert.equal(diagnostic.usage.completeness, "unavailable");
+  // Per-call diagnostic records never become invocation-cumulative worker charges.
+  assert.deepEqual(readUsageSummaryEvents(repository, 1), []);
 });
