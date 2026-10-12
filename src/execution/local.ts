@@ -1291,7 +1291,9 @@ export async function collectWorktreeResult(
   checkpointAssets?: (assets: CapturedAssetSet[]) => Promise<void>,
 ): Promise<ExecutionResult> {
   const handoffPath = join(worktree, ".factory-handoff.json");
-  const handoffNotes = judgedAsWork(() => readWorkHandoff(worktree));
+  const handoffNotes = judgedAsWork(() =>
+    readWorkHandoff(worktree, request.handoffPeers),
+  );
   if (handoffNotes) {
     if (
       pinnedGit(worktree, "ls-tree", "HEAD", "--", ".factory-handoff.json") ||
@@ -2088,6 +2090,9 @@ export class LocalExecutionDriver implements ExecutionDriver {
       });
       const managerUpdate = packageManagerUpdate(request.objectiveBody ?? "");
       const preparedHarnessRequest: HarnessRequest = {
+        ...(request.handoffPeers && {
+          handoffPeers: structuredClone(request.handoffPeers),
+        }),
         ...(request.childAgents && { childAgents: request.childAgents }),
         ...(request.discovery &&
           discoveryBody && {

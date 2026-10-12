@@ -317,6 +317,9 @@ export async function runWorker(
         attemptId: work.attempt,
       },
       item: attemptedItem,
+      handoffPeers: state.graph.items
+        .filter((peer) => peer.id !== item.id)
+        .map(({ id, title }) => ({ id, title })),
       ...(retained && args.driver.retainedFailedResultContext === true
         ? { retainedFailedResult: retained }
         : {}),
