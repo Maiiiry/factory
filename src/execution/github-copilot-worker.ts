@@ -16,9 +16,9 @@ import {
 } from "./github-copilot.js";
 import { bounded, cleanupCopilotClient } from "./github-copilot-lifecycle.js";
 import {
+  assertCopilotToolPolicy,
   githubCopilotClientOptions,
   githubCopilotSessionOptions,
-  assertCopilotToolPolicy,
 } from "./github-copilot-options.js";
 import {
   type CopilotSessionData,
@@ -306,6 +306,7 @@ async function main(): Promise<void> {
       capture.copilot(event, nativeId, observedUsage);
       if (!progressLost)
         try {
+          // Only exact duplicates/history are omitted; ambiguous counters stay private evidence.
           if (event.type === "assistant.usage" && !observedUsage) return;
           privateProgress(progressPath, {
             ...progressEvent(

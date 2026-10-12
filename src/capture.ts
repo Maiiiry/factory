@@ -11,13 +11,13 @@ import {
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
-import { stateRoot } from "./config.js";
-import { LocalContentStore } from "./content/local.js";
-import type { ContentRef } from "./contracts.js";
 import {
   readAccountingRecords,
   retainAccountingCapture,
 } from "./accounting.js";
+import { stateRoot } from "./config.js";
+import { LocalContentStore } from "./content/local.js";
+import type { ContentRef } from "./contracts.js";
 import {
   diagnosticPath,
   privateRecords,
@@ -254,6 +254,17 @@ export interface InteractionMetadata {
     inputSemantics?: "provider-reported-inclusion-unknown";
     /** Stable observation identity where provided; missing means dedup unknown. */
     deduplicationKey?: string;
+    /** Native usage observations; tracing identifiers never establish call identity. */
+    providerEventId?: string;
+    apiCallId?: string;
+    providerCallId?: string;
+    /** Conflicting or unidentified observations are diagnostics, not accounted calls. */
+    ambiguityReason?:
+      | "missing-session-identity"
+      | "missing-event-identity"
+      | "conflicting-counters"
+      | "identity-collision";
+    conflictingIdentityKinds?: ("event" | "api")[];
     terminal: boolean;
     completeness: "available-categories" | "unavailable";
     normalized: {
