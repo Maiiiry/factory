@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isDeepStrictEqual } from "node:util";
 import type { SessionEvent } from "@github/copilot-sdk";
 import { GITHUB_COPILOT_SDK_ADAPTER_IDENTITY } from "../config.js";
 import type { WorkerUsageObservation } from "../contracts.js";
@@ -17,6 +16,7 @@ import {
 } from "./github-copilot.js";
 import { bounded, cleanupCopilotClient } from "./github-copilot-lifecycle.js";
 import {
+  assertCopilotToolPolicy,
   githubCopilotClientOptions,
   githubCopilotSessionOptions,
 } from "./github-copilot-options.js";
@@ -79,56 +79,63 @@ async function release(
   };
   const { CopilotClient } = await import("@github/copilot-sdk");
   const client = new CopilotClient(
-    githubCopilotClientOptions(
-      releaseInput,
-      process.env,
-      process.env.COPILOT_HOME ?? join(process.env.HOME ?? "", ".copilot"),
-    ),
+    githubCopilotClientOptions(releaseInput, process.env, home),
   );
   let session: import("@github/copilot-sdk").CopilotSession | undefined;
   let failure: unknown;
   try {
     await bounded(client.start(), 2_000, "Copilot release startup timed out");
-    session = await bounded(
-      client.resumeSession(input.session.nativeSessionId, {
-        ...githubCopilotSessionOptions(releaseInput),
-        infiniteSessions: { enabled: false },
-        continuePendingWork: false,
-      }),
-      2_000,
-      "Copilot release attachment timed out",
-    );
-    if (session.sessionId !== input.session.nativeSessionId)
-      throw new Error("Copilot deletion session identity changed");
-    const metadata = await bounded(
-      session.rpc.metadata.snapshot(),
-      2_000,
-      "Copilot release ownership check timed out",
-    );
-    if (
-      metadata.alreadyInUse !== false ||
-      metadata.isRemote !== false ||
-      metadata.sessionId !== input.session.nativeSessionId
-    )
-      throw new Error(
-        "Copilot deletion did not establish exclusive local ownership",
+    if (input.action === "release-unavailable") {
+      // A failed startup can own private workspace metadata without an event
+      // stream. The controller proved worker cessation and storage ownership;
+      // SDK-positive exact-ID deletion requires no attachment or inference.
+      await bounded(
+        client.deleteSession(input.session.nativeSessionId),
+        2_000,
+        "Copilot unavailable session deletion timed out",
       );
-    const [processing, activity] = await bounded(
-      Promise.all([
-        session.rpc.metadata.isProcessing(),
-        session.rpc.metadata.activity(),
-      ]),
-      2_000,
-      "Copilot release activity check timed out",
-    );
-    if (
-      processing.processing !== false ||
-      activity.hasActiveWork !== false ||
-      activity.abortable !== false
-    )
-      throw new Error(
-        "Copilot deletion still has active or unknown native work",
+    } else {
+      session = await bounded(
+        client.resumeSession(input.session.nativeSessionId, {
+          ...githubCopilotSessionOptions(releaseInput),
+          infiniteSessions: { enabled: false },
+          continuePendingWork: false,
+        }),
+        2_000,
+        "Copilot release attachment timed out",
       );
+      if (session.sessionId !== input.session.nativeSessionId)
+        throw new Error("Copilot deletion session identity changed");
+      const metadata = await bounded(
+        session.rpc.metadata.snapshot(),
+        2_000,
+        "Copilot release ownership check timed out",
+      );
+      if (
+        metadata.alreadyInUse !== false ||
+        metadata.isRemote !== false ||
+        metadata.sessionId !== input.session.nativeSessionId
+      )
+        throw new Error(
+          "Copilot deletion did not establish exclusive local ownership",
+        );
+      const [processing, activity] = await bounded(
+        Promise.all([
+          session.rpc.metadata.isProcessing(),
+          session.rpc.metadata.activity(),
+        ]),
+        2_000,
+        "Copilot release activity check timed out",
+      );
+      if (
+        processing.processing !== false ||
+        activity.hasActiveWork !== false ||
+        activity.abortable !== false
+      )
+        throw new Error(
+          "Copilot deletion still has active or unknown native work",
+        );
+    }
   } catch (error) {
     failure = error;
   }
@@ -149,7 +156,7 @@ async function main(): Promise<void> {
   const input = JSON.parse(
     readFileSync(inputPath, "utf8"),
   ) as GitHubCopilotWorkerInput;
-  if (input.action === "release") {
+  if (input.action === "release" || input.action === "release-unavailable") {
     await release(input, resultPath);
     return;
   }
@@ -299,6 +306,7 @@ async function main(): Promise<void> {
       capture.copilot(event, nativeId, observedUsage);
       if (!progressLost)
         try {
+          // Only exact duplicates/history are omitted; ambiguous counters stay private evidence.
           if (event.type === "assistant.usage" && !observedUsage) return;
           privateProgress(progressPath, {
             ...progressEvent(
@@ -368,16 +376,23 @@ async function main(): Promise<void> {
       );
     await race(session.rpc.tools.initializeAndValidate());
     const offered = await race(session.rpc.tools.getCurrentMetadata());
-    if (
-      !offered.tools ||
-      !isDeepStrictEqual(
-        offered.tools.map((tool) => tool.name).sort(),
-        [...input.config.availableTools].sort(),
-      )
-    )
-      throw new Error(
-        "Copilot effective tool policy does not match the current Work Item",
-      );
+    capture.native(
+      {
+        kind: "interaction",
+        providerEvent: "session.tools.catalog",
+        providerSessionId: session.sessionId,
+        coverage: "sdk-exposed",
+      },
+      () => ({
+        configuredTools: input.config.availableTools,
+        requestedTools: sessionOptions.availableTools,
+        nativeTools: offered.tools?.map((tool) => tool.name) ?? null,
+      }),
+    );
+    assertCopilotToolPolicy(
+      input,
+      offered.tools?.map((tool) => tool.name),
+    );
     if (input.session) {
       if (session.sessionId !== input.session.nativeSessionId)
         throw new Error("Copilot native session identity changed");
@@ -435,7 +450,8 @@ async function main(): Promise<void> {
         configuredModel: input.config.model,
         observedModel: metadata.selectedModel,
         reasoningEffort: input.config.reasoningEffort,
-        availableTools: input.config.availableTools,
+        configuredTools: input.config.availableTools,
+        availableTools: offered.tools?.map((tool) => tool.name),
         authenticationType: authentication.authType,
         finalResponse: response?.data.content ?? "",
       },
