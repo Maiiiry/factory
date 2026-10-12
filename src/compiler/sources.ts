@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { markdownLines } from "../markdown.js";
 import type { WorkGraph } from "../contracts.js";
+import type { ReviewPacket } from "../review-evidence.js";
 import {
   plannedPackageManager,
   packageManagerUpdate,
@@ -167,6 +168,86 @@ export function planningGraphView(graph: WorkGraph, sources: PlanningSource[]) {
             return check;
           const { text: _text, ...identity } = check.source;
           return { ...check, source: { ...identity, sourceSpan } };
+        },
+      ),
+    }),
+  };
+}
+
+/** Review references belong to this exact evidence packet, never the compiler catalog. */
+export function reviewGraphView(
+  graph: WorkGraph,
+  evidence: ReviewPacket["evidence"],
+) {
+  const view = planningGraphView(graph, evidence);
+  const reference = (
+    span: {
+      sourceIndex: number;
+      sourceDigest: string;
+      start: number;
+      length: number;
+      contentDigest: string;
+      heading?: string;
+    },
+    path: string,
+  ) => {
+    const row = evidence[span.sourceIndex];
+    if (
+      !row ||
+      !row.complete ||
+      row.path !== path ||
+      row.digest !== span.sourceDigest ||
+      createHash("sha256").update(row.content).digest("hex") !==
+        span.sourceDigest ||
+      span.start < 0 ||
+      span.length <= 0 ||
+      span.start + span.length > row.content.length ||
+      createHash("sha256")
+        .update(row.content.slice(span.start, span.start + span.length))
+        .digest("hex") !== span.contentDigest
+    )
+      throw new Error(
+        "Graph review span requires complete authenticated evidence",
+      );
+    const { sourceIndex, ...selection } = span;
+    return {
+      evidenceIndex: sourceIndex,
+      evidenceId: row.id,
+      path: row.path,
+      ...selection,
+    };
+  };
+  const itemView = (item: (typeof view.items)[number]) => ({
+    ...item,
+    ...(item.inputSources && {
+      inputSources: item.inputSources.map((input) => {
+        if (!("sourceSpan" in input)) return input;
+        const { sourceSpan, ...identity } = input;
+        return { ...identity, evidenceSpan: reference(sourceSpan, input.path) };
+      }),
+    }),
+  });
+  return {
+    ...view,
+    items: view.items.map(itemView),
+    ...(view.expansions && {
+      expansions: view.expansions.map((envelope) => ({
+        ...envelope,
+        template: itemView(envelope.template),
+      })),
+    }),
+    ...(view.requiredPreIntegrationChecks && {
+      requiredPreIntegrationChecks: view.requiredPreIntegrationChecks.map(
+        (check) => {
+          if (!("sourceSpan" in check.source)) return check;
+          const { sourceSpan, ...identity } = check.source;
+          return {
+            ...check,
+            source: {
+              ...identity,
+              evidenceSpan: reference(sourceSpan, check.source.path),
+            },
+          };
         },
       ),
     }),
