@@ -112,6 +112,9 @@ export async function prepareOpenAIInput(args: {
     request: { ...request, sourceAssets },
     harnessRequest: {
       item: request.item,
+      ...(request.handoffPeers && {
+        handoffPeers: structuredClone(request.handoffPeers),
+      }),
       packageManagerUpdate: packageManagerUpdate(request.objectiveBody ?? ""),
       worktree: "/workspace/repo",
       attemptId: request.attemptId,

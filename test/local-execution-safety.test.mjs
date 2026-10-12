@@ -48,7 +48,9 @@ import {
   objectiveKnowledgeView,
   publishObjectiveKnowledge,
   reviewObjectiveKnowledge,
+  workHandoffSchema,
 } from "../dist/objective-knowledge.js";
+import { renderWorkItemPrompt } from "../dist/execution/harness-support.js";
 import {
   buildAdaptiveContext,
   authenticateAdaptiveContextPacket,
@@ -428,7 +430,14 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         docs: { status: "pending" },
       },
     };
-    const request = { item: producer, baseSha, attemptId: "schema-attempt" };
+    const request = {
+      item: producer,
+      baseSha,
+      attemptId: "schema-attempt",
+      handoffPeers: graph.items
+        .filter((item) => item.id !== producer.id)
+        .map(({ id, title }) => ({ id, title })),
+    };
     const store = new LocalContentStore(join(root, "private-content"));
     writeFileSync(join(checkout, "schema.json"), '{"timestamp":"UTC"}\n');
     const manifest = {
@@ -437,13 +446,13 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           kind: "interface",
           summary: "Timestamp uses UTC",
           paths: ["schema.json"],
-          consumers: ["api", "ui"],
+          consumerIndices: [0, 1],
         },
         {
           kind: "hypothesis",
           summary: "Investigate optional errors before integration",
           paths: ["missing.json"],
-          consumers: ["api"],
+          consumerIndices: [],
         },
       ],
     };
@@ -470,7 +479,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
             kind: "pitfall",
             summary: "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
             paths: ["schema.json"],
-            consumers: [],
+            consumerIndices: [],
           },
         ],
       }),
@@ -480,6 +489,49 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       /Secretlint found suspected secret/,
     );
     assert.equal(git(checkout, "rev-parse", "HEAD"), request.baseSha);
+    const emitted = renderWorkItemPrompt({
+      item: producer,
+      worktree: checkout,
+      handoffPeers: request.handoffPeers,
+    });
+    assert(emitted.prompt.includes(JSON.stringify(workHandoffSchema(3))));
+    assert(emitted.prompt.includes('"peerIndex":0,"title":"api"'));
+    const withoutPeers = renderWorkItemPrompt({
+      item: producer,
+      worktree: checkout,
+    });
+    assert(withoutPeers.prompt.includes("Omit peer-targeted handoff notes"));
+    assert(withoutPeers.prompt.includes(JSON.stringify(workHandoffSchema(0))));
+    for (const note of [
+      {
+        kind: "interface",
+        summary: "Unknown recipient",
+        paths: ["schema.json"],
+        consumerIndices: [3],
+      },
+      {
+        kind: "hypothesis",
+        summary: "Unfinished broad change",
+        paths: Array.from({ length: 9 }, (_, index) => `file-${index}.json`),
+        consumerIndices: [],
+      },
+    ]) {
+      writeFileSync(
+        join(checkout, ".factory-handoff.json"),
+        JSON.stringify({ notes: [note] }),
+      );
+      await assert.rejects(
+        () => collectWorktreeResult(checkout, checkout, request, store, {}),
+        /Handoff/,
+      );
+      assert.equal(git(checkout, "rev-parse", "HEAD"), request.baseSha);
+      assert.deepEqual(
+        JSON.parse(
+          readFileSync(join(checkout, ".factory-handoff.json"), "utf8"),
+        ),
+        { notes: [note] },
+      );
+    }
     writeFileSync(
       join(checkout, ".factory-handoff.json"),
       JSON.stringify(manifest),
@@ -895,6 +947,8 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     );
     assert.equal(importedResult.treeSha, result.treeSha);
     assert.deepEqual(importedResult.handoff, result.handoff);
+    assert.deepEqual(result.handoff.notes[0].consumers, ["api", "ui"]);
+    assert.deepEqual(result.handoff.notes[1].consumers, []);
     assert.equal(existsSync(join(checkout, ".factory-handoff.json")), false);
     assert.equal(
       git(checkout, "ls-tree", "HEAD", "--", ".factory-handoff.json"),
@@ -1060,7 +1114,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
               kind: "pitfall",
               summary: "Peer UI requires the timestamp format",
               paths: ["ui.json"],
-              consumers: ["api"],
+              consumerIndices: [0],
             },
           ],
         }),
@@ -1070,6 +1124,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         peerCheckout,
         {
           item: peer,
+          handoffPeers: [{ id: consumer.id, title: consumer.title }],
           baseSha: result.changeRef,
           attemptId: "ui-role-attempt",
         },

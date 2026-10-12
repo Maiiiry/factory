@@ -30,6 +30,7 @@ import {
   markCheckpointDirty,
   checkpointRetentionGaps,
   type RecoveryCheckpointClosure,
+  checkpointOriginalInventory,
 } from "./recovery-checkpoint.js";
 import {
   isCodexUsageIdentity,
@@ -735,23 +736,29 @@ export function readAccountingRecords(
   repository: string,
   objective?: number,
 ): AccountingRecord[] {
+  return readAccountingOriginals(repository)
+    .map(({ record }) => record)
+    .filter(
+      (record) =>
+        objective === undefined || record.binding.objective === objective,
+    );
+}
+function readAccountingOriginals(
+  repository: string,
+): { record: AccountingRecord; bytes: Buffer }[] {
   if (!existsSync(root(repository))) return [];
   privateDirectory(repository);
   return readdirSync(root(repository))
     .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
     .sort()
-    .map((name) =>
-      decodeAccountingRecord(
-        repository,
-        `accounting/${name}`,
-        privateBytes(join(root(repository), name)),
-      ),
-    )
-    .filter(
-      (record) =>
-        objective === undefined || record.binding.objective === objective,
-    )
-    .sort((left, right) => left.at.localeCompare(right.at));
+    .map((name) => {
+      const bytes = privateBytes(join(root(repository), name));
+      return {
+        record: decodeAccountingRecord(repository, `accounting/${name}`, bytes),
+        bytes,
+      };
+    })
+    .sort((left, right) => left.record.at.localeCompare(right.record.at));
 }
 export function accountingPersistenceClosure(
   repository: string,
@@ -802,33 +809,97 @@ export function accountingPersistenceClosure(
         required: true,
       });
   const store = new LocalContentStore(join(stateRoot(repository), "content"));
-  for (const record of readAccountingRecords(repository)) {
-    const bytes = Buffer.from(`${canonical(record)}\n`),
-      ref = store.putBytes(bytes, { mediaType: "application/json" }),
+  const inventory = checkpointOriginalInventory(
+    [root(repository)],
+    "accounting",
+  );
+  const originals = inventory
+    ? inventory.map((source) => ({ source }))
+    : readAccountingOriginals(repository).map((original) => ({ original }));
+  const projected: {
+    orderAt: string;
+    files: RecoveryCheckpointClosure["files"];
+    refs: ContentRef[];
+  }[] = [];
+  for (const entry of originals) {
+    const source = "source" in entry ? entry.source : undefined;
+    const signature =
+      source && JSON.stringify(["accounting-original", repository, source]);
+    const cached = signature
+      ? store.checkpointReferences(signature)
+      : undefined;
+    if (cached?.files && cached.orderAt) {
+      for (const ref of cached.contentRefs) store.verifyPrivateBytes(ref);
+      projected.push({
+        orderAt: cached.orderAt,
+        files: cached.files,
+        refs: cached.contentRefs,
+      });
+      continue;
+    }
+    const { record, bytes } =
+      "original" in entry
+        ? entry.original
+        : (() => {
+            const bytes = privateBytes(source!.path);
+            return {
+              bytes,
+              record: decodeAccountingRecord(
+                repository,
+                `accounting/${source!.path.split("/").at(-1)}`,
+                bytes,
+              ),
+            };
+          })();
+    const ref = store.putBytes(bytes, { mediaType: "application/json" }),
       path = `accounting/${ref.digest}.json`;
-    files.push({ kind: "historical", path, ref, visibility: "private" });
-    contentRefs.set(canonical(ref), ref);
-    if (record.kind !== "interaction") continue;
-    const content = record.capture.content,
-      reference = content.reference,
-      payload = reference?.payload;
-    if (content.payloadRetention === "retained") {
-      if (
-        !payload ||
-        reference?.recordId !== record.capture.recordId ||
-        reference.invocationId !== record.capture.invocationId ||
-        reference.providerAttempt !== record.capture.providerAttempt ||
-        payload.digest !== content.retainedDigest ||
-        payload.bytes !== content.retainedBytes ||
-        payload.mediaType !== "text/plain; charset=utf-8"
-      )
+    const file: RecoveryCheckpointClosure["files"][number] = {
+      kind: "historical",
+      path,
+      ref,
+      visibility: "private",
+    };
+    const recordRefs = [ref];
+    if (record.kind === "interaction") {
+      const content = record.capture.content,
+        reference = content.reference,
+        payload = reference?.payload;
+      if (content.payloadRetention === "retained") {
+        if (
+          !payload ||
+          reference?.recordId !== record.capture.recordId ||
+          reference.invocationId !== record.capture.invocationId ||
+          reference.providerAttempt !== record.capture.providerAttempt ||
+          payload.digest !== content.retainedDigest ||
+          payload.bytes !== content.retainedBytes ||
+          payload.mediaType !== "text/plain; charset=utf-8"
+        )
+          throw new Error(
+            "Accounting capture payload differs from its exact retained identity",
+          );
+        store.readBytes(payload);
+        recordRefs.push(payload);
+      } else if (payload)
         throw new Error(
-          "Accounting capture payload differs from its exact retained identity",
+          "Accounting capture declares an unretained payload body",
         );
-      store.readBytes(payload);
-      contentRefs.set(canonical(payload), payload);
-    } else if (payload)
-      throw new Error("Accounting capture declares an unretained payload body");
+    }
+    projected.push({ orderAt: record.at, files: [file], refs: recordRefs });
+    if (signature)
+      store.retainCheckpointReferences(signature, {
+        files: [file],
+        contentRefs: recordRefs,
+        gitObjects: [],
+        gaps: [],
+        originals: [],
+        orderAt: record.at,
+      });
+  }
+  for (const projection of projected.sort((left, right) =>
+    left.orderAt.localeCompare(right.orderAt),
+  )) {
+    files.push(...projection.files);
+    for (const ref of projection.refs) contentRefs.set(canonical(ref), ref);
   }
   return { files, contentRefs: [...contentRefs.values()], gaps };
 }
@@ -1085,7 +1156,7 @@ export async function assertAccountingSealContent(
   runId: string,
   seal: AccountingSeal,
   readBytes: (ref: ContentRef) => Uint8Array | Promise<Uint8Array>,
-): Promise<void> {
+): Promise<readonly AccountingRecord[]> {
   assertAccountingSealBinding(repository, objective, runId, seal);
   const records = await Promise.all(
     seal.records.map(async (ref) => {
@@ -1102,4 +1173,5 @@ export async function assertAccountingSealContent(
     }),
   );
   assertSealRecords(repository, objective, runId, seal, records);
+  return records;
 }
