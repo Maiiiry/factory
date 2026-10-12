@@ -21,6 +21,7 @@ import {
   claudeModelUsage,
   claudeRawTokenUsage,
 } from "./claude-usage.js";
+import type { CopilotUsageObservation } from "./github-copilot-usage.js";
 import { privateProgress, redact } from "./harness-support.js";
 
 /**
@@ -564,7 +565,7 @@ export class WorkerInteractionCapture {
   copilot(
     event: SessionEvent,
     sessionId?: string,
-    observedUsage?: Record<string, unknown>,
+    observedUsage?: CopilotUsageObservation,
   ): void {
     this.safely(() => {
       const base: CaptureEvent = {
@@ -657,7 +658,7 @@ export class WorkerInteractionCapture {
         this.writer!.record(base, () => ({ error: event.data.message }));
       else if (event.type === "assistant.usage") {
         if (!observedUsage) return;
-        const raw = observedUsage.usage as Record<string, number>;
+        const raw = observedUsage.usage;
         this.writer!.record({
           ...base,
           kind: "usage",
@@ -665,11 +666,18 @@ export class WorkerInteractionCapture {
           usage: {
             scope: "provider-call",
             terminal: false,
-            deduplicationKey:
-              event.data.apiCallId ?? event.data.providerCallId ?? event.id,
-            completeness: Object.keys(raw).length
-              ? "available-categories"
-              : "unavailable",
+            deduplicationKey: event.data.apiCallId ?? event.id,
+            providerEventId: observedUsage.providerEventId,
+            apiCallId: observedUsage.apiCallId,
+            providerCallId: observedUsage.providerCallId,
+            ...(observedUsage.ambiguityReason && {
+              ambiguityReason: observedUsage.ambiguityReason,
+              conflictingIdentityKinds: observedUsage.conflictingIdentityKinds,
+            }),
+            completeness:
+              !observedUsage.ambiguityReason && Object.keys(raw).length
+                ? "available-categories"
+                : "unavailable",
             raw,
             inputSemantics: "provider-reported-inclusion-unknown",
             normalized: normalizeTokenUsage(observedUsage.normalizedUsage),

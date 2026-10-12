@@ -3,8 +3,8 @@ import {
   closeSync,
   constants,
   existsSync,
-  fsyncSync,
   fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -25,12 +25,12 @@ import type {
   WorkerUsageObservation,
 } from "./contracts.js";
 import {
-  markAccountingGap,
-  resolveAccountingGap,
-  markCheckpointDirty,
-  checkpointRetentionGaps,
-  type RecoveryCheckpointClosure,
   checkpointOriginalInventory,
+  checkpointRetentionGaps,
+  markAccountingGap,
+  markCheckpointDirty,
+  type RecoveryCheckpointClosure,
+  resolveAccountingGap,
 } from "./recovery-checkpoint.js";
 import {
   isCodexUsageIdentity,
@@ -251,6 +251,9 @@ const rawCategories = [
   "reasoningOutputTokens",
   "totalTokens",
   "thinkingTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
 ];
 /** Fixed metadata schema: no prompts, arguments, output text, arbitrary evidence or native homes. */
 function safeCapture(value: unknown): InteractionMetadata {
@@ -375,11 +378,40 @@ function safeCapture(value: unknown): InteractionMetadata {
         "scope",
         "inputSemantics",
         "deduplicationKey",
+        "providerEventId",
+        "apiCallId",
+        "providerCallId",
+        "ambiguityReason",
         "terminal",
         "completeness",
         "rawScope",
       ]);
     projected.normalized = normalizeTokenUsage(body.normalized);
+    if (body.ambiguityReason !== undefined) {
+      if (
+        ![
+          "missing-session-identity",
+          "missing-event-identity",
+          "conflicting-counters",
+          "identity-collision",
+        ].includes(String(body.ambiguityReason))
+      )
+        throw new Error("Invalid accounting usage ambiguity reason");
+      projected.normalized = {};
+      projected.completeness = "unavailable";
+    }
+    if (body.conflictingIdentityKinds !== undefined) {
+      if (
+        !Array.isArray(body.conflictingIdentityKinds) ||
+        !body.conflictingIdentityKinds.every(
+          (kind) => kind === "event" || kind === "api",
+        )
+      )
+        throw new Error("Invalid accounting usage conflict identities");
+      projected.conflictingIdentityKinds = [
+        ...new Set(body.conflictingIdentityKinds),
+      ];
+    }
     if (body.raw !== undefined)
       projected.raw = pickTokenCounters(body.raw, rawCategories);
     if (body.modelBreakdown !== undefined)
