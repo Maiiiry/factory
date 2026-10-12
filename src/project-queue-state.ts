@@ -1111,15 +1111,16 @@ export function verifyQueueObservation(
   for (const card of snapshot.cards) {
     if (card.archived) continue;
     if (card.metadata === null) continue;
+    const metadata = parseQueueMetadata(card.metadata);
     const operation = producer(
       config,
       history,
       card.metadata,
       card.issueNodeId,
       card.itemId,
-      historical,
+      historical ||
+        (metadata.kind === "admission" && metadata.state === "withdrawn"),
     );
-    const metadata = parseQueueMetadata(card.metadata);
     if (
       metadata.kind !== "admission" ||
       operation.objective !== card.objective ||
