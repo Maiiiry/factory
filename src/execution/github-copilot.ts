@@ -60,7 +60,7 @@ export interface GitHubCopilotWorkerInput {
   config: GitHubCopilotSdkConfig;
   providerTurnIdleTimeoutMs?: number;
   session?: CopilotWorkerSession;
-  action?: "release";
+  action?: "release" | "release-unavailable";
 }
 
 const copilotAuthenticationEnvironment = [
@@ -380,7 +380,10 @@ export class GitHubCopilotSdkHarness implements AgentHarness {
         ),
         input: {
           ...input,
-          action: "release",
+          action:
+            session.status === "unavailable"
+              ? "release-unavailable"
+              : "release",
           session: { ...input.session, resume: true },
         },
         env: githubCopilotWorkerEnvironment(join(this.root, "empty-gh-config")),
