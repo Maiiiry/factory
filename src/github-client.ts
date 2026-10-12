@@ -2,8 +2,9 @@ import { Octokit } from "@octokit/core";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as time from "./clock.js";
 import {
-  QUEUE_READ_QUERIES,
+  isProjectQueueReadQuery,
   QUEUE_WRITE_QUERIES,
+  SET_ADMISSION_FIELDS,
 } from "./github-project-queue-wire.js";
 import {
   attachedFault,
@@ -13,6 +14,7 @@ import {
   type Fault,
 } from "./fault.js";
 import {
+  assertProcessActive,
   commandAsync,
   currentProcessSignal,
   withProcessCancellation,
@@ -668,15 +670,36 @@ export class GitHubClient {
     variables: Record<string, unknown>,
     readOnly: boolean,
   ): Promise<T> {
-    if (!(readOnly ? QUEUE_READ_QUERIES : QUEUE_WRITE_QUERIES).includes(query))
+    if (
+      !(readOnly
+        ? isProjectQueueReadQuery(query)
+        : QUEUE_WRITE_QUERIES.includes(query))
+    )
       throw new Error("Unsupported Project queue GraphQL operation");
-    const response = await this.dispatch<{ errors?: unknown[]; data?: T }>(
-      "POST",
-      "graphql",
-      { query, variables },
-      undefined,
-      readOnly,
-    );
+    // A compound response may contain a real partial outcome even on an HTTP
+    // rejection. Retain that body privately without changing transport faults.
+    const queueResponse =
+      query === SET_ADMISSION_FIELDS
+        ? ({} as { original?: unknown })
+        : undefined;
+    let response: { errors?: unknown[]; data?: T };
+    try {
+      response = await this.dispatch<{ errors?: unknown[]; data?: T }>(
+        "POST",
+        "graphql",
+        { query, variables },
+        undefined,
+        readOnly,
+        queueResponse,
+      );
+    } catch (error) {
+      if (queueResponse?.original !== undefined && error instanceof Error)
+        Object.defineProperty(error, "original", {
+          value: queueResponse.original,
+          enumerable: false,
+        });
+      throw error;
+    }
     if (
       (response.errors !== undefined &&
         (!Array.isArray(response.errors) || response.errors.length)) ||
@@ -845,6 +868,7 @@ export class GitHubClient {
     body: Record<string, unknown> | undefined,
     observation: { etag?: string } | undefined,
     readOnly: boolean,
+    queueResponse?: { original?: unknown },
   ): Promise<T> {
     const signal = currentProcessSignal();
     let requestSignal = signal;
@@ -913,6 +937,9 @@ export class GitHubClient {
           ...(signal ? [signal] : []),
           AbortSignal.timeout(budget),
         ]);
+      // A busy synchronous preparation can outlast the armed deadline before
+      // its timer runs. Recheck after queue/credential waits, before dispatch.
+      assertProcessActive();
       try {
         transport.dispatch = "sent";
         const response = await client.request(`${method} /${route}`, {
@@ -953,6 +980,8 @@ export class GitHubClient {
             data?: unknown;
           };
         };
+        if (queueResponse && error.response?.data !== undefined)
+          queueResponse.original = error.response.data;
         const failure = transportFailure(cause, requestSignal);
         if (
           requestSignal?.aborted &&

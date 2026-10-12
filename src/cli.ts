@@ -1,6 +1,12 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { runCaptureExportCommand } from "./capture-export-cli.js";
 import { assertKnownFlags, option } from "./cli-flags.js";
 import {
@@ -11,7 +17,11 @@ import {
   stateRoot,
 } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
-import { requestControl } from "./coordinator-control.js";
+import { NativeStackDelivery } from "./delivery/native-stack.js";
+import {
+  ControllerCommandIncompleteError,
+  requestControl,
+} from "./coordinator-control.js";
 import {
   continuationStatusDocument,
   redactDiagnosticDetail,
@@ -21,7 +31,12 @@ import {
   runDiagnosticsScorecardCommand,
 } from "./diagnostics-cli.js";
 import { compose, composeIntake, composePlanning } from "./index.js";
-import type { IntakeAuthorization } from "./intake.js";
+import { RealGitHubGateway } from "./github.js";
+import {
+  type IntakeAuthorization,
+  QUEUE_COMMAND_TIMEOUT_MS,
+  withIntakeCommandDeadline,
+} from "./intake.js";
 import { runDreamCommand } from "./learning.js";
 import { operatorName } from "./operator.js";
 import { runProposeCommand } from "./proposals.js";
@@ -61,7 +76,7 @@ import {
   renderServiceStatus,
   renderStatusText,
 } from "./status-summary.js";
-import { checkIntakeServiceState, supervise } from "./supervision.js";
+import { supervise } from "./supervision.js";
 import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
 
 /** Whether a live controller owns this Objective; null when a lock is unreadable. */
@@ -132,6 +147,12 @@ function help(): void {
       "  select --objective N --item ITEM --set SET_ID [--bind DEPENDENT_ITEM ...]",
       "      Record the pick",
       "  pause|drain|resume|cancel --objective N",
+      "  handoff --objective N --failed-reservation-evidence ABSOLUTE_PRIVATE_FILE",
+      "      Permanently stop an authenticated failed pre-snapshot reservation and preserve its unaccepted evidence",
+      "  handoff --objective N --retired-withdrawal-evidence ABSOLUTE_PRIVATE_FILE",
+      "      Permanently exclude an authenticated stopped uncertain withdrawal; preserve its unknown result",
+      "  handoff --objective N --retired-admission-evidence ABSOLUTE_PRIVATE_FILE",
+      "      Permanently exclude an authenticated stopped uncertain admission; preserve all originals and allocated order",
     ].join("\n"),
   );
 }
@@ -189,9 +210,10 @@ async function queueCommand(args: string[], path: string): Promise<void> {
       throw new Error(
         "queue remove requires Objective numbers: queue remove N",
       );
-    let record: unknown;
-    for (const id of numbers)
-      record = await composeIntake(config).intakeControl("dequeue", id);
+    const record = await composeIntake(config).intakeControl(
+      "dequeue",
+      numbers,
+    );
     console.log(JSON.stringify(record, null, 2));
   } else if (
     action === "list" ||
@@ -205,7 +227,7 @@ async function queueCommand(args: string[], path: string): Promise<void> {
     console.log(
       JSON.stringify(
         await composeIntake(config).intakeControl(
-          action === "list" ? "status" : action,
+          action === "list" ? "sync" : action,
         ),
         null,
         2,
@@ -290,8 +312,11 @@ async function supervisorCommand(args: string[], path: string): Promise<void> {
         : [],
     );
     loadServiceLoginCredentials(config, loaded);
-    await checkIntakeServiceState(config, path);
-    reportIntake(await compose(config, loaded).runIntake());
+    reportIntake(
+      await compose(config, loaded).runIntake({
+        backgroundConfigurationPath: path,
+      }),
+    );
     return;
   }
   if (
@@ -320,7 +345,10 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
   const service = (await supervise("status", path)) as ServiceStatus["service"];
   const queue = (await composeIntake(config).intakeControl(
     "status",
-  )) as ServiceStatus["queue"];
+  )) as ServiceStatus["queue"] &
+    Pick<IntakeAuthorization, "remoteObservation" | "retiredAdmissions"> & {
+      localMode?: string;
+    };
   const objective = queue.activeObjective ?? queue.observation?.needsDecision;
   let current: Pick<
     ServiceStatus,
@@ -356,6 +384,20 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
   if (json) console.log(JSON.stringify(document));
   else {
     for (const line of renderServiceStatus(document)) console.log(line);
+    if (queue.localMode)
+      console.log(
+        `Local new dispatch: ${queue.localMode}; admitted work is retained.`,
+      );
+    if (queue.remoteObservation)
+      console.log(
+        queue.remoteObservation.availability === "last-observed"
+          ? `Project observation: last observed at ${queue.remoteObservation.observedAt}.`
+          : "Project observation: unavailable; status grants no new admission.",
+      );
+    for (const entry of queue.retiredAdmissions ?? [])
+      console.log(
+        `Objective #${entry.objective}: ${entry.state}; remote submission ${entry.remoteSubmission}; permanently ineligible. Admission ${entry.admissionId}, card ${entry.itemId}, retirement operation ${entry.operationId}.`,
+      );
     console.log(`Durability: ${JSON.stringify(document.durability)}`);
   }
 }
@@ -424,6 +466,7 @@ async function dispatchMain(): Promise<void> {
       "export-captures",
       "select",
       "cancel",
+      "handoff",
       "propose-amendment",
       "pause",
       "drain",
@@ -442,6 +485,61 @@ async function dispatchMain(): Promise<void> {
   let application: ReturnType<typeof compose> | undefined;
   const requireApplication = (): ReturnType<typeof compose> =>
     (application ??= compose(config));
+  if (command === "handoff") {
+    const evidenceOptions = [
+      ["failed-reservation-evidence", "failedReservationEvidence"],
+      ["retired-withdrawal-evidence", "retiredWithdrawalEvidence"],
+      ["retired-admission-evidence", "retiredAdmissionEvidence"],
+    ] as const;
+    const selected = evidenceOptions
+      .map(([flag, key]) => ({ key, path: option(args, flag) }))
+      .filter((value) => value.path !== undefined);
+    if (selected.length !== 1)
+      throw new Error(
+        "handoff requires exactly one private evidence file: --failed-reservation-evidence, --retired-withdrawal-evidence or --retired-admission-evidence",
+      );
+    const evidencePath = selected[0]!.path!;
+    if (!isAbsolute(evidencePath))
+      throw new Error(
+        "Handoff evidence requires an absolute private file path",
+      );
+    const file = openSync(
+      evidencePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    let evidence: unknown;
+    try {
+      const observed = fstatSync(file);
+      if (
+        !observed.isFile() ||
+        observed.uid !== process.getuid?.() ||
+        (observed.mode & 0o077) !== 0
+      )
+        throw new Error(
+          "Handoff evidence must be an owned private regular file",
+        );
+      evidence = JSON.parse(readFileSync(file, "utf8"));
+    } finally {
+      closeSync(file);
+    }
+    const result = await controlObjective(
+      config,
+      {
+        objective,
+        action: "handoff",
+        input: {
+          [selected[0]!.key]: evidence,
+          actor: operatorName(),
+        },
+      },
+      new RealGitHubGateway(
+        config.repository,
+        new NativeStackDelivery(config.repository),
+      ),
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (command === "decide") return decideCommand(config, objective, args);
   if (command === "propose-amendment") {
     const proposalPath = option(args, "proposal");
@@ -700,7 +798,38 @@ function reportRun(
 }
 
 async function main(): Promise<void> {
+  const enteredAt = Date.now();
   const [, , command, ...args] = process.argv;
+  if (
+    command === "queue" ||
+    (command === "status" && !option(args, "objective"))
+  ) {
+    assertKnownFlags(command, args);
+    const localStatus = command === "status";
+    // Intake owns both foreground durability and authenticated forwarding. The
+    // CLI prints that exact outcome without a second terminal publication.
+    return withIntakeCommandDeadline(
+      enteredAt + (localStatus ? 1000 : QUEUE_COMMAND_TIMEOUT_MS),
+      dispatchMain,
+      (acknowledgment) => {
+        const ack = acknowledgment as {
+          kind?: string;
+          newDispatch?: string;
+          admittedWork?: string;
+          projectSynchronization?: string;
+        };
+        if (
+          ack?.kind === "local-cessation-acknowledgment" &&
+          ack.newDispatch === "held" &&
+          ack.admittedWork === "retained" &&
+          ack.projectSynchronization === "pending"
+        )
+          console.error(
+            "Factory: New queue dispatch is held. Already admitted work is retained; Project synchronization and durability are pending.",
+          );
+      },
+    );
+  }
   const mutating = new Set([
     "propose",
     "dream",
@@ -743,6 +872,18 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
+  if (error instanceof ControllerCommandIncompleteError)
+    console.error(
+      JSON.stringify({
+        kind: "queue-command-incomplete",
+        requestId: error.requestId ?? null,
+        submission: error.submission,
+        deadlineAt: error.deadlineAt ?? null,
+        completion: "not-established",
+        nextAction:
+          "Inspect retained status; do not replay an unknown mutation",
+      }),
+    );
   console.error(
     `Factory: ${error instanceof Error ? error.message : String(error)}`,
   );
