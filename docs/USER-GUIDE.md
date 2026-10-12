@@ -96,10 +96,10 @@ Factory can retain a planner from preparation through compilation, correction, d
 | Claude planning   | Planning, independent result review and Objective review, using adapter-owned private storage. |
 | Codex worker      | Implementation.                                                                                |
 | Claude worker     | Implementation when user settings are not requested.                                           |
-| Copilot worker    | Fresh; retained continuation is disabled pending live qualification.                           |
+| Copilot worker    | Resume the owned implementation conversation with the current worktree and permissions.        |
 | Managed execution | Fresh across attempts.                                                                         |
 
-Copilot continuation is implemented but remains disabled until native account access, restart, current-checkout rebinding and accounting behavior are qualified.
+Copilot retains only settled local implementation conversations. Each turn rebinds the current model, effort, worktree, tools and permissions; cross-session memory and retrieval remain disabled. Disposal authenticates the owned session after its worker has ceased.
 
 Claude follow-ups require the same authenticated native identity, privately owned transcript, current model/permission selection and settled preceding turn. Cumulative native counters are converted to new-turn per-model/category and cost deltas; missing or reset categories remain unknown. Reviewers retain their own independent conversation and read-only current evidence, never the worker's conversation or write permissions. Managed execution stays fresh across attempts. Missing or disabled retention never clears active or unknown work or grants a fresh attempt.
 
