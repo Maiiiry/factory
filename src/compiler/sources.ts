@@ -200,7 +200,7 @@ export function reviewGraphView(
       createHash("sha256").update(row.content).digest("hex") !==
         span.sourceDigest ||
       span.start < 0 ||
-      span.length <= 0 ||
+      span.length < 0 ||
       span.start + span.length > row.content.length ||
       createHash("sha256")
         .update(row.content.slice(span.start, span.start + span.length))
