@@ -295,6 +295,30 @@ export function createPlanningContextResolver(input: {
       .sort((a, b) => Number(b.request.required) - Number(a.request.required))
       .map(({ request }) => request),
   );
+  // Optional metadata follows required facts and stays inside the same frozen allowance.
+  const inventories = options.selectors
+    .filter((selector) => selector.endsWith("/"))
+    .slice(0, Math.max(0, 128 - automatic.length))
+    .map(
+      (selector, index): ContextRequest => ({
+        id: `automatic-directory-inventory-${index}`,
+        operation: "inventory",
+        collection: "repository",
+        selector,
+        query: "",
+        required: false,
+        reason:
+          "Supply tracked path presence from the admitted immutable directory; incomplete inventory cannot establish absence",
+      }),
+    );
+  const optionalMemoryIndex = automatic.findIndex(
+    (request) => request.id === "automatic-relevant-memory",
+  );
+  automatic.splice(
+    optionalMemoryIndex < 0 ? automatic.length : optionalMemoryIndex,
+    0,
+    ...inventories,
+  );
   const catalog: PlanningContextResolver["catalog"] = [
     {
       id: "repository",

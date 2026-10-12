@@ -786,7 +786,7 @@ export function repositoryContextResult(
   try {
     const entries = run([
       "ls-tree",
-      "-rz",
+      "-rzl",
       "--full-tree",
       baseSha,
       ...(request.selector ? ["--", request.selector] : []),
@@ -796,8 +796,14 @@ export function repositoryContextResult(
       .filter(Boolean)
       .map((line) => {
         const tab = line.indexOf("\t");
-        const [mode, type, sha] = line.slice(0, tab).split(" ");
-        return { path: line.slice(tab + 1), mode, type, sha };
+        const [mode, type, sha, size] = line.slice(0, tab).trim().split(/\s+/);
+        return {
+          path: line.slice(tab + 1),
+          mode,
+          type,
+          sha,
+          size: type === "blob" ? Number(size) : null,
+        };
       })
       .filter((e) =>
         request.operation === "read"
@@ -818,7 +824,13 @@ export function repositoryContextResult(
       );
     if (request.operation === "inventory") {
       const content = JSON.stringify(
-        entries.map(({ path, mode, type, sha }) => ({ path, mode, type, sha })),
+        entries.map(({ path, mode, type, sha, size }) => ({
+          path,
+          mode,
+          type,
+          sha,
+          size,
+        })),
       );
       if (
         entries.length > remaining.maxResults ||
