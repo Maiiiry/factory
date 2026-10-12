@@ -1,19 +1,28 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
 } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   type AccountingSeal,
   assertAccountingSealBinding,
   assertAccountingSealContent,
 } from "./accounting.js";
+import {
+  assertAgentSessionRef,
+  assertAgentSessionScope,
+} from "./agent-session.js";
 import type { FactoryConfig } from "./config.js";
 import { stateRoot } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
@@ -953,17 +962,198 @@ function privateBytes(path: string, root: string): Buffer {
     realpathSync(path) !== resolve(path)
   )
     throw new Error("Recovery checkpoint original is outside its private root");
-  const stat = lstatSync(path);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    const fingerprint = (value: typeof stat) =>
+      [
+        value.dev,
+        value.ino,
+        value.mode,
+        value.uid,
+        value.size,
+        value.mtimeNs,
+        value.ctimeNs,
+      ].join(":");
+    if (
+      !stat.isFile() ||
+      stat.uid !== BigInt(process.getuid!()) ||
+      stat.mode & 0o077n ||
+      fingerprint(stat) !== fingerprint(lstatSync(path, { bigint: true }))
+    )
+      throw new Error(
+        "Recovery checkpoint original must be an owned private regular file",
+      );
+    const bytes = readFileSync(fd);
+    if (
+      fingerprint(stat) !== fingerprint(fstatSync(fd, { bigint: true })) ||
+      fingerprint(stat) !== fingerprint(lstatSync(path, { bigint: true })) ||
+      realpathSync(path) !== resolve(path)
+    )
+      throw new Error("Recovery checkpoint original changed during its read");
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Authenticate one recorded worker return, never enumerate its native storage. */
+function localWorkerReturn(
+  root: string,
+  execution: NonNullable<WorkState["execution"]>,
+  scope: {
+    repository: string;
+    objective: number;
+    runId: string;
+    configDigest: string;
+  },
+):
+  | { path: string; bytes: Buffer; returned: Record<string, unknown> }
+  | undefined {
+  const active = object(execution.data);
+  if (!active.handle) return undefined;
+  const handle = object(active.handle);
+  if (!handle.data) return undefined;
+  const worker = object(handle.data);
+  if (typeof worker.resultPath !== "string") return undefined;
+  if (!existsSync(worker.resultPath)) return undefined;
+  const identity = execution.identity;
+  const workerRoot = dirname(resolve(worker.resultPath));
+  const request = object(active.request) as unknown as ExecutionRequest;
   if (
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.uid !== process.getuid?.() ||
-    stat.mode & 0o077
+    !/^[A-Za-z0-9_-]{1,160}$/.test(identity) ||
+    handle.identity !== identity ||
+    request.attemptId !== identity ||
+    !workerRoot.startsWith(`${resolve(root)}${sep}`) ||
+    worker.requestPath !== join(workerRoot, `${identity}.request.json`) ||
+    worker.resultPath !== join(workerRoot, `${identity}.result.json`) ||
+    worker.logPath !== join(workerRoot, `${identity}.log`) ||
+    realpathSync(workerRoot) !== workerRoot
   )
     throw new Error(
-      "Recovery checkpoint original must be an owned private regular file",
+      "Returned worker evidence is outside its authenticated root",
     );
-  return readFileSync(path);
+  const directory = lstatSync(workerRoot);
+  if (
+    !directory.isDirectory() ||
+    directory.uid !== process.getuid?.() ||
+    directory.mode & 0o077
+  )
+    throw new Error("Returned worker evidence root must be owned and private");
+  const input = object(
+    JSON.parse(
+      privateBytes(worker.requestPath as string, root).toString("utf8"),
+    ),
+  );
+  const originalRequest = object(input.request) as unknown as HarnessRequest;
+  if (
+    originalRequest.attemptId !== identity ||
+    originalRequest.worktree !== active.worktree ||
+    !isDeepStrictEqual(originalRequest.item, request.item) ||
+    !isDeepStrictEqual(originalRequest.session, request.session)
+  )
+    throw new Error(
+      "Returned worker original differs from its execution request",
+    );
+  const bytes = privateBytes(worker.resultPath, root);
+  const returned = object(JSON.parse(bytes.toString("utf8")));
+  const collected =
+    active.result === undefined ? undefined : object(active.result);
+  if (collected?.session !== undefined && returned.session === undefined)
+    throw new Error("Collected worker conversation has no original return");
+  if (request.session) {
+    assertAgentSessionScope(request.session.scope);
+    if (
+      request.session.scope.repository !== scope.repository ||
+      request.session.scope.objective !== scope.objective ||
+      request.session.scope.runId !== scope.runId ||
+      request.session.scope.configDigest !== scope.configDigest ||
+      request.session.scope.role !== "implementation" ||
+      request.session.scope.itemId !== request.item.id
+    )
+      throw new Error(
+        "Returned worker session differs from its continuation scope",
+      );
+    if (returned.session !== undefined) {
+      assertAgentSessionRef(returned.session, request.session.scope);
+      if (
+        returned.session.identity !== request.session.identity ||
+        returned.session.executionIdentity !== identity
+      )
+        throw new Error(
+          "Returned worker conversation differs from its execution owner",
+        );
+      const admitted = object(input.session);
+      assertAgentSessionRef(admitted.ref, request.session.scope);
+      if (
+        admitted.ref.identity !== returned.session.identity ||
+        admitted.ref.executionIdentity !== identity ||
+        admitted.ref.adapter !== returned.session.adapter ||
+        admitted.ref.turn !== returned.session.turn ||
+        admitted.ref.currentTurn?.requestDigest !==
+          returned.session.currentTurn?.requestDigest
+      )
+        throw new Error(
+          "Returned worker conversation differs from its original admission",
+        );
+      const native =
+        returned.session.data === undefined
+          ? undefined
+          : object(returned.session.data);
+      const admittedData =
+        admitted.ref.data === undefined ? undefined : object(admitted.ref.data);
+      if (
+        typeof native?.selectionDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(native.selectionDigest) ||
+        native.selectionDigest !== admittedData?.selectionDigest ||
+        (admitted.data !== undefined &&
+          native.selectionDigest !== object(admitted.data).selectionDigest)
+      )
+        throw new Error(
+          "Returned worker selection differs from its original admission",
+        );
+      if (
+        native?.root !== undefined &&
+        (native.root !==
+          join(workerRoot, "sessions", request.session.identity) ||
+          native.root !== admittedData?.root)
+      )
+        throw new Error(
+          "Returned worker native storage differs from its private root",
+        );
+      if (collected && collected.session !== undefined) {
+        assertAgentSessionRef(collected.session, request.session.scope);
+        const original = returned.session;
+        const frozen = collected.session;
+        if (
+          frozen.identity !== original.identity ||
+          frozen.executionIdentity !== identity ||
+          frozen.adapter !== original.adapter ||
+          frozen.turn !== original.turn ||
+          frozen.currentTurn?.requestDigest !==
+            original.currentTurn?.requestDigest
+        )
+          throw new Error(
+            "Collected worker conversation differs from its original return",
+          );
+        const data =
+          frozen.data === undefined ? undefined : object(frozen.data);
+        if (
+          data?.root !== native?.root ||
+          data?.selectionDigest !== native?.selectionDigest
+        )
+          throw new Error(
+            "Collected worker native storage differs from its original return",
+          );
+        if (data?.worker && !isDeepStrictEqual(data.worker, worker))
+          throw new Error(
+            "Collected worker paths differ from their original handle",
+          );
+      }
+    }
+  } else if (returned.session !== undefined)
+    throw new Error("Returned worker has an unsolicited conversation receipt");
+  return { path: worker.resultPath, bytes, returned };
 }
 async function retainBytes(
   store: LocalContentStore,
@@ -1135,22 +1325,13 @@ async function buildRecoveryCheckpointClosureLocal(input: {
               }
               // A returned result is evidence, not a restored native process.
               if (work.execution.provider === "local") {
-                const handle = active.handle
-                  ? object(active.handle)
-                  : undefined;
-                const worker = handle?.data ? object(handle.data) : undefined;
-                const resultPath = worker?.resultPath;
-                if (typeof resultPath === "string" && existsSync(resultPath)) {
-                  if (
-                    !resolve(resultPath).startsWith(
-                      `${join(root, "harness")}${sep}`,
-                    ) ||
-                    !resultPath.endsWith(".result.json")
-                  )
-                    throw new Error(
-                      "Returned worker evidence is outside its authenticated root",
-                    );
-                  const returnedBytes = privateBytes(resultPath, root);
+                const original = localWorkerReturn(root, work.execution, state);
+                if (original) {
+                  const {
+                    path: resultPath,
+                    bytes: returnedBytes,
+                    returned,
+                  } = original;
                   if (
                     rejected &&
                     (rejected.rawReturn.provenance !==
@@ -1174,9 +1355,6 @@ async function buildRecoveryCheckpointClosureLocal(input: {
                       "historical",
                       returnedBytes,
                     );
-                  const returned = object(
-                    JSON.parse(returnedBytes.toString("utf8")),
-                  );
                   if (
                     returned.state === "complete" &&
                     active.result === undefined &&
