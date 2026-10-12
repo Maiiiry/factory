@@ -26,6 +26,7 @@ import {
 import {
   hydrateWorkerInputSources,
   planningGraphView,
+  reviewGraphView,
   planningSources,
 } from "../dist/compiler/sources.js";
 import {
@@ -948,6 +949,50 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     /admit planningContext/,
   );
   const runtimeResolver = createPlanningContextResolver(runtimeInput);
+  const initialInventory = await initializeContextLookup(runtimeResolver);
+  const scopedInventory = initialInventory.packet.automatic.find(
+    (result) => result.request.operation === "inventory",
+  );
+  assert.equal(scopedInventory.request.selector, "api/");
+  assert.equal(scopedInventory.disposition, "complete");
+  const tracked = JSON.parse(scopedInventory.matches[0].content);
+  assert.deepEqual(
+    tracked.map((entry) => entry.path),
+    ["api/contract.txt", tabPath],
+  );
+  assert.equal(tracked[0].size, Buffer.byteLength(originalBody));
+  assert.equal(tracked[0].sha, originalBlob);
+  assert.equal(initialInventory.providerCalls, 0);
+  assert.equal(initialInventory.packet.bounds.maxProviderCalls, 1);
+  const narrowInventory = await initializeContextLookup(
+    createPlanningContextResolver({
+      ...runtimeInput,
+      config: {
+        ...config,
+        planningContext: {
+          ...config.planningContext,
+          bounds: { ...config.planningContext.bounds, maxResults: 1 },
+        },
+      },
+    }),
+  );
+  assert.equal(narrowInventory.packet.automatic[0].disposition, "incomplete");
+  assert.deepEqual(narrowInventory.packet.automatic[0].matches, []);
+  const absentInventory = await initializeContextLookup(
+    createPlanningContextResolver({
+      ...runtimeInput,
+      config: {
+        ...config,
+        planningContext: { ...config.planningContext, selectors: ["absent/"] },
+      },
+    }),
+  );
+  assert.equal(absentInventory.packet.automatic[0].disposition, "no-match");
+  assert.ok(
+    !runtimeResolver.automatic.some(
+      (request) => request.selector === "unrelated/",
+    ),
+  );
   const remaining = {
     maxResults: 8,
     maxBytes: 4096,
@@ -1453,7 +1498,72 @@ test("compiler retrieves scoped immutable bodies and retains exact bounded conte
     ...reviewRequest,
     reviewPacket: mixedReviewPacket,
   });
-  assert.ok(mixedReview.prompt.includes('"sourceIndex":1,"evidenceIndex":2'));
+  assert.ok(
+    mixedReview.prompt.includes('"pinnedSourceIndex":1,"evidenceIndex":2'),
+  );
+  const mixedGraph = {
+    items: [
+      {
+        id: "selected",
+        inputSources: [{ path: "api/contract.txt", content: originalBody }],
+      },
+    ],
+  };
+  const reviewedView = reviewGraphView(mixedGraph, mixedReviewPacket.evidence);
+  const selectedInput = reviewedView.items[0].inputSources[0];
+  assert.equal(selectedInput.sourceSpan, undefined);
+  assert.equal(selectedInput.evidenceSpan.evidenceIndex, 2);
+  assert.equal(
+    selectedInput.evidenceSpan.evidenceId,
+    mixedReviewPacket.evidence[2].id,
+  );
+  assert.equal(selectedInput.evidenceSpan.path, "api/contract.txt");
+  assert.equal(
+    mixedReviewPacket.evidence[2].content.slice(
+      selectedInput.evidenceSpan.start,
+      selectedInput.evidenceSpan.start + selectedInput.evidenceSpan.length,
+    ),
+    originalBody,
+  );
+  assert.equal(
+    planningGraphView(mixedGraph, runtimeInput.sources).items[0].inputSources[0]
+      .sourceSpan.sourceIndex,
+    1,
+  );
+  assert.throws(
+    () =>
+      reviewGraphView(
+        mixedGraph,
+        mixedReviewPacket.evidence.map((entry, index) =>
+          index === 2 ? { ...entry, complete: false } : entry,
+        ),
+      ),
+    /complete authenticated evidence/,
+  );
+  assert.throws(
+    () =>
+      reviewGraphView(
+        mixedGraph,
+        mixedReviewPacket.evidence.map((entry, index) =>
+          index === 2 ? { ...entry, digest: "0".repeat(64) } : entry,
+        ),
+      ),
+    /complete authenticated evidence/,
+  );
+  const unmatched = {
+    items: [
+      {
+        id: "unmatched",
+        inputSources: [
+          { path: "missing.txt", content: "unmatched literal body" },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(
+    reviewGraphView(unmatched, mixedReviewPacket.evidence),
+    unmatched,
+  );
   assert.throws(
     () =>
       renderGraphReviewCall({
