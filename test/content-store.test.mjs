@@ -5339,3 +5339,186 @@ test("Copilot conflicting usage stays private evidence without accounted counter
   // Per-call diagnostic records never become invocation-cumulative worker charges.
   assert.deepEqual(readUsageSummaryEvents(repository, 1), []);
 });
+
+test("checkpoint retains authenticated worker returns from a configured private root", async (t) => {
+  const temporary = mkdtempSync(join(tmpdir(), "factory-worker-return-root-"));
+  const repository = `example/worker-return-${randomUUID()}`;
+  const checkout = join(temporary, "checkout");
+  const privateRoot = stateRoot(repository);
+  t.after(() => {
+    rmSync(temporary, { recursive: true, force: true });
+    rmSync(privateRoot, { recursive: true, force: true });
+  });
+  mkdirSync(checkout, { mode: 0o700 });
+  mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.invalid");
+  writeFileSync(join(checkout, "README.md"), "# Private worker history\n");
+  git("add", "README.md");
+  git("commit", "-m", "Original source");
+  const baseSha = git("rev-parse", "HEAD");
+  const selection = { model: "unused-local-check", reasoningEffort: "low" };
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    planning: { kind: "codex-sdk", planner: selection, reviewer: selection },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...selection },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+  };
+  const identity = randomUUID();
+  const workerRoot = join(privateRoot, "configured-worker");
+  mkdirSync(workerRoot, { mode: 0o700 });
+  const worker = {
+    pid: process.pid,
+    startTime: linuxProcessIdentity(process.pid).startTime,
+    requestPath: join(workerRoot, `${identity}.request.json`),
+    resultPath: join(workerRoot, `${identity}.result.json`),
+    logPath: join(workerRoot, `${identity}.log`),
+  };
+  const item = {
+    id: "history",
+    title: "Preserve history",
+    goal: "Preserve history",
+    acceptance: ["Preserve history"],
+    dependencies: [],
+    ownedPaths: ["README.md"],
+    resources: [],
+    brief: "Private historical result",
+    nonGoals: [],
+    validation: [],
+    citations: [],
+    sourceAssets: [],
+    expectedOutputRoles: [],
+    requiredLfsRoles: [],
+    minimumAssetSets: 0,
+  };
+  const graph = {
+    objective: 1,
+    baseSha,
+    items: [item],
+    coverage: [
+      {
+        criterionId: "b".repeat(64),
+        itemId: item.id,
+        source: {
+          path: "README.md",
+          digest: learningDigest("# Private worker history\n"),
+          text: "# Private worker history",
+        },
+        proof: { kind: "result-semantic", acceptanceIndex: 0 },
+        environment: {
+          kind: "local",
+          readiness: "available",
+          probe: "",
+          preparedBy: "",
+        },
+      },
+    ],
+  };
+  const state = {
+    schemaVersion: 7,
+    repository,
+    objective: 1,
+    runId: randomUUID(),
+    configDigest: factoryConfigDigest(config),
+    baseSha,
+    graph,
+    planGraphDigest: graphDigest(graph),
+    capacity: { concurrency: 1 },
+    autonomy: resolveAutonomy(),
+    issueByItemId: { history: 2 },
+    cancelledAt: new Date().toISOString(),
+    work: { history: { status: "cancelled", attempt: identity, baseSha } },
+  };
+  const session = {
+    identity: randomUUID(),
+    scope: {
+      repository,
+      objective: 1,
+      runId: state.runId,
+      configDigest: state.configDigest,
+      role: "implementation",
+      itemId: item.id,
+      graphDigest: state.planGraphDigest,
+    },
+  };
+  const worktree = join(privateRoot, "worktrees", identity);
+  const request = { attemptId: identity, baseSha, item, session };
+  const wrapper = {
+    request: structuredClone({ attemptId: identity, item, session, worktree }),
+  };
+  const execution = {
+    provider: "local",
+    identity,
+    data: {
+      request,
+      worktree,
+      adapterIdentity: "fixture-local",
+      handle: { identity, data: worker },
+    },
+  };
+  state.work.history.execution = execution;
+  saveState(statePath(repository, 1), state);
+  const canonicalBytes = readFileSync(statePath(repository, 1));
+  const saveRequest = () =>
+    writeFileSync(worker.requestPath, `${JSON.stringify(wrapper)}\n`, {
+      mode: 0o600,
+    });
+  saveRequest();
+  // This is the original result of a real finite local failure, not provider output.
+  const failure = childProcess.spawnSync(
+    process.execPath,
+    ["-e", "process.stderr.write('Owned local failure');process.exit(1)"],
+    { encoding: "utf8" },
+  );
+  assert.equal(failure.status, 1);
+  const original = Buffer.from(
+    `${JSON.stringify({ state: "failed", error: failure.stderr })}\n`,
+  );
+  writeFileSync(worker.resultPath, original, { mode: 0o600 });
+  writeFileSync(worker.logPath, failure.stderr, { mode: 0o600 });
+  const closure = await buildRecoveryCheckpointClosure({ config });
+  const returned = closure.files.find(
+    (file) => file.path === `configured-worker/${identity}.result.json`,
+  );
+  assert(returned);
+  assert.deepEqual(
+    new LocalContentStore(join(privateRoot, "content")).readBytes(returned.ref),
+    original,
+  );
+  assert.equal(
+    closure.files.some(
+      (file) =>
+        file.path.startsWith("configured-worker/sessions/") ||
+        file.path.endsWith(".log") ||
+        file.path.endsWith(".request.json"),
+    ),
+    false,
+  );
+  assert.deepEqual(readFileSync(statePath(repository, 1)), canonicalBytes);
+  wrapper.request.session.scope = { ...session.scope, runId: randomUUID() };
+  saveRequest();
+  await assert.rejects(
+    buildRecoveryCheckpointClosure({ config }),
+    /differs from its execution request/,
+  );
+  wrapper.request.session.scope = session.scope;
+  saveRequest();
+  rmSync(worker.resultPath);
+  const other = join(temporary, "foreign.result.json");
+  writeFileSync(other, original, { mode: 0o600 });
+  symlinkSync(other, worker.resultPath);
+  await assert.rejects(
+    buildRecoveryCheckpointClosure({ config }),
+    /outside its private root/,
+  );
+});
