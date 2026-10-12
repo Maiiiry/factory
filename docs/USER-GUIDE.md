@@ -96,10 +96,10 @@ Factory can retain a planner from preparation through compilation, correction, d
 | Claude planning   | Planning only, using adapter-owned private storage. Result and Objective review stay fresh pending live qualification. |
 | Codex worker      | Implementation.                                                                                                        |
 | Claude worker     | Fresh; retained implementation is disabled pending live qualification.                                                 |
-| Copilot worker    | Fresh; retained continuation is disabled pending live qualification.                                                   |
+| Copilot worker    | Resume the owned implementation conversation with the current worktree and permissions.                                |
 | Managed execution | Fresh across attempts.                                                                                                 |
 
-Copilot continuation is implemented but remains disabled until native account access, restart, current-checkout rebinding and accounting behavior are qualified.
+Copilot retains only settled local implementation conversations. Each turn rebinds the current model, effort, worktree, tools and permissions; cross-session memory and retrieval remain disabled. Disposal authenticates the owned session after its worker has ceased.
 
 Claude's other role paths are implemented but unqualified. A planning qualification does not establish worker or review retention. Their existing native receipts and disposal paths remain intact; disabled retention never clears active or unknown work or grants a fresh attempt.
 
