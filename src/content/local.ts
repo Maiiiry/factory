@@ -5,8 +5,8 @@ import {
   copyFileSync,
   createReadStream,
   existsSync,
-  fsyncSync,
   fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -23,6 +23,16 @@ import type {
   ContentRef,
   ContentStore,
 } from "../contracts.js";
+import {
+  cachedRecoveryCheckpointReferences,
+  checkpointClosureBytes,
+  checkpointContentVerified,
+  deferCheckpointClosureVerification,
+  type RecoveryCheckpointReferenceSummary,
+  retainCheckpointClosureBytes,
+  retainCheckpointContentVerification,
+  retainRecoveryCheckpointReferences,
+} from "../recovery-checkpoint.js";
 
 function assertRef(ref: ContentRef): void {
   if (
@@ -103,22 +113,64 @@ export class LocalContentStore implements ContentStore {
     return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   }
 
-  private readDescriptor(fd: number, ref: ContentRef): Buffer {
-    const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077)
+  private descriptorIdentity(
+    fd: number,
+    ref: ContentRef,
+    privateOnly = true,
+  ): string {
+    const stat = fstatSync(fd, { bigint: true });
+    if (
+      !stat.isFile() ||
+      (privateOnly &&
+        (stat.uid !== BigInt(process.getuid!()) || stat.mode & 0o077n))
+    )
       throw new Error("Content object must be an owned private regular file");
-    if (stat.size !== ref.bytes)
+    if (stat.size !== BigInt(ref.bytes))
       throw new Error(
         `Content object ${ref.digest} failed digest verification`,
       );
+    const path = lstatSync(this.path(ref), { bigint: true });
+    if (
+      path.isSymbolicLink() ||
+      !path.isFile() ||
+      path.dev !== stat.dev ||
+      path.ino !== stat.ino ||
+      path.size !== stat.size ||
+      path.mode !== stat.mode ||
+      path.uid !== stat.uid ||
+      path.mtimeNs !== stat.mtimeNs ||
+      path.ctimeNs !== stat.ctimeNs
+    )
+      throw new Error("Content object changed its opened file identity");
+    return JSON.stringify(
+      [
+        stat.dev,
+        stat.ino,
+        stat.mode,
+        stat.uid,
+        stat.size,
+        stat.mtimeNs,
+        stat.ctimeNs,
+      ].map(String),
+    );
+  }
+
+  private readDescriptor(fd: number, ref: ContentRef): Buffer {
+    const identity = this.descriptorIdentity(fd, ref);
+    const verified = checkpointContentVerified(this.root, ref, identity);
     const bytes = readFileSync(fd);
     if (
       bytes.length !== ref.bytes ||
-      createHash("sha256").update(bytes).digest("hex") !== ref.digest
+      (!verified &&
+        createHash("sha256").update(bytes).digest("hex") !== ref.digest)
     )
       throw new Error(
         `Content object ${ref.digest} failed digest verification`,
       );
+    if (this.descriptorIdentity(fd, ref) !== identity)
+      throw new Error("Content object changed during exact byte verification");
+    if (!verified)
+      retainCheckpointContentVerification(this.root, ref, identity);
     return bytes;
   }
 
@@ -131,32 +183,99 @@ export class LocalContentStore implements ContentStore {
       throw error;
     }
     try {
-      this.readDescriptor(fd, ref);
-      // Existing streamed imports also require a durable directory entry.
-      fsyncSync(fd);
-      const directory = openSync(
-        dirname(this.path(ref)),
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
-      try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
-      }
+      this.verifyDescriptor(fd, ref);
+      this.synchronizeObject(fd, ref);
       return true;
     } finally {
       closeSync(fd);
     }
   }
 
-  /** Exact complete bytes for synchronous controller retention and lookup. */
-  readBytes(ref: ContentRef): Buffer {
+  private verifyDescriptor(fd: number, ref: ContentRef): void {
+    const identity = this.descriptorIdentity(fd, ref);
+    if (!checkpointContentVerified(this.root, ref, identity))
+      this.readDescriptor(fd, ref);
+    else if (this.descriptorIdentity(fd, ref) !== identity)
+      throw new Error(
+        "Content object changed during exact reference verification",
+      );
+  }
+
+  /** Authenticate a private original without allocating already verified bytes. */
+  verifyPrivateBytes(ref: ContentRef): void {
+    if (
+      Object.getPrototypeOf(this) === LocalContentStore.prototype &&
+      this.verifyPrivateBytes ===
+        LocalContentStore.prototype.verifyPrivateBytes &&
+      deferCheckpointClosureVerification(this.root, ref)
+    )
+      return;
     const fd = this.openObject(ref);
     try {
-      return this.readDescriptor(fd, ref);
+      this.verifyDescriptor(fd, ref);
     } finally {
       closeSync(fd);
     }
+  }
+
+  private synchronizeObject(
+    fd: number,
+    ref: ContentRef,
+    privateOnly = true,
+  ): void {
+    const identity = this.descriptorIdentity(fd, ref, privateOnly);
+    fsyncSync(fd);
+    const directory = openSync(
+      dirname(this.path(ref)),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      const stat = fstatSync(directory);
+      if (!stat.isDirectory())
+        throw new Error("Content object parent is not a directory");
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+    if (this.descriptorIdentity(fd, ref, privateOnly) !== identity)
+      throw new Error("Content object changed during durable retention");
+  }
+
+  /** Exact complete bytes for synchronous controller retention and lookup. */
+  readBytes(ref: ContentRef): Buffer {
+    const concrete =
+      Object.getPrototypeOf(this) === LocalContentStore.prototype &&
+      this.readBytes === LocalContentStore.prototype.readBytes;
+    const cached = concrete && checkpointClosureBytes(this.root, ref);
+    if (cached) return cached;
+    const fd = this.openObject(ref);
+    try {
+      const bytes = this.readDescriptor(fd, ref);
+      if (concrete) retainCheckpointClosureBytes(this.root, ref, bytes);
+      return bytes;
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  checkpointReferences(
+    description: string,
+  ): RecoveryCheckpointReferenceSummary | undefined {
+    return Object.getPrototypeOf(this) === LocalContentStore.prototype &&
+      this.readBytes === LocalContentStore.prototype.readBytes
+      ? cachedRecoveryCheckpointReferences(this.root, description)
+      : undefined;
+  }
+
+  retainCheckpointReferences(
+    description: string,
+    summary: RecoveryCheckpointReferenceSummary,
+  ): void {
+    if (
+      Object.getPrototypeOf(this) === LocalContentStore.prototype &&
+      this.readBytes === LocalContentStore.prototype.readBytes
+    )
+      retainRecoveryCheckpointReferences(this.root, description, summary);
   }
 
   async put(
@@ -207,7 +326,21 @@ export class LocalContentStore implements ContentStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
-      await this.verify(ref);
+      const retained = this.openObject(ref);
+      try {
+        const identity = this.descriptorIdentity(retained, ref, false);
+        // One streamed digest read authenticates the final linked object. Bind
+        // it to the same opened file, then make that link durable at its producer.
+        await this.verify(ref);
+        if (this.descriptorIdentity(retained, ref, false) !== identity)
+          throw new Error("Content object changed during streamed retention");
+        this.synchronizeObject(retained, ref, false);
+        const current = fstatSync(retained);
+        if (current.uid === process.getuid?.() && !(current.mode & 0o077))
+          retainCheckpointContentVerification(this.root, ref, identity);
+      } finally {
+        closeSync(retained);
+      }
       return ref;
     } finally {
       rmSync(temporary, { force: true });

@@ -13,7 +13,6 @@ import {
   type AccountingSeal,
   assertAccountingSealBinding,
   assertAccountingSealContent,
-  decodeAccountingRecord,
 } from "./accounting.js";
 import type { FactoryConfig } from "./config.js";
 import { stateRoot } from "./config.js";
@@ -36,11 +35,21 @@ import {
   authenticateRejectedCollectionReceipt,
   type RejectedCollectionReceipt,
 } from "./execution/local.js";
-import { pinnedGit, pinnedGitEnvironment, subprocessAsync } from "./process.js";
-import { assertRecoveryCheckpointManifest } from "./recovery-checkpoint.js";
+import {
+  assertProcessActive,
+  pinnedGit,
+  pinnedGitEnvironment,
+  subprocessAsync,
+} from "./process.js";
 import type {
   RecoveryCheckpointClosure,
   RecoveryCheckpointFile,
+} from "./recovery-checkpoint.js";
+import {
+  assertRecoveryCheckpointManifest,
+  cachedRecoveryCheckpointGitPack,
+  retainRecoveryCheckpointGitPack,
+  withRecoveryCheckpointClosureReads,
 } from "./recovery-checkpoint.js";
 import type { RepositoryMemoryBinding } from "./repository-memory.js";
 import { decodeRepositoryMemoryManifest } from "./repository-memory.js";
@@ -570,8 +579,18 @@ export interface RecoveryReferenceReader {
 async function readReference(
   source: ContentStore | RecoveryReferenceReader,
   ref: ContentRef,
+  knownStore?: LocalContentStore,
 ): Promise<Uint8Array> {
   assertRef(ref);
+  // The concrete store verifies its opened owned file and exact content before
+  // returning bytes; repeating the same hash here adds no independent fact.
+  if (
+    knownStore &&
+    source === knownStore &&
+    Object.getPrototypeOf(source) === LocalContentStore.prototype &&
+    knownStore.readBytes === LocalContentStore.prototype.readBytes
+  )
+    return knownStore.readBytes(ref);
   let bytes: Uint8Array;
   if ("readBytes" in source) bytes = await source.readBytes(ref);
   else {
@@ -700,7 +719,29 @@ async function verifyDescription(
     maxBytes: Number.MAX_SAFE_INTEGER,
     maxFiles: Number.MAX_SAFE_INTEGER,
   },
+  knownStore?: LocalContentStore,
 ): Promise<ContinuationReferences> {
+  const concrete =
+    knownStore &&
+    source === knownStore &&
+    Object.getPrototypeOf(source) === LocalContentStore.prototype &&
+    knownStore.readBytes === LocalContentStore.prototype.readBytes;
+  const signature = concrete && JSON.stringify([description, bounds]);
+  const cached = signature && knownStore.checkpointReferences(signature);
+  if (cached) {
+    for (const ref of [...cached.contentRefs, ...cached.originals])
+      knownStore!.verifyPrivateBytes(ref);
+    return {
+      contentRefs: cached.contentRefs,
+      gitObjects: cached.gitObjects,
+      gaps: cached.gaps,
+    };
+  }
+  const originals = new Map<string, ContentRef>();
+  const read = (ref: ContentRef) => {
+    originals.set(refKey(ref), { ...ref });
+    return readReference(source, ref, knownStore);
+  };
   const refs = new Map(
     description.contentRefs.map((ref) => [refKey(ref), ref]),
   );
@@ -732,7 +773,7 @@ async function verifyDescription(
         : `${root.kind}:${refKey(root.ref)}:${JSON.stringify(root.identity ?? null)}`;
     if (visited.has(key)) continue;
     visited.add(key);
-    const bytes = await readReference(source, root.ref);
+    const bytes = await read(root.ref);
     if (root.kind === "restoration-original") {
       const value = object(
         JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
@@ -794,19 +835,14 @@ async function verifyDescription(
       gaps.push(...(value.gaps as RecoveryClosureGap[]));
     } else if (root.kind === "accounting") {
       const seal = root.accounting!;
-      await assertAccountingSealContent(
+      const records = await assertAccountingSealContent(
         seal.repository,
         seal.objective,
         seal.runId,
         seal,
-        (ref) => readReference(source, ref),
+        read,
       );
-      for (const ref of seal.records) {
-        const record = decodeAccountingRecord(
-          seal.repository,
-          `accounting/${ref.digest}.json`,
-          await readReference(source, ref),
-        );
+      for (const record of records) {
         if (record.kind === "interaction") {
           const payload = record.capture.content.reference?.payload;
           if (payload) add(payload);
@@ -819,9 +855,7 @@ async function verifyDescription(
       for (const body of record.bodies)
         if (body.ref) {
           add(body.ref);
-          merge(
-            memoryReferences(body.role, await readReference(source, body.ref)),
-          );
+          merge(memoryReferences(body.role, await read(body.ref)));
         }
       for (const entry of record.sources) if (entry.ref) add(entry.ref);
     } else {
@@ -855,12 +889,30 @@ async function verifyDescription(
       });
     }
   }
-  for (const ref of refs.values()) await readReference(source, ref);
-  return {
+  for (const ref of refs.values()) {
+    originals.set(refKey(ref), { ...ref });
+    if (
+      knownStore &&
+      source === knownStore &&
+      Object.getPrototypeOf(source) === LocalContentStore.prototype &&
+      knownStore.readBytes === LocalContentStore.prototype.readBytes
+    )
+      knownStore.verifyPrivateBytes(ref);
+    else await read(ref);
+  }
+  const result = {
     contentRefs: [...refs.values()],
     gitObjects: [...objects.values()],
     gaps,
   };
+  if (signature)
+    knownStore!.retainCheckpointReferences(signature, {
+      ...result,
+      originals: [...originals]
+        .filter(([key]) => !refs.has(key))
+        .map(([, ref]) => ref),
+    });
+  return result;
 }
 /** Open only declared nested schemas; digest-looking opaque evidence never supplies reads. */
 export async function verifyContinuationReferenceClosure(
@@ -876,6 +928,20 @@ export async function verifyMemoryBodyReferenceClosure(
   source: ContentStore | RecoveryReferenceReader,
 ): Promise<ContinuationReferences> {
   return verifyDescription(memoryReferences(role, bytes), source);
+}
+
+/** The normal local memory producer owns this concrete store; imports stay strict. */
+export async function verifyLocalMemoryBodyReferenceClosure(
+  role: string,
+  bytes: Uint8Array,
+  store: LocalContentStore,
+): Promise<ContinuationReferences> {
+  return verifyDescription(
+    memoryReferences(role, bytes),
+    store,
+    undefined,
+    store,
+  );
 }
 
 function privateBytes(path: string, root: string): Buffer {
@@ -913,21 +979,35 @@ export async function buildRecoveryCheckpointClosure(input: {
   scope?: "private-history" | "repository-knowledge";
   store?: ContentStore;
 }): Promise<RecoveryCheckpointClosure> {
+  return withRecoveryCheckpointClosureReads(
+    input.config,
+    () => buildRecoveryCheckpointClosureLocal(input),
+    !input.store,
+  );
+}
+
+async function buildRecoveryCheckpointClosureLocal(input: {
+  config: FactoryConfig;
+  scope?: "private-history" | "repository-knowledge";
+  store?: ContentStore;
+}): Promise<RecoveryCheckpointClosure> {
   const { config } = input;
   const scope =
     input.scope ?? config.gitPersistence?.scope ?? "private-history";
   const root = stateRoot(config.repository);
   const store = new LocalContentStore(join(root, "content"));
-  const reader: RecoveryReferenceReader = {
-    readBytes: async (ref) => {
-      try {
-        return await readReference(store, ref);
-      } catch (error) {
-        if (!input.store) throw error;
-        return readReference(input.store, ref);
+  const reader: LocalContentStore | RecoveryReferenceReader = input.store
+    ? {
+        readBytes: async (ref) => {
+          try {
+            return await readReference(store, ref, store);
+          } catch (error) {
+            if (!input.store) throw error;
+            return readReference(input.store, ref);
+          }
+        },
       }
-    },
-  };
+    : store;
   const files: RecoveryCheckpointFile[] = [];
   const refs = new Map<string, ContentRef>();
   const objects = new Map<string, RecoveryGitObject>();
@@ -1006,10 +1086,11 @@ export async function buildRecoveryCheckpointClosure(input: {
             config.repository,
             Number(id),
           );
-          const description = await verifyContinuationReferenceClosure(
-            state,
+          const description = await verifyDescription(
+            continuationReferences(state),
             reader,
             config.gitPersistence,
+            input.store ? undefined : store,
           );
           for (const ref of description.contentRefs) refs.set(refKey(ref), ref);
           for (const entry of description.gitObjects)
@@ -1192,13 +1273,25 @@ export async function buildRecoveryCheckpointClosure(input: {
     const roots = [...objects.values()].sort((left, right) =>
       left.sha.localeCompare(right.sha),
     );
-    for (const entry of roots)
-      if (
-        pinnedGit(config.checkout, "cat-file", "-t", entry.sha) !== entry.kind
-      )
-        throw new Error(
-          "Required recovery Git object is missing or has another type",
-        );
+    const inventory = await subprocessAsync(
+      "git",
+      [
+        "-C",
+        config.checkout,
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype)",
+      ],
+      { env: pinnedGitEnvironment() },
+      `${roots.map((entry) => entry.sha).join("\n")}\n`,
+    );
+    if (
+      inventory.status !== 0 ||
+      inventory.stdout !==
+        `${roots.map((entry) => `${entry.sha} ${entry.kind}`).join("\n")}\n`
+    )
+      throw new Error(
+        "Required recovery Git object is missing or has another type",
+      );
     // Git finalizes its pack from the repository object directory by rename.
     // Keep our owned output on that filesystem, including linked worktrees.
     const objectDirectory = realpathSync(
@@ -1212,46 +1305,91 @@ export async function buildRecoveryCheckpointClosure(input: {
     );
     if (!lstatSync(objectDirectory).isDirectory())
       throw new Error("Recovery Git object storage is not a directory");
-    const temporary = mkdtempSync(
-      join(objectDirectory, "factory-checkpoint-objects-"),
-    );
-    try {
-      const packed = await subprocessAsync(
-        "git",
-        [
-          "-C",
-          config.checkout,
-          "pack-objects",
-          "--revs",
-          "--threads=1",
-          join(temporary, "objects"),
-        ],
-        { env: pinnedGitEnvironment() },
-        `${roots.map((entry) => entry.sha).join("\n")}\n`,
+    const identity = createHash("sha256").update(JSON.stringify(roots));
+    const inspect = (path: string, relativePath = "") => {
+      assertProcessActive();
+      const stat = lstatSync(path, { bigint: true });
+      if (stat.isSymbolicLink())
+        throw new Error("Recovery Git object cache contains a symlink");
+      identity.update(
+        JSON.stringify([
+          relativePath,
+          stat.dev.toString(),
+          stat.ino.toString(),
+          stat.mode.toString(),
+          ...(stat.isFile()
+            ? [
+                stat.size.toString(),
+                stat.mtimeNs.toString(),
+                stat.ctimeNs.toString(),
+              ]
+            : []),
+        ]),
       );
-      if (
-        packed.status !== 0 ||
-        !/^[a-f0-9]{40,64}$/.test(packed.stdout.trim())
-      )
-        throw new Error("Required recovery Git objects could not be packed");
-      const packPath = join(temporary, `objects-${packed.stdout.trim()}.pack`);
-      const ref = await retainBytes(
-        store,
-        readFileSync(packPath),
-        "application/x-git-packed-objects",
+      if (stat.isDirectory())
+        for (const name of readdirSync(path).sort())
+          inspect(join(path, name), `${relativePath}/${name}`);
+      else if (!stat.isFile())
+        throw new Error(
+          "Recovery Git object cache contains an unsupported entry",
+        );
+    };
+    inspect(objectDirectory);
+    const key = identity.digest("hex");
+    let ref = cachedRecoveryCheckpointGitPack(key);
+    if (ref) await readReference(reader, ref, input.store ? undefined : store);
+    else {
+      const temporary = mkdtempSync(
+        join(objectDirectory, "factory-checkpoint-objects-"),
       );
-      refs.set(refKey(ref), ref);
-      files.push({
-        kind: "git-pack",
-        path: `git/objects-${ref.digest}.pack`,
-        ref,
-        visibility: scope === "private-history" ? "private" : "repository",
-      });
-    } finally {
-      rmSync(temporary, { recursive: true, force: true });
+      try {
+        const packed = await subprocessAsync(
+          "git",
+          [
+            "-C",
+            config.checkout,
+            "pack-objects",
+            "--revs",
+            "--threads=1",
+            join(temporary, "objects"),
+          ],
+          { env: pinnedGitEnvironment() },
+          `${roots.map((entry) => entry.sha).join("\n")}\n`,
+        );
+        if (
+          packed.status !== 0 ||
+          !/^[a-f0-9]{40,64}$/.test(packed.stdout.trim())
+        )
+          throw new Error("Required recovery Git objects could not be packed");
+        const packPath = join(
+          temporary,
+          `objects-${packed.stdout.trim()}.pack`,
+        );
+        ref = await retainBytes(
+          store,
+          readFileSync(packPath),
+          "application/x-git-packed-objects",
+        );
+      } finally {
+        rmSync(temporary, { recursive: true, force: true });
+      }
+      retainRecoveryCheckpointGitPack(key, ref!);
     }
+    refs.set(refKey(ref!), ref!);
+    files.push({
+      kind: "git-pack",
+      path: `git/objects-${ref!.digest}.pack`,
+      ref: ref!,
+      visibility: scope === "private-history" ? "private" : "repository",
+    });
   }
   for (const ref of refs.values()) {
+    // Existing local originals already occupy their durable content address.
+    // Only a supplied import store needs to copy missing originals into it.
+    if (!input.store) {
+      store.verifyPrivateBytes(ref);
+      continue;
+    }
     const bytes = await readReference(reader, ref);
     await retainBytes(store, bytes, ref.mediaType);
   }

@@ -1356,10 +1356,43 @@ export interface ProjectQueueSnapshot {
     archived: boolean;
   }[];
 }
+/** Exact current command target; never a complete Project scheduling observation. */
+export type ProjectQueueTarget = Omit<
+  ProjectQueueCard,
+  "title" | "body" | "state"
+>;
+export interface ProjectQueueInspection {
+  scope: "target";
+  binding: ProjectQueueBinding;
+  observedAt: string;
+  actorId: number;
+  owner: string;
+  control: { itemId: string; metadata: string | null };
+  target?: ProjectQueueTarget;
+  issue?: Pick<
+    ProjectQueueCard,
+    "issueNodeId" | "objective" | "repository" | "title" | "body" | "state"
+  >;
+  /** Complete membership for only the requested Issue in the configured Project. */
+  membership?: { itemId: string; archived: boolean }[];
+}
+export interface ProjectQueueExpectedTarget {
+  itemId: string;
+  metadata: string | null;
+  order?: number | null;
+  issueNodeId?: string;
+  objective?: number;
+}
 export type ProjectQueueAction =
   | { action: "ensure-card"; issueNodeId: string }
   | { action: "set-order"; itemId: string; order: number }
-  | { action: "set-metadata"; itemId: string; metadata: string };
+  | { action: "set-metadata"; itemId: string; metadata: string }
+  | {
+      action: "set-admission-fields";
+      itemId: string;
+      order: number;
+      metadata: string;
+    };
 export type ProjectQueueIntent = ProjectQueueAction & {
   binding: ProjectQueueBinding;
   requestId: string;
@@ -1369,9 +1402,68 @@ export type ProjectQueueIntent = ProjectQueueAction & {
   /** Exact fixed adapter request retained before the effect, including selection variables. */
   request: { query: string; variables: Record<string, unknown> };
 };
+/** A generated card identity comes only from the named original ensure receipt. */
+export type ProjectQueueItemSelector =
+  | { itemId: string }
+  | { resultOf: string };
+export type ProjectQueuePlannedAction =
+  | { action: "ensure-card"; issueNodeId: string }
+  | {
+      action: "set-order";
+      target: ProjectQueueItemSelector;
+      fieldId: string;
+      order: number;
+    }
+  | {
+      action: "set-metadata";
+      target: ProjectQueueItemSelector;
+      fieldId: string;
+      metadata: string;
+    }
+  | {
+      action: "set-admission-fields";
+      target: ProjectQueueItemSelector;
+      orderFieldId: string;
+      metadataFieldId: string;
+      order: number;
+      metadata: string;
+    };
+export type ProjectQueuePlannedEffectInput = ProjectQueuePlannedAction & {
+  operationId: string;
+  requestId: string;
+  actorId: number;
+  expectedIssue?: {
+    issueNodeId: string;
+    objective: number;
+    bodyDigest: string;
+  };
+  /** Initial exact target, or the target in the named validated preceding response. */
+  prior: { target: ProjectQueueExpectedTarget | null } | { resultOf: string };
+  /** Current control remains exact, including an explicitly planned preceding control write. */
+  control: { metadata: string | null } | { resultOf: string };
+};
+/** Immutable command obligation; it grants no permission to replay an effect. */
+export type ProjectQueuePlannedEffect = ProjectQueuePlannedEffectInput & {
+  /** Only declared itemId inputs may contain the explicit resultOf selector. */
+  request: { query: string; variables: Record<string, unknown> };
+};
 export type ProjectQueueWriteRequest = ProjectQueueAction & {
   binding: ProjectQueueBinding;
   requestId: string;
+  /** Current Issue contents required by admission/publication, never cached approval. */
+  expectedIssue?: {
+    issueNodeId: string;
+    objective: number;
+    bodyDigest: string;
+  };
+  /** Exact operation inspection or unchanged preceding original response, never persisted as authority. */
+  observation?: ProjectQueueInspection | ProjectQueueWriteReceipt;
+  /** Ephemeral current target proof, rechecked after durable admission. */
+  expectedTarget?: ProjectQueueExpectedTarget;
+  /** The exact whole-command declaration already retained by the owning controller. */
+  plannedEffect?: ProjectQueuePlannedEffect;
+  /** Actual validated originals used solely to hydrate declared dependencies. */
+  dependencyReceipts?: ProjectQueueWriteReceipt[];
   /** The owner durably retains this exact intent and admits it before transport. */
   beforeWrite(intent: ProjectQueueIntent): void | Promise<void>;
   /** A submitted prior effect permits no further mutation. */
@@ -1409,9 +1501,18 @@ export interface NamedCheckEvidence {
 export interface GitHubGateway {
   readonly effectAdmission?: "controller-checkpoint-v1";
   readonly projectionMutationAdmission?: "controller-checkpoint-v1";
+  /** One finite owned operation; reuse is private and never grants spending authority. */
+  withProjectQueueObservation?<T>(
+    binding: ProjectQueueBinding,
+    task: () => Promise<T>,
+  ): Promise<T>;
   projectQueueRead?(
     binding: ProjectQueueBinding,
   ): Promise<ProjectQueueSnapshot>;
+  projectQueueInspect?(
+    binding: ProjectQueueBinding,
+    request?: { itemId?: string; objective?: number },
+  ): Promise<ProjectQueueInspection>;
   projectQueueWrite?(
     request: ProjectQueueWriteRequest,
   ): Promise<ProjectQueueWriteReceipt>;

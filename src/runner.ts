@@ -59,11 +59,15 @@ import {
   withProcessCancellation,
 } from "./process.js";
 import {
+  abandonFailedProjectQueueReservation,
   assertProjectQueueRunLive,
-  claimProjectQueueRun,
   bindProjectQueueRun,
-  settleCancelledProjectQueueRun,
+  claimProjectQueueRun,
   type QueueOwnerClaim,
+  retireUnknownProjectAdmission,
+  retireUnknownProjectWithdrawal,
+  settleCancelledProjectQueueRun,
+  settleFailedProjectQueueReservation,
   settleProjectQueueRun,
   settleStoppedProjectQueueRun,
 } from "./project-queue-state.js";
@@ -71,6 +75,7 @@ import { objectiveCandidate } from "./qa.js";
 import {
   awaitCheckpointAdmission,
   isCheckpointAdmissionFailure,
+  withQueueControlVerification,
   withRecoveryCheckpointScope,
 } from "./recovery-checkpoint.js";
 import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
@@ -108,6 +113,7 @@ import {
   setCoordinatorMode,
 } from "./state.js";
 import {
+  acquireInstallationLock,
   acquireObjectiveLock,
   assertRestoredContinuationReady,
   assertRestoredInstallationDispatchReady,
@@ -279,9 +285,73 @@ function modeChangeResult(
   };
 }
 
+/** A stopped disposition owns verification and settlement until lease release. */
+async function stoppedOperatorHandoff(
+  config: FactoryConfig,
+  request: ControlRequest,
+  github?: GitHubGateway,
+): Promise<unknown> {
+  const input = request.input;
+  if (!input || !github || typeof input.actor !== "string" || !input.actor)
+    throw new Error(
+      "Stopped operator disposition requires its explicit local operator and genuine Project gateway",
+    );
+  if (
+    [
+      input.failedReservationEvidence,
+      input.retiredWithdrawalEvidence,
+      input.retiredAdmissionEvidence,
+    ].filter((value) => value !== undefined).length !== 1
+  )
+    throw new Error("Choose one exact stopped operator disposition");
+  const actor = input.actor;
+  const lockPath = installationLockPath(config.repository),
+    lock = acquireInstallationLock(config.repository, request.objective);
+  try {
+    return await withQueueControlVerification(
+      {
+        config,
+        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+      },
+      () =>
+        checkpointController(config, async () => {
+          if (input.retiredAdmissionEvidence !== undefined)
+            return await retireUnknownProjectAdmission(
+              config,
+              github,
+              request.objective,
+              input.retiredAdmissionEvidence,
+              actor,
+              lock,
+            );
+          if (input.retiredWithdrawalEvidence !== undefined)
+            return await retireUnknownProjectWithdrawal(
+              config,
+              github,
+              request.objective,
+              input.retiredWithdrawalEvidence,
+              actor,
+              lock,
+            );
+          return await abandonFailedProjectQueueReservation(
+            config,
+            github,
+            request.objective,
+            input.failedReservationEvidence,
+            actor,
+            lock,
+          );
+        }),
+    );
+  } finally {
+    releaseControllerLock(lockPath, lock);
+  }
+}
+
 async function controlObjectiveUnscoped(
   config: FactoryConfig,
   request: ControlRequest,
+  _github?: GitHubGateway,
 ): Promise<unknown> {
   const retained = readContinuation(config.repository, request.objective);
   if (retained && request.action !== "status")
@@ -496,7 +566,23 @@ async function runObjectiveOwned(
       ),
     };
   } catch (error) {
-    if (!options.ownerLock) releaseControllerLock(lockPath, lock);
+    try {
+      if (queueClaim && !snapshot)
+        await settleFailedProjectQueueReservation(
+          config,
+          queueClaim,
+          lock.token,
+          error,
+        );
+    } catch (settlementError) {
+      throw new AggregateError(
+        [error, settlementError],
+        "Pre-snapshot controller setup and its Project settlement failed",
+        { cause: error },
+      );
+    } finally {
+      if (!options.ownerLock) releaseControllerLock(lockPath, lock);
+    }
     throw error;
   }
   if (snapshot)
@@ -2081,8 +2167,16 @@ export function decideObjective(
 export function controlObjective(
   ...args: Parameters<typeof controlObjectiveUnscoped>
 ): ReturnType<typeof controlObjectiveUnscoped> {
+  const [config, request, github] = args;
+  if (
+    request.action === "handoff" &&
+    (request.input?.failedReservationEvidence !== undefined ||
+      request.input?.retiredWithdrawalEvidence !== undefined ||
+      request.input?.retiredAdmissionEvidence !== undefined)
+  )
+    return stoppedOperatorHandoff(config, request, github);
   return checkpointController(
-    args[0],
+    config,
     () => controlObjectiveUnscoped(...args),
     undefined,
   );
