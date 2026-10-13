@@ -33,6 +33,7 @@ import {
   enqueueIntake,
   intakeControl,
   runIntake,
+  resolveIntakeBase,
   watchIntake,
 } from "../dist/intake.js";
 import { LocalRepositoryMemory } from "../dist/repository-memory.js";
@@ -652,6 +653,26 @@ test("a terminal background watcher holds checkpoint failure while real control 
   // receipts; this is no model response or claim of provider qualification.
   sealFinalAcceptance(state);
   saveState(statePath(repository, 1), state);
+  // Exercise the actual intake eligibility seam against real Git. An empty
+  // native dependency set has no base-dependent eligibility, while the
+  // predecessor path still fetches and proves accepted ancestry before alignment.
+  let sourceReads = 0;
+  const sourceGithub = {
+    ...github,
+    async defaultBranch() {
+      sourceReads++;
+      return "main";
+    },
+  };
+  await resolveIntakeBase(config, sourceGithub, [], 2);
+  assert.equal(sourceReads, 0);
+  await writeFile(join(checkout, "dirty.txt"), "preserve this actual change\n");
+  await assert.rejects(
+    resolveIntakeBase(config, sourceGithub, [], 2),
+    /local changes/,
+  );
+  assert.equal(sourceReads, 0);
+  await rm(join(checkout, "dirty.txt"));
   const sealed = JSON.stringify(state.finalAcceptance);
   const contentStore = new LocalContentStore(
     join(stateRoot(repository), "content"),
@@ -783,6 +804,37 @@ test("a terminal background watcher holds checkpoint failure while real control 
       readControllerOwner(installationLockPath(repository)),
       undefined,
     );
+    const sourceRemote = join(directory, "source.git"),
+      sourceClone = join(directory, "source-clone");
+    execFileSync("git", ["init", "--bare", "-b", "main", sourceRemote], {
+      stdio: "ignore",
+    });
+    git("push", sourceRemote, "HEAD:main");
+    execFileSync("git", ["clone", sourceRemote, sourceClone], {
+      stdio: "ignore",
+    });
+    const sourceConfig = { ...config, checkout: sourceClone };
+    const priorLocalOrigins = process.env.FACTORY_TEST_LOCAL_ORIGINS;
+    process.env.FACTORY_TEST_LOCAL_ORIGINS = "1";
+    try {
+      await resolveIntakeBase(sourceConfig, sourceGithub, [1], 2);
+      assert.equal(sourceReads, 1);
+      assert.equal(
+        execFileSync("git", ["-C", sourceClone, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim(),
+        commit,
+      );
+      await assert.rejects(
+        resolveIntakeBase(sourceConfig, sourceGithub, [999], 2),
+        /lacks bound accepted candidate evidence/,
+      );
+      assert.equal(sourceReads, 2);
+    } finally {
+      if (priorLocalOrigins === undefined)
+        delete process.env.FACTORY_TEST_LOCAL_ORIGINS;
+      else process.env.FACTORY_TEST_LOCAL_ORIGINS = priorLocalOrigins;
+    }
   } finally {
     LocalContentStore.prototype.checkpointReferences = originalReferences;
     if (running) {
