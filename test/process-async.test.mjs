@@ -2216,6 +2216,102 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
     assert.equal(evidence.treeSha, treeSha);
     assert.equal(evidence.commands[0].exitCode, 0);
     assert.equal(evidence.commands[0].executionControl, undefined);
+    // A deterministic review-boundary defect after real passing validation
+    // reuses this exact candidate, not a fabricated failed-command capture.
+    const defectState = structuredClone(state);
+    const defectWork = defectState.work.local;
+    defectWork.validation = structuredClone(evidence);
+    delete defectWork.failedValidation;
+    const reviewDefect = new Error(
+      "Review admission refused before provider dispatch",
+    );
+    recordWorkFailure(defectState, "local", reviewDefect);
+    defectWork.status = "failed";
+    defectWork.error = reviewDefect.message;
+    defectState.error = reviewDefect.message;
+    defectState.errorItem = "local";
+    defectState.coordinator.deadlineAt = new Date(
+      Date.now() + 60_000,
+    ).toISOString();
+    defectState.autonomy.allowances.resultRereviews = 2;
+    defectState.autonomy.repairPolicy.perPath.resultRereviews = 2;
+    const defectOriginal = structuredClone(defectState);
+    for (const change of [
+      (value) => {
+        value.errorItem = "another-item";
+      },
+      (value) => {
+        value.work.local.validation.worktreeObservation.postCommandStatus =
+          "changed";
+      },
+      (value) => {
+        value.work.local.recovery.diagnosisInvocation = {
+          id: randomUUID(),
+          submitted: true,
+          requestDigest: "a".repeat(64),
+        };
+      },
+      (value) => {
+        value.objectiveBodyDigest = createHash("sha256")
+          .update("refusal-only objective binding")
+          .digest("hex");
+        value.sourcePacketDigest = createHash("sha256")
+          .update(JSON.stringify(pinnedSources))
+          .digest("hex");
+        const session = agentSessionContinuation(
+          value,
+          "planning",
+          undefined,
+          () => undefined,
+        );
+        session.checkpoint({
+          scope: session.scope,
+          adapter: "unknown-turn-refusal-only",
+          identity: session.identity,
+          turn: 1,
+          status: "unavailable",
+          data: {},
+          currentTurn: {
+            invocationId: randomUUID(),
+            requestDigest: "b".repeat(64),
+            graphDigest: graphDigest(value.graph),
+            dispatch: "submitted",
+            resources: "settled",
+          },
+        });
+      },
+      (value) => {
+        value.coordinator.deadlineAt = new Date(Date.now() - 1).toISOString();
+      },
+    ]) {
+      const refused = structuredClone(defectOriginal);
+      change(refused);
+      assert.throws(() => {
+        saveState(statePath(config.repository, 1), refused);
+        rereviewWorkItem(config, 1, request);
+      });
+    }
+    saveState(statePath(config.repository, 1), defectOriginal);
+    rereviewWorkItem(config, 1, request);
+    const admittedDefect = readState(config.repository, 1);
+    assert.equal(admittedDefect.error, undefined);
+    assert.equal(admittedDefect.errorItem, undefined);
+    assert.equal(admittedDefect.work.local.attempt, defectWork.attempt);
+    assert.equal(admittedDefect.work.local.baseSha, defectWork.baseSha);
+    assert.equal(admittedDefect.work.local.changeRef, commit);
+    assert.equal(admittedDefect.work.local.treeSha, treeSha);
+    assert.equal(admittedDefect.work.local.step, "validate");
+    assert.equal(admittedDefect.work.local.status, "running");
+    const archivedDefect = admittedDefect.work.local.recovery.history.at(-1);
+    assert.deepEqual(archivedDefect.failure, defectWork.recovery.failure);
+    assert.deepEqual(archivedDefect.work.validation, evidence);
+    assert.equal(archivedDefect.work.error, reviewDefect.message);
+    assert.equal(consumption(admittedDefect).resultRereviews, 2);
+    assert.equal(consumption(admittedDefect).implementationRepairs, 0);
+    assert.equal(
+      admittedDefect.coordinator.deadlineAt,
+      defectOriginal.coordinator.deadlineAt,
+    );
     // The native input contract verifies actual immutable bytes before effects.
     const imageInputRoot = join(root, "image-input");
     mkdirSync(join(imageInputRoot, "artifacts"), { recursive: true });
