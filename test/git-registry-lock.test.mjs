@@ -15,6 +15,7 @@ import {
 } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { diagnosticPath } from "../dist/diagnostics.js";
+import { RegularDelivery } from "../dist/delivery/regular.js";
 import { CodexPlanningModel } from "../dist/compiler/model.js";
 import { sealFinalAcceptance } from "../dist/completion.js";
 import { LocalExecutionDriver, CodexHarness } from "../dist/execution/local.js";
@@ -446,7 +447,7 @@ test("a terminal background watcher holds checkpoint failure while real control 
       contentStore,
       "codex",
     ),
-    delivery: { effectAdmission: "controller-checkpoint-v1" },
+    delivery: new RegularDelivery(checkout, github),
   };
   let running;
   try {
