@@ -26,7 +26,7 @@ A version with a suffix, such as `0.2.0-rc.1`, is published as a GitHub prerelea
 
 2. **Review the batch.** Merge the phase's diagnosed fixes through the normal protected pull request path with green Quality checks. Retain focused independent review for changes to credentials, isolation or persisted state. Refresh the release branch after the batch is complete, and independently review its exact candidate.
 
-3. **Accept the phase.** Before merging `X.Y.0`, complete the release issue's recorded phase exits and independent completed-batch review. Run the phase acceptance after the batch is complete; a separate public fixture qualification is optional diagnosis, not an additional release or adopter-start gate. Retain the final reviewed source commit, tree, packed archive checksum, installation and outcome evidence for the distribution comparison. CI supplies the packed CLI integration check. Keeping the version PR unmerged until these gates pass leaves the marketplaces on an existing release tag.
+3. **Accept the phase.** Before merging `X.Y.0`, complete the release issue's recorded phase exits and independent completed-batch review. Confirm acceptance on the completed batch using meaningful affected tests and retained evidence where they still prove the required behavior. Run a live check only for a specific remaining unproved changed behavior; a separate public fixture qualification is optional diagnosis, not an additional release or adopter-start gate. Retain the final reviewed source commit, tree, packed archive checksum, installation and outcome evidence for the distribution comparison. CI supplies the packed CLI integration check. Keeping the version PR unmerged until these gates pass leaves the marketplaces on an existing release tag.
 
 4. **Merge.** Merge through the normal protected path after the required phase exits pass. For a minor version, verify that the merged tree equals the retained phase-accepted tree before tagging.
 
@@ -56,7 +56,9 @@ For a minor version, also compare the downloaded archive byte for byte with the 
 
 ## Phase acceptance
 
-The release issue defines the required phase outcomes and their order. Complete those outcomes with the approved providers, targets, substantive acceptance and resource limits. Keep exact candidate identities, real results, failures, usage and consumed allowances. Local checks and historical accepted work do not substitute for the current outcome's acceptance.
+The release issue defines the required phase outcomes and their order. Complete those outcomes with the approved providers, targets, substantive acceptance and resource limits. Keep exact candidate identities, real results, failures, usage and consumed allowances. Reuse meaningful tests and retained evidence for the facts they actually prove; they do not turn failed historical work into current acceptance.
+
+Qualification must remain proportional to the product change. Broad provider/profile matrices, benchmarks and deliberate fault drills are not automatic release or feature-closure gates. A live check is needed only when a specific changed behavior remains unproved by the existing tests and retained facts. New live provider capabilities require actual SDK evidence for the named claim, using the smallest bounded check that proves it. Preserve security, ownership, unknown outcomes, accounting and recorded limits. Stop when the required behavior works and its checks pass; do not grow a qualification program around a completed outcome.
 
 Batch corrections before the milestone review, and repeat a failed check only after a demonstrated correction. Preserve terminal runs and their accounting without reviving them or treating them as successful evidence. The release issue holds the current roadmap and acceptance evidence; do not duplicate that tracking here.
 
