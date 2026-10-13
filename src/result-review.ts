@@ -158,6 +158,7 @@ export async function reviewAcceptance(args: {
     baseSha,
     commit,
     Math.floor(availableBudget / 2),
+    sources.map((source) => source.path),
   );
   const remainingBudget = availableBudget - byteComparisons.textBytes;
   const inventory = resultTreeInventory(

@@ -406,6 +406,16 @@ function checkpointObservation(
     },
   };
 }
+export function recoveryCheckpointGitPackObservation(
+  config: FactoryConfig,
+  metadata: () => Record<string, string | number | boolean>,
+) {
+  return checkpointObservation(
+    config,
+    "recovery-checkpoint-source-pack",
+    metadata,
+  );
+}
 class CheckpointConflict extends Error {}
 class CheckpointRestoreRequired extends Error {}
 export function isCheckpointAdmissionFailure(

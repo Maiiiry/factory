@@ -58,6 +58,7 @@ import type {
 import {
   assertRecoveryCheckpointManifest,
   cachedRecoveryCheckpointGitPack,
+  recoveryCheckpointGitPackObservation,
   retainRecoveryCheckpointGitPack,
   withRecoveryCheckpointClosureReads,
 } from "./recovery-checkpoint.js";
@@ -1559,10 +1560,49 @@ async function buildRecoveryCheckpointClosureLocal(input: {
     // authority. A smaller/different source scope needs a fresh full capture.
     const reusable =
       cached &&
-      unchangedMaterial &&
       cached.roots.every((entry) =>
         currentRoots.has(`${entry.kind}:${entry.sha}`),
       );
+    const observed = recoveryCheckpointGitPackObservation(config, () => ({
+      cache: !cached
+        ? "absent"
+        : !reusable
+          ? "scope-changed"
+          : unchangedMaterial
+            ? "unchanged"
+            : "material-changed",
+      roots: roots.length,
+      baselinePacks: reusable ? cached.refs.length : 0,
+    }));
+    if (reusable && !unchangedMaterial) {
+      // Git freshens existing packs when it writes a result. Stat changes do
+      // not invalidate authenticated retained bytes, but current source objects
+      // must still be genuine before excluding their covered reachable set.
+      observed.start("source-integrity");
+      try {
+        const verified = await subprocessAsync(
+          "git",
+          [
+            "-C",
+            config.checkout,
+            "fsck",
+            "--strict",
+            "--no-reflogs",
+            "--no-dangling",
+            ...roots.map((entry) => entry.sha),
+          ],
+          { env: pinnedGitEnvironment() },
+        );
+        if (verified.status !== 0)
+          throw new Error(
+            "Recovery Git source failed exact reachable-object verification",
+          );
+        observed.complete();
+      } catch (error) {
+        observed.fail(error);
+        throw error;
+      }
+    }
     const packs = reusable ? cached.refs : [];
     const coveredRoots = new Set(
       (reusable ? cached.roots : []).map(
@@ -1572,6 +1612,7 @@ async function buildRecoveryCheckpointClosureLocal(input: {
     const addedRoots = roots.filter(
       (entry) => !coveredRoots.has(`${entry.kind}:${entry.sha}`),
     );
+    observed.start(addedRoots.length ? "capture" : "reuse");
     if (addedRoots.length) {
       const temporary = mkdtempSync(
         join(objectDirectory, "factory-checkpoint-objects-"),
@@ -1606,8 +1647,8 @@ async function buildRecoveryCheckpointClosureLocal(input: {
         if (cached) {
           // Authenticate expanded coverage in an owned scratch database, never
           // in the archive's remote-only verifier. An unchanged baseline cannot
-          // supply integrity for newly reachable local objects. Repacking instead
-          // supplies a complete new pack without inherited object material.
+          // supply integrity for newly reachable local objects. Changed source
+          // storage was separately authenticated before retaining its baseline.
           const verified = join(temporary, "verified.git");
           const format = pinnedGit(
             config.checkout,
@@ -1692,11 +1733,15 @@ async function buildRecoveryCheckpointClosureLocal(input: {
         );
         if (!packs.some((retained) => refKey(retained) === refKey(ref)))
           packs.push(ref);
+      } catch (error) {
+        observed.fail(error);
+        throw error;
       } finally {
         rmSync(temporary, { recursive: true, force: true });
       }
     }
     retainRecoveryCheckpointGitPack(roots, packs, material);
+    observed.complete();
     for (const ref of packs) {
       refs.set(refKey(ref), ref);
       files.push({

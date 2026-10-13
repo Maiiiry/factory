@@ -1,45 +1,48 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
-  readFileSync,
-  readdirSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
-  writeFileSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { gitAsync, pinnedGit, pinnedGitCommand } from "../dist/process.js";
+import { deflateSync } from "node:zlib";
+import {
+  CODEX_PLANNING_CONFIG,
+  CODEX_SOURCE_READ_CONFIG,
+  CODEX_TREE_REVIEW_CONFIG,
+  createCodexHome,
+} from "../dist/codex-planning-isolation.js";
+import { renderResultReviewCall } from "../dist/compiler/model.js";
 import { deliveryDescription } from "../dist/delivery/description.js";
-import { validateTree } from "../dist/validation.js";
+import { gitAsync, pinnedGit, pinnedGitCommand } from "../dist/process.js";
 import {
   configuredResultReviewRawBudget,
   materializeResultTree,
-  reviewNavigationEvidence,
   resultChangePacket,
   resultTreeInventory,
+  reviewNavigationEvidence,
   unchangedResultByteEvidence,
 } from "../dist/result-evidence.js";
-import { createHash } from "node:crypto";
-import {
-  createCodexHome,
-  CODEX_TREE_REVIEW_CONFIG,
-  CODEX_SOURCE_READ_CONFIG,
-  CODEX_PLANNING_CONFIG,
-} from "../dist/codex-planning-isolation.js";
-import { renderResultReviewCall } from "../dist/compiler/model.js";
 import {
   decodeReview,
   renderReviewPacket,
+  resolveReviewBodyContent,
+  resolveReviewReferences,
   reviewPacket,
   reviewSchema,
-  resolveReviewBodyContent,
 } from "../dist/review-evidence.js";
+import { validateTree } from "../dist/validation.js";
 
 function git(root, ...args) {
   return execFileSync("git", ["-C", root, ...args], {
@@ -278,46 +281,96 @@ test("controller Git ignores executable configuration shared by a worker worktre
   assert.ok(comparisons.textBytes <= 16_000);
   assert.ok(comparisons.rawBytes <= configuredResultReviewRawBudget());
   assert.ok(comparisons.rawBytes > 48_000);
+  const comparisonSource = comparisons.sources[0];
+  const comparisonPacket = {
+    ...JSON.parse(comparisonSource.content),
+    observations: comparisons.sources.flatMap(
+      (source) => JSON.parse(source.content).observations ?? [],
+    ),
+  };
+  assert.deepEqual(comparisonPacket.identity, {
+    comparisonBaseCommitSha: baseSha,
+    comparisonBaseTreeSha: git(checkout, "rev-parse", `${baseSha}^{tree}`),
+    resultCommitSha: changeRef,
+    resultTreeSha: treeSha,
+  });
+  assert.equal(
+    comparisonPacket.comparison,
+    "complete-raw-Git-blob-Buffer.equals",
+  );
   const comparison = (path) => {
-    const source = comparisons.sources.find(
-      (entry) => JSON.parse(entry.content).path === path,
+    const row = comparisonPacket.observations.find(
+      (entry) => entry[0] === path,
     );
-    assert.ok(source);
-    return { source, receipt: JSON.parse(source.content) };
+    assert.ok(row);
+    return row;
   };
   for (const path of ["unchanged.txt", "source.png", "empty.txt"]) {
-    const { source, receipt } = comparison(path);
-    assert.equal(source.complete, true);
-    assert.equal(receipt.byteEqual, true);
-    assert.equal(receipt.comparison, "complete-raw-Git-blob-Buffer.equals");
-    assert.equal(receipt.comparisonBaseCommitSha, baseSha);
-    assert.equal(
-      receipt.comparisonBaseTreeSha,
-      git(checkout, "rev-parse", `${baseSha}^{tree}`),
-    );
-    assert.equal(receipt.resultCommitSha, changeRef);
-    assert.equal(receipt.resultTreeSha, treeSha);
-    assert.equal(receipt.base.blobOid, receipt.result.blobOid);
-    assert.equal(receipt.base.byteCount, receipt.result.byteCount);
-    assert.equal(receipt.base.sha256, receipt.result.sha256);
+    const row = comparison(path);
+    assert.equal(row[1], true);
+    assert.equal(row[2], "100644");
+    assert.equal(row[3], git(checkout, "rev-parse", `${baseSha}:${path}`));
+    assert.equal(row[3], git(checkout, "rev-parse", `${changeRef}:${path}`));
+    const bytes = execFileSync("git", [
+      "-C",
+      checkout,
+      "cat-file",
+      "blob",
+      row[3],
+    ]);
+    assert.equal(row[4], bytes.length);
+    assert.equal(row[5], createHash("sha256").update(bytes).digest("hex"));
+    assert.equal(row[6], true);
   }
-  const image = comparison("source.png").receipt;
-  assert.deepEqual(
-    Buffer.from(image.baselineContent.content, "base64"),
-    binary,
-  );
-  assert.equal(
-    image.base.sha256,
-    createHash("sha256").update(binary).digest("hex"),
-  );
-  assert.equal(image.baselineContent.complete, true);
-  assert.equal(comparison("unchanged.txt").receipt.baselineContent, undefined);
+  const image = comparison("source.png")[7];
+  assert.deepEqual(Buffer.from(image.content, "base64"), binary);
+  assert.equal(image.complete, true);
+  assert.equal(comparison("unchanged.txt")[7], undefined);
   for (const path of ["notes.txt", "note-link", "large.bin"]) {
-    const { source, receipt } = comparison(path);
-    assert.equal(source.complete, false);
-    assert.equal(receipt.availability, "unavailable");
-    assert.equal(receipt.byteEqual, undefined);
+    const row = comparison(path);
+    assert.equal(row[1], false);
+    assert.equal(row[6], undefined);
   }
+  const comparisonReview = reviewPacket(
+    ["Preserve exact tracked bytes"],
+    comparisons.sources.map((entry) => ({ ...entry, origin: "controller" })),
+  );
+  const completeEvidence = comparisonReview.evidence.find(
+    (entry) => entry.complete,
+  );
+  const unavailableEvidence = comparisonReview.evidence.find(
+    (entry) => !entry.complete,
+  );
+  assert(completeEvidence && unavailableEvidence);
+  assert.equal(
+    resolveReviewReferences([completeEvidence.id], comparisonReview, true)
+      .length,
+    1,
+  );
+  assert.throws(
+    () =>
+      resolveReviewReferences([unavailableEvidence.id], comparisonReview, true),
+    /incomplete cited evidence/,
+  );
+  const unavailablePass = decodeReview(
+    {
+      packetId: comparisonReview.id,
+      findings: [
+        {
+          criterionIndex: 0,
+          verdict: "pass",
+          evidenceIndices: [
+            comparisonReview.evidence.indexOf(unavailableEvidence),
+          ],
+          detail: "Cannot pass from unknown bytes",
+          question: "",
+        },
+      ],
+    },
+    comparisonReview,
+  );
+  assert.equal(unavailablePass.findings[0], undefined);
+  assert.match(unavailablePass.errors[0], /incomplete cited evidence/);
   const bounded = unchangedResultByteEvidence(
     checkout,
     baseSha,
@@ -337,6 +390,94 @@ test("controller Git ignores executable configuration shared by a worker worktre
   assert.ok(missing.sources.every((source) => source.complete === false));
   assert.match(missing.sources[0].content, /commit unavailable/);
   assert.equal(existsSync(marker), false);
+  // Counting delegates every call to the real hardened Git child unchanged.
+  const originalSpawn = childProcess.spawnSync;
+  let rawCalls = 0;
+  try {
+    childProcess.spawnSync = function (file, args, options) {
+      if (
+        file === "git" &&
+        (args.includes("ls-tree") || args.includes("--batch"))
+      )
+        rawCalls++;
+      return Reflect.apply(originalSpawn, this, [file, args, options]);
+    };
+    syncBuiltinESMExports();
+    unchangedResultByteEvidence(checkout, baseSha, changeRef, 16_000);
+    assert.equal(
+      rawCalls,
+      3,
+      "two complete inventories and one raw blob batch",
+    );
+  } finally {
+    childProcess.spawnSync = originalSpawn;
+    syncBuiltinESMExports();
+  }
+  // A real malformed object never becomes observed byte equality merely
+  // because both tree paths still name that OID and Git reports its blob type.
+  const unchangedOid = pinnedGit(
+    checkout,
+    "rev-parse",
+    `${baseSha}:unchanged.txt`,
+  );
+  const objectRoot = pinnedGit(
+    checkout,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "objects",
+  );
+  const objectPath = join(
+    objectRoot,
+    unchangedOid.slice(0, 2),
+    unchangedOid.slice(2),
+  );
+  const originalObject = readFileSync(objectPath);
+  try {
+    chmodSync(objectPath, 0o600);
+    const corruptBytes = Buffer.from("different retained bytes\n");
+    writeFileSync(
+      objectPath,
+      deflateSync(
+        Buffer.concat([
+          Buffer.from(`blob ${corruptBytes.length}\0`),
+          corruptBytes,
+        ]),
+      ),
+    );
+    const corrupt = unchangedResultByteEvidence(
+      checkout,
+      baseSha,
+      changeRef,
+      16_000,
+    );
+    const corruptRows = JSON.parse(corrupt.sources[0].content).observations;
+    assert(corruptRows.every((row) => row[1] === false));
+    assert(corruptRows.every((row) => row[6] === undefined));
+  } finally {
+    writeFileSync(objectPath, originalObject);
+    chmodSync(objectPath, 0o444);
+  }
+  const originalRawBudget = process.env.FACTORY_RESULT_REVIEW_RAW_BUDGET_BYTES;
+  try {
+    process.env.FACTORY_RESULT_REVIEW_RAW_BUDGET_BYTES = "2048";
+    const finite = unchangedResultByteEvidence(
+      checkout,
+      baseSha,
+      changeRef,
+      16_000,
+    );
+    assert(finite.rawBytes <= 2048);
+    assert(
+      finite.sources
+        .flatMap((source) => JSON.parse(source.content).observations)
+        .some((row) => row[1] === false && row[2] === "b"),
+    );
+  } finally {
+    if (originalRawBudget === undefined)
+      delete process.env.FACTORY_RESULT_REVIEW_RAW_BUDGET_BYTES;
+    else process.env.FACTORY_RESULT_REVIEW_RAW_BUDGET_BYTES = originalRawBudget;
+  }
   const pinnedCode = execFileSync(
     "git",
     ["-C", checkout, "show", `${baseSha}:source.ts`],
@@ -673,4 +814,77 @@ test("controller Git ignores executable configuration shared by a worker worktre
     ),
     /private-example-value/,
   );
+  // Extend this same real Git fixture beyond the old per-file receipt budget.
+  // Explicit source priority preserves a late production path, without altering
+  // the full inventory or granting unavailable siblings an equality result.
+  mkdirSync(join(checkout, "bulk"));
+  mkdirSync(join(checkout, "src"));
+  for (let index = 0; index < 300; index++)
+    writeFileSync(
+      join(checkout, "bulk", `${String(index).padStart(3, "0")}.txt`),
+      `literal body ${index}\n`,
+    );
+  writeFileSync(
+    join(checkout, "src", "protected.ts"),
+    "export const protectedValue = 1;\n",
+  );
+  await gitAsync(checkout, "add", "bulk", "src");
+  await gitAsync(
+    checkout,
+    ...identity,
+    "commit",
+    "-m",
+    "actual multi-file baseline",
+  );
+  const manyBase = pinnedGit(checkout, "rev-parse", "HEAD");
+  writeFileSync(join(checkout, "notes.txt"), "another candidate change\n");
+  await gitAsync(checkout, "add", "notes.txt");
+  await gitAsync(
+    checkout,
+    ...identity,
+    "commit",
+    "-m",
+    "same-source bounded candidate",
+  );
+  const manyResult = pinnedGit(checkout, "rev-parse", "HEAD");
+  const many = unchangedResultByteEvidence(
+    checkout,
+    manyBase,
+    manyResult,
+    24_000,
+    ["src/protected.ts"],
+  );
+  const manyPacket = {
+    ...JSON.parse(many.sources[0].content),
+    observations: many.sources.flatMap(
+      (source) => JSON.parse(source.content).observations ?? [],
+    ),
+  };
+  assert.equal(
+    JSON.parse(many.sources.find((source) => !source.complete).content)
+      .omittedPaths,
+    0,
+  );
+  assert.equal(manyPacket.observations.length, 310);
+  assert(many.textBytes <= 24_000);
+  assert(many.rawBytes <= configuredResultReviewRawBudget());
+  assert.equal(
+    (many.sources[0].content.match(/comparisonBaseCommitSha/g) ?? []).length,
+    1,
+  );
+  const protectedRow = manyPacket.observations.find(
+    (row) => row[0] === "src/protected.ts",
+  );
+  assert.equal(protectedRow[1], true);
+  assert.equal(protectedRow[6], true);
+  assert.equal(
+    protectedRow[5],
+    createHash("sha256")
+      .update(readFileSync(join(checkout, "src", "protected.ts")))
+      .digest("hex"),
+  );
+  assert(
+    manyPacket.observations.some((row) => row[1] === false && row[2] === "t"),
+  );
+  assert.equal(existsSync(marker), false);
 });
