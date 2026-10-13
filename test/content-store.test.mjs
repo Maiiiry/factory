@@ -100,6 +100,7 @@ import {
 } from "../dist/qa.js";
 import {
   acceptForwardedCheckpointCompletion,
+  assertRecoveryCheckpointManifest,
   awaitCheckpointAdmission,
   gitPersistenceStatus,
   inspectRecoveryCheckpoint,
@@ -116,8 +117,9 @@ import {
 import {
   buildRecoveryCheckpointClosure,
   describeMemoryBodyReferences,
+  uniqueRecoveryCheckpointFiles,
 } from "../dist/recovery-checkpoint-closure.js";
-import { resolveAutonomy } from "../dist/repair-policy.js";
+import { archiveAttempt, resolveAutonomy } from "../dist/repair-policy.js";
 import {
   LocalRepositoryMemory,
   retainPlanningSourceMemory,
@@ -5468,7 +5470,7 @@ test("checkpoint retains authenticated worker returns from a configured private 
   };
   state.work.history.execution = execution;
   saveState(statePath(repository, 1), state);
-  const canonicalBytes = readFileSync(statePath(repository, 1));
+  let canonicalBytes = readFileSync(statePath(repository, 1));
   const saveRequest = () =>
     writeFileSync(worker.requestPath, `${JSON.stringify(wrapper)}\n`, {
       mode: 0o600,
@@ -5505,6 +5507,84 @@ test("checkpoint retains authenticated worker returns from a configured private 
     false,
   );
   assert.deepEqual(readFileSync(statePath(repository, 1)), canonicalBytes);
+  // Same-result rereview keeps the current attempt and its genuine original
+  // in history. Both aliases must authenticate; the manifest declares it once.
+  state.work.history.recovery = archiveAttempt(state.work.history);
+  saveState(statePath(repository, 1), state);
+  canonicalBytes = readFileSync(statePath(repository, 1));
+  const aliased = await buildRecoveryCheckpointClosure({ config });
+  assert.equal(
+    aliased.files.filter((file) => file.path === returned.path).length,
+    1,
+  );
+  const binding = {
+    repository,
+    remoteDigest: learningDigest("real local manifest fixture"),
+    ref: "refs/heads/history",
+    visibility: "private",
+    scope: "private-history",
+  };
+  const manifest = {
+    ...aliased,
+    schemaVersion: 1,
+    binding,
+    sequence: 0,
+    createdAt: new Date().toISOString(),
+  };
+  const bounds = { maxBytes: 64 * 1024 * 1024, maxFiles: 4096 };
+  assertRecoveryCheckpointManifest(manifest, binding, bounds);
+  assert.deepEqual(
+    uniqueRecoveryCheckpointFiles([...aliased.files, returned]),
+    aliased.files,
+  );
+  for (const change of [
+    (file) => {
+      file.kind = "content";
+    },
+    (file) => {
+      file.visibility = "repository";
+    },
+    (file) => {
+      file.ref.digest = "f".repeat(64);
+    },
+    (file) => {
+      file.ref.bytes++;
+    },
+    (file) => {
+      file.ref.mediaType = "application/octet-stream";
+    },
+  ]) {
+    const conflict = structuredClone(returned);
+    change(conflict);
+    assert.throws(
+      () => uniqueRecoveryCheckpointFiles([...aliased.files, conflict]),
+      /conflicting declarations/,
+    );
+  }
+
+  assert.deepEqual(readFileSync(statePath(repository, 1)), canonicalBytes);
+  const historical = state.work.history.recovery.history[0].work.execution;
+  historical.data.request.session.scope.runId = randomUUID();
+  saveState(statePath(repository, 1), state);
+  await assert.rejects(
+    buildRecoveryCheckpointClosure({ config }),
+    /differs from its execution request/,
+  );
+  historical.data.request.session.scope.runId = state.runId;
+  saveState(statePath(repository, 1), state);
+  canonicalBytes = readFileSync(statePath(repository, 1));
+  assert.throws(
+    () =>
+      assertRecoveryCheckpointManifest(
+        {
+          ...manifest,
+          files: [...manifest.files, { ...returned, kind: "content" }],
+        },
+        binding,
+        bounds,
+      ),
+    /invalid or duplicate/,
+  );
   wrapper.request.session.scope = { ...session.scope, runId: randomUUID() };
   saveRequest();
   await assert.rejects(
