@@ -100,6 +100,7 @@ import {
   ownerKey,
   owners,
   releaseMutationLock,
+  releaseCancelledSessions,
   synchronizeWorkItemPause,
 } from "./runner/ownership.js";
 import { decidePlan } from "./runner/planning.js";
@@ -116,6 +117,7 @@ import {
   acquireInstallationLock,
   acquireObjectiveLock,
   assertRestoredContinuationReady,
+  cancelledContinuationResourceHold,
   assertRestoredInstallationDispatchReady,
   type ControllerLock,
   continuationConfigurationMatches,
@@ -124,6 +126,7 @@ import {
   objectiveLockPath,
   readContinuation,
   readControllerOwner,
+  restoredContinuationOwnershipHold,
   releaseControllerLock,
   saveState,
   statePath,
@@ -1088,11 +1091,13 @@ async function runObjectiveOwned(
           await owner.cancellation;
           await closeCancelledIssues(state, services.github, persist);
           if (!state.coordinator?.cancelError) {
-            await releaseAgentSessions(
+            await releaseCancelledSessions(
+              config,
               state,
               services.driver,
               services.planningModel,
               persist,
+              lock,
             );
             const alreadyCancelled = !!state.cancelledAt;
             state.cancelledAt = new Date().toISOString();
@@ -1276,7 +1281,9 @@ async function runObjectiveOwned(
           controlReleased &&
           queueClaim &&
           owner.snapshot &&
-          canHandoff(owner.snapshot)
+          (owner.snapshot.cancelledAt
+            ? !cancelledContinuationResourceHold(owner.snapshot)
+            : canHandoff(owner.snapshot))
         ) {
           if (owner.snapshot.cancelledAt) {
             await cancelKnownWork(
@@ -1285,11 +1292,13 @@ async function runObjectiveOwned(
               persist,
               true,
             );
-            await releaseAgentSessions(
+            await releaseCancelledSessions(
+              config,
               owner.snapshot,
               services.driver,
               services.planningModel,
               persist,
+              lock,
             );
             await settleCancelledProjectQueueRun(config, owner.snapshot, lock);
           } else
@@ -1378,8 +1387,13 @@ async function cancelObjectiveOwned(
             saveState(statePath(config.repository, objective), continuation),
           true,
         );
-      await releaseAgentSessions(continuation, driver, planningModel, () =>
-        saveState(statePath(config.repository, objective), continuation),
+      await releaseCancelledSessions(
+        config,
+        continuation,
+        driver,
+        planningModel,
+        () => saveState(statePath(config.repository, objective), continuation),
+        lockHandle,
       );
       saveState(statePath(config.repository, objective), continuation);
       await settleCancelledProjectQueueRun(config, continuation, lockHandle);
@@ -1443,8 +1457,14 @@ async function cancelObjectiveOwned(
           work.completedAt = new Date().toISOString();
         }
       }
-    await releaseAgentSessions(continuation, driver, planningModel, () =>
-      saveState(statePath(config.repository, objective), continuation),
+    saveState(statePath(config.repository, objective), continuation);
+    await releaseCancelledSessions(
+      config,
+      continuation,
+      driver,
+      planningModel,
+      () => saveState(statePath(config.repository, objective), continuation),
+      lockHandle,
     );
     continuation.cancelledAt = new Date().toISOString();
     clearAllRepeats(continuation);
@@ -1705,7 +1725,7 @@ export function repairWorkItem(
 
 /**
  * Request bounded validation and automatic review of the exact retained result.
- * A settled command failure may be revalidated; a refused result cannot be reopened.
+ * A settled command failure or validated review defect may be revalidated; refusal stays closed.
  */
 export function rereviewWorkItem(
   config: FactoryConfig,
@@ -1717,7 +1737,6 @@ export function rereviewWorkItem(
     const state = mutationState(config, objective);
     if (!state) throw new Error("Objective has no Factory state");
     if (
-      state.error ||
       state.cancelRequested ||
       state.cancelledAt ||
       state.finalValidation?.passed ||
@@ -1747,6 +1766,24 @@ export function rereviewWorkItem(
       work.step === "approve-result" &&
       work.acceptancePending;
     const failed = work.status === "failed" && work.step === "validate";
+    const failure = work.recovery?.failure;
+    const validatedDefect =
+      failed &&
+      failure?.classification === "defect" &&
+      !failure.semanticRefusal &&
+      !work.failedValidation &&
+      !work.acceptancePending &&
+      !work.acceptanceDecisions?.length &&
+      !!work.validation;
+    if (
+      state.error &&
+      (!validatedDefect ||
+        state.errorItem !== input.item ||
+        state.error !== work.error ||
+        state.error !== failure?.detail)
+    )
+      throw new Error("Objective is not awaiting result re-review");
+
     if (!pending && !failed)
       throw new Error("Work Item is not awaiting result re-review");
     if (
@@ -1781,7 +1818,51 @@ export function rereviewWorkItem(
         "Result re-review tree differs from the pending exact result",
       );
     if (!input.actor.trim()) throw new Error("Result re-review requires actor");
-    if (failed) {
+    if (validatedDefect) {
+      const validation = work.validation!;
+      const observation = validation.worktreeObservation;
+      const item = state.graph.items.find((entry) => entry.id === input.item)!;
+      if (
+        work.graphRevisionDigest !== graphDigest(state.graph) ||
+        validation.treeSha !== work.treeSha ||
+        validation.nativeReturns?.length ||
+        validation.criteria?.length ||
+        validation.selectedLfs?.length ||
+        validation.commands.length !== item.validation.length ||
+        validation.commands.some(
+          (command, index) =>
+            command.index !== index ||
+            command.command !== item.validation[index]!.command ||
+            command.passed !== true ||
+            command.exitCode !== 0 ||
+            command.treeSha !== work.treeSha ||
+            command.stoppedLeftovers !== undefined,
+        ) ||
+        observation?.treeSha !== work.treeSha ||
+        observation.initialStatus !== "clean" ||
+        !observation.postHydrationStatus.empty ||
+        observation.postCommandStatus !== "unchanged" ||
+        observation.selectedLfsMembers !== 0 ||
+        observation.subprocessOwnership !== "settled" ||
+        [
+          ...Object.values(state.agentSessions ?? {}),
+          ...(state.agentSessionHistory ?? []),
+        ].some((ref) => ref.currentTurn && !ref.currentTurn.terminal) ||
+        restoredContinuationOwnershipHold(state) ||
+        (state.coordinator?.deadlineAt &&
+          Date.now() >= Date.parse(state.coordinator.deadlineAt))
+      )
+        throw new Error(
+          "Result re-review defect requires complete unchanged passing validation and settled ownership within its original deadline",
+        );
+      pinnedGit(
+        config.checkout,
+        "merge-base",
+        "--is-ancestor",
+        work.baseSha,
+        work.changeRef,
+      );
+    } else if (failed) {
       assertFailedValidationRecord(
         work.failedValidation,
         state,
@@ -1817,6 +1898,10 @@ export function rereviewWorkItem(
     delete recovery.correction;
     delete recovery.phase;
     work.recovery = recovery;
+    if (validatedDefect && state.error) {
+      delete state.error;
+      delete state.errorItem;
+    }
     work.status = "running";
     work.step = "validate";
     delete work.acceptancePending;

@@ -1,3 +1,4 @@
+import { compilePlan } from "../dist/compiler/recovery.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -119,6 +120,7 @@ import {
 } from "../dist/runner/execution.js";
 import {
   canHandoff,
+  releaseCancelledSessions,
   synchronizeWorkItemPause,
 } from "../dist/runner/ownership.js";
 import {
@@ -131,8 +133,12 @@ import {
 import { parseFactoryState, setCoordinatorMode } from "../dist/state.js";
 import {
   acquireInstallationLock,
+  acquireObjectiveLock,
   installationLockPath,
+  objectiveLockPath,
   readContinuation,
+  cancelledContinuationResourceHold,
+  restoredContinuationOwnershipHold,
   readState,
   releaseControllerLock,
   saveState,
@@ -1234,7 +1240,12 @@ test("cancellation stops an owned shell and its process group", async () => {
     await withGitHubTransportObserver(
       (observation) => observations.push(observation),
       async () => {
-        for (const route of ["direct", "controller"]) {
+        for (const route of [
+          "direct",
+          "controller",
+          "diagnosis",
+          "planning-empty",
+        ]) {
           const preparation = {
             schemaVersion: 8,
             kind: "preparing",
@@ -1259,6 +1270,28 @@ test("cancellation stops an owned shell and its process group", async () => {
               processes: [],
             },
           };
+          if (route === "diagnosis") {
+            // A stopped pending execution can retain an unknown diagnosis
+            // without any invented native completion. The same real atomic
+            // scope and adapter-owned home must be disposed by ordinary cancel.
+            delete preparation.kind;
+            preparation.schemaVersion = 7;
+            preparation.graph = structuredClone(snapshot.graph);
+            preparation.planGraphDigest = snapshot.planGraphDigest;
+            preparation.issueByItemId = snapshot.issueByItemId;
+            preparation.work = {
+              local: {
+                status: "pending",
+                recovery: {
+                  diagnosisInvocation: {
+                    id: randomUUID(),
+                    submitted: true,
+                    requestDigest: "a".repeat(64),
+                  },
+                },
+              },
+            };
+          }
           const savePreparation = () =>
             saveState(statePath(config.repository, 1), preparation);
           savePreparation();
@@ -1487,6 +1520,161 @@ try {
             preparation.coordinator.mode = "paused";
             savePreparation();
           }
+          if (route === "planning-empty") {
+            const originalGenerate =
+              planningModel.generateStructured.bind(planningModel);
+            const legacy = new Proxy(planningModel, {
+              get(target, property) {
+                if (property === "providerDispatchAdmission") return undefined;
+                if (property === "generateStructured")
+                  return async (request) => {
+                    const admit = request.invocation.beforeProviderAttempt;
+                    request.invocation.beforeProviderAttempt = async () => {
+                      await admit?.();
+                      writeFileSync(
+                        join(root, "missing-phase-inputs", "compile.json"),
+                        JSON.stringify(request.sources),
+                        { mode: 0o600 },
+                      );
+                    };
+                    return originalGenerate(request);
+                  };
+                return Reflect.get(target, property, target);
+              },
+            });
+            const prepared = structuredClone(preparation);
+            const guardedCurrent = new Proxy(legacy, {
+              get(target, property) {
+                if (property === "providerDispatchAdmission")
+                  return planningModel.providerDispatchAdmission;
+                return Reflect.get(target, property, target);
+              },
+            });
+            await assert.rejects(
+              compilePlan(
+                1,
+                "## Sources\n- README.md\n## Acceptance\n- Preserve the exact source.\n",
+                snapshot.baseSha,
+                checkout,
+                guardedCurrent,
+                factoryConfigDigest(config),
+                undefined,
+                undefined,
+                {
+                  state: prepared,
+                  sessionState: prepared,
+                  save: () =>
+                    saveState(statePath(config.repository, 1), prepared),
+                },
+              ),
+              /ENOENT/,
+            );
+            assert.equal(prepared.planningRecovery.phase, "ready");
+            assert.equal(prepared.planningRecovery.invocations.length, 1);
+            assert.equal(prepared.planningRecovery.response, undefined);
+            assert.equal(
+              prepared.planningRecovery.diagnosisResponse,
+              undefined,
+            );
+            assert.equal(prepared.agentSessions, undefined);
+            savePreparation();
+            await assert.rejects(
+              compilePlan(
+                1,
+                "## Sources\n- README.md\n## Acceptance\n- Preserve the exact source.\n",
+                snapshot.baseSha,
+                checkout,
+                legacy,
+                factoryConfigDigest(config),
+                undefined,
+                undefined,
+                {
+                  state: preparation,
+                  sessionState: preparation,
+                  save: savePreparation,
+                },
+              ),
+              /ENOENT/,
+            );
+            assert.equal(preparation.planningRecovery.phase, "submitted");
+            assert.equal(preparation.agentSessions, undefined);
+            const originalPlanning = structuredClone(
+              preparation.planningRecovery,
+            );
+            const uncovered = new Proxy(planningModel, {
+              get(target, property) {
+                if (property === "retainedPlannerCheckpointCoverage")
+                  return undefined;
+                return Reflect.get(target, property, target);
+              },
+            });
+            await assert.rejects(
+              cancelObjective(config, 1, services.driver, github, uncovered),
+              /recognized native checkpoint producer/,
+            );
+            assert.equal(
+              readContinuation(config.repository, 1).cancelledAt,
+              undefined,
+            );
+            assert.equal(
+              await cancelObjective(
+                config,
+                1,
+                services.driver,
+                github,
+                planningModel,
+              ),
+              "cancelled",
+            );
+            const cancelled = readContinuation(config.repository, 1);
+            const { cancelledResources, ...retainedPlanning } =
+              cancelled.planningRecovery;
+            assert.deepEqual(retainedPlanning, originalPlanning);
+            assert.equal(
+              cancelledResources.invocationId,
+              originalPlanning.invocation.id,
+            );
+            assert.equal(
+              cancelledContinuationResourceHold(cancelled),
+              undefined,
+            );
+            assert.match(
+              restoredContinuationOwnershipHold(cancelled),
+              /Submitted planning/,
+            );
+            for (const change of [
+              (value) => {
+                delete value.planningRecovery.cancelledResources;
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.invocationId =
+                  randomUUID();
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.scope.runId =
+                  randomUUID();
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.coverage.adapter =
+                  "uncovered";
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.phase =
+                  "graph-review";
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources = null;
+              },
+            ]) {
+              const refused = structuredClone(cancelled);
+              change(refused);
+              assert.throws(() => {
+                const hold = cancelledContinuationResourceHold(refused);
+                if (hold) throw new Error(hold);
+              });
+            }
+            continue;
+          }
           const session = agentSessionContinuation(
             preparation,
             "planning",
@@ -1547,7 +1735,68 @@ try {
             savePreparation();
           };
           restoreOwnedHome();
-          if (route === "direct") {
+          if (route === "diagnosis") {
+            const pendingPlanningId = randomUUID();
+            preparation.planningRecovery = {
+              phase: "submitted",
+              invocation: { id: pendingPlanningId, phase: "compile" },
+              invocations: [{ id: pendingPlanningId, phase: "compile" }],
+              history: [],
+            };
+            savePreparation();
+
+            assert.equal(canHandoff(preparation), false);
+            const originalIntent = structuredClone(
+              preparation.work.local.recovery.diagnosisInvocation,
+            );
+            const lock = acquireObjectiveLock(config.repository, 1);
+            try {
+              preparation.cancelRequested = true;
+              preparation.work.local.status = "cancelled";
+              await assert.rejects(
+                releaseCancelledSessions(
+                  config,
+                  preparation,
+                  services.driver,
+                  planningModel,
+                  savePreparation,
+                  lock,
+                ),
+                /current atomic scope/,
+              );
+              assert.equal(existsSync(stoppedReceipt.data.sessionRoot), true);
+              // Normal cancel publishes these changes before calling the same
+              // direct ownership producer, and preserves all unknown intent.
+              savePreparation();
+              await releaseCancelledSessions(
+                config,
+                preparation,
+                services.driver,
+                planningModel,
+                savePreparation,
+                lock,
+              );
+              preparation.cancelledAt = new Date().toISOString();
+              savePreparation();
+              assert.deepEqual(
+                preparation.work.local.recovery.diagnosisInvocation,
+                originalIntent,
+              );
+              assert.equal(
+                cancelledContinuationResourceHold(preparation),
+                undefined,
+              );
+              assert.match(
+                restoredContinuationOwnershipHold(preparation),
+                /Submitted work diagnosis|Submitted planning/,
+              );
+            } finally {
+              releaseControllerLock(
+                objectiveLockPath(config.repository, 1),
+                lock,
+              );
+            }
+          } else if (route === "direct") {
             await assert.rejects(
               () => cancelObjective(config, 1, services.driver, github),
               /requires its authenticated adapter/,
@@ -1577,6 +1826,18 @@ try {
           }
           const cancelled = readContinuation(config.repository, 1);
           assert.ok(cancelled.cancelledAt);
+          if (route === "diagnosis") {
+            assert.equal(cancelled.work.local.status, "cancelled");
+            assert.deepEqual(
+              cancelled.work.local.recovery.diagnosisInvocation,
+              preparation.work.local.recovery.diagnosisInvocation,
+            );
+            assert.equal(
+              cancelled.work.local.recovery.diagnosisInvocation.response,
+              undefined,
+            );
+            assert.equal(canHandoff(cancelled), false);
+          }
           assert.equal(cancelled.agentSessions[sessionKey].status, "released");
           assert.deepEqual(
             cancelled.agentSessions[sessionKey].currentTurn,
@@ -1589,12 +1850,28 @@ try {
           const terminalOriginal = readFileSync(
             statePath(config.repository, 1),
           );
-          checkServiceState(changedConfig, 1, join(root, "config.json"));
+          if (route === "diagnosis")
+            assert.throws(
+              () =>
+                checkServiceState(changedConfig, 1, join(root, "config.json")),
+              /different configuration binding/,
+            );
+          else checkServiceState(changedConfig, 1, join(root, "config.json"));
           assert.deepEqual(
             readFileSync(statePath(config.repository, 1)),
             terminalOriginal,
           );
           assert.equal(cancelled.configDigest, factoryConfigDigest(config));
+          if (route === "diagnosis") {
+            assert.equal(cancelled.planningRecovery.phase, "submitted");
+            assert.equal(cancelled.planningRecovery.response, undefined);
+            assert.ok(cancelled.planningRecovery.cancelledResources);
+            const active = structuredClone(cancelled);
+            active.agentSessions[sessionKey].status = "in-flight";
+            active.agentSessions[sessionKey].currentTurn.resources = "active";
+            assert.throws(() => cancelledContinuationResourceHold(active));
+            continue;
+          }
           // Repeated cancellation also disposes a retained old terminal checkpoint.
           Object.assign(preparation, cancelled);
           restoreOwnedHome();
@@ -2119,6 +2396,102 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
     assert.equal(evidence.treeSha, treeSha);
     assert.equal(evidence.commands[0].exitCode, 0);
     assert.equal(evidence.commands[0].executionControl, undefined);
+    // A deterministic review-boundary defect after real passing validation
+    // reuses this exact candidate, not a fabricated failed-command capture.
+    const defectState = structuredClone(state);
+    const defectWork = defectState.work.local;
+    defectWork.validation = structuredClone(evidence);
+    delete defectWork.failedValidation;
+    const reviewDefect = new Error(
+      "Review admission refused before provider dispatch",
+    );
+    recordWorkFailure(defectState, "local", reviewDefect);
+    defectWork.status = "failed";
+    defectWork.error = reviewDefect.message;
+    defectState.error = reviewDefect.message;
+    defectState.errorItem = "local";
+    defectState.coordinator.deadlineAt = new Date(
+      Date.now() + 60_000,
+    ).toISOString();
+    defectState.autonomy.allowances.resultRereviews = 2;
+    defectState.autonomy.repairPolicy.perPath.resultRereviews = 2;
+    const defectOriginal = structuredClone(defectState);
+    for (const change of [
+      (value) => {
+        value.errorItem = "another-item";
+      },
+      (value) => {
+        value.work.local.validation.worktreeObservation.postCommandStatus =
+          "changed";
+      },
+      (value) => {
+        value.work.local.recovery.diagnosisInvocation = {
+          id: randomUUID(),
+          submitted: true,
+          requestDigest: "a".repeat(64),
+        };
+      },
+      (value) => {
+        value.objectiveBodyDigest = createHash("sha256")
+          .update("refusal-only objective binding")
+          .digest("hex");
+        value.sourcePacketDigest = createHash("sha256")
+          .update(JSON.stringify(pinnedSources))
+          .digest("hex");
+        const session = agentSessionContinuation(
+          value,
+          "planning",
+          undefined,
+          () => undefined,
+        );
+        session.checkpoint({
+          scope: session.scope,
+          adapter: "unknown-turn-refusal-only",
+          identity: session.identity,
+          turn: 1,
+          status: "unavailable",
+          data: {},
+          currentTurn: {
+            invocationId: randomUUID(),
+            requestDigest: "b".repeat(64),
+            graphDigest: graphDigest(value.graph),
+            dispatch: "submitted",
+            resources: "settled",
+          },
+        });
+      },
+      (value) => {
+        value.coordinator.deadlineAt = new Date(Date.now() - 1).toISOString();
+      },
+    ]) {
+      const refused = structuredClone(defectOriginal);
+      change(refused);
+      assert.throws(() => {
+        saveState(statePath(config.repository, 1), refused);
+        rereviewWorkItem(config, 1, request);
+      });
+    }
+    saveState(statePath(config.repository, 1), defectOriginal);
+    rereviewWorkItem(config, 1, request);
+    const admittedDefect = readState(config.repository, 1);
+    assert.equal(admittedDefect.error, undefined);
+    assert.equal(admittedDefect.errorItem, undefined);
+    assert.equal(admittedDefect.work.local.attempt, defectWork.attempt);
+    assert.equal(admittedDefect.work.local.baseSha, defectWork.baseSha);
+    assert.equal(admittedDefect.work.local.changeRef, commit);
+    assert.equal(admittedDefect.work.local.treeSha, treeSha);
+    assert.equal(admittedDefect.work.local.step, "validate");
+    assert.equal(admittedDefect.work.local.status, "running");
+    const archivedDefect = admittedDefect.work.local.recovery.history.at(-1);
+    assert.deepEqual(archivedDefect.failure, defectWork.recovery.failure);
+    assert.deepEqual(archivedDefect.work.validation, evidence);
+    assert.equal(archivedDefect.work.error, reviewDefect.message);
+    assert.equal(consumption(admittedDefect).resultRereviews, 2);
+    assert.equal(consumption(admittedDefect).implementationRepairs, 0);
+    assert.equal(
+      admittedDefect.coordinator.deadlineAt,
+      defectOriginal.coordinator.deadlineAt,
+    );
     // The native input contract verifies actual immutable bytes before effects.
     const imageInputRoot = join(root, "image-input");
     mkdirSync(join(imageInputRoot, "artifacts"), { recursive: true });

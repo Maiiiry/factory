@@ -1,3 +1,4 @@
+import { assertRetainedPlannerCheckpointCoverage } from "./compiler/transport.js";
 import { LocalContentStore } from "./content/local.js";
 import { stateRoot } from "./config.js";
 import {
@@ -314,6 +315,47 @@ export function assertAgentSessions(state: ContinuationState): void {
         "Agent session differs from its retained Objective owner",
       );
   }
+  const proof = state.planningRecovery?.cancelledResources;
+  if (proof !== undefined) {
+    object(proof);
+    const planning = state.planningRecovery!;
+    assertRetainedPlannerCheckpointCoverage(proof.coverage);
+    assertAgentSessionScope(proof.scope);
+    const expected = {
+      repository: state.repository,
+      objective: state.objective,
+      runId: state.runId,
+      configDigest: state.configDigest,
+      role: "planning",
+      planningInputDigest: planningSessionInputDigest(state),
+    };
+    if (
+      Object.keys(proof).sort().join() !==
+        "coverage,invocationId,phase,scope" ||
+      !state.cancelRequested ||
+      planning.phase !== "submitted" ||
+      planning.response !== undefined ||
+      !["compile", "diagnosis"].includes(proof.phase) ||
+      proof.invocationId !== planning.invocation?.id ||
+      proof.phase !== planning.invocation?.phase ||
+      !isDeepStrictEqual(proof.scope, expected) ||
+      planning.invocations?.some(
+        (entry) => entry.id === proof.invocationId && entry.resultDigest,
+      ) ||
+      records.some(([, ref]) => {
+        assertAgentSessionRef(ref);
+        return (
+          ref.status !== "released" ||
+          (ref.currentTurn && ref.currentTurn.resources !== "settled") ||
+          (ref.scope.role === "planning" &&
+            ref.adapter !== proof.coverage.adapter)
+        );
+      })
+    )
+      throw new Error(
+        "Planning cancellation resource proof differs from its current invocation or scope",
+      );
+  }
 }
 
 /** The caller already owns the lifecycle mutation lock and paid-step admission. */
@@ -588,6 +630,7 @@ export async function releaseAgentSessions(
   driver: ExecutionDriver | undefined,
   model: PlanningModel | undefined,
   save: () => void,
+  assertCurrent?: () => void,
 ): Promise<void> {
   assertAgentSessions(state);
   if (state.coordinator?.processes?.length)
@@ -607,7 +650,9 @@ export async function releaseAgentSessions(
       throw new Error(
         "Agent session disposal requires its authenticated adapter",
       );
+    assertCurrent?.();
     await owner.releaseSession(ref);
+    assertCurrent?.();
     state.agentSessions![entryKey] = { ...ref, status: "released" };
     save();
   }
@@ -619,7 +664,9 @@ export async function releaseAgentSessions(
       throw new Error(
         "Agent session disposal requires its authenticated adapter",
       );
+    assertCurrent?.();
     await owner.releaseSession(ref);
+    assertCurrent?.();
     state.agentSessionHistory![index] = { ...ref, status: "released" };
     save();
   }

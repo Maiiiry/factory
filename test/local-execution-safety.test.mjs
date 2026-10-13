@@ -1,3 +1,4 @@
+import { checkpointPlanningDispatch } from "../dist/compiler/recovery.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -121,7 +122,10 @@ import {
   planningSessionInputDigest,
   releaseAgentSessions,
 } from "../dist/agent-session.js";
-import { StructuredPlanningModel } from "../dist/compiler/model.js";
+import {
+  CodexPlanningModel,
+  StructuredPlanningModel,
+} from "../dist/compiler/model.js";
 import {
   ProviderTurnGuard,
   ProviderTurnTimeoutError,
@@ -3390,6 +3394,13 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       timeoutGuard.finish();
       const timeoutEvents = [];
       const ownedProcesses = [];
+      // This standalone timeout probe has no owned continuation; retained
+      // planning now requires its real controller checkpoint header.
+      const timeoutTransport = new CodexPlanningTransport(
+        checkout,
+        selection,
+        selection,
+      );
       const timeoutInvocation = {
         invocationId: randomUUID(),
         phase: "diagnosis",
@@ -3401,7 +3412,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
           withProcessCancellation(
             timeoutGuard.signal,
             () =>
-              new StructuredPlanningModel(transport).generateStructured({
+              new StructuredPlanningModel(timeoutTransport).generateStructured({
                 purpose: "diagnosis",
                 objective:
                   "Diagnose the retained failure without weakening acceptance.",
@@ -3519,4 +3530,177 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("diagnosis dispatch intent follows complete admission before real process effects", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-diagnosis-admission-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourcePath = join(root, "failure-test.mjs");
+  writeFileSync(
+    sourcePath,
+    "assert.equal(currentKeyboardOwner, requestedOwner);\n",
+  );
+  const beforeEffect = join(root, "dispatch-intent.json");
+  const afterEffect = join(root, "actual-process.json");
+  const transport = {
+    provider: "local-process-check",
+    adapter: "owned-local-process-check",
+    selection: () => ({ model: "unused", reasoningEffort: "low" }),
+    settings: () => ({ sandboxMode: "read-only", approvalPolicy: "never" }),
+    run: async ({ turn }) => {
+      assert.equal(
+        JSON.parse(readFileSync(beforeEffect, "utf8")).submitted,
+        true,
+      );
+      const result = await subprocessAsync(
+        process.execPath,
+        [
+          "-e",
+          "process.stderr.write('Owned process failure');process.exit(23)",
+        ],
+        {},
+      );
+      assert.equal(result.status, 23);
+      writeFileSync(afterEffect, JSON.stringify({ status: result.status }), {
+        mode: 0o600,
+      });
+      turn.nativeInvocationStarted = true;
+      throw new Error(result.stderr);
+    },
+  };
+  const model = new StructuredPlanningModel(transport);
+  assert.equal(model.providerDispatchAdmission, "after-attempt-admission-v1");
+  const request = {
+    purpose: "diagnosis",
+    objective: "Inspect this exact complete failure source.",
+    baseSha: "a".repeat(40),
+    sources: [
+      { path: "failure-test.mjs", content: readFileSync(sourcePath, "utf8") },
+    ],
+    schema: { type: "object" },
+    invocation: {
+      invocationId: randomUUID(),
+      phase: "diagnosis",
+      ordinal: 0,
+      beforeProviderDispatch: () =>
+        writeFileSync(beforeEffect, JSON.stringify({ submitted: true }), {
+          mode: 0o600,
+        }),
+    },
+  };
+  const originalAdmission = async () => {
+    assert.equal(existsSync(sourcePath), true);
+  };
+  // Exercise the demonstrated outer guard AFTER its original admission, with
+  // actual rendered model inputs and no native/provider response fixture.
+  request.invocation.beforeProviderAttempt = async () => {
+    await originalAdmission();
+    throw new Error("Complete failure file omitted before diagnosis");
+  };
+  await assert.rejects(
+    model.generateStructured(request),
+    /Complete failure file omitted/,
+  );
+  assert.equal(existsSync(beforeEffect), false);
+  assert.equal(existsSync(afterEffect), false);
+  request.invocation.invocationId = randomUUID();
+  request.invocation.beforeProviderAttempt = originalAdmission;
+  const admitDispatch = request.invocation.beforeProviderDispatch;
+  request.invocation.beforeProviderDispatch = async () => {
+    await admitDispatch();
+    throw new Error("Submitted intent checkpoint admission refused");
+  };
+  await assert.rejects(
+    model.generateStructured(request),
+    /Submitted intent checkpoint admission refused/,
+  );
+  assert.equal(JSON.parse(readFileSync(beforeEffect, "utf8")).submitted, true);
+  assert.equal(existsSync(afterEffect), false);
+  request.invocation.invocationId = randomUUID();
+  request.invocation.beforeProviderDispatch = admitDispatch;
+  await assert.rejects(
+    model.generateStructured(request),
+    /Owned process failure/,
+  );
+  assert.equal(JSON.parse(readFileSync(beforeEffect, "utf8")).submitted, true);
+  assert.equal(JSON.parse(readFileSync(afterEffect, "utf8")).status, 23);
+  for (const phase of ["compile", "graph-review", "diagnosis"]) {
+    rmSync(afterEffect);
+    const id = randomUUID();
+    const record = {
+      phase: "ready",
+      history: [],
+      invocation: { id, phase },
+      invocations: [{ id, phase }],
+    };
+    const mark = () =>
+      checkpointPlanningDispatch({
+        record,
+        id,
+        phase,
+        save: () =>
+          writeFileSync(
+            beforeEffect,
+            JSON.stringify({ submitted: record.phase === "submitted", phase }),
+            { mode: 0o600 },
+          ),
+      });
+    request.invocation = {
+      invocationId: id,
+      phase,
+      ordinal: 0,
+      beforeProviderAttempt: async () => {
+        throw new Error("Complete outer admission refused");
+      },
+      beforeProviderDispatch: mark,
+    };
+    await assert.rejects(
+      model.generateStructured(request),
+      /Complete outer admission refused/,
+    );
+    assert.equal(record.phase, "ready");
+    assert.equal(existsSync(afterEffect), false);
+    request.invocation.beforeProviderAttempt = originalAdmission;
+    request.invocation.beforeProviderDispatch = async () => {
+      await mark();
+      throw new Error("Current submitted intent checkpoint refused");
+    };
+    await assert.rejects(
+      model.generateStructured(request),
+      /submitted intent checkpoint refused/,
+    );
+    assert.equal(record.phase, "submitted");
+    assert.equal(existsSync(afterEffect), false);
+    request.invocation.beforeProviderDispatch = mark;
+    await assert.rejects(
+      model.generateStructured(request),
+      /Owned process failure/,
+    );
+    assert.equal(record.phase, "submitted");
+    assert.equal(JSON.parse(readFileSync(afterEffect)).status, 23);
+  }
+  const ownedModel = new CodexPlanningModel(
+    root,
+    { model: "unused", reasoningEffort: "low" },
+    { model: "unused", reasoningEffort: "low" },
+    undefined,
+    { sessionRoot: join(root, "native-sessions") },
+  );
+  assert.equal(
+    ownedModel.retainedPlannerCheckpointCoverage.contract,
+    "retained-planner-native-checkpoint-v1",
+  );
+  const unknownNativeTurn = { response: "", ended: false };
+  await assert.rejects(
+    ownedModel.transport.run({
+      role: "planner",
+      prompt: "No native dispatch",
+      schema: { type: "object" },
+      invocation: { invocationId: randomUUID(), phase: "compile", ordinal: 0 },
+      turn: unknownNativeTurn,
+    }),
+    /controller-owned checkpoint header/,
+  );
+  assert.equal(unknownNativeTurn.nativeInvocationStarted, undefined);
+  assert.equal(existsSync(join(root, "native-sessions")), false);
 });

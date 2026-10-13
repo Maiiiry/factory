@@ -1,4 +1,9 @@
-import { agentSessionContinuation } from "../agent-session.js";
+import { assertRetainedPlannerCheckpointCoverage } from "../compiler/transport.js";
+import { isDeepStrictEqual } from "node:util";
+import {
+  agentSessionContinuation,
+  releaseAgentSessions,
+} from "../agent-session.js";
 import { closeCancelledWorkItems } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
 import type {
@@ -19,6 +24,9 @@ import {
   acquireObjectiveLock,
   assertRestoredContinuationReady,
   type ControllerLock,
+  continuationConfigurationMatches,
+  installationLockPath,
+  readControllerOwner,
   objectiveLockPath,
   readContinuation,
   readState,
@@ -339,3 +347,108 @@ export type ObjectiveStep = <T>(
   paid?: boolean,
   pausable?: boolean,
 ) => Promise<T>;
+
+/** Disposal authenticates the current atomic scope under its actual exclusive owner. */
+export async function releaseCancelledSessions(
+  config: FactoryConfig,
+  state: ContinuationState,
+  driver: ExecutionDriver,
+  model: PlanningModel | undefined,
+  save: () => void,
+  lock: ControllerLock,
+): Promise<void> {
+  const assertCurrent = () => {
+    const current = readContinuation(config.repository, state.objective);
+    const host = linuxProcessIdentity(process.pid);
+    const owner = [
+      objectiveLockPath(config.repository, state.objective),
+      installationLockPath(config.repository),
+    ]
+      .map((path) => readControllerOwner(path))
+      .find((value) => value?.token === lock.token);
+    if (
+      !state.cancelRequested ||
+      !host ||
+      !owner ||
+      owner.pid !== process.pid ||
+      owner.startTime !== host.startTime ||
+      owner.objective !== state.objective ||
+      !continuationConfigurationMatches(state, config) ||
+      !isDeepStrictEqual(current, state)
+    )
+      throw new Error(
+        "Cancellation disposal lost its current atomic scope or exclusive owner",
+      );
+  };
+  assertCurrent();
+  const planning = state.planningRecovery;
+  const unresolvedPlanning =
+    planning?.phase === "submitted" &&
+    planning.response === undefined &&
+    !planning.invocations?.some(
+      (entry) => entry.id === planning.invocation?.id && entry.resultDigest,
+    );
+  let planningScope:
+    | ReturnType<typeof agentSessionContinuation>["scope"]
+    | undefined;
+  if (unresolvedPlanning) {
+    if (state.restoration)
+      throw new Error(
+        "Unresolved restored planning has no authenticated original checkpoint coverage",
+      );
+    assertRetainedPlannerCheckpointCoverage(
+      model?.retainedPlannerCheckpointCoverage,
+    );
+    if (
+      !model?.sessionCapabilities?.resumeRoles.includes("planning") ||
+      !["compile", "diagnosis"].includes(planning.invocation?.phase ?? "")
+    )
+      throw new Error(
+        "Pending planning resource scope has no supported retained-planner coverage",
+      );
+    planningScope = agentSessionContinuation(
+      state,
+      "planning",
+      undefined,
+      save,
+    ).scope;
+    if (
+      [
+        ...Object.values(state.agentSessions ?? {}),
+        ...(state.agentSessionHistory ?? []),
+      ].some(
+        (ref) =>
+          ref.scope.role === "planning" &&
+          ref.adapter !== model.retainedPlannerCheckpointCoverage!.adapter,
+      )
+    )
+      throw new Error(
+        "Planning resource coverage differs from the actual selected adapter",
+      );
+  }
+  await releaseAgentSessions(state, driver, model, save, assertCurrent);
+  if (unresolvedPlanning) {
+    assertCurrent();
+    if (
+      [
+        ...Object.values(state.agentSessions ?? {}),
+        ...(state.agentSessionHistory ?? []),
+      ].some(
+        (ref) =>
+          ref.status !== "released" ||
+          (ref.currentTurn && ref.currentTurn.resources !== "settled"),
+      )
+    )
+      throw new Error(
+        "Pending planning requires positive disposal of every covered native scope",
+      );
+    planning.cancelledResources = {
+      coverage: { ...model!.retainedPlannerCheckpointCoverage! },
+      invocationId: planning.invocation!.id,
+      phase: planning.invocation!.phase as "compile" | "diagnosis",
+      scope: planningScope!,
+    };
+    save();
+    assertCurrent();
+  }
+}

@@ -29,6 +29,7 @@ import {
 import {
   admitQueueCommand,
   assertQueueCommandHistory,
+  assertProjectQueueClaimAdmission,
   assertQueueOperationReferenceBodies,
   authenticateQueueOwnerReferences,
   completeQueueCommand,
@@ -959,6 +960,62 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         /exact authenticated explicit producer receipt/,
       );
       assert.equal(retainedQueueEntry(config, [synthetic], 6).order, 17);
+      // Exercise the exact shared stopped/cancelled settlement admission boundary.
+      // Originals above are narrow schema fixtures; this does not claim remote effects.
+      const settlementClaim = {
+        ...claim,
+        objective: synthetic.objective,
+        bodyDigest: synthetic.bodyDigest,
+        authorityDigest: synthetic.authorityDigest,
+        receiptId: synthetic.id,
+        admissionId: JSON.parse(synthetic.metadata).admissionId,
+      };
+      const settlementState = {
+        objective: synthetic.objective,
+        objectiveBodyDigest: synthetic.bodyDigest,
+      };
+      assert.doesNotThrow(() =>
+        assertProjectQueueClaimAdmission(
+          config,
+          [synthetic],
+          settlementClaim,
+          settlementState,
+        ),
+      );
+      for (const change of [
+        (record) => {
+          delete record.completed;
+        },
+        (record) => {
+          delete record.effects[1].original;
+        },
+        (record) => {
+          record.effects[1].intent.order++;
+        },
+        (record) => {
+          record.bodyDigest = hash("changed original body");
+        },
+      ]) {
+        const changed = structuredClone(synthetic);
+        change(changed);
+        assert.throws(() =>
+          assertProjectQueueClaimAdmission(
+            config,
+            [changed],
+            settlementClaim,
+            settlementState,
+          ),
+        );
+      }
+      assert.throws(() =>
+        assertProjectQueueClaimAdmission(
+          config,
+          [synthetic],
+          { ...settlementClaim, admissionId: randomUUID() },
+          settlementState,
+        ),
+      );
+
       for (const change of [
         (value) => {
           delete value.admission;
