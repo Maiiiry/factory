@@ -3520,3 +3520,97 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("diagnosis dispatch intent follows complete admission before real process effects", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-diagnosis-admission-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourcePath = join(root, "failure-test.mjs");
+  writeFileSync(
+    sourcePath,
+    "assert.equal(currentKeyboardOwner, requestedOwner);\n",
+  );
+  const beforeEffect = join(root, "dispatch-intent.json");
+  const afterEffect = join(root, "actual-process.json");
+  const transport = {
+    provider: "local-process-check",
+    adapter: "owned-local-process-check",
+    selection: () => ({ model: "unused", reasoningEffort: "low" }),
+    settings: () => ({ sandboxMode: "read-only", approvalPolicy: "never" }),
+    run: async ({ turn }) => {
+      assert.equal(
+        JSON.parse(readFileSync(beforeEffect, "utf8")).submitted,
+        true,
+      );
+      const result = await subprocessAsync(
+        process.execPath,
+        [
+          "-e",
+          "process.stderr.write('Owned process failure');process.exit(23)",
+        ],
+        {},
+      );
+      assert.equal(result.status, 23);
+      writeFileSync(afterEffect, JSON.stringify({ status: result.status }), {
+        mode: 0o600,
+      });
+      turn.nativeInvocationStarted = true;
+      throw new Error(result.stderr);
+    },
+  };
+  const model = new StructuredPlanningModel(transport);
+  assert.equal(model.providerDispatchAdmission, "after-attempt-admission-v1");
+  const request = {
+    purpose: "diagnosis",
+    objective: "Inspect this exact complete failure source.",
+    baseSha: "a".repeat(40),
+    sources: [
+      { path: "failure-test.mjs", content: readFileSync(sourcePath, "utf8") },
+    ],
+    schema: { type: "object" },
+    invocation: {
+      invocationId: randomUUID(),
+      phase: "diagnosis",
+      ordinal: 0,
+      beforeProviderDispatch: () =>
+        writeFileSync(beforeEffect, JSON.stringify({ submitted: true }), {
+          mode: 0o600,
+        }),
+    },
+  };
+  const originalAdmission = async () => {
+    assert.equal(existsSync(sourcePath), true);
+  };
+  // Exercise the demonstrated outer guard AFTER its original admission, with
+  // actual rendered model inputs and no native/provider response fixture.
+  request.invocation.beforeProviderAttempt = async () => {
+    await originalAdmission();
+    throw new Error("Complete failure file omitted before diagnosis");
+  };
+  await assert.rejects(
+    model.generateStructured(request),
+    /Complete failure file omitted/,
+  );
+  assert.equal(existsSync(beforeEffect), false);
+  assert.equal(existsSync(afterEffect), false);
+  request.invocation.invocationId = randomUUID();
+  request.invocation.beforeProviderAttempt = originalAdmission;
+  const admitDispatch = request.invocation.beforeProviderDispatch;
+  request.invocation.beforeProviderDispatch = async () => {
+    await admitDispatch();
+    throw new Error("Submitted intent checkpoint admission refused");
+  };
+  await assert.rejects(
+    model.generateStructured(request),
+    /Submitted intent checkpoint admission refused/,
+  );
+  assert.equal(JSON.parse(readFileSync(beforeEffect, "utf8")).submitted, true);
+  assert.equal(existsSync(afterEffect), false);
+  request.invocation.invocationId = randomUUID();
+  request.invocation.beforeProviderDispatch = admitDispatch;
+  await assert.rejects(
+    model.generateStructured(request),
+    /Owned process failure/,
+  );
+  assert.equal(JSON.parse(readFileSync(beforeEffect, "utf8")).submitted, true);
+  assert.equal(JSON.parse(readFileSync(afterEffect, "utf8")).status, 23);
+});

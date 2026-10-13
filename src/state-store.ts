@@ -72,6 +72,7 @@ import {
   assertCoordinator,
   assertStateWorkflowRecipe,
   isPreparationState,
+  isExecutionState,
   type ContinuationState,
   type FactoryState,
   type PreparationState,
@@ -773,6 +774,74 @@ export function assertRestoredContinuationReady(
 export function restoredContinuationOwnershipHold(
   state: ContinuationState,
 ): string | undefined {
+  return continuationOwnershipHold(state);
+}
+
+/** Outcome uncertainty remains historical after permanent cancellation and positive scope disposal. */
+export function cancelledContinuationResourceHold(
+  state: ContinuationState,
+): string | undefined {
+  if (
+    !state.cancelRequested ||
+    !state.cancelledAt ||
+    state.coordinator?.cancelError ||
+    (isExecutionState(state) && state.finalAcceptance)
+  )
+    return "Cancellation is not permanently terminal and unaccepted";
+  assertAgentSessions(state);
+  const sessions = [
+    ...Object.values(state.agentSessions ?? {}),
+    ...(state.agentSessionHistory ?? []),
+  ];
+  if (
+    sessions.some(
+      (ref) =>
+        ref.status !== "released" ||
+        (ref.currentTurn && ref.currentTurn.resources !== "settled"),
+    )
+  )
+    return "Cancellation requires positive disposal of every native scope";
+  const diagnoses = isExecutionState(state)
+    ? Object.values(state.work).flatMap((work) => [
+        work.recovery?.diagnosisInvocation,
+        ...(work.recovery?.history ?? []).map(
+          (entry) => entry.diagnosisInvocation,
+        ),
+      ])
+    : [];
+  if (
+    diagnoses.some(
+      (invocation) =>
+        invocation?.submitted && invocation.response === undefined,
+    ) &&
+    !sessions.some(
+      (ref) =>
+        ref.scope.role === "planning" &&
+        ref.scope.repository === state.repository &&
+        ref.scope.objective === state.objective &&
+        ref.scope.runId === state.runId &&
+        ref.scope.configDigest === state.configDigest &&
+        ref.currentTurn?.resources === "settled",
+    )
+  )
+    return "Unresolved diagnosis has no disposed same-run planning scope";
+  if (
+    isExecutionState(state) &&
+    Object.values(state.work).some(
+      (work) =>
+        work.status === "running" ||
+        (work.status === "published" &&
+          (!work.pullRequest || !work.changeRef || !work.treeSha)),
+    )
+  )
+    return "Cancellation retains active or unresolved Work Item ownership";
+  return continuationOwnershipHold(state, true);
+}
+
+function continuationOwnershipHold(
+  state: ContinuationState,
+  cancelledDiagnosis = false,
+): string | undefined {
   if (Object.values(state.repeats ?? {}).some((record) => record.inFlight))
     return "Retained paid call has no recorded settlement";
   if (state.coordinator?.processes?.length)
@@ -801,6 +870,7 @@ export function restoredContinuationOwnershipHold(
     return "Submitted planning invocation has no authenticated settlement";
   if (isPreparationState(state)) return undefined;
   if (
+    !cancelledDiagnosis &&
     Object.values(state.work).some((work) =>
       work.recovery?.history?.some(
         (entry) =>
@@ -831,6 +901,7 @@ export function restoredContinuationOwnershipHold(
     }
     const recovery = (work as import("./state.js").WorkState).recovery;
     if (
+      !cancelledDiagnosis &&
       recovery?.diagnosisInvocation?.submitted &&
       recovery.diagnosisInvocation.response === undefined
     )

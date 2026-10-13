@@ -62,6 +62,7 @@ import {
 import type { ContinuationState } from "./state.js";
 import {
   assertRestoredContinuationReady,
+  cancelledContinuationResourceHold,
   continuationConfigurationMatches,
   parsePortableContinuation,
   readControllerOwner,
@@ -1790,8 +1791,7 @@ function assertQueueOwnerReferenceBodies(
       !terminal.cancelRequested ||
       Date.parse(record.settled!.at) < Date.parse(terminal.cancelledAt) ||
       (isExecutionState(terminal) && terminal.finalAcceptance) ||
-      !canHandoff(terminal) ||
-      restoredContinuationOwnershipHold(terminal)
+      cancelledContinuationResourceHold(terminal)
     )
       throw new Error(
         "Project cancellation has no authenticated terminal quiescent continuation",
@@ -2804,6 +2804,77 @@ function producer(
       "Project metadata role differs from its explicit original action",
     );
   return record;
+}
+
+/** Settlement consumes the same complete, exact field receipt as queue admission. */
+function admissionEffect(
+  config: FactoryConfig,
+  history: QueueRecord[],
+  admission: QueueOperation | undefined,
+): QueueOperation["effects"][number] | undefined {
+  const effect = admission?.effects.at(-1);
+  if (
+    !admission?.metadata ||
+    admission.action !== "admit" ||
+    !effect ||
+    !("itemId" in effect.intent) ||
+    !effect.intent.itemId
+  )
+    return undefined;
+  if (
+    producer(
+      config,
+      history,
+      admission.metadata,
+      admission.scope,
+      effect.intent.itemId,
+    ) !== admission ||
+    !effect.original
+  )
+    throw new Error(
+      "Project settlement lacks its complete original admission response",
+    );
+  return effect;
+}
+/** Pure claim/admission binding shared by stopped and cancelled settlement. */
+export function assertProjectQueueClaimAdmission(
+  config: FactoryConfig,
+  history: QueueRecord[],
+  claim: QueueOwnerClaim,
+  state: Pick<ContinuationState, "objective" | "objectiveBodyDigest">,
+): void {
+  const admission = history.find(
+    (record): record is QueueOperation =>
+      record.kind === "project-queue-operation" &&
+      record.id === claim.receiptId,
+  );
+  const metadata = admission?.metadata
+    ? parseQueueMetadata(admission.metadata)
+    : undefined;
+  const effect = admissionEffect(config, history, admission);
+  if (
+    claim.authorityDigest !== factoryAuthorityDigest(config) ||
+    claim.bodyDigest !== state.objectiveBodyDigest ||
+    !admission?.completed ||
+    admission.action !== "admit" ||
+    admission.objective !== state.objective ||
+    admission.bodyDigest !== claim.bodyDigest ||
+    admission.authorityDigest !== claim.authorityDigest ||
+    JSON.stringify(admission.binding) !==
+      JSON.stringify(config.queue?.project) ||
+    metadata?.kind !== "admission" ||
+    metadata.state !== "queued" ||
+    metadata.admissionId !== claim.admissionId ||
+    metadata.receiptId !== claim.receiptId ||
+    (effect?.intent.action !== "set-metadata" &&
+      effect?.intent.action !== "set-admission-fields") ||
+    effect.intent.metadata !== admission.metadata ||
+    effect.receipt?.kind !== "response" ||
+    !effect.original
+  )
+    throw new Error(
+      "Project settlement differs from its original authenticated admission receipt",
+    );
 }
 function assertQueueHistorySettled(history: QueueRecord[]): void {
   if (
@@ -5223,40 +5294,15 @@ export async function settleStoppedProjectQueueRun(
   if (pending.length !== 1 || pending[0]!.objective !== state.objective)
     throw new Error("Stopped Project handoff has competing unfinished claims");
   const claim = pending[0]!;
-  const admission = history.find(
-    (record): record is QueueOperation =>
-      record.kind === "project-queue-operation" &&
-      record.id === claim.receiptId,
-  );
-  const metadata = admission?.metadata
-    ? parseQueueMetadata(admission.metadata)
-    : undefined;
-  const effect = admission?.effects.at(-1);
   if (
     !claim.runBinding ||
     claim.runBinding.runId !== state.runId ||
-    claim.authorityDigest !== factoryAuthorityDigest(config) ||
-    claim.bodyDigest !== state.objectiveBodyDigest ||
-    claim.deadlineAt !== (state.coordinator?.deadlineAt ?? null) ||
-    !admission?.completed ||
-    admission.action !== "admit" ||
-    admission.objective !== state.objective ||
-    admission.bodyDigest !== claim.bodyDigest ||
-    admission.authorityDigest !== claim.authorityDigest ||
-    JSON.stringify(admission.binding) !==
-      JSON.stringify(config.queue?.project) ||
-    metadata?.kind !== "admission" ||
-    metadata.state !== "queued" ||
-    metadata.admissionId !== claim.admissionId ||
-    metadata.receiptId !== claim.receiptId ||
-    effect?.intent.action !== "set-metadata" ||
-    effect.intent.metadata !== admission.metadata ||
-    effect.receipt?.kind !== "response" ||
-    !effect.original
+    claim.deadlineAt !== (state.coordinator?.deadlineAt ?? null)
   )
     throw new Error(
-      "Stopped handoff differs from its original authenticated Project admission",
+      "Stopped handoff differs from its original Project run binding",
     );
+  assertProjectQueueClaimAdmission(config, history, claim, state);
   const archive = await readVerifiedRecoveryCheckpoint(config);
   const snapshotFile = archive.manifest.files.find(
     (file) => file.path === `objectives/${state.objective}/state.json`,
@@ -5347,8 +5393,7 @@ export async function settleCancelledProjectQueueRun(
     !state.cancelledAt ||
     !state.cancelRequested ||
     (isExecutionState(state) && state.finalAcceptance) ||
-    !canHandoff(state) ||
-    restoredContinuationOwnershipHold(state) ||
+    cancelledContinuationResourceHold(state) ||
     !continuationConfigurationMatches(state, config)
   )
     throw new Error(
@@ -5383,37 +5428,7 @@ export async function settleCancelledProjectQueueRun(
   if (pending.length !== 1)
     throw new Error("Project cancellation has competing unfinished claims");
   const claim = pending[0]!;
-  const admission = history.find(
-    (record): record is QueueOperation =>
-      record.kind === "project-queue-operation" &&
-      record.id === claim.receiptId,
-  );
-  const metadata = admission?.metadata
-    ? parseQueueMetadata(admission.metadata)
-    : undefined;
-  const effect = admission?.effects.at(-1);
-  if (
-    claim.authorityDigest !== factoryAuthorityDigest(config) ||
-    claim.bodyDigest !== state.objectiveBodyDigest ||
-    !admission?.completed ||
-    admission.action !== "admit" ||
-    admission.objective !== state.objective ||
-    admission.bodyDigest !== claim.bodyDigest ||
-    admission.authorityDigest !== claim.authorityDigest ||
-    JSON.stringify(admission.binding) !==
-      JSON.stringify(config.queue.project) ||
-    metadata?.kind !== "admission" ||
-    metadata.state !== "queued" ||
-    metadata.admissionId !== claim.admissionId ||
-    metadata.receiptId !== claim.receiptId ||
-    effect?.intent.action !== "set-metadata" ||
-    effect.intent.metadata !== admission.metadata ||
-    effect.receipt?.kind !== "response" ||
-    !effect.original
-  )
-    throw new Error(
-      "Project cancellation differs from its original authenticated admission receipt",
-    );
+  assertProjectQueueClaimAdmission(config, history, claim, state);
   const archive = await readVerifiedRecoveryCheckpoint(
     config,
     undefined,
