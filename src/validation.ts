@@ -23,6 +23,7 @@ import type {
 } from "./contracts.js";
 import type { FailedValidationEvidence } from "./failed-validation.js";
 import { StepFault, transient } from "./fault.js";
+import { ownsPath } from "./ownership.js";
 import {
   assertPackageManagerUpdate,
   packageMetadata,
@@ -1173,6 +1174,14 @@ export async function validateWorkItem(
   retainFailedValidation = true,
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
 ): Promise<ValidationEvidence> {
+  // Validate every declaration before selection, including unowned producers.
+  assertReviewArtifactSelectors(reviewArtifacts);
+  const selectedArtifacts = reviewArtifacts.filter(
+    (selector) =>
+      item.kind !== "work" ||
+      !("text" in selector) ||
+      ownsPath(selector.text.source, item.ownedPaths),
+  );
   assertPinnedNpmScripts(
     checkout,
     acceptedBaseSha,
@@ -1187,7 +1196,7 @@ export async function validateWorkItem(
       packageManagerUpdate,
     },
   );
-  return validateTree(
+  const evidence = await validateTree(
     checkout,
     root,
     commit,
@@ -1200,8 +1209,15 @@ export async function validateWorkItem(
     acceptedBaseSha,
     retainFailedValidation,
     { commands: [] },
-    reviewArtifacts,
+    selectedArtifacts,
   );
+  // Keep the installation selector identity when only this item's producers
+  // were selected. QA and final validation still use the complete selection.
+  for (const artifact of evidence.reviewArtifacts ?? [])
+    artifact.selectorIndex = reviewArtifacts.indexOf(
+      selectedArtifacts[artifact.selectorIndex]!,
+    );
+  return evidence;
 }
 export {
   commandPassEvidence,
