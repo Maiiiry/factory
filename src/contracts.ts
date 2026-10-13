@@ -685,7 +685,13 @@ export type AgentSessionReconciliation =
       usage?: ModelInvocationUsage;
     };
 
+export interface RetainedPlannerCheckpointCoverage {
+  contract: "retained-planner-native-checkpoint-v1";
+  adapter: string;
+}
+
 export interface PlanningModel {
+  readonly retainedPlannerCheckpointCoverage?: RetainedPlannerCheckpointCoverage;
   readonly providerAttemptAdmission?: "controller-checkpoint-v1";
   /** The model checkpoints dispatch only after the complete attempt-admission callback succeeds. */
   readonly providerDispatchAdmission?: "after-attempt-admission-v1";

@@ -1,3 +1,4 @@
+import { assertRetainedPlannerCheckpointCoverage } from "../compiler/transport.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   agentSessionContinuation,
@@ -380,5 +381,74 @@ export async function releaseCancelledSessions(
       );
   };
   assertCurrent();
+  const planning = state.planningRecovery;
+  const unresolvedPlanning =
+    planning?.phase === "submitted" &&
+    planning.response === undefined &&
+    !planning.invocations?.some(
+      (entry) => entry.id === planning.invocation?.id && entry.resultDigest,
+    );
+  let planningScope:
+    | ReturnType<typeof agentSessionContinuation>["scope"]
+    | undefined;
+  if (unresolvedPlanning) {
+    if (state.restoration)
+      throw new Error(
+        "Unresolved restored planning has no authenticated original checkpoint coverage",
+      );
+    assertRetainedPlannerCheckpointCoverage(
+      model?.retainedPlannerCheckpointCoverage,
+    );
+    if (
+      !model?.sessionCapabilities?.resumeRoles.includes("planning") ||
+      !["compile", "diagnosis"].includes(planning.invocation?.phase ?? "")
+    )
+      throw new Error(
+        "Pending planning resource scope has no supported retained-planner coverage",
+      );
+    planningScope = agentSessionContinuation(
+      state,
+      "planning",
+      undefined,
+      save,
+    ).scope;
+    if (
+      [
+        ...Object.values(state.agentSessions ?? {}),
+        ...(state.agentSessionHistory ?? []),
+      ].some(
+        (ref) =>
+          ref.scope.role === "planning" &&
+          ref.adapter !== model.retainedPlannerCheckpointCoverage!.adapter,
+      )
+    )
+      throw new Error(
+        "Planning resource coverage differs from the actual selected adapter",
+      );
+  }
   await releaseAgentSessions(state, driver, model, save, assertCurrent);
+  if (unresolvedPlanning) {
+    assertCurrent();
+    if (
+      [
+        ...Object.values(state.agentSessions ?? {}),
+        ...(state.agentSessionHistory ?? []),
+      ].some(
+        (ref) =>
+          ref.status !== "released" ||
+          (ref.currentTurn && ref.currentTurn.resources !== "settled"),
+      )
+    )
+      throw new Error(
+        "Pending planning requires positive disposal of every covered native scope",
+      );
+    planning.cancelledResources = {
+      coverage: { ...model!.retainedPlannerCheckpointCoverage! },
+      invocationId: planning.invocation!.id,
+      phase: planning.invocation!.phase as "compile" | "diagnosis",
+      scope: planningScope!,
+    };
+    save();
+    assertCurrent();
+  }
 }
