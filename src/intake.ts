@@ -1315,12 +1315,22 @@ export async function resumeWatcherAfterUpgrade(
     return true;
   });
 }
-async function resolveBase(
+export async function resolveIntakeBase(
   config: FactoryConfig,
   github: GitHubGateway,
   predecessors: number[],
   objective: number,
 ): Promise<void> {
+  // With no predecessor outputs there is no base-dependent eligibility to
+  // resolve here. The new preparation fetches and aligns its authoritative
+  // default head after the fresh Project claim; do not fetch it twice.
+  if (!predecessors.length) {
+    if (git(config.checkout, "status", "--porcelain"))
+      throw new Error(
+        "Compilation checkout has local changes; preserve them before intake",
+      );
+    return;
+  }
   const head = await fetchHead(config.checkout, await github.defaultBranch());
   await planningPrerequisites(config, github, objective, head, predecessors);
   if (git(config.checkout, "status", "--porcelain"))
@@ -1812,7 +1822,7 @@ async function runIntakeOwned(
                   `Predecessor #${missing} has no accepted evidence`;
                 continue;
               }
-              await resolveBase(
+              await resolveIntakeBase(
                 config,
                 services.github,
                 predecessors,

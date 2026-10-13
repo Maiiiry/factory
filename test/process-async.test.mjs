@@ -1,4 +1,5 @@
 import { compilePlan } from "../dist/compiler/recovery.js";
+import { prepareObjective } from "../dist/runner/planning.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -3366,6 +3367,191 @@ test("source readiness prepares each real fresh checkout before its phase checks
     );
     const baseSha = git("rev-parse", "HEAD");
     const baseTree = git("rev-parse", "HEAD^{tree}");
+    // New Project preparation fetches and aligns once at the authoritative
+    // source seam. The real status callback stops before any compiler/provider;
+    // no model answer or accepted graph is supplied by this regression.
+    const sourceRemote = join(root, "source.git"),
+      producer = join(root, "source-producer");
+    execFileSync("git", ["init", "--bare", "-b", "main", sourceRemote], {
+      stdio: "ignore",
+    });
+    git("remote", "add", "origin", sourceRemote);
+    git("push", "origin", "main");
+    execFileSync("git", ["clone", sourceRemote, producer], { stdio: "ignore" });
+    const produce = (...args) =>
+      execFileSync("git", ["-C", producer, ...args], {
+        encoding: "utf8",
+      }).trim();
+    const advance = () => {
+      writeFileSync(
+        join(producer, "new-source.txt"),
+        `source revision ${produce("rev-parse", "HEAD")}\n`,
+      );
+      produce("add", "new-source.txt");
+      produce(
+        "-c",
+        "user.name=Integration",
+        "-c",
+        "user.email=integration@example.invalid",
+        "commit",
+        "-m",
+        "advance source",
+      );
+      produce("push", "origin", "main");
+      return produce("rev-parse", "HEAD");
+    };
+    const latest = advance();
+    const preparationRepository = `integration/preparation-${randomUUID()}`;
+    const selection = { model: "not-dispatched", reasoningEffort: "low" };
+    const preparationConfig = {
+      schemaVersion: 1,
+      repository: preparationRepository,
+      checkout,
+      planning: { kind: "codex-sdk", planner: selection, reviewer: selection },
+      execution: {
+        kind: "local",
+        concurrency: 1,
+        harness: { kind: "codex-sdk", ...selection },
+      },
+      delivery: { kind: "regular" },
+      policy: { network: "off", allowedSecretNames: [] },
+      queue: {
+        project: {
+          repository: preparationRepository,
+          projectId: "PVT_source",
+          metadataFieldId: "PVTF_metadata",
+          orderFieldId: "PVTF_order",
+          controlItemId: "PVTI_control",
+          factoryManagedFields: true,
+        },
+      },
+      gitPersistence: {
+        remote: join(root, "private-history.git"),
+        ref: "refs/heads/history",
+        visibility: "private",
+        scope: "private-history",
+        maxBytes: 16 * 1024 * 1024,
+        maxFiles: 4096,
+        timeoutMs: 1000,
+        coalesceMs: 0,
+      },
+    };
+    const preparationBody =
+      "## Outcome\nInspect the pinned source.\n\n## Acceptance\n- Source is readable.\n\n## Sources\n- `README.md`\n";
+    mkdirSync(stateRoot(preparationRepository), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const preparationStore = new LocalContentStore(
+      join(stateRoot(preparationRepository), "content"),
+    );
+    const preparedBoundary = new Error(
+      "Actual preparation reached the pre-compiler status boundary",
+    );
+    let baseReads = 0;
+    const prepare = async (objective, preparation) => {
+      const owner = {
+        snapshot: preparation,
+        abort: new AbortController(),
+        pause: new AbortController(),
+        workPause: new AbortController(),
+      };
+      const unsaved = {};
+      return prepareObjective({
+        config: preparationConfig,
+        objective,
+        issue: { body: preparationBody },
+        path: statePath(preparationRepository, objective),
+        diagnostics: new DiagnosticEmitter(preparationRepository, objective),
+        planningModel: new CodexPlanningModel(checkout, selection, selection),
+        github: {
+          async defaultBranch() {
+            baseReads++;
+            return "main";
+          },
+          async objectiveDependencies() {
+            return [];
+          },
+        },
+        contentStore: preparationStore,
+        owner,
+        installationConfigDigest: factoryConfigDigest(preparationConfig),
+        preparation,
+        objectiveStep: (current, name, fn, paid) =>
+          step(current ?? unsaved, { scope: "objective", name, paid }, fn, {
+            save: () => {
+              if (current)
+                saveState(statePath(preparationRepository, objective), current);
+            },
+          }),
+        cancellationRequested: () => false,
+        reportRunStatus: () => {
+          throw preparedBoundary;
+        },
+      });
+    };
+    const priorLocalOrigins = process.env.FACTORY_TEST_LOCAL_ORIGINS;
+    process.env.FACTORY_TEST_LOCAL_ORIGINS = "1";
+    try {
+      await assert.rejects(prepare(10), (error) => error === preparedBoundary);
+      assert.equal(baseReads, 1);
+      assert.equal(git("rev-parse", "HEAD"), latest);
+      const retained = readContinuation(preparationRepository, 10);
+      assert.equal(retained.baseSha, latest);
+      const originalRun = retained.runId;
+      const nextHead = advance();
+      await assert.rejects(
+        prepare(10, retained),
+        (error) => error === preparedBoundary,
+      );
+      assert.equal(
+        baseReads,
+        1,
+        "retained preparation never fetches or realigns",
+      );
+      assert.equal(git("rev-parse", "HEAD"), latest);
+      assert.equal(readContinuation(preparationRepository, 10).baseSha, latest);
+      assert.equal(
+        readContinuation(preparationRepository, 10).runId,
+        originalRun,
+      );
+      writeFileSync(join(checkout, "dirty.txt"), "actual unsaved user work\n");
+      await assert.rejects(prepare(11), /local changes/);
+      assert.equal(git("rev-parse", "HEAD"), latest);
+      assert.equal(
+        readFileSync(join(checkout, "dirty.txt"), "utf8"),
+        "actual unsaved user work\n",
+      );
+      assert.equal(readContinuation(preparationRepository, 11), undefined);
+      rmSync(join(checkout, "dirty.txt"));
+      writeFileSync(join(checkout, "diverged.txt"), "actual diverged work\n");
+      git("add", "diverged.txt");
+      git(
+        "-c",
+        "user.name=Integration",
+        "-c",
+        "user.email=integration@example.invalid",
+        "commit",
+        "-m",
+        "diverge from default",
+      );
+      const diverged = git("rev-parse", "HEAD");
+      await assert.rejects(prepare(12), /fast-forward|diverging/i);
+      assert.equal(git("rev-parse", "HEAD"), diverged);
+      assert.equal(readContinuation(preparationRepository, 12), undefined);
+      // Restore this disposable fixture through its named original branch;
+      // no target or contributor checkout is reset.
+      git("switch", "--detach", nextHead);
+      git("switch", "-c", "readiness-fixture", baseSha);
+    } finally {
+      if (priorLocalOrigins === undefined)
+        delete process.env.FACTORY_TEST_LOCAL_ORIGINS;
+      else process.env.FACTORY_TEST_LOCAL_ORIGINS = priorLocalOrigins;
+      rmSync(stateRoot(preparationRepository), {
+        recursive: true,
+        force: true,
+      });
+    }
     let item = {
       id: "implementation",
       kind: "work",

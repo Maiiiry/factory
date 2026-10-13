@@ -35,7 +35,7 @@ import { attachedFault } from "../fault.js";
 import { approvedPlaybook } from "../learning.js";
 import { preflightObjective } from "../local-preflight.js";
 import { planningPrerequisites } from "../objective-prerequisites.js";
-import { fetchHead, git } from "../process.js";
+import { fetchHead, git, gitAsync } from "../process.js";
 import { checkRequiredEnvironment, resolveAutonomy } from "../repair-policy.js";
 import type { PreparationState } from "../state.js";
 import { isPreparationState, projectionStarted } from "../state.js";
@@ -537,9 +537,24 @@ export async function prepareObjective(args: {
   // keeps the base it recorded, like every later run of the Objective.
   const baseSha =
     preparation?.baseSha ??
-    (await objectiveStep(owner.snapshot, "base", async () =>
-      fetchHead(config.checkout, await github.defaultBranch()),
-    ));
+    (await objectiveStep(owner.snapshot, "base", async () => {
+      const head = await fetchHead(
+        config.checkout,
+        await github.defaultBranch(),
+      );
+      if (config.queue?.project) {
+        if (git(config.checkout, "status", "--porcelain"))
+          throw new Error(
+            "Compilation checkout has local changes; preserve them before intake",
+          );
+        await gitAsync(config.checkout, "merge", "--ff-only", head);
+        if (git(config.checkout, "rev-parse", "HEAD") !== head)
+          throw new Error(
+            "Compilation checkout diverges from authenticated default head",
+          );
+      }
+      return head;
+    }));
   const prerequisites = await objectiveStep(
     owner.snapshot,
     "prerequisites",
