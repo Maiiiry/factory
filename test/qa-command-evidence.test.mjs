@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { assertKnownFlags } from "../dist/cli-flags.js";
 import { planningSources } from "../dist/compiler/sources.js";
 import { factoryConfigDigest } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
@@ -242,6 +243,15 @@ else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.
         },
       },
     ];
+    assertKnownFlags("retry", [
+      "--objective",
+      "1",
+      "--item",
+      "qa",
+      "--rereview",
+      "--review-artifacts",
+      "selectors.json",
+    ]);
     saveState(statePath(config.repository, 1), state);
     assert.throws(
       () =>

@@ -602,6 +602,11 @@ async function dispatchMain(): Promise<void> {
     if (args.includes("--rereview")) {
       if (!item) throw new Error("retry --rereview requires --item");
       const selectionFile = option(args, "review-artifacts");
+      if (
+        args.includes("--review-artifacts") &&
+        (!selectionFile || selectionFile.startsWith("--"))
+      )
+        throw new Error("--review-artifacts requires a selector JSON file");
       const input = {
         item,
         actor: operatorName(),
