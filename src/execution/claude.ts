@@ -1,3 +1,4 @@
+import { assertWorkerSourceFiles } from "./harness-support.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
@@ -297,6 +298,7 @@ export class ClaudeAgentSdkHarness implements AgentHarness {
    * unrecorded start of it spawned is stopped first (#585).
    */
   async start(request: HarnessRequest): Promise<HarnessHandle> {
+    assertWorkerSourceFiles(request);
     if (request.discovery || request.item.kind === "discovery")
       throw new Error(
         "Claude harness does not support enforced read-only discovery",

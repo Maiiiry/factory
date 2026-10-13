@@ -3,13 +3,17 @@ import {
   compilePlan,
 } from "../dist/compiler/recovery.js";
 import { paidPlanningModel } from "../dist/compiler/planning.js";
-import { planningSources } from "../dist/compiler/sources.js";
+import {
+  planningSources,
+  hydrateWorkerInputSources,
+} from "../dist/compiler/sources.js";
 import { step, repeatKey } from "../dist/step.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -59,11 +63,17 @@ import {
   reviewObjectiveKnowledge,
   workHandoffSchema,
 } from "../dist/objective-knowledge.js";
-import { renderWorkItemPrompt } from "../dist/execution/harness-support.js";
+import {
+  renderWorkItemPrompt,
+  materializeWorkerSources,
+  assertWorkerSourceFiles,
+} from "../dist/execution/harness-support.js";
 import {
   buildAdaptiveContext,
   authenticateAdaptiveContextPacket,
 } from "../dist/adaptive-context.js";
+import { prepareClaudeInput } from "../dist/execution/claude-managed-input.js";
+import { prepareOpenAIInput } from "../dist/execution/openai-managed-files.js";
 import { createPlanningContextResolver } from "../dist/compiler/context-runtime.js";
 import { initializeContextLookup } from "../dist/compiler/context.js";
 import {
@@ -367,6 +377,25 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     mkdirSync(checkout);
     git(checkout, "init", "-b", "main");
     writeFileSync(join(checkout, "README.md"), "# Target\n");
+    const originalLock = JSON.stringify(
+      {
+        lockfileVersion: 3,
+        packages: Object.fromEntries(
+          Array.from({ length: 4096 }, (_, index) => [
+            `node_modules/public-fixture-${index}`,
+            { version: "1.0.0", integrity: "public-synthetic" },
+          ]),
+        ),
+      },
+      null,
+      2,
+    );
+    writeFileSync(join(checkout, "package-lock.json"), originalLock);
+    writeFileSync(
+      join(checkout, "contract.md"),
+      "# Selected\nOriginal accepted section.\n# Other\nUnselected private-scope fixture text.\n",
+    );
+
     git(checkout, "add", ".");
     git(
       checkout,
@@ -400,6 +429,18 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     const consumer = item("api", ["schema"], ["api.json"]);
     const peer = item("ui", [], ["ui.json"]);
     const unrelated = item("docs", [], ["docs.md"]);
+    producer.citations = [
+      { path: "package-lock.json", heading: "" },
+      { path: "contract.md", heading: "Selected" },
+    ];
+    hydrateWorkerInputSources(
+      { items: [producer] },
+      planningSources(
+        "## Sources\n- package-lock.json\n- contract.md\n",
+        baseSha,
+        checkout,
+      ),
+    );
     const graph = {
       objective: 1,
       baseSha,
@@ -445,6 +486,7 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     const request = {
       item: producer,
       baseSha,
+      sourceBaseSha: baseSha,
       attemptId: "schema-attempt",
       handoffPeers: graph.items
         .filter((item) => item.id !== producer.id)
@@ -469,7 +511,11 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       ],
     };
     writeFileSync(join(checkout, ".gitignore"), ".factory-handoff.json\n");
-    git(checkout, "add", ".gitignore");
+    writeFileSync(
+      join(checkout, "package-lock.json"),
+      '{"lockfileVersion":3,"packages":{}}\n',
+    );
+    git(checkout, "add", ".gitignore", "package-lock.json");
     git(
       checkout,
       "-c",
@@ -483,6 +529,105 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     request.baseSha = git(checkout, "rev-parse", "HEAD");
     state.baseSha = graph.baseSha = request.baseSha;
     state.planGraphDigest = graphDigest(graph);
+    const sourceDelivery = materializeWorkerSources(checkout, request);
+    assert.notEqual(request.baseSha, sourceDelivery.baseSha);
+    assert.equal(sourceDelivery.baseSha, baseSha);
+    assert.equal(
+      readFileSync(
+        join(sourceDelivery.root, sourceDelivery.files[0].file),
+        "utf8",
+      ),
+      originalLock,
+    );
+    const sectionFile = join(sourceDelivery.root, sourceDelivery.files[1].file);
+    assert.equal(
+      readFileSync(sectionFile, "utf8"),
+      producer.inputSources[1].content,
+    );
+    assert.equal(
+      readFileSync(sectionFile, "utf8").includes("Unselected private-scope"),
+      false,
+    );
+    const references = {
+      item: producer,
+      sourceBaseSha: baseSha,
+      sourceDelivery,
+      worktree: checkout,
+    };
+    assertWorkerSourceFiles(references);
+    const rendered = renderWorkItemPrompt(references);
+    assert.equal(
+      rendered.prompt.includes(JSON.stringify(producer.inputSources)),
+      false,
+    );
+    assert.equal(
+      rendered.prompt.includes("node_modules/public-fixture-4095"),
+      false,
+    );
+    assert(rendered.prompt.includes(sourceDelivery.files[0].digest));
+    assert(rendered.prompt.includes("targeted entries"));
+    assert(rendered.prompt.includes('"heading":"Selected"'));
+    assert.equal(
+      JSON.parse(
+        readFileSync(
+          join(sourceDelivery.root, sourceDelivery.files[0].file),
+          "utf8",
+        ),
+      ).packages["node_modules/public-fixture-1"].version,
+      "1.0.0",
+    );
+    assert.throws(
+      () =>
+        renderWorkItemPrompt({
+          ...references,
+          sourceDelivery: { ...sourceDelivery, baseSha: request.baseSha },
+        }),
+      /original accepted bodies/,
+    );
+    assert.throws(
+      () => materializeWorkerSources(checkout, { item: producer }),
+      /original accepted source pin/,
+    );
+    assert.throws(
+      () => renderWorkItemPrompt({ item: producer, worktree: checkout }),
+      /complete source file delivery/,
+    );
+
+    const managedClaude = await prepareClaudeInput(
+      checkout,
+      join(root, "claude-input"),
+      request,
+      store,
+    );
+    const claudeInput = JSON.parse(readFileSync(managedClaude.path, "utf8"));
+    const pinnedRelative =
+      ".factory-inputs/pinned-sources/" + sourceDelivery.files[0].file;
+    assert.equal(
+      Buffer.from(
+        claudeInput.files.find((file) => file.path === pinnedRelative).content,
+        "base64",
+      ).toString("utf8"),
+      originalLock,
+    );
+    assert.equal(managedClaude.request.sourceBaseSha, baseSha);
+    const managedOpenAI = await prepareOpenAIInput({
+      checkout,
+      root: join(root, "openai-input"),
+      request,
+      store,
+    });
+    assert.equal(
+      readFileSync(join(root, "openai-input", "repo", pinnedRelative), "utf8"),
+      originalLock,
+    );
+    const managedPrompt = renderWorkItemPrompt(managedOpenAI.harnessRequest);
+    assert.equal(
+      managedPrompt.prompt.includes(JSON.stringify(producer.inputSources)),
+      false,
+    );
+    assert(managedPrompt.prompt.includes("/workspace/repo/" + pinnedRelative));
+    assert.equal(managedOpenAI.harnessRequest.sourceBaseSha, baseSha);
+
     writeFileSync(
       join(checkout, ".factory-handoff.json"),
       JSON.stringify({
@@ -503,6 +648,8 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     assert.equal(git(checkout, "rev-parse", "HEAD"), request.baseSha);
     const emitted = renderWorkItemPrompt({
       item: producer,
+      sourceBaseSha: baseSha,
+      sourceDelivery,
       worktree: checkout,
       handoffPeers: request.handoffPeers,
     });
@@ -510,6 +657,8 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     assert(emitted.prompt.includes('"peerIndex":0,"title":"api"'));
     const withoutPeers = renderWorkItemPrompt({
       item: producer,
+      sourceBaseSha: baseSha,
+      sourceDelivery,
       worktree: checkout,
     });
     assert(withoutPeers.prompt.includes("Omit peer-targeted handoff notes"));
@@ -548,6 +697,22 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       join(checkout, ".factory-handoff.json"),
       JSON.stringify(manifest),
     );
+    chmodSync(sectionFile, 0o600);
+    writeFileSync(sectionFile, "Changed worker source.\n");
+    assert.throws(
+      () => assertWorkerSourceFiles(references),
+      /missing, redirected or changed/,
+    );
+    await assert.rejects(
+      () => collectWorktreeResult(checkout, checkout, request, store, {}),
+      /Bound asset input differs/,
+    );
+    assert.throws(
+      () => materializeWorkerSources(checkout, request),
+      /Immutable planning source file differs/,
+    );
+    writeFileSync(sectionFile, producer.inputSources[1].content);
+    chmodSync(sectionFile, 0o400);
     const script = join(root, "export.mjs");
     const bindingPath = join(root, "binding.json");
     const output = join(root, "private-export.json");
@@ -566,6 +731,13 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
     const exported = parseClaudeResultSnapshot(readFileSync(output), binding);
     assert.ok(
       exported.files.some((file) => file.path === ".factory-handoff.json"),
+    );
+    assert.equal(
+      Buffer.from(
+        exported.files.find((file) => file.path === pinnedRelative).content,
+        "base64",
+      ).toString("utf8"),
+      originalLock,
     );
     const materialized = join(root, "exported-bytes");
     materializeClaudeSnapshot(materialized, exported);

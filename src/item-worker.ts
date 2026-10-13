@@ -324,6 +324,7 @@ export async function runWorker(
         ? { retainedFailedResult: retained }
         : {}),
       baseSha,
+      sourceBaseSha: state.baseSha,
       attemptId,
       objectiveBody: args.objectiveBody,
       selectedAssets: selectedInputsForItem(state, item),

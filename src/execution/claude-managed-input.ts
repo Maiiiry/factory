@@ -1,3 +1,4 @@
+import { materializeWorkerSources } from "./harness-support.js";
 import {
   mkdirSync,
   readdirSync,
@@ -55,6 +56,7 @@ export async function prepareClaudeInput(
       asset.ref,
       join(repo, ".factory-inputs", `selected-${index}`),
     );
+  materializeWorkerSources(repo, request);
   const files: ClaudeFile[] = [];
   const visit = (directory: string) => {
     for (const name of readdirSync(directory).sort()) {
