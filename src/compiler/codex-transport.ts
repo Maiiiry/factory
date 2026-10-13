@@ -806,10 +806,14 @@ export class CodexPlanningTransport implements PlanningTransport {
       checkpointSession("in-flight");
       initialCheckpointed = true;
       if (preparedSource) preparedSource.adopted = true;
-      await awaitCheckpointAdmission(
-        continuation?.scope.repository,
-        "before-effect",
-      );
+      // Exec has no native effect between this local intent and the submitted
+      // checkpoint below. Admit their complete facts together at that final
+      // pre-effect barrier. App-server retains its distinct native boundaries.
+      if (selectedTransport === "app-server")
+        await awaitCheckpointAdmission(
+          continuation?.scope.repository,
+          "before-effect",
+        );
       if (sessionTurn)
         observeModelInvocation(invocation, {
           type: "progress",
