@@ -7,6 +7,7 @@ These rules govern building Factory. The README and packaged skills govern using
 - Finish one phase at a time. Use concurrent agents within that phase with clear file ownership.
 - Batch related fixes into a complete outcome. Merge with green CI and the maintainer’s read; independently review the completed milestone once. Credentials, isolation and persisted-state changes also need one focused independent review.
 - CI is the routine check. Run an affected local check only when it resolves an actual uncertainty; do not repeat full suites or add per-fix qualification.
+- Use meaningful affected tests, retained evidence, independent review and green CI to finish the product outcome. Add a live check only for a specific changed behavior that these facts do not prove. Reuse evidence where it still applies, and stop when the behavior works and the required checks pass.
 - Issues and pull requests record scope, decisions and results. Match current issue conventions for native issue type, existing labels, Project status and applicable relationships. Comment when a fix merges, an actual blocker appears or the plan changes. No separate status documents, per-PR changelog entries, mandatory issue-heading templates or label taxonomy.
 - Follow [the release procedure](docs/RELEASING.md) and the release issue’s actual exits. Do not invent additional release gates. GitHub release notes record changes.
 
@@ -23,6 +24,8 @@ Use the existing atomic continuation snapshot. Diagnostics observe; they never d
 ## Coverage and model contracts
 
 Keep the small real integration suite: actual Git repositories, processes, files, scanner and offline packed CLI. Reuse an existing workflow for a demonstrated regression. Do not add unit tests, mocks, fake services/providers, scripted responses, fault matrices or fixture frameworks. Real provider/GitHub acceptance occurs at the approved milestone when its substantive exits require it; CI does not claim that acceptance.
+
+Qualification serves the product outcome. Broad provider/profile matrices, benchmarks and deliberate fault drills are not automatic feature-closure or release gates. A new live provider capability still needs real SDK evidence for the named claim; use the smallest bounded check that proves it. Preserve security, ownership, unknown outcomes, accounting and recorded limits without expanding qualification beyond the required behavior.
 
 For local process/resource observations, establish that the observer shares the recorded owners' runtime and process namespace before claiming cessation; a sandbox-only `/proc` scan does not prove host closure. Keep unproved namespace or resource visibility unknown. Verify prerequisite setup and probes use the exact source-authorized commands and order in the actual fresh checkout for that phase. Distinguish transferred Git-tracked inputs from ignored installations and generated runtime artifacts, and verify the latter are prepared there.
 
