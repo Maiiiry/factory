@@ -62,6 +62,7 @@ import {
 import type { ContinuationState } from "./state.js";
 import {
   assertRestoredContinuationReady,
+  cancelledContinuationResourceHold,
   continuationConfigurationMatches,
   parsePortableContinuation,
   readControllerOwner,
@@ -1790,8 +1791,7 @@ function assertQueueOwnerReferenceBodies(
       !terminal.cancelRequested ||
       Date.parse(record.settled!.at) < Date.parse(terminal.cancelledAt) ||
       (isExecutionState(terminal) && terminal.finalAcceptance) ||
-      !canHandoff(terminal) ||
-      restoredContinuationOwnershipHold(terminal)
+      cancelledContinuationResourceHold(terminal)
     )
       throw new Error(
         "Project cancellation has no authenticated terminal quiescent continuation",
@@ -2804,6 +2804,37 @@ function producer(
       "Project metadata role differs from its explicit original action",
     );
   return record;
+}
+
+/** Settlement consumes the same complete, exact field receipt as queue admission. */
+function admissionEffect(
+  config: FactoryConfig,
+  history: QueueRecord[],
+  admission: QueueOperation | undefined,
+): QueueOperation["effects"][number] | undefined {
+  const effect = admission?.effects.at(-1);
+  if (
+    !admission?.metadata ||
+    admission.action !== "admit" ||
+    !effect ||
+    !("itemId" in effect.intent) ||
+    !effect.intent.itemId
+  )
+    return undefined;
+  if (
+    producer(
+      config,
+      history,
+      admission.metadata,
+      admission.scope,
+      effect.intent.itemId,
+    ) !== admission ||
+    !effect.original
+  )
+    throw new Error(
+      "Project settlement lacks its complete original admission response",
+    );
+  return effect;
 }
 function assertQueueHistorySettled(history: QueueRecord[]): void {
   if (
@@ -5231,7 +5262,7 @@ export async function settleStoppedProjectQueueRun(
   const metadata = admission?.metadata
     ? parseQueueMetadata(admission.metadata)
     : undefined;
-  const effect = admission?.effects.at(-1);
+  const effect = admissionEffect(config, history, admission);
   if (
     !claim.runBinding ||
     claim.runBinding.runId !== state.runId ||
@@ -5249,7 +5280,8 @@ export async function settleStoppedProjectQueueRun(
     metadata.state !== "queued" ||
     metadata.admissionId !== claim.admissionId ||
     metadata.receiptId !== claim.receiptId ||
-    effect?.intent.action !== "set-metadata" ||
+    (effect?.intent.action !== "set-metadata" &&
+      effect?.intent.action !== "set-admission-fields") ||
     effect.intent.metadata !== admission.metadata ||
     effect.receipt?.kind !== "response" ||
     !effect.original
@@ -5347,8 +5379,7 @@ export async function settleCancelledProjectQueueRun(
     !state.cancelledAt ||
     !state.cancelRequested ||
     (isExecutionState(state) && state.finalAcceptance) ||
-    !canHandoff(state) ||
-    restoredContinuationOwnershipHold(state) ||
+    cancelledContinuationResourceHold(state) ||
     !continuationConfigurationMatches(state, config)
   )
     throw new Error(
@@ -5391,7 +5422,7 @@ export async function settleCancelledProjectQueueRun(
   const metadata = admission?.metadata
     ? parseQueueMetadata(admission.metadata)
     : undefined;
-  const effect = admission?.effects.at(-1);
+  const effect = admissionEffect(config, history, admission);
   if (
     claim.authorityDigest !== factoryAuthorityDigest(config) ||
     claim.bodyDigest !== state.objectiveBodyDigest ||
@@ -5406,7 +5437,8 @@ export async function settleCancelledProjectQueueRun(
     metadata.state !== "queued" ||
     metadata.admissionId !== claim.admissionId ||
     metadata.receiptId !== claim.receiptId ||
-    effect?.intent.action !== "set-metadata" ||
+    (effect?.intent.action !== "set-metadata" &&
+      effect?.intent.action !== "set-admission-fields") ||
     effect.intent.metadata !== admission.metadata ||
     effect.receipt?.kind !== "response" ||
     !effect.original

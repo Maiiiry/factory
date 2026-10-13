@@ -129,6 +129,9 @@ export function bindPlanningPlaybook(
     ...(model.providerAttemptAdmission
       ? { providerAttemptAdmission: model.providerAttemptAdmission }
       : {}),
+    ...(model.providerDispatchAdmission
+      ? { providerDispatchAdmission: model.providerDispatchAdmission }
+      : {}),
     approvedPlaybookPin: pin,
     generateStructured: model.generateStructured.bind(model),
     reviewGraph: model.reviewGraph.bind(model),
@@ -547,6 +550,7 @@ Objective:\n`;
 
 export class StructuredPlanningModel implements PlanningModel {
   readonly providerAttemptAdmission = "controller-checkpoint-v1" as const;
+  readonly providerDispatchAdmission = "after-attempt-admission-v1" as const;
   approvedPlaybook?: ApprovedPlaybook;
   approvedPlaybookPin?: ApprovedPlaybookPin;
   private readonly reviewCapacityRetryDelaysMs: readonly number[];
@@ -835,6 +839,7 @@ export class StructuredPlanningModel implements PlanningModel {
         throw new ProviderTurnElapsedTimeoutError(args.deadlineAt);
       }
       await invocation.beforeProviderAttempt?.();
+      await invocation.beforeProviderDispatch?.();
       await this.transport.run({
         role: args.role,
         prompt: args.prompt,

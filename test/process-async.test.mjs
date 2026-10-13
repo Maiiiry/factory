@@ -119,6 +119,7 @@ import {
 } from "../dist/runner/execution.js";
 import {
   canHandoff,
+  releaseCancelledSessions,
   synchronizeWorkItemPause,
 } from "../dist/runner/ownership.js";
 import {
@@ -131,8 +132,12 @@ import {
 import { parseFactoryState, setCoordinatorMode } from "../dist/state.js";
 import {
   acquireInstallationLock,
+  acquireObjectiveLock,
   installationLockPath,
+  objectiveLockPath,
   readContinuation,
+  cancelledContinuationResourceHold,
+  restoredContinuationOwnershipHold,
   readState,
   releaseControllerLock,
   saveState,
@@ -1234,7 +1239,7 @@ test("cancellation stops an owned shell and its process group", async () => {
     await withGitHubTransportObserver(
       (observation) => observations.push(observation),
       async () => {
-        for (const route of ["direct", "controller"]) {
+        for (const route of ["direct", "controller", "diagnosis"]) {
           const preparation = {
             schemaVersion: 8,
             kind: "preparing",
@@ -1259,6 +1264,28 @@ test("cancellation stops an owned shell and its process group", async () => {
               processes: [],
             },
           };
+          if (route === "diagnosis") {
+            // A stopped pending execution can retain an unknown diagnosis
+            // without any invented native completion. The same real atomic
+            // scope and adapter-owned home must be disposed by ordinary cancel.
+            delete preparation.kind;
+            preparation.schemaVersion = 7;
+            preparation.graph = structuredClone(snapshot.graph);
+            preparation.planGraphDigest = snapshot.planGraphDigest;
+            preparation.issueByItemId = snapshot.issueByItemId;
+            preparation.work = {
+              local: {
+                status: "pending",
+                recovery: {
+                  diagnosisInvocation: {
+                    id: randomUUID(),
+                    submitted: true,
+                    requestDigest: "a".repeat(64),
+                  },
+                },
+              },
+            };
+          }
           const savePreparation = () =>
             saveState(statePath(config.repository, 1), preparation);
           savePreparation();
@@ -1547,7 +1574,59 @@ try {
             savePreparation();
           };
           restoreOwnedHome();
-          if (route === "direct") {
+          if (route === "diagnosis") {
+            assert.equal(canHandoff(preparation), false);
+            const originalIntent = structuredClone(
+              preparation.work.local.recovery.diagnosisInvocation,
+            );
+            const lock = acquireObjectiveLock(config.repository, 1);
+            try {
+              preparation.cancelRequested = true;
+              preparation.work.local.status = "cancelled";
+              await assert.rejects(
+                releaseCancelledSessions(
+                  config,
+                  preparation,
+                  services.driver,
+                  planningModel,
+                  savePreparation,
+                  lock,
+                ),
+                /current atomic scope/,
+              );
+              assert.equal(existsSync(stoppedReceipt.data.sessionRoot), true);
+              // Normal cancel publishes these changes before calling the same
+              // direct ownership producer, and preserves all unknown intent.
+              savePreparation();
+              await releaseCancelledSessions(
+                config,
+                preparation,
+                services.driver,
+                planningModel,
+                savePreparation,
+                lock,
+              );
+              preparation.cancelledAt = new Date().toISOString();
+              savePreparation();
+              assert.deepEqual(
+                preparation.work.local.recovery.diagnosisInvocation,
+                originalIntent,
+              );
+              assert.equal(
+                cancelledContinuationResourceHold(preparation),
+                undefined,
+              );
+              assert.match(
+                restoredContinuationOwnershipHold(preparation),
+                /Submitted work diagnosis/,
+              );
+            } finally {
+              releaseControllerLock(
+                objectiveLockPath(config.repository, 1),
+                lock,
+              );
+            }
+          } else if (route === "direct") {
             await assert.rejects(
               () => cancelObjective(config, 1, services.driver, github),
               /requires its authenticated adapter/,
@@ -1577,6 +1656,18 @@ try {
           }
           const cancelled = readContinuation(config.repository, 1);
           assert.ok(cancelled.cancelledAt);
+          if (route === "diagnosis") {
+            assert.equal(cancelled.work.local.status, "cancelled");
+            assert.deepEqual(
+              cancelled.work.local.recovery.diagnosisInvocation,
+              preparation.work.local.recovery.diagnosisInvocation,
+            );
+            assert.equal(
+              cancelled.work.local.recovery.diagnosisInvocation.response,
+              undefined,
+            );
+            assert.equal(canHandoff(cancelled), false);
+          }
           assert.equal(cancelled.agentSessions[sessionKey].status, "released");
           assert.deepEqual(
             cancelled.agentSessions[sessionKey].currentTurn,
@@ -1589,7 +1680,13 @@ try {
           const terminalOriginal = readFileSync(
             statePath(config.repository, 1),
           );
-          checkServiceState(changedConfig, 1, join(root, "config.json"));
+          if (route === "diagnosis")
+            assert.throws(
+              () =>
+                checkServiceState(changedConfig, 1, join(root, "config.json")),
+              /different configuration binding/,
+            );
+          else checkServiceState(changedConfig, 1, join(root, "config.json"));
           assert.deepEqual(
             readFileSync(statePath(config.repository, 1)),
             terminalOriginal,
