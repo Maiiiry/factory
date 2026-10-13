@@ -452,6 +452,7 @@ interface QueueVerificationContext {
     refs: ContentRef[];
     material: { path: string; identity: string }[];
   };
+  gitPackBytes?: number;
 }
 const scopes = new AsyncLocalStorage<{
   config: FactoryConfig;
@@ -1297,6 +1298,8 @@ export function withQueueControlVerification<T>(
       delete verification.baseIdentityBytes;
       delete verification.publisherObjects;
       delete verification.publisherObjectBytes;
+      delete verification.gitPack;
+      delete verification.gitPackBytes;
     }
     if (failed) throw failure;
     assertCaptured(verification, true);
@@ -1737,7 +1740,8 @@ function verificationMetadataBytes(context: QueueVerificationContext): number {
     (context.objects ? context.objectBytes : 0) +
     negotiationTipCharge(context.negotiationTip) +
     (context.baseIdentityBytes ?? 0) +
-    (context.publisherObjectBytes ?? 0)
+    (context.publisherObjectBytes ?? 0) +
+    (context.gitPackBytes ?? 0)
   );
 }
 
@@ -1796,6 +1800,8 @@ function clearRebuildableVerificationMetadata(
   delete context.baseIdentityBytes;
   delete context.publisherObjects;
   delete context.publisherObjectBytes;
+  delete context.gitPack;
+  delete context.gitPackBytes;
 }
 
 function retainContentVerification(
@@ -1933,8 +1939,27 @@ export function retainRecoveryCheckpointGitPack(
   )
     throw new Error("Invalid derived checkpoint Git pack identity");
   cachedRecoveryCheckpointGitPack();
-  const context = scopes.getStore()?.verification;
-  if (context) context.gitPack = structuredClone({ roots, refs, material });
+  const scope = scopes.getStore();
+  const context = scope?.verification;
+  const options = scope && settings(scope.config);
+  if (!context || !options) return;
+  const packet = { roots, refs, material };
+  const charge =
+    Buffer.byteLength("git-pack") + Buffer.byteLength(canonical(packet));
+  if (
+    !reserveVerificationMetadata(
+      context,
+      options,
+      charge,
+      context.gitPackBytes ?? 0,
+    )
+  ) {
+    delete context.gitPack;
+    delete context.gitPackBytes;
+    return;
+  }
+  context.gitPack = structuredClone(packet);
+  context.gitPackBytes = charge;
 }
 /** A producer completes durability before returning; an explicit forwarding caller may reuse it. */
 export function withRecoveryCheckpointOperation<T>(

@@ -1603,10 +1603,11 @@ async function buildRecoveryCheckpointClosureLocal(input: {
           `objects-${packed.stdout.trim()}.pack`,
         );
         const bytes = readFileSync(packPath);
-        if (cached && !unchangedMaterial) {
-          // Git may legitimately replace object material during repacking. A
-          // fresh complete pack must prove its own hashes and reachable roots
-          // in an isolated database before it replaces cached coverage.
+        if (cached) {
+          // Authenticate expanded coverage in an owned scratch database, never
+          // in the archive's remote-only verifier. An unchanged baseline cannot
+          // supply integrity for newly reachable local objects. Repacking instead
+          // supplies a complete new pack without inherited object material.
           const verified = join(temporary, "verified.git");
           const format = pinnedGit(
             config.checkout,
@@ -1622,39 +1623,63 @@ async function buildRecoveryCheckpointClosureLocal(input: {
           );
           if (initialized.status !== 0)
             throw new Error("Recovery Git pack verifier could not initialize");
-          const original = join(
-            verified,
-            "objects",
-            "pack",
-            `pack-${packed.stdout.trim()}.pack`,
-          );
-          writeFileSync(original, bytes, { mode: 0o600 });
-          const indexed = await subprocessAsync(
+          const index = async (originalBytes: Uint8Array) => {
+            const identity = Buffer.from(
+              originalBytes.subarray(
+                originalBytes.length - (format === "sha1" ? 20 : 32),
+              ),
+            ).toString("hex");
+            const original = join(
+              verified,
+              "objects",
+              "pack",
+              `pack-${identity}.pack`,
+            );
+            writeFileSync(original, originalBytes, { mode: 0o600 });
+            const indexed = await subprocessAsync(
+              "git",
+              ["-C", verified, "index-pack", "--strict", original],
+              { env: pinnedGitEnvironment() },
+            );
+            if (indexed.status !== 0)
+              throw new Error(
+                "Recovery Git pack union failed exact reachable-object verification",
+              );
+          };
+          for (const ref of packs)
+            await index(await readReference(store, ref, store));
+          await index(bytes);
+          const connectivity = await subprocessAsync(
             "git",
-            ["-C", verified, "index-pack", "--strict", original],
+            [
+              "-C",
+              verified,
+              "fsck",
+              "--strict",
+              "--no-reflogs",
+              "--no-dangling",
+            ],
             { env: pinnedGitEnvironment() },
           );
-          const verifiedRoots =
-            indexed.status === 0
-              ? await subprocessAsync(
-                  "git",
-                  [
-                    "-C",
-                    verified,
-                    "cat-file",
-                    "--batch-check=%(objectname) %(objecttype)",
-                  ],
-                  { env: pinnedGitEnvironment() },
-                  `${roots.map((entry) => entry.sha).join("\n")}\n`,
-                )
-              : undefined;
+          const verifiedRoots = await subprocessAsync(
+            "git",
+            [
+              "-C",
+              verified,
+              "cat-file",
+              "--batch-check=%(objectname) %(objecttype)",
+            ],
+            { env: pinnedGitEnvironment() },
+            `${roots.map((entry) => entry.sha).join("\n")}\n`,
+          );
           if (
-            verifiedRoots?.status !== 0 ||
+            connectivity.status !== 0 ||
+            verifiedRoots.status !== 0 ||
             verifiedRoots.stdout !==
               `${roots.map((entry) => `${entry.sha} ${entry.kind}`).join("\n")}\n`
           )
             throw new Error(
-              "Recovery Git full pack failed exact reachable-object verification",
+              "Recovery Git pack union failed exact reachable-object verification",
             );
         }
         // No --thin: each new pack indexes independently. Its reachable-set

@@ -2661,6 +2661,40 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         sources: [],
         bindings: {},
       });
+      // This new blob was never covered by the baseline. Its wrong-OID bytes
+      // must refuse even though every previously observed object is unchanged.
+      const newBlob = git(
+        "rev-parse",
+        `${incrementalSourceCommit}:incremental.md`,
+      );
+      const newObjectPath = join(
+        git("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        newBlob.slice(0, 2),
+        newBlob.slice(2),
+      );
+      const newObjectOriginal = readFileSync(newObjectPath);
+      const newObjectMode = statSync(newObjectPath).mode & 0o777;
+      const wrongNewBlob = Buffer.from("Changed retained source.\n");
+      try {
+        chmodSync(newObjectPath, 0o600);
+        writeFileSync(
+          newObjectPath,
+          deflateSync(
+            Buffer.concat([
+              Buffer.from(`blob ${wrongNewBlob.length}\0`),
+              wrongNewBlob,
+            ]),
+          ),
+        );
+        assert.equal(git("cat-file", "-t", newBlob), "blob");
+        await assert.rejects(
+          buildClosure(),
+          /pack union failed exact reachable-object verification|objects could not be packed/,
+        );
+      } finally {
+        writeFileSync(newObjectPath, newObjectOriginal);
+        chmodSync(newObjectPath, newObjectMode);
+      }
       incrementalSourcePacks = (await buildClosure()).files.filter(
         (file) => file.kind === "git-pack",
       );
@@ -2686,10 +2720,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
           { encoding: "utf8" },
         ).trim(),
         "commit",
-      );
-      const newBlob = git(
-        "rev-parse",
-        `${incrementalSourceCommit}:incremental.md`,
       );
       assert.equal(
         execFileSync("git", ["-C", packedOnly, "cat-file", "-t", newBlob], {
@@ -2756,7 +2786,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         );
         await assert.rejects(
           buildClosure(),
-          /full pack failed exact reachable-object verification|objects could not be packed/,
+          /pack union failed exact reachable-object verification|objects could not be packed/,
         );
       } finally {
         writeFileSync(sourceObjectPath, sourceObject);
@@ -3772,10 +3802,12 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     /unsupported fields/,
   );
   // Pin reads require exact bodies; a lost recipe cannot become latest advice.
-  const { readContinuation, statePath } =
-    await import("../dist/state-store.js");
-  const { planningSessionInputDigest } =
-    await import("../dist/agent-session.js");
+  const { readContinuation, statePath } = await import(
+    "../dist/state-store.js"
+  );
+  const { planningSessionInputDigest } = await import(
+    "../dist/agent-session.js"
+  );
   const preparationRepository = "test-fixtures/recipe-discovery";
   const preparation = {
     schemaVersion: 16,
