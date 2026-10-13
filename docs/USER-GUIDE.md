@@ -101,7 +101,7 @@ Factory can retain a planner from preparation through compilation, correction, d
 
 Copilot retains only settled local implementation conversations. Each turn rebinds the current model, effort, worktree, tools and permissions; cross-session memory and retrieval remain disabled. Disposal authenticates the owned session after its worker has ceased.
 
-Claude's other role paths are implemented but unqualified. A planning qualification does not establish worker or review retention. Their existing native receipts and disposal paths remain intact; disabled retention never clears active or unknown work or grants a fresh attempt.
+Claude binds each continuation to its owned native ID, role, current selection and authenticated private transcript. Resumed queries rebuild current workspace and permission hooks and record new-turn usage from the retained baseline. Result and Objective reviewers remain separate from implementation. A settled conversation does not accept a result; active or unknown work cannot be replayed or replaced with a fresh attempt.
 
 Codex defaults to exec. `--planning-transport app-server` at setup, or setting `planning.codex.transport` to `"app-server"` in the configuration before starting an Objective, selects the app-server transport for tool-free compilation, graph review and diagnosis. Tree result and final Objective reviews remain explicitly on exec with their exact-candidate offline permission profile; SDK workers are unchanged. This is selected routing, never a fallback after an ambiguous dispatch. The [upstream app-server documentation](https://learn.chatgpt.com/docs/app-server) labels the command experimental and unsupported for production workloads. Opt-in does not establish improved latency or live qualification.
 
