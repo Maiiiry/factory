@@ -71,7 +71,9 @@ import {
   acceptForwardedCheckpointCompletion,
   bindRecoveryCheckpointControllerScope,
   checkpointRetentionGaps,
+  CheckpointProducerInventoryChanged,
   gitPersistenceStatus,
+  isCheckpointAdmissionFailure,
   readVerifiedRecoveryCheckpoint,
   withRecoveryCheckpointCommandOperation,
   withRecoveryCheckpointOperation,
@@ -1359,6 +1361,7 @@ async function runIntakeOwned(
     | undefined;
   let handingOff = false;
   let localMode: QueueMode | undefined;
+  let completedCheckpointFailure: IntakeAuthorization["observation"];
   let wake: (() => void) | undefined;
   let wakePending = false;
   const signalWake = () => {
@@ -1476,6 +1479,9 @@ async function runIntakeOwned(
   };
   const localStatus = () => ({
     ...record,
+    ...(completedCheckpointFailure
+      ? { observation: completedCheckpointFailure }
+      : {}),
     activeObjective: activeObjective ?? null,
     ...(localMode ? { localMode } : {}),
     pendingMutations,
@@ -1644,8 +1650,10 @@ async function runIntakeOwned(
             : await task();
         context.signal.throwIfAborted();
         assertProcessActive();
-        if (request.objective === 0 && request.action === "resume")
+        if (request.objective === 0 && request.action === "resume") {
           localMode = undefined;
+          completedCheckpointFailure = undefined;
+        }
         signalWake();
         return completed;
       })
@@ -1708,6 +1716,22 @@ async function runIntakeOwned(
         return { ...record, mode: "draining" };
       if (pendingMutations) {
         await controlTail;
+        continue;
+      }
+      if (completedCheckpointFailure) {
+        // A held owner serves authenticated control only. Background polling
+        // must not repeat the failed publication or create dispatch authority.
+        await pauseObservation(
+          queuePollSeconds(config) * 1000,
+          heldUntil,
+          (handler) => {
+            wake = handler;
+            if (handler && wakePending) {
+              wakePending = false;
+              handler();
+            }
+          },
+        );
         continue;
       }
       let observed: VerifiedQueueObservation | undefined;
@@ -1856,6 +1880,18 @@ async function runIntakeOwned(
               reasons,
               error: String(error),
             };
+            if (
+              options.backgroundConfigurationPath &&
+              terminal(readContinuation(config.repository, selected)) &&
+              (error instanceof CheckpointProducerInventoryChanged ||
+                isCheckpointAdmissionFailure(error))
+            ) {
+              // Retain the actual failure and local dispatch stop while status
+              // and explicit recovery use the ordinary checkpoint barriers.
+              // Historical acceptance and archive uncertainty stay unchanged.
+              completedCheckpointFailure = record.observation;
+              continue;
+            }
             try {
               await applyControl(config, services.github, "pause");
             } catch {

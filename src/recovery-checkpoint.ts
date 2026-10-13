@@ -318,6 +318,14 @@ export class CheckpointAdmissionFailure extends Error {
     );
   }
 }
+/** A complete local producer inventory changed before strict closure verification. */
+export class CheckpointProducerInventoryChanged extends Error {
+  constructor(kind: "accounting" | "memory" | "learning", directory: string) {
+    super(
+      `Checkpoint producer source inventory changed during its build: ${kind} (${directory})`,
+    );
+  }
+}
 export function markCheckpointEffectDispatched(
   error: CheckpointAdmissionFailure,
 ): void {
@@ -1396,8 +1404,9 @@ async function withFiniteCheckpointReads<T>(
           JSON.stringify(originalNames(directory, inventory.kind)) !==
           JSON.stringify(inventory.names)
         )
-          throw new Error(
-            "Checkpoint producer source inventory changed during its build",
+          throw new CheckpointProducerInventoryChanged(
+            inventory.kind,
+            relative(dirname(phase.root), directory),
           );
       for (const [path, fingerprint] of phase.sourceOriginals)
         if (originalFingerprint(path) !== fingerprint)
