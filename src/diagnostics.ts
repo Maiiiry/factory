@@ -830,6 +830,7 @@ export class DiagnosticEmitter {
     errorOutcome?: (error: unknown) => "waiting" | "failed" | "handed-off",
   ): Promise<T> {
     const started = Date.now();
+    const startedCpu = process.cpuUsage();
     const operationAttemptId = randomUUID();
     const parentOperationAttemptId = currentObservedOperationAttemptId();
     const formalAttempt = {
@@ -855,6 +856,7 @@ export class DiagnosticEmitter {
           `Factory diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}\n`,
         );
       }
+      const cpu = process.cpuUsage(startedCpu);
       this.emit({
         ...context,
         operationAttemptId,
@@ -866,7 +868,13 @@ export class DiagnosticEmitter {
         },
         outcome: "completed",
         durationMs: Date.now() - started,
-        metadata,
+        metadata: {
+          ...metadata,
+          parentCpuUserUs: cpu.user,
+          parentCpuSystemUs: cpu.system,
+          parentCpuScope: "process-wide-interval",
+          childCpu: "unavailable",
+        },
       });
       return result;
     } catch (error) {
@@ -878,6 +886,7 @@ export class DiagnosticEmitter {
         if (session) session.lostObservations++;
       }
       const outcome = disposition === "handed-off" ? "waiting" : disposition;
+      const cpu = process.cpuUsage(startedCpu);
       this.emit({
         ...context,
         operationAttemptId,
@@ -897,9 +906,16 @@ export class DiagnosticEmitter {
         },
         outcome,
         durationMs: Date.now() - started,
-        ...(disposition === "handed-off" && {
-          metadata: { ...context.metadata, controllerDisposition: disposition },
-        }),
+        metadata: {
+          ...context.metadata,
+          parentCpuUserUs: cpu.user,
+          parentCpuSystemUs: cpu.system,
+          parentCpuScope: "process-wide-interval",
+          childCpu: "unavailable",
+          ...(disposition === "handed-off" && {
+            controllerDisposition: disposition,
+          }),
+        },
         detail: error instanceof Error ? error.message : String(error),
       });
       throw error;

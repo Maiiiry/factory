@@ -11,6 +11,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -1507,15 +1508,15 @@ async function buildRecoveryCheckpointClosureLocal(input: {
     );
     if (!lstatSync(objectDirectory).isDirectory())
       throw new Error("Recovery Git object storage is not a directory");
-    const identity = createHash("sha256").update(JSON.stringify(roots));
+    const material: { path: string; identity: string }[] = [];
     const inspect = (path: string, relativePath = "") => {
       assertProcessActive();
       const stat = lstatSync(path, { bigint: true });
       if (stat.isSymbolicLink())
         throw new Error("Recovery Git object cache contains a symlink");
-      identity.update(
-        JSON.stringify([
-          relativePath,
+      material.push({
+        path: relativePath,
+        identity: JSON.stringify([
           stat.dev.toString(),
           stat.ino.toString(),
           stat.mode.toString(),
@@ -1527,20 +1528,51 @@ async function buildRecoveryCheckpointClosureLocal(input: {
               ]
             : []),
         ]),
-      );
+      });
       if (stat.isDirectory())
         for (const name of readdirSync(path).sort())
-          inspect(join(path, name), `${relativePath}/${name}`);
+          inspect(
+            join(path, name),
+            relativePath ? `${relativePath}/${name}` : name,
+          );
       else if (!stat.isFile())
         throw new Error(
           "Recovery Git object cache contains an unsupported entry",
         );
     };
     inspect(objectDirectory);
-    const key = identity.digest("hex");
-    let ref = cachedRecoveryCheckpointGitPack(key);
-    if (ref) await readReference(reader, ref, input.store ? undefined : store);
-    else {
+    const cached = cachedRecoveryCheckpointGitPack();
+    let unchangedMaterial = true;
+    if (cached) {
+      for (const ref of cached.refs) await readReference(store, ref, store);
+      const currentMaterial = new Map(
+        material.map((entry) => [entry.path, entry.identity]),
+      );
+      for (const entry of cached.material)
+        if (currentMaterial.get(entry.path) !== entry.identity)
+          unchangedMaterial = false;
+    }
+    const currentRoots = new Set(
+      roots.map((entry) => `${entry.kind}:${entry.sha}`),
+    );
+    // The admitted owner remembers coverage, never acceptance or live Git
+    // authority. A smaller/different source scope needs a fresh full capture.
+    const reusable =
+      cached &&
+      unchangedMaterial &&
+      cached.roots.every((entry) =>
+        currentRoots.has(`${entry.kind}:${entry.sha}`),
+      );
+    const packs = reusable ? cached.refs : [];
+    const coveredRoots = new Set(
+      (reusable ? cached.roots : []).map(
+        (entry) => `${entry.kind}:${entry.sha}`,
+      ),
+    );
+    const addedRoots = roots.filter(
+      (entry) => !coveredRoots.has(`${entry.kind}:${entry.sha}`),
+    );
+    if (addedRoots.length) {
       const temporary = mkdtempSync(
         join(objectDirectory, "factory-checkpoint-objects-"),
       );
@@ -1556,7 +1588,10 @@ async function buildRecoveryCheckpointClosureLocal(input: {
             join(temporary, "objects"),
           ],
           { env: pinnedGitEnvironment() },
-          `${roots.map((entry) => entry.sha).join("\n")}\n`,
+          `${[
+            ...addedRoots.map((entry) => entry.sha),
+            ...(reusable ? cached.roots.map((entry) => `^${entry.sha}`) : []),
+          ].join("\n")}\n`,
         );
         if (
           packed.status !== 0 ||
@@ -1567,23 +1602,85 @@ async function buildRecoveryCheckpointClosureLocal(input: {
           temporary,
           `objects-${packed.stdout.trim()}.pack`,
         );
-        ref = await retainBytes(
+        const bytes = readFileSync(packPath);
+        if (cached && !unchangedMaterial) {
+          // Git may legitimately replace object material during repacking. A
+          // fresh complete pack must prove its own hashes and reachable roots
+          // in an isolated database before it replaces cached coverage.
+          const verified = join(temporary, "verified.git");
+          const format = pinnedGit(
+            config.checkout,
+            "rev-parse",
+            "--show-object-format",
+          );
+          if (format !== "sha1" && format !== "sha256")
+            throw new Error("Recovery Git object format is unsupported");
+          const initialized = await subprocessAsync(
+            "git",
+            ["init", "--bare", `--object-format=${format}`, verified],
+            { env: pinnedGitEnvironment() },
+          );
+          if (initialized.status !== 0)
+            throw new Error("Recovery Git pack verifier could not initialize");
+          const original = join(
+            verified,
+            "objects",
+            "pack",
+            `pack-${packed.stdout.trim()}.pack`,
+          );
+          writeFileSync(original, bytes, { mode: 0o600 });
+          const indexed = await subprocessAsync(
+            "git",
+            ["-C", verified, "index-pack", "--strict", original],
+            { env: pinnedGitEnvironment() },
+          );
+          const verifiedRoots =
+            indexed.status === 0
+              ? await subprocessAsync(
+                  "git",
+                  [
+                    "-C",
+                    verified,
+                    "cat-file",
+                    "--batch-check=%(objectname) %(objecttype)",
+                  ],
+                  { env: pinnedGitEnvironment() },
+                  `${roots.map((entry) => entry.sha).join("\n")}\n`,
+                )
+              : undefined;
+          if (
+            verifiedRoots?.status !== 0 ||
+            verifiedRoots.stdout !==
+              `${roots.map((entry) => `${entry.sha} ${entry.kind}`).join("\n")}\n`
+          )
+            throw new Error(
+              "Recovery Git full pack failed exact reachable-object verification",
+            );
+        }
+        // No --thin: each new pack indexes independently. Its reachable-set
+        // exclusions are supplied only by authenticated retained originals,
+        // and the current manifest always carries their complete pack union.
+        const ref = await retainBytes(
           store,
-          readFileSync(packPath),
+          bytes,
           "application/x-git-packed-objects",
         );
+        if (!packs.some((retained) => refKey(retained) === refKey(ref)))
+          packs.push(ref);
       } finally {
         rmSync(temporary, { recursive: true, force: true });
       }
-      retainRecoveryCheckpointGitPack(key, ref!);
     }
-    refs.set(refKey(ref!), ref!);
-    files.push({
-      kind: "git-pack",
-      path: `git/objects-${ref!.digest}.pack`,
-      ref: ref!,
-      visibility: scope === "private-history" ? "private" : "repository",
-    });
+    retainRecoveryCheckpointGitPack(roots, packs, material);
+    for (const ref of packs) {
+      refs.set(refKey(ref), ref);
+      files.push({
+        kind: "git-pack",
+        path: `git/objects-${ref.digest}.pack`,
+        ref,
+        visibility: scope === "private-history" ? "private" : "repository",
+      });
+    }
   }
   for (const ref of refs.values()) {
     // Existing local originals already occupy their durable content address.

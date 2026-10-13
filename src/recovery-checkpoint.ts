@@ -353,11 +353,14 @@ function checkpointObservation(
   }
   let phase: string | undefined;
   let startedAt = 0;
+  let startedCpu = process.cpuUsage();
   const emit = (
     outcome: "started" | "completed" | "failed",
     error?: unknown,
   ) => {
     try {
+      const cpu =
+        outcome === "started" ? undefined : process.cpuUsage(startedCpu);
       emitter?.emit({
         operation,
         operationAttemptId,
@@ -365,7 +368,18 @@ function checkpointObservation(
         ...(outcome === "started"
           ? {}
           : { durationMs: performance.now() - startedAt }),
-        metadata: { ...metadata(), phase: phase! },
+        metadata: {
+          ...metadata(),
+          phase: phase!,
+          ...(outcome === "started"
+            ? {}
+            : {
+                parentCpuUserUs: cpu!.user,
+                parentCpuSystemUs: cpu!.system,
+                parentCpuScope: "process-wide-interval",
+                childCpu: "unavailable",
+              }),
+        },
         ...(error === undefined
           ? {}
           : { detail: error instanceof Error ? error.stack : String(error) }),
@@ -379,6 +393,7 @@ function checkpointObservation(
       if (phase) emit("completed");
       phase = next;
       startedAt = performance.now();
+      startedCpu = process.cpuUsage();
       emit("started");
     },
     complete() {
@@ -426,11 +441,17 @@ interface QueueVerificationContext {
   negotiationTip?: string;
   baseIdentity?: VerifiedBaseIdentity;
   baseIdentityBytes?: number;
+  publisherObjects?: Map<string, string>;
+  publisherObjectBytes?: number;
   lineages: Map<string, CachedQueueLineage>;
   lineageBytes: number;
   reservationPrefixes: Map<string, string>;
   reservationPrefixBytes: number;
-  gitPack?: { key: string; ref: ContentRef };
+  gitPack?: {
+    roots: { sha: string; kind: "commit" | "tree" | "blob" }[];
+    refs: ContentRef[];
+    material: { path: string; identity: string }[];
+  };
 }
 const scopes = new AsyncLocalStorage<{
   config: FactoryConfig;
@@ -1274,6 +1295,8 @@ export function withQueueControlVerification<T>(
       delete verification.negotiationTip;
       delete verification.baseIdentity;
       delete verification.baseIdentityBytes;
+      delete verification.publisherObjects;
+      delete verification.publisherObjectBytes;
     }
     if (failed) throw failure;
     assertCaptured(verification, true);
@@ -1713,7 +1736,8 @@ function verificationMetadataBytes(context: QueueVerificationContext): number {
     context.pendingReferenceBytes +
     (context.objects ? context.objectBytes : 0) +
     negotiationTipCharge(context.negotiationTip) +
-    (context.baseIdentityBytes ?? 0)
+    (context.baseIdentityBytes ?? 0) +
+    (context.publisherObjectBytes ?? 0)
   );
 }
 
@@ -1770,6 +1794,8 @@ function clearRebuildableVerificationMetadata(
   context.contentBytes = 0;
   delete context.baseIdentity;
   delete context.baseIdentityBytes;
+  delete context.publisherObjects;
+  delete context.publisherObjectBytes;
 }
 
 function retainContentVerification(
@@ -1870,10 +1896,8 @@ export function bindRecoveryCheckpointControllerScope<
       return result;
     });
 }
-/** One derived pack identity; current Git roots and local body bytes remain checked. */
-export function cachedRecoveryCheckpointGitPack(
-  key: string,
-): ContentRef | undefined {
+/** Immutable retained pack coverage; current roots and every original remain checked by the producer. */
+export function cachedRecoveryCheckpointGitPack() {
   const scope = scopes.getStore();
   const context = scope?.verification;
   const options = scope && settings(scope.config);
@@ -1886,21 +1910,31 @@ export function cachedRecoveryCheckpointGitPack(
     throw new Error(
       "Checkpoint Git pack cache has a different admitted binding",
     );
-  return context.gitPack?.key === key ? { ...context.gitPack.ref } : undefined;
+  return context.gitPack && structuredClone(context.gitPack);
 }
 export function retainRecoveryCheckpointGitPack(
-  key: string,
-  ref: ContentRef,
+  roots: { sha: string; kind: "commit" | "tree" | "blob" }[],
+  refs: ContentRef[],
+  material: { path: string; identity: string }[],
 ): void {
-  assertRef(ref);
+  for (const ref of refs) assertRef(ref);
   if (
-    !/^[a-f0-9]{64}$/.test(key) ||
-    ref.mediaType !== "application/x-git-packed-objects"
+    !roots.length ||
+    !refs.length ||
+    roots.some(
+      (root) =>
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(root.sha) ||
+        !["commit", "tree", "blob"].includes(root.kind),
+    ) ||
+    new Set(roots.map((root) => `${root.kind}:${root.sha}`)).size !==
+      roots.length ||
+    refs.some((ref) => ref.mediaType !== "application/x-git-packed-objects") ||
+    new Set(refs.map((ref) => ref.digest)).size !== refs.length
   )
     throw new Error("Invalid derived checkpoint Git pack identity");
-  cachedRecoveryCheckpointGitPack(key);
+  cachedRecoveryCheckpointGitPack();
   const context = scopes.getStore()?.verification;
-  if (context) context.gitPack = { key, ref: { ...ref } };
+  if (context) context.gitPack = structuredClone({ roots, refs, material });
 }
 /** A producer completes durability before returning; an explicit forwarding caller may reuse it. */
 export function withRecoveryCheckpointOperation<T>(
@@ -2296,6 +2330,7 @@ async function boundedCommand(
   options: GitPersistenceConfig,
   env?: NodeJS.ProcessEnv,
   input?: string,
+  observe?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
 ): Promise<string> {
   assertProcessActive();
   const controller = new AbortController();
@@ -2310,7 +2345,14 @@ async function boundedCommand(
       (_stream, chunk) => {
         bytes += chunk.length;
         if (bytes > options.maxBytes + 65536) controller.abort();
+        try {
+          observe?.(_stream, chunk);
+        } catch {
+          /* Diagnostics never change command control. */
+        }
       },
+      undefined,
+      env?.GIT_TRACE2_EVENT === "1" ? { stderr: false } : undefined,
     );
     if (result.status !== 0)
       throw new Error("Bounded Git archive transport command failed");
@@ -2330,7 +2372,97 @@ async function gitRemote(
     "protocol.file.allow=always",
     ...args,
   ]);
-  return boundedCommand("git", command.args, options, command.env, input);
+  const kind =
+    args.find((value) =>
+      ["fetch", "push", "ls-remote", "fsck"].includes(value),
+    ) ?? "other";
+  const scope = scopes.getStore();
+  const timings: Record<string, number> = {};
+  let trace = "";
+  const observeTrace =
+    kind === "push"
+      ? (stream: "stdout" | "stderr", chunk: Buffer) => {
+          if (stream !== "stderr") return;
+          trace += chunk.toString("utf8");
+          if (trace.length > options.maxBytes + 65536) {
+            trace = "";
+            return;
+          }
+          for (;;) {
+            const end = trace.indexOf("\n");
+            if (end === -1) break;
+            const line = trace.slice(0, end);
+            trace = trace.slice(end + 1);
+            try {
+              const event = JSON.parse(line);
+              const labels: Record<string, string> = {
+                "enumerate-objects": "packEnumerateWallMs",
+                "prepare-pack": "packPrepareWallMs",
+                "write-pack-file": "packWriteWallMs",
+              };
+              if (
+                event.event === "region_leave" &&
+                event.category === "pack-objects" &&
+                Object.hasOwn(labels, event.label) &&
+                typeof event.t_rel === "number" &&
+                Number.isFinite(event.t_rel) &&
+                event.t_rel >= 0
+              )
+                timings[labels[event.label]!] =
+                  (timings[labels[event.label]!] ?? 0) + event.t_rel * 1000;
+              if (
+                event.event === "child_exit" &&
+                typeof event.t_rel === "number" &&
+                Number.isFinite(event.t_rel) &&
+                event.t_rel >= 0
+              )
+                timings.maxGitChildWallMs = Math.max(
+                  timings.maxGitChildWallMs ?? 0,
+                  event.t_rel * 1000,
+                );
+              if (
+                event.event === "data" &&
+                event.category === "pack-objects" &&
+                event.key === "write_pack_file/wrote" &&
+                Number.isSafeInteger(Number(event.value)) &&
+                Number(event.value) >= 0
+              )
+                timings.packedObjects = Number(event.value);
+            } catch {
+              /* Raw trace lines, arguments and identities are discarded. */
+            }
+          }
+        }
+      : undefined;
+  const observed = scope
+    ? checkpointObservation(
+        scope.config,
+        "recovery-checkpoint-transport",
+        () => ({
+          kind,
+          ...(observeTrace && {
+            trace2: Object.keys(timings).length ? "observed" : "unavailable",
+            ...timings,
+          }),
+        }),
+      )
+    : undefined;
+  observed?.start("command");
+  try {
+    const result = await boundedCommand(
+      "git",
+      command.args,
+      options,
+      observeTrace ? { ...command.env, GIT_TRACE2_EVENT: "1" } : command.env,
+      input,
+      observeTrace,
+    );
+    observed?.complete();
+    return result;
+  } catch (error) {
+    observed?.fail(error);
+    throw error;
+  }
 }
 function githubRepository(remote: string): string | undefined {
   return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(
@@ -2341,11 +2473,27 @@ async function githubVisibility(
   repository: string,
   options: GitPersistenceConfig,
 ): Promise<boolean> {
-  const bytes = await boundedCommand(
-    "gh",
-    ["api", "--hostname", "github.com", `repos/${repository}`],
-    options,
-  );
+  const scope = scopes.getStore();
+  const observed = scope
+    ? checkpointObservation(
+        scope.config,
+        "recovery-checkpoint-transport",
+        () => ({ kind: "visibility" }),
+      )
+    : undefined;
+  observed?.start("command");
+  let bytes: string;
+  try {
+    bytes = await boundedCommand(
+      "gh",
+      ["api", "--hostname", "github.com", `repos/${repository}`],
+      options,
+    );
+    observed?.complete();
+  } catch (error) {
+    observed?.fail(error);
+    throw error;
+  }
   const value = JSON.parse(bytes);
   if (
     typeof value.private !== "boolean" ||
@@ -4237,6 +4385,178 @@ async function verifiedBaseIdentity(
     release();
   }
 }
+/** Authenticate only the selected parent and required closure, never trust publisher presence. */
+function verifiedPublisherParent(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  directory: string,
+  identity: VerifiedBaseIdentity,
+): boolean {
+  const context = scopes.getStore()?.verification;
+  if (!context || context.key !== identity.verificationKey) return false;
+  assertProcessActive();
+  assertRemoteOnlyVerifier(directory, options);
+  const material = scanVerifierObjects(directory, options);
+  const prior = context.publisherObjects;
+  if (prior) assertVerifierUnchanged(material, prior, true);
+  // One bounded batch authenticates the selected commit, its two trees and
+  // exact manifest. It neither scans ancestry nor grants remote authority.
+  const packet = git(
+    directory,
+    options,
+    ["cat-file", "--batch"],
+    [
+      identity.commitSha,
+      `${identity.commitSha}^{tree}`,
+      `${identity.commitSha}:blobs`,
+      `${identity.commitSha}:checkpoint.json`,
+    ]
+      .map((selector) => `${selector}\n`)
+      .join(""),
+  );
+  let cursor = 0;
+  let manifestOid = "";
+  let manifest: Buffer = Buffer.alloc(0);
+  for (const [index, type] of ["commit", "tree", "tree", "blob"].entries()) {
+    const end = packet.indexOf(10, cursor);
+    if (end === -1) throw new Error("Publisher parent packet is incomplete");
+    const header = packet.subarray(cursor, end).toString("utf8");
+    if (header.endsWith(" missing")) return false;
+    const [oid, actualType, rawSize] = header.split(" ");
+    const size = Number(rawSize);
+    if (
+      !oid ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid) ||
+      actualType !== type ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      (index === 0 && oid !== identity.commitSha)
+    )
+      throw new Error("Publisher parent object identity or type differs");
+    const bytes = packet.subarray(end + 1, end + 1 + size);
+    cursor = end + 1 + size;
+    if (
+      bytes.length !== size ||
+      packet[cursor++] !== 10 ||
+      createHash(oid.length === 40 ? "sha1" : "sha256")
+        .update(`${type} ${size}\0`)
+        .update(bytes)
+        .digest("hex") !== oid
+    )
+      throw new Error("Publisher parent object failed exact integrity");
+    if (index === 3) {
+      manifest = bytes;
+      manifestOid = oid;
+    }
+  }
+  if (cursor !== packet.length || hash(manifest) !== identity.payloadDigest)
+    throw new Error(
+      "Publisher parent manifest differs from its independent ACK",
+    );
+  const decoded = JSON.parse(manifest.toString("utf8"));
+  assertManifest(decoded, binding(config, options), options);
+  if (decoded.sequence !== identity.sequence)
+    throw new Error(
+      "Publisher parent sequence differs from its independent ACK",
+    );
+  const expected = [
+    `100644 blob ${manifestOid}\tcheckpoint.json`,
+    ...identity.blobEntries.map(
+      ({ ref, oid }) => `100644 blob ${oid}\tblobs/${ref.digest}`,
+    ),
+  ].sort();
+  const actual = git(directory, options, [
+    "ls-tree",
+    "-rz",
+    "--full-tree",
+    identity.commitSha,
+  ])
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  if (canonical(expected) !== canonical(actual))
+    throw new Error(
+      "Publisher parent bodies differ from their independent identities",
+    );
+  const unverified = identity.blobEntries.filter(
+    (entry) =>
+      !prior ||
+      context.content.get(
+        canonical(["publisher", directory, entry.oid, entry.ref]),
+      ) !== "verified",
+  );
+  const availability = git(
+    directory,
+    options,
+    ["cat-file", "--batch-check"],
+    unverified.map(({ oid }) => `${oid}\n`).join(""),
+  )
+    .toString("utf8")
+    .trim()
+    .split("\n");
+  if (availability.some((entry) => entry.endsWith(" missing"))) return false;
+  readRecoveryCheckpointBodies(directory, options, unverified);
+  if (material)
+    assertVerifierUnchanged(scanVerifierObjects(directory, options), material);
+  if (material) {
+    const charge = [...material].reduce(
+      (bytes, [path, fingerprint]) =>
+        bytes + Buffer.byteLength(path) + Buffer.byteLength(fingerprint),
+      0,
+    );
+    if (
+      reserveVerificationMetadata(
+        context,
+        options,
+        charge,
+        context.publisherObjectBytes ?? 0,
+      )
+    ) {
+      context.publisherObjects = material;
+      context.publisherObjectBytes = charge;
+      for (const entry of unverified)
+        retainContentVerification(
+          context,
+          options,
+          canonical(["publisher", directory, entry.oid, entry.ref]),
+          "verified",
+        );
+    }
+  }
+  return true;
+}
+/** Git freshens existing loose trees it deterministically writes; rehash only those exact objects. */
+function refreshProducedPublisherTrees(
+  directory: string,
+  options: GitPersistenceConfig,
+  oids: string[],
+): void {
+  const context = scopes.getStore()?.verification;
+  const prior = context?.publisherObjects;
+  if (!context || !prior) return;
+  const material = scanVerifierObjects(directory, options);
+  if (!material) {
+    delete context.publisherObjects;
+    delete context.publisherObjectBytes;
+    return;
+  }
+  for (const oid of oids) {
+    const path = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+    if (!prior.has(path) || prior.get(path) === material.get(path)) continue;
+    const bytes = git(directory, options, ["cat-file", "tree", oid]);
+    if (
+      createHash(oid.length === 40 ? "sha1" : "sha256")
+        .update(`tree ${bytes.length}\0`)
+        .update(bytes)
+        .digest("hex") !== oid ||
+      !material.has(path)
+    )
+      throw new Error("Produced publisher tree failed exact integrity");
+    prior.set(path, material.get(path)!);
+  }
+  assertVerifierUnchanged(material, prior, true);
+}
 async function freshArchiveOwned(
   config: FactoryConfig,
   options: GitPersistenceConfig,
@@ -5430,7 +5750,36 @@ async function publishCheckpoint(
         assertManifest(manifest, manifest.binding, options);
       }
       initializeGit(p.git, options);
-      const base = await remoteTip(p.git, options);
+      const knownBase = record.lastAcknowledged?.commitSha;
+      const knownIdentity =
+        knownBase && record.lastAcknowledged
+          ? await verifiedBaseIdentity(
+              config,
+              options,
+              knownBase,
+              record.lastAcknowledged,
+            )
+          : undefined;
+      const parentObservation = checkpointObservation(
+        config,
+        "recovery-checkpoint-publication-parent",
+        () => ({ reused: Boolean(reusedParent) }),
+      );
+      let reusedParent = false;
+      parentObservation.start("selected-parent-integrity");
+      try {
+        reusedParent = Boolean(
+          knownIdentity &&
+            verifiedPublisherParent(config, options, p.git, knownIdentity),
+        );
+        parentObservation.complete();
+      } catch (error) {
+        parentObservation.fail(error);
+        throw error;
+      }
+      // A verified immutable parent is not live remote authority. The existing
+      // fresh pre-push exact-ref check below still admits the sole publication.
+      const base = reusedParent ? knownBase : await remoteTip(p.git, options);
       let verifiedBaseEntries: { ref: ContentRef; oid: string }[] = [];
       if (base) {
         if (!record.lastAcknowledged) {
@@ -5449,28 +5798,33 @@ async function publishCheckpoint(
           throw new CheckpointConflict(
             "Remote archive advanced outside the acknowledged writer; conflict requires inspection",
           );
-        await gitRemote(p.git, options, [
-          "fetch",
-          "--no-tags",
-          "--",
-          options.remote,
-          options.ref,
-        ]);
-        const fetched = git(p.git, options, ["rev-parse", "FETCH_HEAD"])
-          .toString("utf8")
-          .trim();
+        if (!reusedParent)
+          await gitRemote(p.git, options, [
+            "fetch",
+            "--no-tags",
+            "--",
+            options.remote,
+            options.ref,
+          ]);
+        const fetched = reusedParent
+          ? base
+          : git(p.git, options, ["rev-parse", "FETCH_HEAD"])
+              .toString("utf8")
+              .trim();
         if (fetched !== base)
           throw new CheckpointConflict(
             "Remote checkpoint changed during base fetch",
           );
         // Only the independently fetched remote-only verifier grants reusable
         // base identities. The publisher directory is never that witness.
-        const identity = await verifiedBaseIdentity(
-          config,
-          options,
-          base,
-          record.lastAcknowledged,
-        );
+        const identity = reusedParent
+          ? knownIdentity
+          : await verifiedBaseIdentity(
+              config,
+              options,
+              base,
+              record.lastAcknowledged,
+            );
         const baseObservation = checkpointObservation(
           config,
           "recovery-checkpoint-publication-base",
@@ -5538,6 +5892,7 @@ async function publishCheckpoint(
       )
         .toString("utf8")
         .trim();
+      refreshProducedPublisherTrees(p.git, options, [blobsTree, tree]);
       const candidate = git(
         p.git,
         options,

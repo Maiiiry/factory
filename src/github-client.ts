@@ -1,18 +1,19 @@
-import { Octokit } from "@octokit/core";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { performance } from "node:perf_hooks";
+import { Octokit } from "@octokit/core";
 import * as time from "./clock.js";
+import {
+  attachedFault,
+  attachFault,
+  decision,
+  type Fault,
+  transient,
+} from "./fault.js";
 import {
   isProjectQueueReadQuery,
   QUEUE_WRITE_QUERIES,
   SET_ADMISSION_FIELDS,
 } from "./github-project-queue-wire.js";
-import {
-  attachedFault,
-  attachFault,
-  decision,
-  transient,
-  type Fault,
-} from "./fault.js";
 import {
   assertProcessActive,
   commandAsync,
@@ -42,6 +43,11 @@ export interface GitHubTransportObservation {
   timeout: boolean | null;
   cancellation: boolean | null;
   requestId: string | null;
+  /** Actual Octokit handoff and completion; queue/credential time is separate. */
+  requestStartedAt?: string;
+  requestFinishedAt?: string;
+  requestDurationMs?: number;
+  preparationDurationMs?: number;
 }
 
 const transportObserver = new AsyncLocalStorage<
@@ -871,6 +877,8 @@ export class GitHubClient {
     queueResponse?: { original?: unknown },
   ): Promise<T> {
     const signal = currentProcessSignal();
+    const preparedAt = performance.now();
+    let dispatchedAt: number | undefined;
     let requestSignal = signal;
     let transport: GitHubTransportObservation = {
       method: method as GitHubTransportObservation["method"],
@@ -883,6 +891,17 @@ export class GitHubClient {
       cancellation: null,
       requestId: null,
     };
+    let completedObservation: GitHubTransportObservation | undefined;
+    const timed = (): GitHubTransportObservation =>
+      (completedObservation ??= {
+        ...transport,
+        ...(dispatchedAt === undefined
+          ? { preparationDurationMs: performance.now() - preparedAt }
+          : {
+              requestFinishedAt: new Date().toISOString(),
+              requestDurationMs: performance.now() - dispatchedAt,
+            }),
+      });
     // Cancelled before the request was sent: nothing reached GitHub.
     const cancelled = () =>
       attachFault(new Error("GitHub request cancelled before dispatch"), {
@@ -895,8 +914,9 @@ export class GitHubClient {
         ...transportFailure(signal.reason, signal),
         outcome: "cancelled",
       };
-      observeTransport(transport);
-      throw observedError(cancelled(), transport);
+      const observation = timed();
+      observeTransport(observation);
+      throw observedError(cancelled(), observation);
     }
     const previous = this.queue;
     let release!: () => void;
@@ -942,6 +962,9 @@ export class GitHubClient {
       assertProcessActive();
       try {
         transport.dispatch = "sent";
+        dispatchedAt = performance.now();
+        transport.requestStartedAt = new Date().toISOString();
+        transport.preparationDurationMs = dispatchedAt - preparedAt;
         const response = await client.request(`${method} /${route}`, {
           ...body,
           baseUrl: "https://api.github.com",
@@ -1056,10 +1079,10 @@ export class GitHubClient {
           ...transportFailure(signal.reason, signal),
           outcome: "cancelled",
         };
-      if (error instanceof Error) throw observedError(error, transport);
+      if (error instanceof Error) throw observedError(error, timed());
       throw error;
     } finally {
-      observeTransport(transport);
+      observeTransport(timed());
       if (abortListener) signal?.removeEventListener("abort", abortListener);
       void previous.then(release);
     }

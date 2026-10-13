@@ -262,7 +262,10 @@ await withGitHubTransportObserver(observation => {
     return true;
   });
 }));
-assert.deepEqual(transport, { method: "POST", operation: "mutation", dispatch: "not-sent", outcome: "cancelled", category: "cancelled", status: null, timeout: null, cancellation: true, requestId: null });
+assert(transport.preparationDurationMs >= 0);
+assert.equal(transport.requestDurationMs, undefined);
+const { preparationDurationMs, ...untimed } = transport;
+assert.deepEqual(untimed, { method: "POST", operation: "mutation", dispatch: "not-sent", outcome: "cancelled", category: "cancelled", status: null, timeout: null, cancellation: true, requestId: null });
 assert.equal(Object.isFrozen(transport), true);
 const retained = readFileSync(join(stateRoot(${JSON.stringify(repository)}), "objectives", "1", "diagnostics.ndjson"), "utf8");
 assert.equal(retained.includes("private"), false);
