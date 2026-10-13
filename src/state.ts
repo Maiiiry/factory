@@ -13,7 +13,10 @@ import {
   discoverySpecificationDigest,
 } from "./discovery.js";
 import { assertRepositoryMemoryBindings } from "./repository-memory.js";
-import { assertReviewArtifacts } from "./review-artifacts.js";
+import {
+  assertReviewArtifactSelection,
+  assertReviewArtifacts,
+} from "./review-artifacts.js";
 import { assertAgentSessions } from "./agent-session.js";
 import { assertFinalAcceptance } from "./completion.js";
 import { type Capacity, validateCapacity } from "./config.js";
@@ -124,6 +127,8 @@ export function pendingQuestions(
 }
 
 export interface WorkState {
+  /** Explicit prospective proof selection on the same retained QA attempt. */
+  reviewArtifactSelection?: import("./review-artifacts.js").ReviewArtifactSelector[];
   /** Authenticated outcome routing, separate from implementation acceptance. */
   routing?: import("./runner/routing.js").WorkRoutingDisposition;
   /** Immutable selected dispatch packet; operational ownership remains here. */
@@ -1212,6 +1217,19 @@ export function parseFactoryState(
     if (!Number.isSafeInteger(projected[id]) || Number(projected[id]) <= 0)
       throw new Error(`Work Item ${id} has no projected Issue identity`);
     const item = record(work[id], `work.${id}`);
+    if (item.reviewArtifactSelection !== undefined) {
+      const planned = (graph.items as WorkGraph["items"]).find(
+        (entry) => entry.id === id,
+      )!;
+      if (planned.kind !== "qa" && planned.kind !== "aggregate")
+        throw new Error(
+          "Prospective review evidence requires a read-only QA item",
+        );
+      assertReviewArtifactSelection(
+        item.reviewArtifactSelection,
+        planned.validation.map((check) => check.command),
+      );
+    }
     for (const legacy of ["pendingEffect", "interruptions", "waitingReason"])
       if (item[legacy] !== undefined)
         throw new Error(

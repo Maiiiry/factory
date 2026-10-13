@@ -148,7 +148,7 @@ export interface FactoryApplication {
   ): void;
   rereviewWorkItem(
     objective: number,
-    input: { item: string; actor: string },
+    input: Parameters<typeof rereviewWorkItem>[2],
   ): void;
   decideResult(
     objective: number,

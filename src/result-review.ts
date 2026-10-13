@@ -33,6 +33,7 @@ import {
   loadReviewArtifactObservations,
   materializeReviewImages,
   reviewArtifactEvidence,
+  reviewTextArtifactEvidence,
 } from "./review-image-evidence.js";
 import {
   SemanticAcceptanceFailure,
@@ -113,6 +114,16 @@ export async function reviewAcceptance(args: {
     args.acceptedWorkItemImages,
     args.contentStore,
   );
+  const retainedText = await reviewTextArtifactEvidence(
+    checkout,
+    evidence,
+    args.acceptedWorkItemImages,
+    args.contentStore,
+    retainedArtifacts.reduce(
+      (sum, artifact) => sum + artifact.imageBytes.length,
+      0,
+    ),
+  );
   const selectedLfsEvidence = selectedLfsReviewEvidence(checkout, evidence);
   assertValidationWorktreeObservation(
     evidence.worktreeObservation,
@@ -167,6 +178,7 @@ export async function reviewAcceptance(args: {
     ...selectedLfsEvidence.sources,
     ...worktreeEvidence,
     ...reviewArtifactEvidence(retainedArtifacts),
+    ...retainedText,
     ...(evidence.preparation?.length
       ? [
           {

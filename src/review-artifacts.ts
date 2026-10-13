@@ -8,7 +8,7 @@ import {
   readSync,
   realpathSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   ContentRef,
   ContentStore,
@@ -21,7 +21,7 @@ export const MAX_REVIEW_RECEIPT_BYTES = 1024 * 1024;
 export const MAX_REVIEW_IMAGE_BYTES = 16 * 1024 * 1024;
 export const MAX_REVIEW_IMAGES = 8;
 export const MAX_REVIEW_TOTAL_IMAGE_BYTES = 64 * 1024 * 1024;
-export interface ReviewArtifactSelector {
+export interface ReviewImageArtifactSelector {
   command: string;
   receipt: {
     stdoutPathField: string;
@@ -31,7 +31,30 @@ export interface ReviewArtifactSelector {
   image: { file: string; sha256Field: string; maxBytes: number };
   candidate: { file: string; sha256Field: string };
 }
-export interface ReviewArtifactEvidence {
+export interface ReviewTextFileSelector {
+  file: string;
+  mediaType: "text/plain" | "application/json";
+  maxBytes: number;
+}
+export interface ReviewTextArtifactSelector {
+  command: string;
+  text: {
+    /** Tracked exact-candidate source declaring this proof responsibility. */
+    source: string;
+    stdout?: { maxBytes: number };
+    stderr?: { maxBytes: number };
+    files?: ReviewTextFileSelector[];
+    locator?: {
+      /** Literal marker preceding a directory path within one stdout line. */
+      stdoutPathPrefix: string;
+      files: ReviewTextFileSelector[];
+    };
+  };
+}
+export type ReviewArtifactSelector =
+  | ReviewImageArtifactSelector
+  | ReviewTextArtifactSelector;
+export interface ReviewImageArtifactEvidence {
   selectorIndex: number;
   commandIndex: number;
   command: string;
@@ -40,6 +63,30 @@ export interface ReviewArtifactEvidence {
   receipt: { path: string; ref: ContentRef };
   image: { path: string; ref: ContentRef };
   complete: true;
+}
+export interface ReviewTextArtifactEvidence {
+  selectorIndex: number;
+  commandIndex: number;
+  command: string;
+  treeSha: string;
+  text: {
+    source: { path: string; sha256: string };
+    bodies: {
+      origin: "stdout" | "stderr" | "checkout-file" | "temporary-file";
+      path: string;
+      resolvedPath?: string;
+      ref: ContentRef;
+    }[];
+  };
+  complete: true;
+}
+export type ReviewArtifactEvidence =
+  | ReviewImageArtifactEvidence
+  | ReviewTextArtifactEvidence;
+export function isReviewImageArtifact(
+  value: ReviewArtifactEvidence,
+): value is ReviewImageArtifactEvidence {
+  return "image" in value;
 }
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -95,6 +142,14 @@ export function assertReviewArtifactSelectors(
   const identities = new Set<string>();
   for (const raw of value) {
     const selector = object(raw);
+    if (selector.text !== undefined) {
+      assertTextSelector(selector);
+      const identity = JSON.stringify(selector);
+      if (identities.has(identity))
+        throw new Error("Review artifact selectors duplicate an output");
+      identities.add(identity);
+      continue;
+    }
     refuseUnknownFields(
       selector,
       ["command", "receipt", "image", "candidate"],
@@ -155,6 +210,80 @@ function ref(value: unknown, mediaType: string, maximum: number): void {
   if (reference.mediaType !== mediaType)
     throw new Error("Review artifact content MIME is invalid");
 }
+function assertTextSelector(selector: Record<string, unknown>): void {
+  refuseUnknownFields(selector, ["command", "text"], "text artifact selector");
+  if (
+    typeof selector.command !== "string" ||
+    !selector.command.trim() ||
+    /[\r\n]/.test(selector.command)
+  )
+    throw new Error("Review artifact command is invalid");
+  const text = object(selector.text);
+  refuseUnknownFields(
+    text,
+    ["source", "stdout", "stderr", "files", "locator"],
+    "text artifact selection",
+  );
+  path(text.source);
+  let selected = false;
+  for (const stream of ["stdout", "stderr"]) {
+    if (text[stream] === undefined) continue;
+    const selectedStream = object(text[stream]);
+    refuseUnknownFields(selectedStream, ["maxBytes"], "text stream selection");
+    bound(selectedStream.maxBytes, MAX_REVIEW_IMAGE_BYTES);
+    selected = true;
+  }
+  const files = (value: unknown) => {
+    if (!Array.isArray(value) || !value.length)
+      throw new Error(
+        "Text artifact files must be explicit nonempty selections",
+      );
+    const seen = new Set<string>();
+    for (const raw of value) {
+      const file = object(raw);
+      refuseUnknownFields(
+        file,
+        ["file", "mediaType", "maxBytes"],
+        "text artifact file selection",
+      );
+      path(file.file);
+      if (
+        !["text/plain", "application/json"].includes(file.mediaType as string)
+      )
+        throw new Error("Text artifact MIME is unsupported");
+      bound(file.maxBytes, MAX_REVIEW_IMAGE_BYTES);
+      if (seen.has(file.file as string))
+        throw new Error("Text artifact file is duplicated");
+      seen.add(file.file as string);
+    }
+  };
+  if (text.files !== undefined) {
+    files(text.files);
+    selected = true;
+  }
+  if (text.locator !== undefined) {
+    const locator = object(text.locator);
+    refuseUnknownFields(
+      locator,
+      ["stdoutPathPrefix", "files"],
+      "text artifact locator",
+    );
+    if (
+      typeof locator.stdoutPathPrefix !== "string" ||
+      !locator.stdoutPathPrefix ||
+      [...locator.stdoutPathPrefix].some(
+        (character) =>
+          character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+      )
+    )
+      throw new Error(
+        "Text artifact locator requires an explicit literal stdout prefix",
+      );
+    files(locator.files);
+    selected = true;
+  }
+  if (!selected) throw new Error("Text artifact selection contains no bodies");
+}
 export function assertReviewArtifacts(
   value: unknown,
   treeSha: string,
@@ -178,6 +307,7 @@ export function assertReviewArtifacts(
         "receipt",
         "image",
         "complete",
+        "text",
       ],
       "retained review artifact",
     );
@@ -203,6 +333,83 @@ export function assertReviewArtifacts(
       throw new Error(
         "Retained review artifact lacks its passing exact command",
       );
+    if (artifact.text !== undefined) {
+      refuseUnknownFields(
+        artifact,
+        [
+          "selectorIndex",
+          "commandIndex",
+          "command",
+          "treeSha",
+          "text",
+          "complete",
+        ],
+        "retained text artifact",
+      );
+      const text = object(artifact.text);
+      refuseUnknownFields(
+        text,
+        ["source", "bodies"],
+        "retained text artifact selection",
+      );
+      const source = object(text.source);
+      refuseUnknownFields(
+        source,
+        ["path", "sha256"],
+        "retained text artifact source",
+      );
+      path(source.path);
+      digest(source.sha256);
+      if (!Array.isArray(text.bodies) || !text.bodies.length)
+        throw new Error("Retained text artifact has no complete bodies");
+      const seen = new Set<string>();
+      for (const raw of text.bodies) {
+        const body = object(raw);
+        refuseUnknownFields(
+          body,
+          ["origin", "path", "resolvedPath", "ref"],
+          "retained text artifact body",
+        );
+        if (
+          !["stdout", "stderr", "checkout-file", "temporary-file"].includes(
+            body.origin as string,
+          )
+        )
+          throw new Error("Retained text artifact origin is invalid");
+        path(body.path);
+        if (body.resolvedPath !== undefined) path(body.resolvedPath);
+        const reference = object(body.ref);
+        refuseUnknownFields(
+          reference,
+          ["digest", "bytes", "mediaType"],
+          "retained text artifact reference",
+        );
+        digest(reference.digest);
+        if (
+          !Number.isSafeInteger(reference.bytes) ||
+          (reference.bytes as number) < 0 ||
+          (reference.bytes as number) > MAX_REVIEW_IMAGE_BYTES ||
+          !["text/plain", "application/json"].includes(
+            reference.mediaType as string,
+          )
+        )
+          throw new Error("Retained text artifact reference is invalid");
+        totalImageBytes += reference.bytes as number;
+        const key = JSON.stringify([body.origin, body.path]);
+        if (seen.has(key))
+          throw new Error("Retained text artifact body is duplicated");
+        seen.add(key);
+      }
+      if (totalImageBytes > MAX_REVIEW_TOTAL_IMAGE_BYTES)
+        throw new Error(
+          "Retained review artifacts exceed their aggregate byte bound",
+        );
+      const identity = `${artifact.selectorIndex}:${artifact.commandIndex}`;
+      if (identities.has(identity))
+        throw new Error("Retained review artifact identity is duplicated");
+      identities.add(identity);
+      continue;
+    }
     const candidate = object(artifact.candidate),
       receipt = object(artifact.receipt),
       image = object(artifact.image);
@@ -287,6 +494,7 @@ function readContained(
   root: string,
   relativePath: string,
   maximum: number,
+  allowEmpty = false,
 ): Buffer {
   path(relativePath);
   const base = resolve(root);
@@ -309,7 +517,8 @@ function readContained(
     const stat = fstatSync(fd);
     if (
       !stat.isFile() ||
-      stat.size <= 0 ||
+      stat.size < 0 ||
+      (stat.size === 0 && !allowEmpty) ||
       stat.size > maximum ||
       realpathSync(current) !== current
     )
@@ -336,6 +545,185 @@ function readContained(
 }
 const hash = (bytes: Buffer) =>
   createHash("sha256").update(bytes).digest("hex");
+function textBytes(bytes: Buffer, mediaType: string): void {
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value, "utf8").equals(bytes))
+    throw new Error("Selected text artifact is not complete UTF-8");
+  if (mediaType === "application/json") JSON.parse(value);
+}
+function sourceBinding(worktree: string, treeSha: string, file: string) {
+  path(file);
+  const entry = pinnedGitRaw(
+    worktree,
+    "--literal-pathspecs",
+    "ls-tree",
+    "-z",
+    treeSha,
+    "--",
+    file,
+  ).toString("utf8");
+  if (
+    !/^100(?:644|755) blob [a-f0-9]{40}\t/.test(entry) ||
+    entry.slice(0, -1).split("\t")[1] !== file ||
+    !entry.endsWith("\0")
+  )
+    throw new Error(
+      "Text artifact source is not a tracked regular file in the exact tree",
+    );
+  return {
+    path: file,
+    sha256: hash(pinnedGitRaw(worktree, "show", `${treeSha}:${file}`)),
+  };
+}
+/** Prospective selection narrows proof collection, never command authority. */
+export function assertReviewArtifactSelection(
+  value: unknown,
+  commands: readonly string[],
+): asserts value is ReviewArtifactSelector[] | undefined {
+  assertReviewArtifactSelectors(value);
+  for (const selector of value ?? [])
+    if (!commands.includes(selector.command))
+      throw new Error(
+        "Review artifact selection is not an exact declared validation command",
+      );
+}
+export function assertReviewArtifactSelectionSources(
+  checkout: string,
+  treeSha: string,
+  selectors: readonly ReviewArtifactSelector[],
+): void {
+  for (const selector of selectors)
+    sourceBinding(
+      checkout,
+      treeSha,
+      "text" in selector ? selector.text.source : selector.candidate.file,
+    );
+}
+
+/** Follow an explicitly selected dependency alias only within this owned checkout. */
+function readSelectedText(root: string, file: string, maximum: number) {
+  path(file);
+  const base = realpathSync(root);
+  const selected = join(base, file);
+  const canonical = realpathSync(selected);
+  const resolvedPath = relative(base, canonical);
+  path(resolvedPath);
+  const bytes = readContained(base, resolvedPath, maximum, true);
+  if (realpathSync(selected) !== canonical)
+    throw new Error("Selected text artifact alias changed while reading");
+  return { bytes, resolvedPath };
+}
+
+async function captureTextArtifact(
+  args: Parameters<typeof captureReviewArtifacts>[0],
+  selector: ReviewTextArtifactSelector,
+  selectorIndex: number,
+): Promise<ReviewTextArtifactEvidence> {
+  const source = sourceBinding(
+    args.worktree,
+    args.treeSha,
+    selector.text.source,
+  );
+  const bodies: ReviewTextArtifactEvidence["text"]["bodies"] = [];
+  const append = async (
+    body: Omit<(typeof bodies)[number], "ref">,
+    bytes: Buffer,
+    mediaType: string,
+    maximum: number,
+  ) => {
+    if (bytes.length > maximum)
+      throw new Error("Selected text artifact exceeds its admitted byte bound");
+    textBytes(bytes, mediaType);
+    bodies.push({
+      ...body,
+      ref: await retain(args.contentStore, bytes, mediaType),
+    });
+  };
+  for (const stream of ["stdout", "stderr"] as const) {
+    const selected = selector.text[stream];
+    if (selected) {
+      const original = args[`${stream}Bytes`];
+      if (!original)
+        throw new Error("Selected text stream lacks original subprocess bytes");
+      await append(
+        { origin: stream, path: stream },
+        original,
+        "text/plain",
+        selected.maxBytes,
+      );
+    }
+  }
+  for (const selected of selector.text.files ?? []) {
+    const { bytes, resolvedPath } = readSelectedText(
+      args.worktree,
+      selected.file,
+      selected.maxBytes,
+    );
+    await append(
+      { origin: "checkout-file", path: selected.file, resolvedPath },
+      bytes,
+      selected.mediaType,
+      selected.maxBytes,
+    );
+  }
+  if (selector.text.locator) {
+    if (!args.temporaryRoot)
+      throw new Error(
+        "Text artifact locator lacks an owned validation temporary root",
+      );
+    const prefix = selector.text.locator.stdoutPathPrefix;
+    if (!args.stdoutBytes || args.stdoutBytes.length > MAX_REVIEW_IMAGE_BYTES)
+      throw new Error(
+        "Text artifact locator lacks complete bounded original stdout",
+      );
+    textBytes(args.stdoutBytes, "text/plain");
+    const matches = args.stdoutBytes
+      .toString("utf8")
+      .split(/\r?\n/)
+      .flatMap((line) => {
+        const index = line.indexOf(prefix);
+        if (index < 0) return [];
+        if (line.indexOf(prefix, index + prefix.length) >= 0)
+          throw new Error("Text artifact locator is ambiguous");
+        return [line.slice(index + prefix.length)];
+      });
+    if (matches.length !== 1 || !isAbsolute(matches[0]!))
+      throw new Error(
+        "Text artifact locator requires one complete absolute path",
+      );
+    const temporaryRoot = realpathSync(args.temporaryRoot);
+    const directory = realpathSync(matches[0]!);
+    const directoryPath = relative(temporaryRoot, directory);
+    path(directoryPath);
+    if (!lstatSync(directory).isDirectory())
+      throw new Error("Text artifact locator is not a directory");
+    for (const selected of selector.text.locator.files) {
+      const { bytes, resolvedPath } = readSelectedText(
+        temporaryRoot,
+        join(directoryPath, selected.file),
+        selected.maxBytes,
+      );
+      await append(
+        {
+          origin: "temporary-file",
+          path: join(directoryPath, selected.file),
+          resolvedPath,
+        },
+        bytes,
+        selected.mediaType,
+        selected.maxBytes,
+      );
+    }
+  }
+  return {
+    selectorIndex,
+    commandIndex: args.commandIndex,
+    command: args.command,
+    treeSha: args.treeSha,
+    text: { source, bodies },
+    complete: true,
+  };
+}
 async function retain(
   store: ContentStore,
   bytes: Buffer,
@@ -365,12 +753,21 @@ export async function captureReviewArtifacts(args: {
   commandIndex: number;
   command: string;
   stdout: string;
+  stderr?: string;
+  /** Actual subprocess bytes for explicitly selected text/control evidence. */
+  stdoutBytes?: Buffer;
+  stderrBytes?: Buffer;
+  temporaryRoot?: string;
   selectors: readonly ReviewArtifactSelector[];
   contentStore: ContentStore;
 }): Promise<ReviewArtifactEvidence[]> {
   const artifacts: ReviewArtifactEvidence[] = [];
   for (const [selectorIndex, selector] of args.selectors.entries()) {
     if (selector.command !== args.command) continue;
+    if ("text" in selector) {
+      artifacts.push(await captureTextArtifact(args, selector, selectorIndex));
+      continue;
+    }
     const line = args.stdout.trimEnd().split(/\r?\n/).at(-1);
     if (!line || Buffer.byteLength(line) > MAX_REVIEW_RECEIPT_BYTES)
       throw new Error(

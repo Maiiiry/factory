@@ -117,6 +117,43 @@ Use real tool installation directories on `PATH`, rather than version-manager sh
 
 Claude and Copilot keep the login-bearing home in the SDK process, but the model has no shell and its file tools stay inside the worktree. Claude personal instructions, skills, plugins, subagents and memory are disabled; explicitly selected settings and administrator-managed components remain trusted. Copilot shell, web, GitHub, MCP, plugins and configuration discovery are disabled. Harness processes run as your OS user; these controls do not isolate hostile code.
 
+### Selected command and file proof
+
+Read-only QA runs its declared commands and named CI checks. Its brief does not trigger an implementation turn, dependency inspection or artifact collection. When acceptance requires command output or runtime files, explicitly select that evidence before execution. Selected validation proof is separate from optional raw model capture.
+
+A `reviewArtifacts` text selector selects an exact command and a tracked candidate source declaring the proof responsibility:
+
+```json
+{
+  "command": "npm test",
+  "text": {
+    "source": "test/runtime.mjs",
+    "stdout": { "maxBytes": 65536 },
+    "files": [
+      {
+        "file": "node_modules/example/package.json",
+        "mediaType": "application/json",
+        "maxBytes": 65536
+      }
+    ],
+    "locator": {
+      "stdoutPathPrefix": "Runtime evidence: ",
+      "files": [
+        {
+          "file": "comparison.json",
+          "mediaType": "application/json",
+          "maxBytes": 65536
+        }
+      ]
+    }
+  }
+}
+```
+
+`stdout` and `stderr` retain complete original UTF-8 command bytes. `files` select explicit checkout-relative UTF-8 or JSON files, including dependency aliases whose real targets stay inside the owned checkout. A locator selects exactly one absolute directory printed after its literal prefix within a stdout line. Factory sets `TMPDIR`, `TMP` and `TEMP` to a fresh owned directory; located files must stay inside it. Stale external paths, invalid text/JSON, missing or oversized bodies refuse capture. Nothing scans shared temporary directories or dependencies. Each body may select at most 16 MiB, with the existing eight-selector and 64 MiB combined artifact limits. The controller records the exact command, tree, declaring source digest and verified body identities before cleanup. Command success and retained bytes do not establish cache freshness or semantic acceptance.
+
+For an unpublished read-only QA result, `factory retry --objective N --item ITEM --rereview --review-artifacts selectors.json` prospectively selects proof using an array of the same selectors. It preserves configuration, graph, candidate and attempt, archives the old missing proof and uses the existing rereview allowance. Commands then rerun and produce new evidence; the file imports no historical outputs or acceptance. Configured selectors remain required. Accepted same-tree QA proof can reach final Objective review with its original accepted-item provenance, while final commands supply their own fresh receipts.
+
 ### Images from validation
 
 Reviewers receive no generated images by default. If acceptance needs visual evidence, add explicit `reviewArtifacts` selectors to the private installation configuration before starting the Objective. This example selects the output of `npm test`:

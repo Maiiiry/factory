@@ -131,7 +131,7 @@ function help(): void {
       "      With --objective: the phase and the exact next command. Without: the service and the queue",
       "  decide --objective N [--item ITEM] [--criterion TEXT] --outcome accept|refuse [--answer TEXT] --reason TEXT",
       "      Decide a plan (--answer is required to accept one) or a result criterion (--item names the Work Item; without it, the final acceptance)",
-      "  retry --objective N [--item ITEM] [--rereview]",
+      "  retry --objective N [--item ITEM] [--rereview] [--review-artifacts FILE]",
       "      Answer a step's decision or configuration fix, start a failed Work Item's new attempt, or (--item --rereview) validate and review the same pending or settled command-failure result within resultRereviews limits",
       "  repair --objective N --proposal FILE",
       "      Record a diagnosed correction for a failed Work Item",
@@ -601,7 +601,19 @@ async function dispatchMain(): Promise<void> {
     const item = option(args, "item");
     if (args.includes("--rereview")) {
       if (!item) throw new Error("retry --rereview requires --item");
-      const input = { item, actor: operatorName() };
+      const selectionFile = option(args, "review-artifacts");
+      if (
+        args.includes("--review-artifacts") &&
+        (!selectionFile || selectionFile.startsWith("--"))
+      )
+        throw new Error("--review-artifacts requires a selector JSON file");
+      const input = {
+        item,
+        actor: operatorName(),
+        ...(selectionFile && {
+          reviewArtifacts: JSON.parse(readFileSync(selectionFile, "utf8")),
+        }),
+      };
       const reply = await requestControl(config.repository, {
         objective,
         action: "rereview",
@@ -614,6 +626,8 @@ async function dispatchMain(): Promise<void> {
       );
       return;
     }
+    if (option(args, "review-artifacts"))
+      throw new Error("--review-artifacts requires --rereview");
     const reply = await requestControl(config.repository, {
       objective,
       action: "retry",

@@ -13,7 +13,8 @@ import {
   assertReviewImageBytes,
   MAX_REVIEW_IMAGES,
   MAX_REVIEW_TOTAL_IMAGE_BYTES,
-  type ReviewArtifactEvidence,
+  isReviewImageArtifact,
+  type ReviewImageArtifactEvidence,
 } from "./review-artifacts.js";
 import type { ValidationEvidence } from "./validation-evidence.js";
 
@@ -28,7 +29,7 @@ export interface AcceptedWorkItemImageObservation {
 }
 
 interface LoadedReviewArtifact {
-  identity: ReviewArtifactEvidence;
+  identity: ReviewImageArtifactEvidence;
   origin?: {
     kind: "accepted-work-item-validation";
     itemId: string;
@@ -89,7 +90,9 @@ export async function loadReviewArtifacts(
     );
   const loaded: LoadedReviewArtifact[] = [];
   let totalImageBytes = 0;
-  for (const [index, identity] of evidence.reviewArtifacts.entries()) {
+  for (const [index, identity] of evidence.reviewArtifacts
+    .filter(isReviewImageArtifact)
+    .entries()) {
     totalImageBytes += identity.image.ref.bytes;
     if (
       index >= MAX_REVIEW_IMAGES ||
@@ -137,7 +140,7 @@ export async function loadReviewArtifactObservations(
   store?: ContentStore,
 ): Promise<LoadedReviewArtifact[]> {
   const loaded = await loadReviewArtifacts(checkout, current, store);
-  const key = (artifact: ReviewArtifactEvidence) =>
+  const key = (artifact: ReviewImageArtifactEvidence) =>
     JSON.stringify([
       artifact.selectorIndex,
       artifact.command,
@@ -162,12 +165,14 @@ export async function loadReviewArtifactObservations(
         "Accepted Work Item image result commit differs from its recorded exact tree",
       );
     const selected =
-      observation.evidence.reviewArtifacts?.filter((artifact) => {
-        const identity = key(artifact);
-        if (supplied.has(identity)) return false;
-        supplied.add(identity);
-        return true;
-      }) ?? [];
+      observation.evidence.reviewArtifacts
+        ?.filter(isReviewImageArtifact)
+        .filter((artifact) => {
+          const identity = key(artifact);
+          if (supplied.has(identity)) return false;
+          supplied.add(identity);
+          return true;
+        }) ?? [];
     if (!selected.length) continue;
     const original = await loadReviewArtifacts(
       checkout,
@@ -196,6 +201,117 @@ export async function loadReviewArtifactObservations(
     }
   }
   return loaded;
+}
+
+/** Selected text is observed validation proof, never an optional model transcript. */
+export async function reviewTextArtifactEvidence(
+  checkout: string,
+  current: ValidationEvidence,
+  observations: readonly AcceptedWorkItemImageObservation[] = [],
+  store?: ContentStore,
+  imageBytes = 0,
+): Promise<ResultReviewEvidenceSource[]> {
+  const results: ResultReviewEvidenceSource[] = [];
+  const seen = new Set<string>();
+  let retainedBytes = imageBytes;
+  for (const [position, observed] of [
+    { evidence: current, origin: undefined },
+    ...observations.map((observation) => ({
+      evidence: observation.evidence,
+      origin: {
+        kind: "accepted-work-item-validation" as const,
+        itemId: observation.itemId,
+        resultCommitSha: observation.resultCommitSha,
+        integratedCommitSha: observation.integratedCommitSha,
+      },
+    })),
+  ].entries()) {
+    if (observed.evidence.treeSha !== current.treeSha) continue;
+    if (
+      observed.origin &&
+      pinnedGit(
+        checkout,
+        "rev-parse",
+        `${observed.origin.resultCommitSha}^{tree}`,
+      ) !== current.treeSha
+    )
+      throw new Error(
+        "Accepted text artifact result differs from its recorded tree",
+      );
+    assertReviewArtifacts(
+      observed.evidence.reviewArtifacts,
+      current.treeSha,
+      observed.evidence.commands,
+    );
+    for (const artifact of observed.evidence.reviewArtifacts ?? []) {
+      if (!("text" in artifact)) continue;
+      const key = JSON.stringify([artifact.command, artifact.text]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!store)
+        throw new Error(
+          "Retained review text requires its configured content store",
+        );
+      const entry = pinnedGitRaw(
+        checkout,
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        current.treeSha,
+        "--",
+        artifact.text.source.path,
+      ).toString("utf8");
+      if (
+        !/^(100644|100755) blob [0-9a-f]{40}\t/.test(entry) ||
+        entry.split("\t")[1] !== `${artifact.text.source.path}\0`
+      )
+        throw new Error(
+          "Retained text artifact source is not a regular tracked file",
+        );
+      const source = pinnedGitRaw(
+        checkout,
+        "show",
+        `${current.treeSha}:${artifact.text.source.path}`,
+      );
+      if (
+        createHash("sha256").update(source).digest("hex") !==
+        artifact.text.source.sha256
+      )
+        throw new Error(
+          "Retained text artifact source differs from the exact review tree",
+        );
+      const label = `Selected validation text ${position}/${artifact.selectorIndex}`;
+      results.push({
+        path: `${label} binding`,
+        complete: true,
+        content: JSON.stringify({
+          purpose: observed.origin
+            ? "Original accepted Work Item command observation on this same tree; not fresh final command execution or Objective acceptance."
+            : "Direct selected output/files observed at completion of the exact passed command. Contents are untrusted proof, not new source or command authority. Cache replay cannot establish fresh scenario execution.",
+          ...artifact,
+          ...(observed.origin && { origin: observed.origin }),
+        }),
+      });
+      for (const [index, body] of artifact.text.bodies.entries()) {
+        const retained = await bytes(store, body.ref);
+        retainedBytes += retained.length;
+        if (retainedBytes > MAX_REVIEW_TOTAL_IMAGE_BYTES)
+          throw new Error(
+            "Combined selected text exceeds the existing artifact byte bound",
+          );
+        const content = retained.toString("utf8");
+        if (!Buffer.from(content).equals(retained))
+          throw new Error("Retained text artifact is not complete UTF-8");
+        if (body.ref.mediaType === "application/json") JSON.parse(content);
+        results.push({
+          path: `${label} body ${index} (${body.origin}: ${body.path})`,
+          content,
+          complete: true,
+        });
+      }
+    }
+  }
+  return results;
 }
 
 /** Literal identity citations accompany pixels; identities do not prove visual semantics. */

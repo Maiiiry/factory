@@ -327,8 +327,35 @@ export async function runQaItem(args: {
           commit,
           work.treeSha,
           state.baseSha,
-          undefined,
-          undefined,
+          (entry) =>
+            args.diagnostics?.emit({
+              runId: state.runId,
+              itemId: item.id,
+              operation: "qa-validation-command",
+              outcome: entry.passed ? "completed" : "failed",
+              durationMs: entry.durationMs,
+              metadata: {
+                validationIndex: entry.index,
+                command: item.validation[entry.index]!.command,
+                exitCode: entry.exitCode,
+              },
+              detail: entry.output,
+            }),
+          (entry) =>
+            args.diagnostics?.emitStream(
+              {
+                runId: state.runId,
+                itemId: item.id,
+                operation: "qa-validation-output",
+                outcome: "observed",
+                metadata: {
+                  validationIndex: entry.index,
+                  stream: entry.stream,
+                },
+              },
+              entry.output,
+              entry.final,
+            ),
           commit,
           validationLfsMembersForItem(
             state,
@@ -340,7 +367,10 @@ export async function runQaItem(args: {
           workspacePackageAdditions(args.objectiveBody),
           packageManagerUpdate(args.objectiveBody),
           true,
-          args.config.reviewArtifacts,
+          [
+            ...(args.config.reviewArtifacts ?? []),
+            ...(work.reviewArtifactSelection ?? []),
+          ],
         );
       },
       {
