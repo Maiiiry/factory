@@ -598,8 +598,9 @@ export async function prepareObjective(args: {
     );
     workflowRecipe = await retainWorkflowRecipe(resolution, args.contentStore);
   }
+  const sources = planningSources(issue.body, baseSha, config.checkout);
   const sourcePacketDigest = preparationSourceDigest(
-    planningSources(issue.body, baseSha, config.checkout),
+    sources,
     prerequisites,
     localExecutables,
     approvedPlaybookPin,
@@ -724,11 +725,7 @@ export async function prepareObjective(args: {
                     objectiveBody: issue.body,
                     runId: preparation!.runId,
                     baseSha,
-                    sources: planningSources(
-                      issue.body,
-                      baseSha,
-                      config.checkout,
-                    ),
+                    sources,
                     contentStore: args.contentStore,
                     workflowRecipe,
                   }),
