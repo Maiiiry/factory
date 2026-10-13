@@ -129,6 +129,12 @@ export function bindPlanningPlaybook(
     ...(model.providerAttemptAdmission
       ? { providerAttemptAdmission: model.providerAttemptAdmission }
       : {}),
+    ...(model.retainedPlannerCheckpointCoverage
+      ? {
+          retainedPlannerCheckpointCoverage:
+            model.retainedPlannerCheckpointCoverage,
+        }
+      : {}),
     ...(model.providerDispatchAdmission
       ? { providerDispatchAdmission: model.providerDispatchAdmission }
       : {}),
@@ -556,6 +562,10 @@ export class StructuredPlanningModel implements PlanningModel {
   private readonly reviewCapacityRetryDelaysMs: readonly number[];
   private readonly wait: (milliseconds: number) => Promise<void>;
   private readonly providerTurnElapsedTimeoutMs: number;
+
+  get retainedPlannerCheckpointCoverage() {
+    return this.transport.retainedPlannerCheckpointCoverage;
+  }
 
   get sessionCapabilities() {
     return this.transport.sessionCapabilities;
