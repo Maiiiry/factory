@@ -96,6 +96,13 @@ export interface PlanningInvocationReceipt {
 }
 
 export interface PlanningRecoveryRecord {
+  /** Resource coverage only; never a native response or non-submission verdict. */
+  cancelledResources?: {
+    coverage: import("../contracts.js").RetainedPlannerCheckpointCoverage;
+    invocationId: string;
+    phase: "compile" | "diagnosis";
+    scope: import("../contracts.js").AgentSessionScope;
+  };
   contextLookup?: PlanningLookupRecord;
   phase: "ready" | "submitted" | "complete" | "stopped";
   invocation?: { id: string; phase: string };
@@ -183,6 +190,24 @@ function retainedPlanningReview(
     contextDigest,
     packet: reviewPacket([], planningReviewEvidence(packet)),
   };
+}
+
+/** Freeze and admit the current logical intent after complete provider admission. */
+export async function checkpointPlanningDispatch(args: {
+  record: PlanningRecoveryRecord;
+  id: string;
+  phase: ModelInvocationPhase;
+  repository?: string;
+  save: () => void;
+}): Promise<void> {
+  if (
+    args.record.invocation?.id !== args.id ||
+    args.record.invocation.phase !== args.phase
+  )
+    throw new Error("Planning dispatch differs from its current invocation");
+  args.record.phase = "submitted";
+  args.save();
+  await awaitCheckpointAdmission(args.repository, "before-effect");
 }
 
 export interface PlanningRecoveryContext {
@@ -365,8 +390,20 @@ async function compilePlanAdmitted(
     phase: ModelInvocationPhase,
   ): Pick<
     ModelInvocationContext,
-    "beforeProviderAttempt" | "retainNativeReturn"
+    "beforeProviderAttempt" | "beforeProviderDispatch" | "retainNativeReturn"
   > => ({
+    ...(model.providerDispatchAdmission === "after-attempt-admission-v1"
+      ? {
+          beforeProviderDispatch: () =>
+            checkpointPlanningDispatch({
+              record,
+              id,
+              phase,
+              repository: context.sessionState?.repository,
+              save,
+            }),
+        }
+      : {}),
     beforeProviderAttempt: async () => {
       if (phase === "compile" && record.contextLookup) {
         const lookup = record.contextLookup;
@@ -451,11 +488,17 @@ async function compilePlanAdmitted(
         "Frozen planning lookup provider allowance is exhausted",
       );
     }
-    const id = randomUUID();
-    record.phase = "submitted";
+    const prepared =
+      record.invocation?.phase === phase &&
+      !record.invocations?.some(
+        (entry) => entry.id === record.invocation!.id && entry.resultDigest,
+      );
+    const id = prepared ? record.invocation!.id : randomUUID();
+    if (model.providerDispatchAdmission !== "after-attempt-admission-v1")
+      record.phase = "submitted";
     record.invocation = { id, phase };
     record.invocations ??= [];
-    record.invocations.push({ id, phase });
+    if (!prepared) record.invocations.push({ id, phase });
     save();
     return {
       ...invocationHooks(id, phase),
@@ -472,6 +515,12 @@ async function compilePlanAdmitted(
   const observedModel: PlanningModel = {
     ...(model.providerAttemptAdmission
       ? { providerAttemptAdmission: model.providerAttemptAdmission }
+      : {}),
+    ...(model.retainedPlannerCheckpointCoverage
+      ? {
+          retainedPlannerCheckpointCoverage:
+            model.retainedPlannerCheckpointCoverage,
+        }
       : {}),
     ...(model.providerDispatchAdmission
       ? { providerDispatchAdmission: model.providerDispatchAdmission }
@@ -674,6 +723,12 @@ async function compilePlanAdmitted(
         (error instanceof MalformedPlannerOutput ||
           error instanceof PlanValidationError);
       if (
+        (model.providerDispatchAdmission === "after-attempt-admission-v1" &&
+          record.phase === "ready" &&
+          record.invocation &&
+          !record.invocations?.some(
+            (entry) => entry.id === record.invocation!.id && entry.resultDigest,
+          )) ||
         error instanceof UnsettledSubprocessError ||
         error instanceof PlanningReviewBindingError ||
         context.stopped?.() ||

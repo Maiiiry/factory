@@ -835,12 +835,17 @@ export function cancelledContinuationResourceHold(
     )
   )
     return "Cancellation retains active or unresolved Work Item ownership";
-  return continuationOwnershipHold(state, true);
+  return continuationOwnershipHold(
+    state,
+    true,
+    Boolean(state.planningRecovery?.cancelledResources),
+  );
 }
 
 function continuationOwnershipHold(
   state: ContinuationState,
   cancelledDiagnosis = false,
+  cancelledPlanning = false,
 ): string | undefined {
   if (Object.values(state.repeats ?? {}).some((record) => record.inFlight))
     return "Retained paid call has no recorded settlement";
@@ -861,6 +866,7 @@ function continuationOwnershipHold(
   }
   const planning = state.planningRecovery;
   if (
+    !cancelledPlanning &&
     planning?.phase === "submitted" &&
     planning.response === undefined &&
     !planning.invocations?.some(

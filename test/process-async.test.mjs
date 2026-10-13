@@ -1,3 +1,4 @@
+import { compilePlan } from "../dist/compiler/recovery.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -1239,7 +1240,12 @@ test("cancellation stops an owned shell and its process group", async () => {
     await withGitHubTransportObserver(
       (observation) => observations.push(observation),
       async () => {
-        for (const route of ["direct", "controller", "diagnosis"]) {
+        for (const route of [
+          "direct",
+          "controller",
+          "diagnosis",
+          "planning-empty",
+        ]) {
           const preparation = {
             schemaVersion: 8,
             kind: "preparing",
@@ -1514,6 +1520,161 @@ try {
             preparation.coordinator.mode = "paused";
             savePreparation();
           }
+          if (route === "planning-empty") {
+            const originalGenerate =
+              planningModel.generateStructured.bind(planningModel);
+            const legacy = new Proxy(planningModel, {
+              get(target, property) {
+                if (property === "providerDispatchAdmission") return undefined;
+                if (property === "generateStructured")
+                  return async (request) => {
+                    const admit = request.invocation.beforeProviderAttempt;
+                    request.invocation.beforeProviderAttempt = async () => {
+                      await admit?.();
+                      writeFileSync(
+                        join(root, "missing-phase-inputs", "compile.json"),
+                        JSON.stringify(request.sources),
+                        { mode: 0o600 },
+                      );
+                    };
+                    return originalGenerate(request);
+                  };
+                return Reflect.get(target, property, target);
+              },
+            });
+            const prepared = structuredClone(preparation);
+            const guardedCurrent = new Proxy(legacy, {
+              get(target, property) {
+                if (property === "providerDispatchAdmission")
+                  return planningModel.providerDispatchAdmission;
+                return Reflect.get(target, property, target);
+              },
+            });
+            await assert.rejects(
+              compilePlan(
+                1,
+                "## Sources\n- README.md\n## Acceptance\n- Preserve the exact source.\n",
+                snapshot.baseSha,
+                checkout,
+                guardedCurrent,
+                factoryConfigDigest(config),
+                undefined,
+                undefined,
+                {
+                  state: prepared,
+                  sessionState: prepared,
+                  save: () =>
+                    saveState(statePath(config.repository, 1), prepared),
+                },
+              ),
+              /ENOENT/,
+            );
+            assert.equal(prepared.planningRecovery.phase, "ready");
+            assert.equal(prepared.planningRecovery.invocations.length, 1);
+            assert.equal(prepared.planningRecovery.response, undefined);
+            assert.equal(
+              prepared.planningRecovery.diagnosisResponse,
+              undefined,
+            );
+            assert.equal(prepared.agentSessions, undefined);
+            savePreparation();
+            await assert.rejects(
+              compilePlan(
+                1,
+                "## Sources\n- README.md\n## Acceptance\n- Preserve the exact source.\n",
+                snapshot.baseSha,
+                checkout,
+                legacy,
+                factoryConfigDigest(config),
+                undefined,
+                undefined,
+                {
+                  state: preparation,
+                  sessionState: preparation,
+                  save: savePreparation,
+                },
+              ),
+              /ENOENT/,
+            );
+            assert.equal(preparation.planningRecovery.phase, "submitted");
+            assert.equal(preparation.agentSessions, undefined);
+            const originalPlanning = structuredClone(
+              preparation.planningRecovery,
+            );
+            const uncovered = new Proxy(planningModel, {
+              get(target, property) {
+                if (property === "retainedPlannerCheckpointCoverage")
+                  return undefined;
+                return Reflect.get(target, property, target);
+              },
+            });
+            await assert.rejects(
+              cancelObjective(config, 1, services.driver, github, uncovered),
+              /recognized native checkpoint producer/,
+            );
+            assert.equal(
+              readContinuation(config.repository, 1).cancelledAt,
+              undefined,
+            );
+            assert.equal(
+              await cancelObjective(
+                config,
+                1,
+                services.driver,
+                github,
+                planningModel,
+              ),
+              "cancelled",
+            );
+            const cancelled = readContinuation(config.repository, 1);
+            const { cancelledResources, ...retainedPlanning } =
+              cancelled.planningRecovery;
+            assert.deepEqual(retainedPlanning, originalPlanning);
+            assert.equal(
+              cancelledResources.invocationId,
+              originalPlanning.invocation.id,
+            );
+            assert.equal(
+              cancelledContinuationResourceHold(cancelled),
+              undefined,
+            );
+            assert.match(
+              restoredContinuationOwnershipHold(cancelled),
+              /Submitted planning/,
+            );
+            for (const change of [
+              (value) => {
+                delete value.planningRecovery.cancelledResources;
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.invocationId =
+                  randomUUID();
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.scope.runId =
+                  randomUUID();
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.coverage.adapter =
+                  "uncovered";
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources.phase =
+                  "graph-review";
+              },
+              (value) => {
+                value.planningRecovery.cancelledResources = null;
+              },
+            ]) {
+              const refused = structuredClone(cancelled);
+              change(refused);
+              assert.throws(() => {
+                const hold = cancelledContinuationResourceHold(refused);
+                if (hold) throw new Error(hold);
+              });
+            }
+            continue;
+          }
           const session = agentSessionContinuation(
             preparation,
             "planning",
@@ -1575,6 +1736,15 @@ try {
           };
           restoreOwnedHome();
           if (route === "diagnosis") {
+            const pendingPlanningId = randomUUID();
+            preparation.planningRecovery = {
+              phase: "submitted",
+              invocation: { id: pendingPlanningId, phase: "compile" },
+              invocations: [{ id: pendingPlanningId, phase: "compile" }],
+              history: [],
+            };
+            savePreparation();
+
             assert.equal(canHandoff(preparation), false);
             const originalIntent = structuredClone(
               preparation.work.local.recovery.diagnosisInvocation,
@@ -1618,7 +1788,7 @@ try {
               );
               assert.match(
                 restoredContinuationOwnershipHold(preparation),
-                /Submitted work diagnosis/,
+                /Submitted work diagnosis|Submitted planning/,
               );
             } finally {
               releaseControllerLock(
@@ -1692,6 +1862,16 @@ try {
             terminalOriginal,
           );
           assert.equal(cancelled.configDigest, factoryConfigDigest(config));
+          if (route === "diagnosis") {
+            assert.equal(cancelled.planningRecovery.phase, "submitted");
+            assert.equal(cancelled.planningRecovery.response, undefined);
+            assert.ok(cancelled.planningRecovery.cancelledResources);
+            const active = structuredClone(cancelled);
+            active.agentSessions[sessionKey].status = "in-flight";
+            active.agentSessions[sessionKey].currentTurn.resources = "active";
+            assert.throws(() => cancelledContinuationResourceHold(active));
+            continue;
+          }
           // Repeated cancellation also disposes a retained old terminal checkpoint.
           Object.assign(preparation, cancelled);
           restoreOwnedHome();
