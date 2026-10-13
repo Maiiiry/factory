@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { COMPILER_READINESS_GUIDANCE } from "../compiler-wire.js";
 import { stateRoot } from "../config.js";
 import { LocalContentStore } from "../content/local.js";
-import { COMPILER_READINESS_GUIDANCE } from "../compiler-wire.js";
 import type {
   ApprovedPlaybookPin,
   ContentRef,
@@ -199,7 +199,7 @@ export async function checkpointPlanningDispatch(args: {
   phase: ModelInvocationPhase;
   repository?: string;
   save: () => void;
-}): Promise<void> {
+}): Promise<"admission-complete"> {
   if (
     args.record.invocation?.id !== args.id ||
     args.record.invocation.phase !== args.phase
@@ -208,6 +208,7 @@ export async function checkpointPlanningDispatch(args: {
   args.record.phase = "submitted";
   args.save();
   await awaitCheckpointAdmission(args.repository, "before-effect");
+  return "admission-complete";
 }
 
 export interface PlanningRecoveryContext {

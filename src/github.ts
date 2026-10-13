@@ -46,6 +46,10 @@ import {
   withProjectQueueObservationOnGitHub,
 } from "./github-project-queue.js";
 import { availableIssueType } from "./issue-type.js";
+import {
+  CheckpointProducerInventoryChanged,
+  isCheckpointAdmissionFailure,
+} from "./recovery-checkpoint.js";
 
 type Issue = {
   id: number;
@@ -913,6 +917,36 @@ export class RealGitHubGateway implements GitHubGateway {
   }
 
   async projectGraph(request: GraphProjection): Promise<ProjectedGraph> {
+    let result: ProjectedGraph;
+    try {
+      result = await this.projectGraphObserved(request);
+    } catch (error) {
+      // A refused admission keeps its original fence. Cleanup cannot retry it
+      // and manufacture a successful checkpoint for the stopped caller.
+      if (
+        request.expansionControl &&
+        !isCheckpointAdmissionFailure(error) &&
+        !(error instanceof CheckpointProducerInventoryChanged)
+      ) {
+        try {
+          await request.expansionControl.complete();
+        } catch (settlement) {
+          throw new AggregateError(
+            [error, settlement],
+            "Graph projection stopped with a pending Git checkpoint",
+            { cause: error },
+          );
+        }
+      }
+      throw error;
+    }
+    await request.expansionControl?.complete();
+    return result;
+  }
+
+  private async projectGraphObserved(
+    request: GraphProjection,
+  ): Promise<ProjectedGraph> {
     const control = request.expansionControl;
     const effects = new Map(
       (control?.effects ?? []).map((effect) => [effect.key, effect]),

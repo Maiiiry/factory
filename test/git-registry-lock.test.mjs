@@ -3,7 +3,16 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, readlinkSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1169,6 +1178,135 @@ test("the actual creating lease settles only a fresh failed reservation and arch
     assert.equal(
       restoredHistory.find((row) => row.id === operationId).retiredWithdrawal,
       undefined,
+    );
+
+    // One exact-ref fetch observes the current tip, while a selected older
+    // checkpoint must still be its authenticated ancestor. Neither a previous
+    // FETCH_HEAD nor the publisher's local objects supply read authority.
+    await withRecoveryCheckpointControllerVerification(
+      { config, buildClosure },
+      async () => {
+        const offset = (await readFile(diagnosticPath(repository, 0))).length;
+        const selected = await readVerifiedRecoveryCheckpoint(
+          config,
+          archive.commitSha,
+        );
+        assert.notEqual(archive.commitSha, restoredArchive.commitSha);
+        assert.equal(selected.commitSha, archive.commitSha);
+        assert.equal(selected.remoteTip, restoredArchive.commitSha);
+        const events = (await readFile(diagnosticPath(repository, 0)))
+          .subarray(offset)
+          .toString("utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .filter((event) => event.operation === "recovery-checkpoint-archive");
+        assert.equal(
+          events.filter(
+            (event) =>
+              event.metadata.phase === "fetch" && event.outcome === "started",
+          ).length,
+          1,
+        );
+        assert.equal(
+          events.some((event) => event.metadata.phase === "remote-tip"),
+          false,
+        );
+        const recovery = join(stateRoot(repository), "recovery");
+        const verifier = async () => {
+          const names = (await readdir(recovery)).filter(
+            (name) => name.startsWith("verify-") && name.endsWith(".git"),
+          );
+          assert.equal(names.length, 1);
+          return join(recovery, names[0]);
+        };
+        const staleHead = await readFile(join(await verifier(), "FETCH_HEAD"));
+        assert(staleHead.toString().startsWith(restoredArchive.commitSha));
+        execFileSync("git", [
+          `--git-dir=${remote}`,
+          "update-ref",
+          "-d",
+          config.gitPersistence.ref,
+          restoredArchive.commitSha,
+        ]);
+        const missingOffset = (await readFile(diagnosticPath(repository, 0)))
+          .length;
+        try {
+          await assert.rejects(
+            readVerifiedRecoveryCheckpoint(config),
+            /Bounded Git archive transport command failed/,
+          );
+          const missingEvents = (await readFile(diagnosticPath(repository, 0)))
+            .subarray(missingOffset)
+            .toString("utf8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line))
+            .filter(
+              (event) => event.operation === "recovery-checkpoint-archive",
+            );
+          assert(
+            missingEvents.some(
+              (event) =>
+                event.metadata.phase === "fetch" && event.outcome === "failed",
+            ),
+          );
+          assert.equal(
+            missingEvents.some(
+              (event) => event.metadata.phase === "fetched-material",
+            ),
+            false,
+            "a failed fetch cannot inspect or accept its stale FETCH_HEAD",
+          );
+        } finally {
+          execFileSync("git", [
+            `--git-dir=${remote}`,
+            "update-ref",
+            config.gitPersistence.ref,
+            restoredArchive.commitSha,
+          ]);
+        }
+        assert.equal(
+          (await readVerifiedRecoveryCheckpoint(config)).commitSha,
+          restoredArchive.commitSha,
+        );
+        await assert.rejects(
+          readVerifiedRecoveryCheckpoint(config, git("rev-parse", "HEAD")),
+          /merge-base|bad object|Not a valid|unknown revision/i,
+        );
+        const changedBinding = structuredClone(config);
+        changedBinding.gitPersistence.ref = "refs/heads/another-history";
+        await assert.rejects(
+          readVerifiedRecoveryCheckpoint(changedBinding),
+          /different admitted binding|admitted binding changed/,
+        );
+
+        await readVerifiedRecoveryCheckpoint(config);
+        const objectRoot = join(await verifier(), "objects");
+        const objects = await readdir(objectRoot, {
+          recursive: true,
+          withFileTypes: true,
+        });
+        const object = objects.find(
+          (entry) => entry.isFile() && !entry.parentPath.endsWith("/info"),
+        );
+        assert(object);
+        const objectPath = join(object.parentPath, object.name);
+        const bytes = await readFile(objectPath);
+        const mode = (await stat(objectPath)).mode & 0o777;
+        await chmod(objectPath, 0o600);
+        await writeFile(objectPath, Buffer.concat([bytes, Buffer.from("x")]));
+        await chmod(objectPath, mode);
+        await assert.rejects(
+          readVerifiedRecoveryCheckpoint(config),
+          /altered or missing object material/,
+        );
+        assert.equal(
+          (await readVerifiedRecoveryCheckpoint(config)).commitSha,
+          restoredArchive.commitSha,
+          "a failed owned verifier is discarded before a fresh strict read",
+        );
+      },
     );
 
     // Freeze a whole multi-target removal as real local records, then archive it

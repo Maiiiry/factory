@@ -197,6 +197,14 @@ export class CodexPlanningTransport implements PlanningTransport {
       : undefined;
   }
 
+  logicalDispatchAdmission(
+    tree?: string,
+  ): "native-before-effect-v1" | undefined {
+    return tree || this.transport === "exec"
+      ? "native-before-effect-v1"
+      : undefined;
+  }
+
   private sessionOwner(
     session: Pick<AgentSessionRef, "scope" | "identity" | "adapter" | "data">,
   ): string {
@@ -528,6 +536,9 @@ export class CodexPlanningTransport implements PlanningTransport {
     };
     candidateDigest?: string;
     invocation: ModelInvocationContext;
+    beforeNativeDispatch?: NonNullable<
+      ModelInvocationContext["beforeProviderDispatch"]
+    >;
     turn: PlanningTurn;
     tree?: string;
     reviewImages?: ReviewImageInput[];
@@ -538,6 +549,10 @@ export class CodexPlanningTransport implements PlanningTransport {
     const { invocation, turn: state } = args;
     const selection = this.selection(args.role);
     const selectedTransport = args.tree ? "exec" : this.transport;
+    if (args.beforeNativeDispatch && selectedTransport !== "exec")
+      throw new Error(
+        "Composed logical dispatch requires the Codex exec route",
+      );
     if (args.reviewImages?.length) {
       if (
         !args.tree ||
@@ -837,10 +852,14 @@ export class CodexPlanningTransport implements PlanningTransport {
         session.currentTurn.dispatch = "submitted";
         checkpointSession("in-flight");
       }
-      await awaitCheckpointAdmission(
-        continuation?.scope.repository,
-        "before-effect",
-      );
+      // The controller callback admits charged attempts, logical submission
+      // and this complete native ownership in one exact pre-effect snapshot.
+      const admission = await args.beforeNativeDispatch?.();
+      if (admission !== "admission-complete")
+        await awaitCheckpointAdmission(
+          continuation?.scope.repository,
+          "before-effect",
+        );
       nativeAttempted = true;
       state.nativeInvocationStarted = true;
       const execute =

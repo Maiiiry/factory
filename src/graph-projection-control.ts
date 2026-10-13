@@ -277,7 +277,14 @@ export function graphProjectionControl(
       else effect.observation = structuredClone(observation);
       assertGraphProjectionIntents(state);
       save();
-      await awaitCheckpointAdmission(state.repository, "settled");
+      // No new external effect follows this local observation. The next
+      // beforeWrite admits it together with that mutation's exact intent;
+      // complete admits the final observations before the caller can proceed.
+    },
+    complete: async () => {
+      check();
+      assertGraphProjectionIntents(state);
+      await awaitCheckpointAdmission(state.repository, "explicit");
     },
   };
 }
