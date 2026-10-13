@@ -1163,6 +1163,22 @@ async function retainBytes(
   return store.putBytes(bytes, { mediaType });
 }
 
+/** Called only after every original has been authenticated by its producer. */
+export function uniqueRecoveryCheckpointFiles(
+  files: RecoveryCheckpointFile[],
+): RecoveryCheckpointFile[] {
+  const declared = new Map<string, RecoveryCheckpointFile>();
+  for (const file of files) {
+    const previous = declared.get(file.path);
+    if (previous && !isDeepStrictEqual(previous, file))
+      throw new Error(
+        "Checkpoint producer has conflicting declarations for one original path",
+      );
+    declared.set(file.path, file);
+  }
+  return [...declared.values()];
+}
+
 /** Capture only authenticated original roots; installations, owners and native homes are excluded. */
 export async function buildRecoveryCheckpointClosure(input: {
   config: FactoryConfig;
@@ -1572,7 +1588,7 @@ async function buildRecoveryCheckpointClosureLocal(input: {
     await retainBytes(store, bytes, ref.mediaType);
   }
   return {
-    files,
+    files: uniqueRecoveryCheckpointFiles(files),
     contentRefs: [...refs.values()],
     gitObjects: [...objects.values()]
       .filter((entry) => entry.kind === "commit")
