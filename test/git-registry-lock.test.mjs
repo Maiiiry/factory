@@ -55,6 +55,8 @@ import {
   parseQueueRecord,
   performQueueCommandEffect,
   readQueueHistory,
+  queueObservationTargets,
+  verifyQueueObservation,
   retainedQueueEntry,
   retireUnknownProjectAdmission,
   settleFailedProjectQueueReservation,
@@ -68,6 +70,15 @@ import {
   withRecoveryCheckpointScope,
 } from "../dist/recovery-checkpoint.js";
 import { buildRecoveryCheckpointClosure } from "../dist/recovery-checkpoint-closure.js";
+import {
+  projectQueueReadOnGitHub,
+  withProjectQueueObservationOnGitHub,
+} from "../dist/github-project-queue.js";
+import {
+  FIELD_BINDING,
+  ITEMS,
+  INSPECT,
+} from "../dist/github-project-queue-wire.js";
 import { controlObjective } from "../dist/runner.js";
 import {
   acquireInstallationLock,
@@ -163,22 +174,168 @@ test("a terminal background watcher holds checkpoint failure while real control 
   };
   let reads = 0,
     writes = 0;
+  let indexReads = 0;
+  let membershipVisible = true;
+  let changeControlDuringRead = false;
+  const fields = (metadata, order) => [
+    ...(metadata === null
+      ? []
+      : [
+          {
+            __typename: "ProjectV2ItemFieldTextValue",
+            text: metadata,
+            field: { id: binding.metadataFieldId },
+          },
+        ]),
+    ...(order === null
+      ? []
+      : [
+          {
+            __typename: "ProjectV2ItemFieldNumberValue",
+            number: order,
+            field: { id: binding.orderFieldId },
+          },
+        ]),
+  ];
+  const wireCard = (control = false) => ({
+    __typename: "ProjectV2Item",
+    id: control ? binding.controlItemId : card.itemId,
+    isArchived: control ? false : card.archived,
+    project: { id: binding.projectId },
+    content: control
+      ? { __typename: "DraftIssue", id: "D_control" }
+      : {
+          __typename: "Issue",
+          id: card.issueNodeId,
+          number: card.objective,
+          repository: { nameWithOwner: repository },
+        },
+    fieldValues: {
+      nodes: fields(
+        control ? controlMetadata : card.metadata,
+        control ? null : card.order,
+      ),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    metadataValue:
+      (control ? controlMetadata : card.metadata) === null
+        ? null
+        : fields(control ? controlMetadata : card.metadata, null)[0],
+    orderValue:
+      control || card.order === null ? null : fields(null, card.order)[0],
+  });
+  const wireAccess = () => ({
+    viewer: { databaseId: 1 },
+    project: {
+      __typename: "ProjectV2",
+      id: binding.projectId,
+      closed: false,
+      viewerCanUpdate: true,
+      owner: { __typename: "Organization", login: "fixture" },
+      fields: {
+        nodes: [
+          {
+            __typename: "ProjectV2Field",
+            id: binding.metadataFieldId,
+            name: "Factory Admission",
+          },
+          {
+            __typename: "ProjectV2Field",
+            id: binding.orderFieldId,
+            name: "Factory Order",
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    },
+    metadata: {
+      __typename: "ProjectV2Field",
+      id: binding.metadataFieldId,
+      name: "Factory Admission",
+      dataType: "TEXT",
+      project: { id: binding.projectId },
+    },
+    order: {
+      __typename: "ProjectV2Field",
+      id: binding.orderFieldId,
+      name: "Factory Order",
+      dataType: "NUMBER",
+      project: { id: binding.projectId },
+    },
+  });
+  // Literal current wire shapes reproduce the observed index/membership disagreement.
+  // The actual decoder, receipt production, Git archive and watcher stay real.
+  const graphql = async (query, variables, readOnly) => {
+    assert.equal(readOnly, true);
+    if (query === FIELD_BINDING) return wireAccess();
+    if (query === ITEMS) {
+      indexReads++;
+      return {
+        node: {
+          __typename: "ProjectV2",
+          id: binding.projectId,
+          items: {
+            nodes: [wireCard(true)],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      };
+    }
+    if (query === INSPECT) {
+      if (changeControlDuringRead) {
+        changeControlDuringRead = false;
+        controlMetadata += " ";
+      }
+      return {
+        ...wireAccess(),
+        control: wireCard(true),
+        ...(variables.includeItem ? { target: wireCard(false) } : {}),
+        repository: {
+          nameWithOwner: repository,
+          ...(variables.includeIssue
+            ? {
+                issue: {
+                  __typename: "Issue",
+                  id: card.issueNodeId,
+                  number: card.objective,
+                  title: card.title,
+                  body: card.body,
+                  state: card.state === "open" ? "OPEN" : "CLOSED",
+                  repository: { nameWithOwner: repository },
+                  projectItems: {
+                    nodes:
+                      card.metadata === null || !membershipVisible
+                        ? []
+                        : [
+                            {
+                              id: card.itemId,
+                              isArchived: card.archived,
+                              project: { id: binding.projectId },
+                            },
+                          ],
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                  },
+                },
+              }
+            : {}),
+        },
+      };
+    }
+    throw new Error("Unexpected Project read query in wire workflow");
+  };
   // Only the remote Project contract is a fixture; actual receipt production,
   // durable Git publication, runner completion and local control remain real.
   const github = {
     effectAdmission: "controller-checkpoint-v1",
     projectionMutationAdmission: "controller-checkpoint-v1",
-    async projectQueueRead() {
+    async projectQueueRead(_binding, knownTargets) {
       reads++;
-      return {
+      return projectQueueReadOnGitHub(
+        repository,
         binding,
-        actorId: 1,
-        owner: "fixture",
-        observedAt: new Date().toISOString(),
-        control: { itemId: binding.controlItemId, metadata: controlMetadata },
-        cards: card.metadata ? [structuredClone(card)] : [],
-        ignoredCards: [],
-      };
+        graphql,
+        knownTargets,
+      );
     },
     async projectQueueInspect(_binding, request) {
       return {
@@ -296,6 +453,102 @@ test("a terminal background watcher holds checkpoint failure while real control 
   };
   await watchIntake(config, github);
   await enqueueIntake(config, github, [1]);
+  // Authenticated real Git originals are stable identity hints, not a cached queue.
+  const history = await readQueueHistory(config),
+    hints = queueObservationTargets(history);
+  assert.deepEqual(hints, [
+    { objective: 1, issueNodeId: card.issueNodeId, itemId: card.itemId },
+  ]);
+  const beforeIndexReads = indexReads;
+  await withProjectQueueObservationOnGitHub(
+    repository,
+    binding,
+    graphql,
+    async () => {
+      assert.equal(
+        (await projectQueueReadOnGitHub(repository, binding, graphql)).cards
+          .length,
+        0,
+      );
+      const current = await projectQueueReadOnGitHub(
+        repository,
+        binding,
+        graphql,
+        hints,
+      );
+      assert.equal(current.cards[0].body, body);
+      assert.equal(
+        verifyQueueObservation(config, current, history).entries[0].state,
+        "queued",
+      );
+    },
+  );
+  assert.equal(
+    indexReads - beforeIndexReads,
+    2,
+    "new mappings cannot reuse the index-only observation",
+  );
+  card.archived = true;
+  const archived = await projectQueueReadOnGitHub(
+    repository,
+    binding,
+    graphql,
+    hints,
+  );
+  assert.equal(archived.cards[0].archived, true);
+  assert.equal(
+    verifyQueueObservation(config, archived, history).entries.length,
+    0,
+  );
+  card.archived = false;
+  membershipVisible = false;
+  assert.equal(
+    (await projectQueueReadOnGitHub(repository, binding, graphql, hints)).cards
+      .length,
+    0,
+  );
+  membershipVisible = true;
+  card.order++;
+  const reordered = await projectQueueReadOnGitHub(
+    repository,
+    binding,
+    graphql,
+    hints,
+  );
+  assert.equal(reordered.cards[0].order, card.order);
+  assert.throws(
+    () => verifyQueueObservation(config, reordered, history),
+    /differs from original admission/,
+  );
+  card.order--;
+  card.body += "Current changed contents.\n";
+  const changed = await projectQueueReadOnGitHub(
+    repository,
+    binding,
+    graphql,
+    hints,
+  );
+  assert.equal(changed.cards[0].body, card.body);
+  assert.notEqual(
+    createHash("sha256").update(changed.cards[0].body).digest("hex"),
+    verifyQueueObservation(config, changed, history).entries[0].bodyDigest,
+  );
+  card.body = body;
+  const originalIssueId = card.issueNodeId;
+  card.issueNodeId = "I_foreign";
+  await assert.rejects(
+    () => projectQueueReadOnGitHub(repository, binding, graphql, hints),
+    /differs from current full observation/,
+  );
+  card.issueNodeId = originalIssueId;
+  const originalControl = controlMetadata;
+  changeControlDuringRead = true;
+  await assert.rejects(
+    () => projectQueueReadOnGitHub(repository, binding, graphql, hints),
+    /differs from current full observation/,
+  );
+  controlMetadata = originalControl;
+
   const commit = git("rev-parse", "HEAD"),
     treeSha = git("rev-parse", "HEAD^{tree}");
   const item = {

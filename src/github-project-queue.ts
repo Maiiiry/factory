@@ -9,6 +9,7 @@ import type {
   ProjectQueueTarget,
   ProjectQueueExpectedTarget,
   ProjectQueueSnapshot,
+  ProjectQueueKnownTarget,
   ProjectQueueWriteReceipt,
   ProjectQueueWriteRequest,
   ProjectQueuePlannedEffect,
@@ -972,6 +973,7 @@ async function readQueueFresh(
   repository: string,
   binding: ProjectQueueBinding,
   graphql: ProjectGraphQL,
+  knownTargets: readonly ProjectQueueKnownTarget[] = [],
 ) {
   const { access, names } = await readQueueBinding(
     repository,
@@ -1089,6 +1091,99 @@ async function readQueueFresh(
   }
   if (!control)
     throw new Error("Project queue lacks its configured control card");
+  // A complete Project.items cursor can omit a mapped item that current Issue
+  // membership still exposes. Original receipts are lookup hints only: read all
+  // current membership/fields/body/control before adding any missing cards.
+  let supplemented = false;
+  for (const hint of knownTargets) {
+    if (seenCards.has(hint.itemId)) continue;
+    const observed = await projectQueueInspectOnGitHub(
+      repository,
+      binding,
+      graphql,
+      { objective: hint.objective },
+    );
+    if (
+      observed.actorId !== access.actorId ||
+      observed.owner !== access.owner ||
+      !same(observed.control, control) ||
+      observed.issue?.issueNodeId !== hint.issueNodeId ||
+      observed.issue.objective !== hint.objective ||
+      observed.issue.repository !== repository
+    )
+      throw new Error(
+        "Mapped Project membership differs from current full observation",
+      );
+    for (const member of observed.membership!) {
+      const existing = cards.find((card) => card.itemId === member.itemId);
+      if (existing) {
+        if (
+          existing.issueNodeId !== observed.issue.issueNodeId ||
+          existing.archived !== member.archived ||
+          existing.body !== observed.issue.body ||
+          existing.state !== observed.issue.state ||
+          (observed.target?.itemId === member.itemId &&
+            (existing.metadata !== observed.target.metadata ||
+              existing.order !== observed.target.order))
+        )
+          throw new Error(
+            "Project index and current Issue membership conflict",
+          );
+        continue;
+      }
+      if (seenCards.has(member.itemId))
+        throw new Error(
+          "Mapped Project membership conflicts with another indexed target",
+        );
+      const exact =
+        observed.target?.itemId === member.itemId
+          ? observed
+          : await projectQueueInspectOnGitHub(repository, binding, graphql, {
+              itemId: member.itemId,
+            });
+      const target = exact.target;
+      if (
+        exact.actorId !== access.actorId ||
+        exact.owner !== access.owner ||
+        !same(exact.control, control) ||
+        !target ||
+        target.itemId !== member.itemId ||
+        target.issueNodeId !== observed.issue.issueNodeId ||
+        target.objective !== hint.objective ||
+        target.repository !== repository ||
+        target.archived !== member.archived
+      )
+        throw new Error(
+          "Current mapped Project target differs from its scoped membership",
+        );
+      if (!target.archived && issues.has(target.issueNodeId))
+        throw new Error("Project queue has duplicate Objective cards");
+      if (!target.archived) issues.add(target.issueNodeId);
+      seenCards.add(target.itemId);
+      cards.push({
+        ...target,
+        title: observed.issue.title,
+        body: observed.issue.body,
+        state: observed.issue.state,
+      });
+      supplemented = true;
+    }
+  }
+  if (supplemented) {
+    const currentControl = await projectQueueInspectOnGitHub(
+      repository,
+      binding,
+      graphql,
+    );
+    if (
+      currentControl.actorId !== access.actorId ||
+      currentControl.owner !== access.owner ||
+      !same(currentControl.control, control)
+    )
+      throw new Error(
+        "Project queue control changed during mapped membership observation",
+      );
+  }
   // Recheck capabilities after pagination; the API offers no version/CAS guarantee.
   const current = await readQueueBinding(repository, binding, graphql);
   if (
@@ -1115,6 +1210,7 @@ const observationScope = new AsyncLocalStorage<{
   graphql: ProjectGraphQL;
   active: boolean;
   observation?: Promise<Observation>;
+  knownTargets?: readonly ProjectQueueKnownTarget[];
 }>();
 
 /** Rebuildable observation only for this finite owner's callback, never across commands. */
@@ -1169,11 +1265,20 @@ async function readQueue(
   repository: string,
   binding: ProjectQueueBinding,
   graphql: ProjectGraphQL,
+  knownTargets: readonly ProjectQueueKnownTarget[] = [],
 ) {
   assertProcessActive();
   const scope = currentObservation(repository, binding, graphql);
-  if (!scope) return readQueueFresh(repository, binding, graphql);
-  scope.observation ??= readQueueFresh(repository, binding, graphql);
+  if (!scope) return readQueueFresh(repository, binding, graphql, knownTargets);
+  if (!same(scope.knownTargets ?? [], knownTargets))
+    scope.observation = undefined;
+  scope.knownTargets = structuredClone(knownTargets);
+  scope.observation ??= readQueueFresh(
+    repository,
+    binding,
+    graphql,
+    knownTargets,
+  );
   try {
     return await scope.observation;
   } catch (error) {
@@ -1541,9 +1646,30 @@ export async function projectQueueReadOnGitHub(
   repository: string,
   binding: ProjectQueueBinding,
   graphql: ProjectGraphQL,
+  knownTargets: readonly ProjectQueueKnownTarget[] = [],
 ): Promise<ProjectQueueSnapshot> {
+  if (
+    !Array.isArray(knownTargets) ||
+    knownTargets.some(
+      (target) =>
+        !positiveInteger(target.objective) ||
+        !nodeId(target.issueNodeId) ||
+        !nodeId(target.itemId) ||
+        target.itemId === binding.controlItemId,
+    ) ||
+    new Set(knownTargets.map((target) => target.itemId)).size !==
+      knownTargets.length
+  )
+    throw new Error("Invalid original Project target identity hints");
   return structuredClone(
-    (await readQueue(repository, structuredClone(binding), graphql)).snapshot,
+    (
+      await readQueue(
+        repository,
+        structuredClone(binding),
+        graphql,
+        structuredClone(knownTargets),
+      )
+    ).snapshot,
   );
 }
 

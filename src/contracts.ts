@@ -1358,6 +1358,13 @@ export interface ProjectQueueCard {
   metadata: string | null;
   archived: boolean;
 }
+/** Stable lookup hints from authenticated original receipts; never current authority. */
+export interface ProjectQueueKnownTarget {
+  objective: number;
+  issueNodeId: string;
+  itemId: string;
+}
+/** Paginated Project index plus freshly reconciled known Issue memberships, not unseen absence proof. */
 export interface ProjectQueueSnapshot {
   binding: ProjectQueueBinding;
   observedAt: string;
@@ -1523,6 +1530,7 @@ export interface GitHubGateway {
   ): Promise<T>;
   projectQueueRead?(
     binding: ProjectQueueBinding,
+    knownTargets?: readonly ProjectQueueKnownTarget[],
   ): Promise<ProjectQueueSnapshot>;
   projectQueueInspect?(
     binding: ProjectQueueBinding,
