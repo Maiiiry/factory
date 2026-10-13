@@ -346,7 +346,7 @@ export async function validateTree(
   await removeValidationWorktree(checkout, worktree);
   await addWorktree(checkout, worktree, commit);
   try {
-    return await validateCheckout(
+    const evidence = await validateCheckout(
       worktree,
       root,
       commit,
@@ -361,6 +361,12 @@ export async function validateTree(
       preparation,
       reviewArtifacts,
     );
+    evidence.worktreeObservation!.checkoutPreparation = {
+      kind: "fresh-detached-worktree",
+      commitSha: commit,
+      commandSequence: "after-checkout-creation",
+    };
+    return evidence;
   } finally {
     if (!hasUnresolvedSubprocesses()) await removeWorktree(checkout, worktree);
   }

@@ -187,6 +187,10 @@ export async function finalizeObjective(args: {
     );
     assertCompletedCoverage(state);
     const finalValidationStarted = Date.now();
+    const integratedBeforeValidation =
+      objectiveCandidate(state)!.basis === "current-graph-integration"
+        ? state.integratedSha
+        : undefined;
     diagnostics.emit({
       runId: state.runId,
       operation: "objective-validation",
@@ -306,6 +310,12 @@ export async function finalizeObjective(args: {
           },
           config.reviewArtifacts,
         );
+        // This ordering is controller-observed, not inferred from cleanliness
+        // or an identical tree. Baseline/read-only QA makes no integration claim.
+        if (integratedBeforeValidation)
+          commandEvidence.worktreeObservation!
+            .checkoutPreparation!.afterIntegrationSha =
+            integratedBeforeValidation;
         const selectedAssets = graph.items.flatMap((item) => {
           const work = state.work[item.id];
           const set = work?.assets?.find(
