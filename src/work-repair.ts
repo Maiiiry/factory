@@ -1418,11 +1418,13 @@ export async function diagnoseWorkRepair(args: {
                           );
                         invocation.submitted = true;
                         save();
-                        if ([17, 19].includes(state.schemaVersion))
+                        if ([17, 19].includes(state.schemaVersion)) {
                           await awaitCheckpointAdmission(
                             state.repository,
                             "before-effect",
                           );
+                          return "admission-complete" as const;
+                        }
                       },
                     }
                   : {}),

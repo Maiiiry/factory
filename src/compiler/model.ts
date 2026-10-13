@@ -884,7 +884,15 @@ export class StructuredPlanningModel implements PlanningModel {
         throw new ProviderTurnElapsedTimeoutError(args.deadlineAt);
       }
       await invocation.beforeProviderAttempt?.();
-      await invocation.beforeProviderDispatch?.();
+      const logicalDispatch =
+        invocation.beforeProviderDispatch?.bind(invocation);
+      const beforeNativeDispatch =
+        logicalDispatch &&
+        this.transport.logicalDispatchAdmission?.(args.tree) ===
+          "native-before-effect-v1"
+          ? logicalDispatch
+          : undefined;
+      if (!beforeNativeDispatch) await logicalDispatch?.();
       await this.transport.run({
         role: args.role,
         prompt: args.prompt,
@@ -893,6 +901,7 @@ export class StructuredPlanningModel implements PlanningModel {
         planningSources: args.planningSources,
         candidateDigest: args.candidateDigest,
         invocation,
+        ...(beforeNativeDispatch && { beforeNativeDispatch }),
         turn,
         tree: args.tree,
         reviewImages: args.reviewImages,

@@ -1793,6 +1793,24 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         phase: "admitted",
         issueByItemId: { ...expanded.issueByItemId },
       };
+      const projectionRemote = join(root, "projection-archive.git");
+      git(root, "init", "--bare", projectionRemote);
+      const projectionConfig = {
+        repository: `fixture/projection-${randomUUID()}`,
+        checkout,
+        execution: { kind: "local" },
+        policy: { allowedSecretNames: [] },
+        gitPersistence: {
+          remote: projectionRemote,
+          ref: "refs/heads/history",
+          visibility: "private",
+          scope: "private-history",
+          maxBytes: 16 * 1024 * 1024,
+          maxFiles: 4096,
+          timeoutMs: 30000,
+          coalesceMs: 0,
+        },
+      };
       const expansionPath = join(root, "private-state", "expansion.json");
       const saveExpanded = () => saveState(expansionPath, expanded);
       saveExpanded();
@@ -1821,6 +1839,110 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
         materialized.graph,
         saveExpanded,
       ).beforeWrite(effect);
+      // Use this real discovery's graph in a fresh pending projection, without
+      // importing the earlier fixture's deliberately edited memory episodes.
+      const projectionState = {
+        schemaVersion: 11,
+        repository: projectionConfig.repository,
+        objective: 1,
+        runId: randomUUID(),
+        configDigest: factoryConfigDigest(projectionConfig),
+        baseSha: materialized.graph.baseSha,
+        graph: structuredClone(materialized.graph),
+        planGraphDigest: graphDigest(materialized.graph),
+        capacity: { concurrency: 1 },
+        autonomy: resolveAutonomy(),
+        issueByItemId: Object.fromEntries(
+          materialized.graph.items.map((item, index) => [item.id, index + 2]),
+        ),
+        work: Object.fromEntries(
+          materialized.graph.items.map((item) => [
+            item.id,
+            { status: "pending" },
+          ]),
+        ),
+      };
+      const projectionPath = statePath(projectionState.repository, 1);
+      const saveProjection = () => saveState(projectionPath, projectionState);
+      saveProjection();
+      const projectionMetadata = {
+        ...effectMetadata,
+        path: `repos/${projectionState.repository}/issues`,
+      };
+      const projectionEffect = {
+        ...effect,
+        ...projectionMetadata,
+        id: createHash("sha256")
+          .update(JSON.stringify(projectionMetadata))
+          .digest("hex"),
+      };
+      const projectionControl = graphProjectionControl(
+        projectionState,
+        projectionState.graph,
+        saveProjection,
+      );
+      await withRecoveryCheckpointScope(
+        {
+          config: projectionConfig,
+          buildClosure: () =>
+            buildRecoveryCheckpointClosure({ config: projectionConfig }),
+        },
+        async () => {
+          await projectionControl.beforeWrite(projectionEffect);
+          const intentAck =
+            gitPersistenceStatus(projectionConfig).lastAcknowledged;
+          assert.ok(intentAck);
+          const receipt = {
+            outcome: "responded",
+            responseDigest: createHash("sha256")
+              .update(inputBytes)
+              .digest("hex"),
+            identity: { id: 6, number: 6 },
+          };
+          await projectionControl.observed(projectionEffect.id, receipt);
+          await projectionControl.observed(projectionEffect.id, {
+            ...receipt,
+            outcome: "reconciled",
+          });
+          assert.equal(
+            gitPersistenceStatus(projectionConfig).lastAcknowledged.commitSha,
+            intentAck.commitSha,
+            "response and readback stay local until the next effect or completion",
+          );
+          const locallySaved = parseFactoryState(
+            JSON.parse(readFileSync(projectionPath, "utf8")),
+            projectionState.repository,
+            projectionState.objective,
+          );
+          assert.equal(
+            locallySaved.graphProjectionIntents[expansionReceipt.graphDigest]
+              .effects[0].reconciliation.outcome,
+            "reconciled",
+          );
+          await projectionControl.complete();
+          const finalAck =
+            gitPersistenceStatus(projectionConfig).lastAcknowledged;
+          assert.notEqual(finalAck.commitSha, intentAck.commitSha);
+          const archived = await readVerifiedRecoveryCheckpoint(
+            projectionConfig,
+            finalAck.commitSha,
+          );
+          const snapshot = archived.manifest.files.find(
+            (entry) => entry.path === "objectives/1/state.json",
+          );
+          const complete = JSON.parse(
+            Buffer.from(await archived.readVerifiedBlob(snapshot.ref)).toString(
+              "utf8",
+            ),
+          );
+          assert.deepEqual(
+            complete.graphProjectionIntents[expansionReceipt.graphDigest]
+              .effects,
+            projectionState.graphProjectionIntents[expansionReceipt.graphDigest]
+              .effects,
+          );
+        },
+      );
       const reloadedExpansion = parseFactoryState(
         JSON.parse(readFileSync(expansionPath, "utf8")),
         expanded.repository,
@@ -4023,13 +4145,11 @@ test("diagnosis dispatch intent follows complete admission before real process e
   );
   assert.equal(
     beforeNativeBuilds.length,
-    2,
-    "one complete logical admission plus one complete native admission",
+    1,
+    "one acknowledgment contains both complete logical and native admissions",
   );
-  const [logical, native] = beforeNativeBuilds;
-  assert.equal(logical.planningRecovery.phase, "submitted");
-  assert.equal(logical.repeats[repeatKey("objective", "plan")].inFlight, true);
-  assert.equal(Object.keys(logical.agentSessions ?? {}).length, 0);
+  const [native] = beforeNativeBuilds;
+  assert.equal(native.planningRecovery.phase, "submitted");
   const session = Object.values(native.agentSessions)[0];
   assert.equal(session.status, "in-flight");
   assert.equal(session.currentTurn.dispatch, "submitted");
@@ -4083,7 +4203,7 @@ test("diagnosis dispatch intent follows complete admission before real process e
     acknowledgedStates.filter(
       (entry) => Object.keys(entry.agentSessions ?? {}).length === 0,
     ).length,
-    1,
+    0,
   );
   const activeAdmissions = acknowledgedStates.filter((entry) =>
     Object.values(entry.agentSessions ?? {}).some(

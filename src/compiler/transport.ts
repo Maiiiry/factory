@@ -83,6 +83,10 @@ export interface PlanningTransport {
   readonly provider: string;
   /** Pinned adapter identity recorded with opt-in captures. */
   readonly adapter: string;
+  /** The selected native route can acknowledge the logical callback with complete native intent before its first effect. */
+  logicalDispatchAdmission?(
+    tree?: string,
+  ): "native-before-effect-v1" | undefined;
   readonly sessionCapabilities?: AgentSessionCapabilities;
   /** Native image observations; absence is unsupported, never silent omission. */
   readonly retainedPlannerCheckpointCoverage?: RetainedPlannerCheckpointCoverage;
@@ -128,6 +132,10 @@ export interface PlanningTransport {
     };
     candidateDigest?: string;
     invocation: ModelInvocationContext;
+    /** Confirm complete logical/native acknowledgment only after it succeeds; void callers retain native admission. */
+    beforeNativeDispatch?: NonNullable<
+      ModelInvocationContext["beforeProviderDispatch"]
+    >;
     turn: PlanningTurn;
     tree?: string;
     reviewImages?: ReviewImageInput[];

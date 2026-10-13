@@ -273,8 +273,12 @@ export type ModelInvocationObserver = ((
 export interface ModelInvocationContext {
   /** Record and validate each bounded attempt; facts may share the declared following dispatch checkpoint. Absent on cached decode. */
   beforeProviderAttempt?: () => void | Promise<void>;
-  /** Awaited dispatch intent and all prior attempt facts after local attempt admission succeeds, immediately before transport submission. */
-  beforeProviderDispatch?: () => void | Promise<void>;
+  /** Awaited dispatch intent and prior attempt facts before transport submission. Confirm admission only after the complete durable checkpoint succeeds. */
+  beforeProviderDispatch?: () =>
+    | void
+    | "admission-complete"
+    | Promise<void>
+    | Promise<undefined | "admission-complete">;
   /** Exact native return retained before release. Confirm admission only after its durable checkpoint succeeds; void callers retain adapter admission. */
   retainNativeReturn?(receipt: {
     response: string;
@@ -693,7 +697,7 @@ export interface RetainedPlannerCheckpointCoverage {
 export interface PlanningModel {
   readonly retainedPlannerCheckpointCoverage?: RetainedPlannerCheckpointCoverage;
   readonly providerAttemptAdmission?: "controller-checkpoint-v1";
-  /** Invoke the awaited dispatch callback immediately after complete local attempt admission, before any transport effect; their facts may share that checkpoint. */
+  /** Invoke the awaited dispatch callback after complete local attempt admission and before any transport effect; a declared native route may compose it with its complete final pre-effect checkpoint. */
   readonly providerDispatchAdmission?: "after-attempt-admission-v1";
   readonly sessionCapabilities?: AgentSessionCapabilities;
   reconcileSession?(
@@ -1282,6 +1286,8 @@ export interface GraphProjection {
       effectId: string,
       receipt: GraphProjectionEffectObservation,
     ): void | Promise<void>;
+    /** Acknowledge all locally retained observations before the projection returns or yields on failure. */
+    complete(): void | Promise<void>;
   };
   previousGraph?: WorkGraph;
   completedItems?: string[];

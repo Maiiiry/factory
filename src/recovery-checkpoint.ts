@@ -4364,14 +4364,10 @@ async function freshArchiveOwnedStrict(
       );
     const negotiationTip = priorObjects ? context?.negotiationTip : undefined;
     hintUsed = Boolean(negotiationTip);
-    observed.start("remote-tip");
-    const tip = await remoteTip(directory, options);
-    observedTip = tip;
-    if (!tip) throw new Error("Configured Git archive ref has no checkpoint");
-    if (context && context.key !== verificationKey(config, options))
-      throw new Error(
-        "Queue verifier admitted binding changed during remote observation",
-      );
+    // The successful exact-ref fetch is the independent observation boundary.
+    // Do not observe a tip separately and require it to survive another remote
+    // round trip. A failed or missing-ref fetch never grants access to an old
+    // FETCH_HEAD; every check below uses only this settled successful fetch.
     observed.start("fetch");
     await gitRemote(directory, options, [
       "-c",
@@ -4384,6 +4380,7 @@ async function freshArchiveOwnedStrict(
       "transfer.fsckObjects=true",
       "fetch",
       "--no-tags",
+      "--no-append",
       ...(negotiationTip ? [`--negotiation-tip=${negotiationTip}`] : []),
       "--",
       options.remote,
@@ -4392,11 +4389,17 @@ async function freshArchiveOwnedStrict(
     if (context && context.key !== verificationKey(config, options))
       throw new Error("Queue verifier admitted binding changed during fetch");
     observed.start("fetched-material");
-    const fetched = git(directory, options, ["rev-parse", "FETCH_HEAD"])
+    const tip = git(directory, options, ["rev-parse", "--verify", "FETCH_HEAD"])
       .toString("utf8")
       .trim();
-    if (fetched !== tip)
-      throw new Error("Archive ref changed during independent verification");
+    if (
+      !/^[a-f0-9]{40,64}$/.test(tip) ||
+      git(directory, options, ["cat-file", "-t", tip])
+        .toString("utf8")
+        .trim() !== "commit"
+    )
+      throw new Error("Fetched archive ref has no exact commit identity");
+    observedTip = tip;
     if (context) {
       assertRemoteOnlyVerifier(directory, options);
       const objects = scanVerifierObjects(directory, options);
