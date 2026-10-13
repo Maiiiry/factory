@@ -588,6 +588,7 @@ export async function releaseAgentSessions(
   driver: ExecutionDriver | undefined,
   model: PlanningModel | undefined,
   save: () => void,
+  assertCurrent?: () => void,
 ): Promise<void> {
   assertAgentSessions(state);
   if (state.coordinator?.processes?.length)
@@ -607,7 +608,9 @@ export async function releaseAgentSessions(
       throw new Error(
         "Agent session disposal requires its authenticated adapter",
       );
+    assertCurrent?.();
     await owner.releaseSession(ref);
+    assertCurrent?.();
     state.agentSessions![entryKey] = { ...ref, status: "released" };
     save();
   }
@@ -619,7 +622,9 @@ export async function releaseAgentSessions(
       throw new Error(
         "Agent session disposal requires its authenticated adapter",
       );
+    assertCurrent?.();
     await owner.releaseSession(ref);
+    assertCurrent?.();
     state.agentSessionHistory![index] = { ...ref, status: "released" };
     save();
   }

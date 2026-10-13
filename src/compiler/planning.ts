@@ -257,6 +257,9 @@ export function paidModel(
     ...(model.providerAttemptAdmission
       ? { providerAttemptAdmission: model.providerAttemptAdmission }
       : {}),
+    ...(model.providerDispatchAdmission
+      ? { providerDispatchAdmission: model.providerDispatchAdmission }
+      : {}),
     ...(model.sessionCapabilities
       ? { sessionCapabilities: model.sessionCapabilities }
       : {}),

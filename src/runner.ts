@@ -100,6 +100,7 @@ import {
   ownerKey,
   owners,
   releaseMutationLock,
+  releaseCancelledSessions,
   synchronizeWorkItemPause,
 } from "./runner/ownership.js";
 import { decidePlan } from "./runner/planning.js";
@@ -116,6 +117,7 @@ import {
   acquireInstallationLock,
   acquireObjectiveLock,
   assertRestoredContinuationReady,
+  cancelledContinuationResourceHold,
   assertRestoredInstallationDispatchReady,
   type ControllerLock,
   continuationConfigurationMatches,
@@ -1088,11 +1090,13 @@ async function runObjectiveOwned(
           await owner.cancellation;
           await closeCancelledIssues(state, services.github, persist);
           if (!state.coordinator?.cancelError) {
-            await releaseAgentSessions(
+            await releaseCancelledSessions(
+              config,
               state,
               services.driver,
               services.planningModel,
               persist,
+              lock,
             );
             const alreadyCancelled = !!state.cancelledAt;
             state.cancelledAt = new Date().toISOString();
@@ -1276,7 +1280,9 @@ async function runObjectiveOwned(
           controlReleased &&
           queueClaim &&
           owner.snapshot &&
-          canHandoff(owner.snapshot)
+          (owner.snapshot.cancelledAt
+            ? !cancelledContinuationResourceHold(owner.snapshot)
+            : canHandoff(owner.snapshot))
         ) {
           if (owner.snapshot.cancelledAt) {
             await cancelKnownWork(
@@ -1285,11 +1291,13 @@ async function runObjectiveOwned(
               persist,
               true,
             );
-            await releaseAgentSessions(
+            await releaseCancelledSessions(
+              config,
               owner.snapshot,
               services.driver,
               services.planningModel,
               persist,
+              lock,
             );
             await settleCancelledProjectQueueRun(config, owner.snapshot, lock);
           } else
@@ -1378,8 +1386,13 @@ async function cancelObjectiveOwned(
             saveState(statePath(config.repository, objective), continuation),
           true,
         );
-      await releaseAgentSessions(continuation, driver, planningModel, () =>
-        saveState(statePath(config.repository, objective), continuation),
+      await releaseCancelledSessions(
+        config,
+        continuation,
+        driver,
+        planningModel,
+        () => saveState(statePath(config.repository, objective), continuation),
+        lockHandle,
       );
       saveState(statePath(config.repository, objective), continuation);
       await settleCancelledProjectQueueRun(config, continuation, lockHandle);
@@ -1443,8 +1456,14 @@ async function cancelObjectiveOwned(
           work.completedAt = new Date().toISOString();
         }
       }
-    await releaseAgentSessions(continuation, driver, planningModel, () =>
-      saveState(statePath(config.repository, objective), continuation),
+    saveState(statePath(config.repository, objective), continuation);
+    await releaseCancelledSessions(
+      config,
+      continuation,
+      driver,
+      planningModel,
+      () => saveState(statePath(config.repository, objective), continuation),
+      lockHandle,
     );
     continuation.cancelledAt = new Date().toISOString();
     clearAllRepeats(continuation);

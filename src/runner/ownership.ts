@@ -1,4 +1,8 @@
-import { agentSessionContinuation } from "../agent-session.js";
+import { isDeepStrictEqual } from "node:util";
+import {
+  agentSessionContinuation,
+  releaseAgentSessions,
+} from "../agent-session.js";
 import { closeCancelledWorkItems } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
 import type {
@@ -19,6 +23,9 @@ import {
   acquireObjectiveLock,
   assertRestoredContinuationReady,
   type ControllerLock,
+  continuationConfigurationMatches,
+  installationLockPath,
+  readControllerOwner,
   objectiveLockPath,
   readContinuation,
   readState,
@@ -339,3 +346,39 @@ export type ObjectiveStep = <T>(
   paid?: boolean,
   pausable?: boolean,
 ) => Promise<T>;
+
+/** Disposal authenticates the current atomic scope under its actual exclusive owner. */
+export async function releaseCancelledSessions(
+  config: FactoryConfig,
+  state: ContinuationState,
+  driver: ExecutionDriver,
+  model: PlanningModel | undefined,
+  save: () => void,
+  lock: ControllerLock,
+): Promise<void> {
+  const assertCurrent = () => {
+    const current = readContinuation(config.repository, state.objective);
+    const host = linuxProcessIdentity(process.pid);
+    const owner = [
+      objectiveLockPath(config.repository, state.objective),
+      installationLockPath(config.repository),
+    ]
+      .map((path) => readControllerOwner(path))
+      .find((value) => value?.token === lock.token);
+    if (
+      !state.cancelRequested ||
+      !host ||
+      !owner ||
+      owner.pid !== process.pid ||
+      owner.startTime !== host.startTime ||
+      owner.objective !== state.objective ||
+      !continuationConfigurationMatches(state, config) ||
+      !isDeepStrictEqual(current, state)
+    )
+      throw new Error(
+        "Cancellation disposal lost its current atomic scope or exclusive owner",
+      );
+  };
+  assertCurrent();
+  await releaseAgentSessions(state, driver, model, save, assertCurrent);
+}
