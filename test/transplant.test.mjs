@@ -753,19 +753,84 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
     }
     assert.equal(expandedFiles.files.at(-1).bytes, 0);
     assert.equal(expandedFiles.files.at(-1).lineCount, 1);
-    const diagnosis = renderDiagnosisCall(
-      { ...request, purpose: "diagnosis", schema: { type: "object" } },
-      sourceFiles,
-    );
+    const rejectedGraph = structuredClone(currentGraph);
+    rejectedGraph.items[0].inputSources.push({
+      path: "unmatched.txt",
+      content: "An unmatched source remains complete literal evidence.\n",
+    });
+    const diagnosisRequest = {
+      ...request,
+      purpose: "diagnosis",
+      schema: { type: "object" },
+      rejectedGraph,
+    };
+    const canonicalDiagnosis = JSON.stringify(diagnosisRequest);
+    const diagnosis = renderDiagnosisCall(diagnosisRequest, sourceFiles);
     assert.ok(diagnosis.prompt.includes('"contentFile"'));
     assert.equal(
       diagnosis.sourcePacket,
-      renderDiagnosisCall({
-        ...request,
-        purpose: "diagnosis",
-        schema: { type: "object" },
-      }).sourcePacket,
+      renderDiagnosisCall(diagnosisRequest).sourcePacket,
     );
+    for (const delivery of [
+      undefined,
+      sourceFiles,
+      { ...sourceFiles, bodyDelivery: undefined, reusedSourceIndices: [] },
+    ]) {
+      const emitted = renderDiagnosisCall(diagnosisRequest, delivery);
+      const graphView = JSON.parse(
+        emitted.prompt.split(
+          "Rejected canonical graph (null when unavailable):\n",
+        )[1],
+      );
+      assert.deepEqual(graphView, planningGraphView(rejectedGraph, sources));
+      for (const [index, item] of graphView.items.entries()) {
+        const original = rejectedGraph.items[index];
+        const referenced = item.inputSources[0];
+        const span = referenced.sourceSpan;
+        assert.equal(referenced.content, undefined);
+        assert.equal(
+          sources[span.sourceIndex].content.slice(
+            span.start,
+            span.start + span.length,
+          ),
+          original.inputSources[0].content,
+        );
+        assert.equal(
+          span.contentDigest,
+          createHash("sha256")
+            .update(original.inputSources[0].content)
+            .digest("hex"),
+        );
+        assert.deepEqual(
+          { ...item, inputSources: original.inputSources },
+          original,
+        );
+      }
+      assert.deepEqual(
+        graphView.items[0].inputSources.at(-1),
+        rejectedGraph.items[0].inputSources.at(-1),
+      );
+      assert.equal(
+        graphView.requiredPreIntegrationChecks[0].source.text,
+        undefined,
+      );
+      assert.deepEqual(
+        JSON.parse(emitted.sourcePacket).rejectedGraph,
+        rejectedGraph,
+      );
+      assert.equal(JSON.stringify(diagnosisRequest), canonicalDiagnosis);
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(graphView)) <
+          Buffer.byteLength(JSON.stringify(rejectedGraph)) / 10,
+      );
+      assert.equal(
+        validPromptSections(
+          emitted.promptSections,
+          Buffer.byteLength(emitted.prompt),
+        ),
+        true,
+      );
+    }
     const evidence = reviewPacket(
       [],
       sources.map((source) => ({ ...source, origin: "source" })),

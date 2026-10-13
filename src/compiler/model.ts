@@ -71,7 +71,11 @@ import {
   assertPlanningSourceDelivery,
   type PlanningSourceDelivery,
 } from "./source-delivery.js";
-import { compilerCitationChoices, reviewGraphView } from "./sources.js";
+import {
+  compilerCitationChoices,
+  planningGraphView,
+  reviewGraphView,
+} from "./sources.js";
 import type {
   CodexPlanningModelOptions,
   PlanningModelOptions,
@@ -270,7 +274,7 @@ export function renderDiagnosisCall(
     ["objective", request.objective],
     [
       "evidence",
-      `\nPinned sources:\n${JSON.stringify(deliveredSources)}\nWork Item diagnosis delivery:\n${JSON.stringify(delivery ?? null)}\nController capabilities:\n${JSON.stringify(request.controllerCapabilities)}\nNative Objective prerequisites:\n${JSON.stringify(request.prerequisites ?? null)}\nController local executable observations:\n${JSON.stringify(request.localExecutables ?? null)}\nController execution bounds:\n${JSON.stringify(request.executionBounds ?? null)}\nRejected canonical graph (null when unavailable):\n${JSON.stringify(request.rejectedGraph ?? null)}`,
+      `\nPinned sources:\n${JSON.stringify(deliveredSources)}\nWork Item diagnosis delivery:\n${JSON.stringify(delivery ?? null)}\nController capabilities:\n${JSON.stringify(request.controllerCapabilities)}\nNative Objective prerequisites:\n${JSON.stringify(request.prerequisites ?? null)}\nController local executable observations:\n${JSON.stringify(request.localExecutables ?? null)}\nController execution bounds:\n${JSON.stringify(request.executionBounds ?? null)}\nRejected canonical graph (null when unavailable):\n${JSON.stringify(request.rejectedGraph ? planningGraphView(request.rejectedGraph, request.sources) : null)}`,
     ],
   ]);
   return {
