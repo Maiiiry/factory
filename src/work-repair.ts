@@ -1377,6 +1377,24 @@ export async function diagnoseWorkRepair(args: {
               rejected,
               invocation: {
                 invocationId: invocation.id,
+                ...(args.model.providerDispatchAdmission ===
+                "after-attempt-admission-v1"
+                  ? {
+                      beforeProviderDispatch: async () => {
+                        if (work.recovery?.diagnosisInvocation !== invocation)
+                          throw new Error(
+                            "Diagnosis dispatch differs from its current owner",
+                          );
+                        invocation.submitted = true;
+                        save();
+                        if ([17, 19].includes(state.schemaVersion))
+                          await awaitCheckpointAdmission(
+                            state.repository,
+                            "before-effect",
+                          );
+                      },
+                    }
+                  : {}),
                 ...([17, 19].includes(state.schemaVersion)
                   ? {
                       beforeProviderAttempt: () =>
@@ -1558,7 +1576,13 @@ export async function diagnoseWorkRepair(args: {
             invocation.requestDigest = requestDigest;
             // Local evidence authentication can fail without any submitted effect.
             // Freeze the complete request before dispatch, never before hydration.
-            invocation.submitted = true;
+            // Opaque models cannot establish an admission/dispatch boundary.
+            // Declared models freeze this intent only after every admission hook passes.
+            if (
+              args.model.providerDispatchAdmission !==
+              "after-attempt-admission-v1"
+            )
+              invocation.submitted = true;
             save();
             const response = (invocation.response ??
               (await generatePlannerStructured<DiagnosisAnswer>(
