@@ -44,6 +44,7 @@ import { codexInvocationUsage, codexRawTokenUsage } from "../usage.js";
 import { observeModelInvocation } from "./observation.js";
 import {
   CODEX_PLANNING_ADAPTER,
+  CODEX_APP_SERVER_PLANNING_ADAPTER,
   CODEX_PLANNING_PROVIDER,
   type PlanningRole,
   type PlanningTransport,
@@ -75,7 +76,7 @@ export class CodexPlanningTransport implements PlanningTransport {
   get adapter(): string {
     return this.transport === "exec"
       ? CODEX_PLANNING_ADAPTER
-      : "@openai/codex@0.160.0/tool-free-app-server-tree-exec-v1";
+      : CODEX_APP_SERVER_PLANNING_ADAPTER;
   }
 
   constructor(
@@ -90,6 +91,15 @@ export class CodexPlanningTransport implements PlanningTransport {
   ) {
     if (sourceArtifacts && transport !== "exec")
       throw new Error("Planning source artifacts require the exec transport");
+  }
+
+  get retainedPlannerCheckpointCoverage() {
+    return this.sessionRoot
+      ? {
+          contract: "retained-planner-native-checkpoint-v1" as const,
+          adapter: this.adapter,
+        }
+      : undefined;
   }
 
   get sessionCapabilities(): AgentSessionCapabilities | undefined {
@@ -446,6 +456,10 @@ export class CodexPlanningTransport implements PlanningTransport {
         throw unsupportedReviewImages(this.adapter);
       assertReviewImages(args.reviewImages, args.tree);
     }
+    if (this.sessionRoot && args.role === "planner" && !args.session)
+      throw new Error(
+        "Retained planner requires its controller-owned checkpoint header",
+      );
     const continuation =
       this.sessionRoot && args.session ? args.session : undefined;
     let sourceRead = false;

@@ -25,6 +25,7 @@ import type {
   ModelInvocationPhase,
   ModelInvocationUsage,
   PlanningRequest,
+  RetainedPlannerCheckpointCoverage,
   ReviewImageInput,
 } from "../contracts.js";
 import type { Fault } from "../fault.js";
@@ -83,6 +84,7 @@ export interface PlanningTransport {
   readonly adapter: string;
   readonly sessionCapabilities?: AgentSessionCapabilities;
   /** Native image observations; absence is unsupported, never silent omission. */
+  readonly retainedPlannerCheckpointCoverage?: RetainedPlannerCheckpointCoverage;
   readonly reviewImageInput?: "png-local-file-v1";
   reconcileSession?(
     session: AgentSessionRef,
@@ -153,6 +155,26 @@ export interface StructuredCall {
 export const CODEX_PLANNING_PROVIDER = "openai-codex-sdk";
 
 export const CODEX_PLANNING_ADAPTER = "@openai/codex@0.160.0/exec-session-v2";
+export const CODEX_APP_SERVER_PLANNING_ADAPTER =
+  "@openai/codex@0.160.0/tool-free-app-server-tree-exec-v1";
+
+/** Only the qualified retained-planner producers declare this exact coverage. */
+export function assertRetainedPlannerCheckpointCoverage(
+  value: unknown,
+): asserts value is RetainedPlannerCheckpointCoverage {
+  const proof = value as RetainedPlannerCheckpointCoverage | undefined;
+  if (
+    !proof ||
+    Object.keys(proof).sort().join() !== "adapter,contract" ||
+    proof.contract !== "retained-planner-native-checkpoint-v1" ||
+    ![CODEX_PLANNING_ADAPTER, CODEX_APP_SERVER_PLANNING_ADAPTER].includes(
+      proof.adapter,
+    )
+  )
+    throw new Error(
+      "Planning resource coverage has no recognized native checkpoint producer",
+    );
+}
 
 /** Exact rendered turn input, shared with authenticated recovery decoding. */
 export function structuredRequestDigest(

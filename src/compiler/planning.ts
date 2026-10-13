@@ -257,6 +257,12 @@ export function paidModel(
     ...(model.providerAttemptAdmission
       ? { providerAttemptAdmission: model.providerAttemptAdmission }
       : {}),
+    ...(model.retainedPlannerCheckpointCoverage
+      ? {
+          retainedPlannerCheckpointCoverage:
+            model.retainedPlannerCheckpointCoverage,
+        }
+      : {}),
     ...(model.providerDispatchAdmission
       ? { providerDispatchAdmission: model.providerDispatchAdmission }
       : {}),
