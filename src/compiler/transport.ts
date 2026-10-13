@@ -9,13 +9,6 @@ import {
   realpathSync,
 } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { attachFault } from "../fault.js";
-import {
-  assertReviewImageBytes,
-  MAX_REVIEW_IMAGE_BYTES,
-  MAX_REVIEW_IMAGES,
-  MAX_REVIEW_TOTAL_IMAGE_BYTES,
-} from "../review-artifacts.js";
 import type {
   AgentSessionCapabilities,
   AgentSessionContinuation,
@@ -29,7 +22,15 @@ import type {
   ReviewImageInput,
 } from "../contracts.js";
 import type { Fault } from "../fault.js";
+import { attachFault } from "../fault.js";
 import type { PromptSection } from "../prompt-bytes.js";
+import {
+  assertReviewImageBytes,
+  MAX_REVIEW_IMAGE_BYTES,
+  MAX_REVIEW_IMAGES,
+  MAX_REVIEW_TOTAL_IMAGE_BYTES,
+} from "../review-artifacts.js";
+import type { ReviewBodyFile, ReviewPacket } from "../review-evidence.js";
 import type { PlanningSourceDelivery } from "./source-delivery.js";
 
 export interface PlanningModelOptions {
@@ -46,7 +47,7 @@ export interface CodexPlanningModelOptions extends PlanningModelOptions {
   sessionRoot?: string;
   /** Explicit planning transport; no runtime fallback. */
   transport?: "exec" | "app-server";
-  /** Explicitly enable canonical-source-only file reads for new exec planners. */
+  /** Canonical-source-only file reads for exec planners; enabled by default. */
   sourceArtifacts?: boolean;
 }
 
@@ -95,14 +96,24 @@ export interface PlanningTransport {
     request: PlanningRequest<unknown>,
     recover?: boolean,
   ): PlanningSourceDelivery | undefined;
+  /** Own fresh files from before rendering through native resource settlement. */
+  withSourceDelivery?<T>(
+    request: PlanningRequest<unknown>,
+    run: (delivery?: PlanningSourceDelivery) => Promise<T>,
+  ): Promise<T>;
+  /** Graph review reads canonical packet bodies, never the target checkout. */
+  withGraphReviewFiles?<T>(
+    packet: ReviewPacket,
+    run: (files: ReviewBodyFile[], root: string) => Promise<T>,
+  ): Promise<T>;
   selection(role: PlanningRole): { model: string; reasoningEffort?: string };
   /** Provider settings recorded with opt-in request capture content. */
   settings(role: PlanningRole, tree?: string): Record<string, unknown>;
   /**
    * Run one attempt, filling `turn`; progress observations are optional. With
    * `tree`, the session may read that directory with read-only tools. An
-   * explicitly configured retained planner may instead read only its current
-   * canonical source artifacts, offline; other planning calls are tool-free.
+   * exec planner reads only its current canonical source artifacts, offline.
+   * Tool-free adapters retain their existing inline delivery.
    */
   run(args: {
     role: PlanningRole;

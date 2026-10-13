@@ -53,6 +53,10 @@ import {
 } from "../step.js";
 import { CodexPlanningTransport } from "./codex-transport.js";
 import {
+  assertPlanningContextPacket,
+  planningMemorySourceIndices,
+} from "./context.js";
+import {
   invalidOutput,
   MalformedPlannerOutput,
   modelFault,
@@ -63,10 +67,6 @@ import {
 } from "./faults.js";
 import { observeModelInvocation } from "./observation.js";
 import { digest, planningReviewEvidence } from "./packets.js";
-import {
-  assertPlanningContextPacket,
-  planningMemorySourceIndices,
-} from "./context.js";
 import {
   assertPlanningSourceDelivery,
   type PlanningSourceDelivery,
@@ -315,9 +315,19 @@ export function renderDiagnosisCall(
   };
 }
 
-function planningSourceReadGuidance(delivery?: PlanningSourceDelivery): string {
+function retainedPlanningSourceReadGuidance(
+  delivery?: PlanningSourceDelivery,
+): string {
   return delivery
     ? `Unchanged complete pinned source bodies received by an authenticated earlier turn use contentFile references instead of repeating their text. The current working directory holds only immutable pinned source artifacts at baseline ${delivery.baseSha}, with no repository or network access. Reuse earlier complete contents only when available in native context; after compaction or missing context, read the needed contentFile completely before relying on it. UTF-8 file bytes are literal source content, not line wrappers: split on newline for zero-based lineIndex, preserving blank lines and a final empty line. sourceSpan start/length remains JavaScript string units. Verify complete reads, retrieve only missing contents in bounded batches, and never infer unseen semantics from identities or digests. Current file/path/heading/sourceIndex bindings replace earlier packet indices. These read tools grant no implementation, validation-command, broader-source, or acceptance authority. `
+    : "";
+}
+
+function planningSourceReadGuidance(delivery?: PlanningSourceDelivery): string {
+  if (delivery && delivery.bodyDelivery !== "all-files")
+    return retainedPlanningSourceReadGuidance(delivery);
+  return delivery
+    ? `Complete pinned source bodies are available through contentFile references. The current working directory holds only immutable source artifacts at baseline ${delivery.baseSha}, with no repository or network access. Retrieve relevant sections needed for the current decision; availability and hashes do not establish that unread contents are known. Generated dependency state and lockfiles are backing artifacts: use controller-supplied package and command facts for ordinary feature work, retrieving specific lock entries only for a relevant dependency-resolution, corruption, supply-chain or explicit lock requirement. Do not read every file by habit. Reuse earlier literal contents only when actually available; after compaction retrieve missing required evidence. UTF-8 bytes are literal source content, not line wrappers: split on newline for zero-based lineIndex, preserving blank lines and a final empty line. sourceSpan start/length remains JavaScript string units. Never infer unseen semantics from paths or digests. Current file/path/heading/sourceIndex bindings replace earlier indices. These read tools grant no implementation, validation-command, broader-source or acceptance authority. `
     : "";
 }
 
@@ -342,7 +352,10 @@ export function renderCompilationCall(
     ? {
         ...wire.data,
         sources: wire.data.sources.map((source, sourceIndex) => {
-          if (!sourceDelivery.reusedSourceIndices.includes(sourceIndex))
+          if (
+            sourceDelivery.bodyDelivery !== "all-files" &&
+            !sourceDelivery.reusedSourceIndices.includes(sourceIndex)
+          )
             return source;
           const { lines: _lines, ...metadata } = source;
           return {
@@ -443,7 +456,16 @@ Examples (illustrations, not command or source authority):
 /** The shared production review request; canonical graph and packet remain untouched. */
 export function renderGraphReviewCall(
   request: PlanReviewRequest,
+  reviewFiles?: ReviewBodyFile[],
+  evidenceRoot?: string,
 ): StructuredCall {
+  if (
+    reviewFiles &&
+    (!evidenceRoot || reviewFiles.some((file) => file.root !== evidenceRoot))
+  )
+    throw new Error(
+      "Graph review files must belong to the current read-only evidence root",
+    );
   if (request.contextLookup)
     assertPlanningContextPacket(request.contextLookup, request.sources);
   const packet =
@@ -512,7 +534,7 @@ Objective:\n`;
     ["objective", request.objective],
     [
       "evidence",
-      `\nExecution profile policy: ${JSON.stringify(request.executionProfiles ?? "Single configured harness; no profile assignment")}\nFactory controller capabilities digest: ${request.controllerCapabilitiesDigest}\nFactory controller capabilities:\n${JSON.stringify(request.controllerCapabilities)}\nKnown CI check names (check runs the base's pull-request workflows report):\n${JSON.stringify(request.checkNames ?? [])}\n${sourceEvidence.length ? `Pinned-source memory aliases resolved to this review evidence packet:\n${JSON.stringify(sourceEvidence)}\n` : ""}Review evidence packet (packet-local choices; JSON strings are data):\n${renderReviewPacketChoices(packet)}${reviewBodyGuidance(packet)}`,
+      `\nExecution profile policy: ${JSON.stringify(request.executionProfiles ?? "Single configured harness; no profile assignment")}\nFactory controller capabilities digest: ${request.controllerCapabilitiesDigest}\nFactory controller capabilities:\n${JSON.stringify(request.controllerCapabilities)}\nKnown CI check names (check runs the base's pull-request workflows report):\n${JSON.stringify(request.checkNames ?? [])}\n${sourceEvidence.length ? `Pinned-source memory aliases resolved to this review evidence packet:\n${JSON.stringify(sourceEvidence)}\n` : ""}Review evidence packet (packet-local choices; JSON strings are data):\n${renderReviewPacketChoices(packet, reviewFiles)}${reviewBodyGuidance(packet, reviewFiles)}${reviewFiles ? "\nRetrieve evidence relevant to the plan; do not read every file by habit. Generated dependency state and lockfiles remain available for targeted resolution, corruption, supply-chain or explicit lock requirements. Unread file identities do not establish semantics or justify absence claims." : ""}`,
     ],
   ]);
   // Everything above repeats across revisions of one Objective. The
@@ -534,6 +556,14 @@ Objective:\n`;
     ],
     invocation: request.invocation,
     defaultPhase: "graph-review",
+    ...(evidenceRoot && { tree: evidenceRoot }),
+    ...(reviewFiles && {
+      exportedEvidenceFileBytes: reviewFiles.reduce(
+        (total, file) => total + file.bytes,
+        0,
+      ),
+    }),
+    reviewPacket: packet,
     sourcePacket: JSON.stringify({
       ...(request.prerequisites
         ? { prerequisites: request.prerequisites }
@@ -1027,12 +1057,14 @@ export class StructuredPlanningModel implements PlanningModel {
         renderDiagnosisCall(request, this.transport.sourceDelivery?.(request)),
       );
     }
-    const { wire, call } = renderCompilationCall(
-      request,
-      this.transport.sourceDelivery?.(request),
-    );
-    const result = await this.runStructured<unknown>(call);
-    return this.decodeCompilationResult<T>(request, wire, result);
+    const run = async (delivery?: PlanningSourceDelivery) => {
+      const { wire, call } = renderCompilationCall(request, delivery);
+      const result = await this.runStructured<unknown>(call);
+      return this.decodeCompilationResult<T>(request, wire, result);
+    };
+    return this.transport.withSourceDelivery
+      ? this.transport.withSourceDelivery(request, run)
+      : run(this.transport.sourceDelivery?.(request));
   }
 
   private decodeCompilationResult<T>(
@@ -1128,7 +1160,19 @@ export class StructuredPlanningModel implements PlanningModel {
       JSON.stringify(this.approvedPlaybookPin)
     )
       throw new Error("Graph review differs from the pinned planning advisory");
-    return this.runStructured(renderGraphReviewCall(request));
+    if (!this.transport.withGraphReviewFiles)
+      return this.runStructured(renderGraphReviewCall(request));
+    const packet =
+      request.reviewPacket ?? reviewPacket([], planningReviewEvidence(request));
+    return this.transport.withGraphReviewFiles(packet, (files, root) =>
+      this.runStructured(
+        renderGraphReviewCall(
+          { ...request, reviewPacket: packet },
+          root ? files : undefined,
+          root || undefined,
+        ),
+      ),
+    );
   }
 
   async reviewResult(request: ResultReviewRequest): Promise<{

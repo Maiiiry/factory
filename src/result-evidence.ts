@@ -1,27 +1,6 @@
-import type { AcceptedWorkItemImageObservation } from "./review-image-evidence.js";
-import { objectiveCandidate } from "./qa.js";
-import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
-import { nativePrerequisiteReviewEvidence } from "./native-prerequisite-evidence.js";
-import { assertGraphRevisions, graphDigest } from "./graph-amendments.js";
-import {
-  allowanceKey,
-  assertRepairLedger,
-  consumption,
-  failureDigest,
-  itemEvent,
-  repairScopes,
-} from "./repair-policy.js";
-import { ownsPath, validOwnershipPath } from "./ownership.js";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import type { ReviewBodyFile, ReviewPacket } from "./review-evidence.js";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -30,24 +9,43 @@ import type {
   CapturedAssetSet,
   ResultReviewEvidenceSource,
   ValidationCommandReceipt,
-  WorkItem,
   WorkDiscovery,
+  WorkItem,
 } from "./contracts.js";
+import { deliveredHead } from "./delivery/branch-update.js";
+import { assertFailedValidationRecord } from "./failed-validation.js";
+import { assertGraphRevisions, graphDigest } from "./graph-amendments.js";
 import { assetSelectionDigest } from "./media.js";
+import { nativePrerequisiteReviewEvidence } from "./native-prerequisite-evidence.js";
+import { ownsPath, validOwnershipPath } from "./ownership.js";
+import { acceptedPlanningDecisionContext } from "./planning-decision-context.js";
 import { pinnedGit, pinnedGitEnvironment, pinnedGitRaw } from "./process.js";
+import { objectiveCandidate } from "./qa.js";
+import {
+  allowanceKey,
+  assertRepairLedger,
+  consumption,
+  failureDigest,
+  itemEvent,
+  repairScopes,
+} from "./repair-policy.js";
+import {
+  materializeReviewBodies,
+  type ReviewBodyFile,
+  type ReviewPacket,
+} from "./review-evidence.js";
+import type { AcceptedWorkItemImageObservation } from "./review-image-evidence.js";
+import { assertWorkRoutingState } from "./runner/routing.js";
 import {
   assertWorkDiscoveryOutput,
   type FactoryState,
   type WorkState,
 } from "./state.js";
-import { assertWorkRoutingState } from "./runner/routing.js";
-import { assertFailedValidationRecord } from "./failed-validation.js";
-import { deliveredHead } from "./delivery/branch-update.js";
 import {
-  type ValidationEvidence,
   assertRetainedReviewEvidence,
-  assertValidationExecutionControl,
   assertSelectedLfsValidation,
+  assertValidationExecutionControl,
+  type ValidationEvidence,
 } from "./validation-evidence.js";
 
 /** Read only tracked attribute files on selected paths, never arbitrary tree blobs. */
@@ -872,33 +870,7 @@ export function materializeResultTree(
     }
     if (!packet) return { directory, remove };
     rmSync(join(root, "index"));
-    mkdirSync(join(root, "pinned"));
-    mkdirSync(join(root, "evidence"));
-    const reviewFiles: ReviewBodyFile[] = [];
-    for (const [evidenceIndex, entry] of packet.evidence.entries()) {
-      // This is an inline presentation threshold, not a truncation budget.
-      // Large source, design, patch and historical bodies stay byte-identical
-      // on demand. Incomplete bodies retain their incomplete packet binding.
-      if (Buffer.byteLength(entry.content) <= 2_048) continue;
-      const bytes = Buffer.from(entry.content, "utf8");
-      if (
-        bytes.toString("utf8") !== entry.content ||
-        createHash("sha256").update(bytes).digest("hex") !== entry.digest
-      )
-        throw new Error("Review evidence bytes differ from canonical packet");
-      const path = `${entry.origin === "source" ? "pinned" : "evidence"}/${evidenceIndex}.txt`;
-      writeFileSync(join(root, path), bytes, { flag: "wx", mode: 0o400 });
-      if (!readFileSync(join(root, path)).equals(bytes))
-        throw new Error("Materialized review evidence bytes differ");
-      reviewFiles.push({
-        evidenceIndex,
-        root,
-        path,
-        encoding: "utf-8",
-        bytes: bytes.length,
-        digest: entry.digest,
-      });
-    }
+    const reviewFiles = materializeReviewBodies(root, packet);
     return { directory: root, reviewFiles, remove };
   } catch (error) {
     remove();
