@@ -1,3 +1,8 @@
+import {
+  assertReviewArtifactSelection,
+  assertReviewArtifactSelectors,
+  assertReviewArtifactSelectionSources,
+} from "./review-artifacts.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import { releaseAgentSessions } from "./agent-session.js";
@@ -1731,7 +1736,11 @@ export function repairWorkItem(
 export function rereviewWorkItem(
   config: FactoryConfig,
   objective: number,
-  input: { item: string; actor: string },
+  input: {
+    item: string;
+    actor: string;
+    reviewArtifacts?: import("./review-artifacts.js").ReviewArtifactSelector[];
+  },
 ): void {
   const handle = mutationLock(config, objective);
   try {
@@ -1819,6 +1828,24 @@ export function rereviewWorkItem(
         "Result re-review tree differs from the pending exact result",
       );
     if (!input.actor.trim()) throw new Error("Result re-review requires actor");
+    if (input.reviewArtifacts !== undefined) {
+      const item = state.graph.items.find((item) => item.id === input.item)!;
+      if (item.kind !== "qa" && item.kind !== "aggregate")
+        throw new Error("Prospective evidence selection requires read-only QA");
+      assertReviewArtifactSelection(
+        input.reviewArtifacts,
+        item.validation.map((check) => check.command),
+      );
+      assertReviewArtifactSelectors([
+        ...(config.reviewArtifacts ?? []),
+        ...input.reviewArtifacts,
+      ]);
+      assertReviewArtifactSelectionSources(
+        config.checkout,
+        treeSha,
+        input.reviewArtifacts,
+      );
+    }
     if (validatedDefect) {
       const validation = work.validation!;
       const observation = validation.worktreeObservation;
@@ -1899,6 +1926,8 @@ export function rereviewWorkItem(
     delete recovery.correction;
     delete recovery.phase;
     work.recovery = recovery;
+    if (input.reviewArtifacts !== undefined)
+      work.reviewArtifactSelection = structuredClone(input.reviewArtifacts);
     if (validatedDefect && state.error) {
       delete state.error;
       delete state.errorItem;

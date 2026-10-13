@@ -247,7 +247,7 @@ export interface FactoryConfig {
     /** Eligible retained knowledge in this same repository only. */
     memory?: boolean;
   };
-  /** Explicit generated PNG evidence selection; omission retains no artifacts. */
+  /** Explicit validation image/text proof selection; omission retains no artifacts. */
   reviewArtifacts?: ReviewArtifactSelector[];
   /** Explicit disclosure opt-in; omission publishes no operational summary. */
   githubManagement?: {

@@ -5,6 +5,7 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readSync,
@@ -43,6 +44,7 @@ import {
   assertReviewArtifactSelectors,
   assertReviewArtifacts,
   captureReviewArtifacts,
+  MAX_REVIEW_IMAGE_BYTES,
   type ReviewArtifactSelector,
 } from "./review-artifacts.js";
 import { stepDeadlineAt } from "./step.js";
@@ -460,175 +462,236 @@ export async function validateCheckout(
       : ("modified" as const);
   if (preparation.commands.length) evidence.preparation = [];
   const sequence = [...preparation.commands, ...commands];
-  for (const [sequenceIndex, check] of sequence.entries()) {
-    const preparing = sequenceIndex < preparation.commands.length;
-    const index = preparing
-      ? sequenceIndex
-      : sequenceIndex - preparation.commands.length;
-    const commandObserver = preparing ? preparation.observe : observe;
-    const outputObserver = preparing
-      ? preparation.observeOutput
-      : observeOutput;
-    const worktreeStatusBefore = candidateStatus();
-    const started = Date.now();
-    const cancellation = currentProcessSignal();
-    const controllerDeadline = currentProcessDeadlineAt();
-    const executionControl: ValidationCommandReceipt["executionControl"] =
-      cancellation && !cancellation.aborted
-        ? {
-            scope: "controller-owned-process-group",
-            cancellation: "active-at-dispatch",
-            settlement: "verified",
-            ...(controllerDeadline === stepDeadlineAt() &&
-              controllerDeadline !== undefined &&
-              Number.isFinite(Date.parse(controllerDeadline)) &&
-              Date.parse(controllerDeadline) > started && {
-                deadlineAt: controllerDeadline,
-              }),
+  const temporaryRoot = reviewArtifacts.some(
+    (selector) => "text" in selector && selector.text.locator,
+  )
+    ? mkdtempSync(join(root, "validation-artifacts-"))
+    : undefined;
+  try {
+    for (const [sequenceIndex, check] of sequence.entries()) {
+      const preparing = sequenceIndex < preparation.commands.length;
+      const index = preparing
+        ? sequenceIndex
+        : sequenceIndex - preparation.commands.length;
+      const commandObserver = preparing ? preparation.observe : observe;
+      const outputObserver = preparing
+        ? preparation.observeOutput
+        : observeOutput;
+      const worktreeStatusBefore = candidateStatus();
+      const started = Date.now();
+      const cancellation = currentProcessSignal();
+      const controllerDeadline = currentProcessDeadlineAt();
+      const executionControl: ValidationCommandReceipt["executionControl"] =
+        cancellation && !cancellation.aborted
+          ? {
+              scope: "controller-owned-process-group",
+              cancellation: "active-at-dispatch",
+              settlement: "verified",
+              ...(controllerDeadline === stepDeadlineAt() &&
+                controllerDeadline !== undefined &&
+                Number.isFinite(Date.parse(controllerDeadline)) &&
+                Date.parse(controllerDeadline) > started && {
+                  deadlineAt: controllerDeadline,
+                }),
+            }
+          : undefined;
+      const settlement = { verified: false };
+      let stdout = "";
+      let stderr = "";
+      const streamLimit = (stream: "stdout" | "stderr") => {
+        const limits = reviewArtifacts.flatMap((selector) =>
+          "text" in selector && selector.command === check
+            ? [
+                ...(selector.text[stream]
+                  ? [selector.text[stream]!.maxBytes]
+                  : []),
+                ...(stream === "stdout" && selector.text.locator
+                  ? [MAX_REVIEW_IMAGE_BYTES]
+                  : []),
+              ]
+            : [],
+        );
+        return limits.length ? Math.min(...limits) : undefined;
+      };
+      const originalStreams = {
+        stdout: {
+          chunks: [] as Buffer[],
+          bytes: 0,
+          limit: streamLimit("stdout"),
+        },
+        stderr: {
+          chunks: [] as Buffer[],
+          bytes: 0,
+          limit: streamLimit("stderr"),
+        },
+      };
+      const decoders = {
+        stdout: new StringDecoder("utf8"),
+        stderr: new StringDecoder("utf8"),
+      };
+      const result = await subprocessAsync(
+        "sh",
+        localValidationShellArguments(check),
+        {
+          cwd: worktree,
+          env: {
+            ...localValidationEnvironment(emptyCredentials),
+            ...(temporaryRoot && {
+              TMPDIR: temporaryRoot,
+              TMP: temporaryRoot,
+              TEMP: temporaryRoot,
+            }),
+          },
+        },
+        undefined,
+        (stream, chunk) => {
+          const original = originalStreams[stream];
+          if (original.limit !== undefined) {
+            const remaining = original.limit + 1 - original.bytes;
+            if (remaining > 0) {
+              const bytes = Buffer.from(chunk.subarray(0, remaining));
+              original.chunks.push(bytes);
+              original.bytes += bytes.length;
+            }
           }
-        : undefined;
-    const settlement = { verified: false };
-    let stdout = "";
-    let stderr = "";
-    const decoders = {
-      stdout: new StringDecoder("utf8"),
-      stderr: new StringDecoder("utf8"),
-    };
-    const result = await subprocessAsync(
-      "sh",
-      localValidationShellArguments(check),
-      {
-        cwd: worktree,
-        env: localValidationEnvironment(emptyCredentials),
-      },
-      undefined,
-      (stream, chunk) => {
-        const text = decoders[stream].write(chunk);
-        if (stream === "stdout") stdout += text;
-        else stderr += text;
-        if (text)
-          outputObserver?.({ index, stream, output: text, final: false });
-      },
-      (entry) => {
-        if (entry.event === "cessation" && entry.status === "verified")
-          settlement.verified = true;
-      },
-    );
-    for (const stream of ["stdout", "stderr"] as const) {
-      const trailing = decoders[stream].end();
-      if (stream === "stdout") stdout += trailing;
-      else stderr += trailing;
-      outputObserver?.({ index, stream, output: trailing, final: true });
-    }
-    const output = `${stdout}${stderr}`;
-    commandObserver?.({
-      index,
-      passed: result.status === 0,
-      exitCode: result.status ?? -1,
-      durationMs: Date.now() - started,
-      output,
-    });
-    if (hasUnresolvedSubprocesses())
-      throw new Error(
-        "Validation subprocess ownership unresolved; checkout retained",
+          const text = decoders[stream].write(chunk);
+          if (stream === "stdout") stdout += text;
+          else stderr += text;
+          if (text)
+            outputObserver?.({ index, stream, output: text, final: false });
+        },
+        (entry) => {
+          if (entry.event === "cessation" && entry.status === "verified")
+            settlement.verified = true;
+        },
       );
-    partial.postCommandStatus = candidateStatus();
-    if (!preparing)
-      partial.commands.push({
+      for (const stream of ["stdout", "stderr"] as const) {
+        const trailing = decoders[stream].end();
+        if (stream === "stdout") stdout += trailing;
+        else stderr += trailing;
+        outputObserver?.({ index, stream, output: trailing, final: true });
+      }
+      const output = `${stdout}${stderr}`;
+      commandObserver?.({
+        index,
+        passed: result.status === 0,
+        exitCode: result.status ?? -1,
+        durationMs: Date.now() - started,
+        output,
+      });
+      if (hasUnresolvedSubprocesses())
+        throw new Error(
+          "Validation subprocess ownership unresolved; checkout retained",
+        );
+      partial.postCommandStatus = candidateStatus();
+      if (!preparing)
+        partial.commands.push({
+          index,
+          command: check,
+          passed: result.status === 0,
+          exitCode: result.status,
+          treeSha,
+          worktreeStatusBefore,
+          worktreeStatusAfter: partial.postCommandStatus,
+          ...(result.stoppedLeftovers && {
+            stoppedLeftovers: result.stoppedLeftovers,
+          }),
+        });
+      if (result.status !== 0) {
+        const detail = `Validation command failed (${result.status}): ${check}: ${output}`;
+        // The dependency install is the controller's own bootstrap step. When
+        // the candidate left every manifest and lockfile as at the accepted
+        // base, the same install worked there, so its failure is the
+        // environment's: it repeats and charges no repair (#839). A changed
+        // manifest or lockfile may be what broke it: the candidate's fault.
+        if (
+          packageBootstrap(check) !== undefined &&
+          !dependencyInputsChanged(worktree, acceptedBaseSha, commit)
+        )
+          throw new StepFault(transient(detail, false));
+        throw new CandidateValidationFailure(
+          detail,
+          retainFailedValidation && !preparing ? partial : undefined,
+        );
+      }
+      if (!preparing && contentStore && reviewArtifacts.length) {
+        const captured = await captureReviewArtifacts({
+          worktree,
+          treeSha,
+          commandIndex: index,
+          command: check,
+          stdout,
+          stderr,
+          ...(originalStreams.stdout.limit !== undefined && {
+            stdoutBytes: Buffer.concat(originalStreams.stdout.chunks),
+          }),
+          ...(originalStreams.stderr.limit !== undefined && {
+            stderrBytes: Buffer.concat(originalStreams.stderr.chunks),
+          }),
+          temporaryRoot,
+          selectors: reviewArtifacts,
+          contentStore,
+        });
+        if (captured.length) {
+          if (!evidence.reviewArtifacts) evidence.reviewArtifacts = [];
+          evidence.reviewArtifacts.push(...captured);
+        }
+      }
+      (preparing ? evidence.preparation! : evidence.commands).push({
         index,
         command: check,
-        passed: result.status === 0,
-        exitCode: result.status,
+        passed: true,
+        exitCode: 0,
         treeSha,
-        worktreeStatusBefore,
-        worktreeStatusAfter: partial.postCommandStatus,
+        ...(executionControl && settlement.verified && { executionControl }),
         ...(result.stoppedLeftovers && {
           stoppedLeftovers: result.stoppedLeftovers,
         }),
       });
-    if (result.status !== 0) {
-      const detail = `Validation command failed (${result.status}): ${check}: ${output}`;
-      // The dependency install is the controller's own bootstrap step. When
-      // the candidate left every manifest and lockfile as at the accepted
-      // base, the same install worked there, so its failure is the
-      // environment's: it repeats and charges no repair (#839). A changed
-      // manifest or lockfile may be what broke it: the candidate's fault.
-      if (
-        packageBootstrap(check) !== undefined &&
-        !dependencyInputsChanged(worktree, acceptedBaseSha, commit)
-      )
-        throw new StepFault(transient(detail, false));
+    }
+    for (const member of lfsMembers) {
+      assertSelectedLfsPointer(worktree, member);
+      assertSelectedLfsBytes(worktree, member);
+    }
+    if (hasUnresolvedSubprocesses())
+      throw new Error(
+        "Validation subprocess ownership unresolved; checkout retained",
+      );
+    if (candidateStatus() !== "unchanged") {
+      partial.reason = "worktree-mutation";
       throw new CandidateValidationFailure(
-        detail,
-        retainFailedValidation && !preparing ? partial : undefined,
+        `Validation command modified the result tree: ${validationMutationDetail(
+          hydratedPaths,
+          pinnedGitRaw(
+            worktree,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+          ),
+        )}`,
+        retainFailedValidation ? partial : undefined,
       );
     }
-    if (!preparing && contentStore && reviewArtifacts.length) {
-      const captured = await captureReviewArtifacts({
-        worktree,
-        treeSha,
-        commandIndex: index,
-        command: check,
-        stdout,
-        selectors: reviewArtifacts,
-        contentStore,
-      });
-      if (captured.length) {
-        if (!evidence.reviewArtifacts) evidence.reviewArtifacts = [];
-        evidence.reviewArtifacts.push(...captured);
-      }
-    }
-    (preparing ? evidence.preparation! : evidence.commands).push({
-      index,
-      command: check,
-      passed: true,
-      exitCode: 0,
+    assertReviewArtifacts(evidence.reviewArtifacts, treeSha, evidence.commands);
+    evidence.worktreeObservation = {
       treeSha,
-      ...(executionControl && settlement.verified && { executionControl }),
-      ...(result.stoppedLeftovers && {
-        stoppedLeftovers: result.stoppedLeftovers,
-      }),
-    });
+      initialStatus: "clean",
+      postHydrationStatus: {
+        porcelainSha256: createHash("sha256")
+          .update(hydratedStatus)
+          .digest("hex"),
+        empty: hydratedStatus.length === 0,
+      },
+      postCommandStatus: "unchanged",
+      selectedLfsMembers: selectedLfs.length,
+      subprocessOwnership: "settled",
+    };
+    return evidence;
+  } finally {
+    if (temporaryRoot && !hasUnresolvedSubprocesses())
+      rmSync(temporaryRoot, { recursive: true, force: true });
   }
-  for (const member of lfsMembers) {
-    assertSelectedLfsPointer(worktree, member);
-    assertSelectedLfsBytes(worktree, member);
-  }
-  if (hasUnresolvedSubprocesses())
-    throw new Error(
-      "Validation subprocess ownership unresolved; checkout retained",
-    );
-  if (candidateStatus() !== "unchanged") {
-    partial.reason = "worktree-mutation";
-    throw new CandidateValidationFailure(
-      `Validation command modified the result tree: ${validationMutationDetail(
-        hydratedPaths,
-        pinnedGitRaw(
-          worktree,
-          "status",
-          "--porcelain=v1",
-          "-z",
-          "--untracked-files=all",
-        ),
-      )}`,
-      retainFailedValidation ? partial : undefined,
-    );
-  }
-  assertReviewArtifacts(evidence.reviewArtifacts, treeSha, evidence.commands);
-  evidence.worktreeObservation = {
-    treeSha,
-    initialStatus: "clean",
-    postHydrationStatus: {
-      porcelainSha256: createHash("sha256")
-        .update(hydratedStatus)
-        .digest("hex"),
-      empty: hydratedStatus.length === 0,
-    },
-    postCommandStatus: "unchanged",
-    selectedLfsMembers: selectedLfs.length,
-    subprocessOwnership: "settled",
-  };
-  return evidence;
 }
 
 /**
