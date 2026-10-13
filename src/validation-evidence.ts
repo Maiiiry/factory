@@ -140,6 +140,14 @@ export function assertRetainedReviewEvidence(
 
 export interface ValidationWorktreeObservation {
   treeSha: string;
+  /** The owning validator created this checkout before executing this sequence. */
+  checkoutPreparation?: {
+    kind: "fresh-detached-worktree";
+    commitSha: string;
+    commandSequence: "after-checkout-creation";
+    /** Only finalization of a recorded current-graph integration supplies this. */
+    afterIntegrationSha?: string;
+  };
   initialStatus: "clean";
   /** Status may differ from empty only because selected bytes were hydrated. */
   postHydrationStatus: { porcelainSha256: string; empty: boolean };
@@ -153,6 +161,7 @@ export function assertValidationWorktreeObservation(
   value: unknown,
   treeSha: string,
   selectedLfs: SelectedLfsValidation[] = [],
+  commitSha?: string,
 ): asserts value is ValidationWorktreeObservation | undefined {
   if (value === undefined) return;
   const observation = value as ValidationWorktreeObservation;
@@ -169,6 +178,9 @@ export function assertValidationWorktreeObservation(
         "postCommandStatus",
         "selectedLfsMembers",
         "subprocessOwnership",
+        ...(observation.checkoutPreparation === undefined
+          ? []
+          : ["checkoutPreparation"]),
       ]
         .sort()
         .join() ||
@@ -193,6 +205,35 @@ export function assertValidationWorktreeObservation(
   )
     throw new Error(
       "Validator worktree observation differs from its canonical exact-tree evidence",
+    );
+  const prepared = observation.checkoutPreparation;
+  if (
+    prepared !== undefined &&
+    (!prepared ||
+      typeof prepared !== "object" ||
+      Array.isArray(prepared) ||
+      Object.keys(prepared).sort().join() !==
+        [
+          "kind",
+          "commitSha",
+          "commandSequence",
+          ...(prepared.afterIntegrationSha === undefined
+            ? []
+            : ["afterIntegrationSha"]),
+        ]
+          .sort()
+          .join() ||
+      prepared.kind !== "fresh-detached-worktree" ||
+      typeof prepared.commitSha !== "string" ||
+      !/^[a-f0-9]{40}$/.test(prepared.commitSha) ||
+      (commitSha !== undefined && prepared.commitSha !== commitSha) ||
+      prepared.commandSequence !== "after-checkout-creation" ||
+      (prepared.afterIntegrationSha !== undefined &&
+        (typeof prepared.afterIntegrationSha !== "string" ||
+          !/^[a-f0-9]{40}$/.test(prepared.afterIntegrationSha))))
+  )
+    throw new Error(
+      "Validation checkout preparation differs from its exact candidate",
     );
 }
 

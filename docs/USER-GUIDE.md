@@ -374,6 +374,8 @@ The section cannot be added retroactively to an accepted plan: its Objective bod
 
 ## Run
 
+Final validation records when its controller creates a new detached checkout of the exact candidate before running commands. A final review receives that preparation fact alongside command/tree receipts and, for a recorded graph integration, the integration commit that preceded validation. Read-only baseline checks make no integration claim. Generic existing-checkout validation and older receipts without preparation provenance remain unknown on checkout freshness; clean status or identical trees cannot supply it.
+
 ```sh
 factory run --objective N [--deadline ISO_TIMESTAMP]
 ```

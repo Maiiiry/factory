@@ -118,7 +118,17 @@ export async function reviewAcceptance(args: {
     evidence.worktreeObservation,
     evidence.treeSha,
     evidence.selectedLfs,
+    commit,
   );
+  const integrated =
+    evidence.worktreeObservation?.checkoutPreparation?.afterIntegrationSha;
+  if (integrated !== undefined) {
+    if (args.reviewPhase !== "objective-review")
+      throw new Error(
+        "Post-integration checkout provenance requires final Objective review",
+      );
+    pinnedGit(checkout, "merge-base", "--is-ancestor", integrated, commit);
+  }
   const worktreeEvidence = evidence.worktreeObservation
     ? [
         {
