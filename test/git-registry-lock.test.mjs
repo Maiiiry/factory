@@ -1052,6 +1052,103 @@ test("the actual creating lease settles only a fresh failed reservation and arch
           await writeFile(failurePath, failureBytes);
         }
         assert.deepEqual(await buildClosure(), verified);
+        const ownedBase = await readVerifiedRecoveryCheckpoint(config);
+        const offset = (await readFile(diagnosticPath(repository, 0))).length;
+        for (let index = 0; index < 2; index++) {
+          markCheckpointDirty(repository, {
+            path: `project-queue-history/${claim.id}.json`,
+            kind: "historical",
+          });
+          await awaitCheckpointAdmission(repository, "before-effect");
+        }
+        const events = (await readFile(diagnosticPath(repository, 0)))
+          .subarray(offset)
+          .toString("utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const completed = events.filter(
+          (event) => event.outcome === "completed",
+        );
+        const transports = completed.filter(
+          (event) => event.operation === "recovery-checkpoint-transport",
+        );
+        assert.equal(
+          transports.filter((event) => event.metadata.kind === "ls-remote")
+            .length,
+          2,
+        );
+        assert.equal(
+          transports.filter((event) => event.metadata.kind === "fetch").length,
+          2,
+          "only the mandatory independently fetched candidate ACK remains per warm push",
+        );
+        assert.equal(
+          transports.filter((event) => event.metadata.kind === "push").length,
+          2,
+        );
+        for (const event of transports.filter(
+          (event) => event.metadata.kind === "push",
+        )) {
+          assert.equal(event.metadata.trace2, "observed");
+          assert(event.metadata.maxGitChildWallMs >= 0);
+          assert.equal(
+            JSON.stringify(event.metadata).includes(directory),
+            false,
+          );
+        }
+        const parents = completed.filter(
+          (event) =>
+            event.operation === "recovery-checkpoint-publication-parent",
+        );
+        assert.equal(parents.length, 2);
+        assert(parents.every((event) => event.metadata.reused));
+        for (const event of [...transports, ...parents]) {
+          assert(event.durationMs >= 0);
+          assert(event.metadata.parentCpuUserUs >= 0);
+          assert(event.metadata.parentCpuSystemUs >= 0);
+          assert.equal(event.metadata.parentCpuScope, "process-wide-interval");
+          assert.equal(event.metadata.childCpu, "unavailable");
+        }
+        const publisher = join(stateRoot(repository), "recovery", "git.git");
+        const objectPath = join(
+          publisher,
+          "objects",
+          ownedBase.commitSha.slice(0, 2),
+          ownedBase.commitSha.slice(2),
+        );
+        const bytes = await readFile(objectPath),
+          mode = (await stat(objectPath)).mode & 0o777;
+        try {
+          await chmod(objectPath, 0o600);
+          await writeFile(objectPath, Buffer.concat([bytes, Buffer.from("x")]));
+          await chmod(objectPath, mode);
+          markCheckpointDirty(repository, {
+            path: `project-queue-history/${claim.id}.json`,
+            kind: "historical",
+          });
+          const before = execFileSync(
+            "git",
+            [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+            { encoding: "utf8" },
+          ).trim();
+          await assert.rejects(
+            awaitCheckpointAdmission(repository, "before-effect"),
+            /altered or missing object material/,
+          );
+          assert.equal(
+            execFileSync(
+              "git",
+              [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+              { encoding: "utf8" },
+            ).trim(),
+            before,
+          );
+        } finally {
+          await chmod(objectPath, 0o600);
+          await writeFile(objectPath, bytes);
+          await chmod(objectPath, mode);
+        }
       },
     );
     const forged = structuredClone(claim);
@@ -2225,6 +2322,79 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         (await readQueueHistory(config)).find((row) => row.id === admission.id)
           .completed,
         undefined,
+      );
+      await withRecoveryCheckpointControllerVerification(
+        { config, buildClosure },
+        async () => {
+          const current = await readVerifiedRecoveryCheckpoint(config);
+          const tree = execFileSync(
+            "git",
+            [`--git-dir=${remote}`, "rev-parse", `${current.commitSha}^{tree}`],
+            { encoding: "utf8" },
+          ).trim();
+          const advanced = execFileSync(
+            "git",
+            [
+              `--git-dir=${remote}`,
+              "-c",
+              "user.name=Fixture",
+              "-c",
+              "user.email=fixture@example.test",
+              "commit-tree",
+              tree,
+              "-p",
+              current.commitSha,
+            ],
+            { input: "External archive advance\n", encoding: "utf8" },
+          ).trim();
+          execFileSync("git", [
+            `--git-dir=${remote}`,
+            "update-ref",
+            config.gitPersistence.ref,
+            advanced,
+            current.commitSha,
+          ]);
+          markCheckpointDirty(repository, {
+            path: `project-queue-history/${operationId}.json`,
+            kind: "historical",
+          });
+          const offset = (await readFile(diagnosticPath(repository, 0))).length;
+          await assert.rejects(
+            awaitCheckpointAdmission(repository, "before-effect"),
+            /changed before.*push|changed before bounded publication/,
+          );
+          assert.equal(
+            execFileSync(
+              "git",
+              [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+              { encoding: "utf8" },
+            ).trim(),
+            advanced,
+          );
+          const events = (await readFile(diagnosticPath(repository, 0)))
+            .subarray(offset)
+            .toString("utf8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          assert(
+            events.some(
+              (event) =>
+                event.operation === "recovery-checkpoint-publication-parent" &&
+                event.outcome === "completed" &&
+                event.metadata.reused,
+            ),
+          );
+          assert.equal(
+            events.some(
+              (event) =>
+                event.operation === "recovery-checkpoint-transport" &&
+                event.metadata.kind === "push",
+            ),
+            false,
+            "immutable parent reuse cannot skip fresh remote authority or dispatch a conflicting push",
+          );
+        },
       );
     });
   } finally {

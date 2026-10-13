@@ -812,6 +812,9 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     { mode: 0o600 },
   );
   const retainedCheckpointSources = [];
+  let incrementalSourceCommit;
+  let incrementalSourceCheckpoint;
+  let incrementalSourcePacks;
   let returnedClosureMutation;
   const buildClosure = async () => {
     const actual = await buildRecoveryCheckpointClosure({
@@ -2334,10 +2337,32 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
           pressureStart.metadata.lineageEntries > 0,
           "cheap metadata pressure preserves the independently validated ancestry",
         );
+        const metadataPressureEvents = pressureEvents.filter(
+          (event) => typeof event.metadata.metadataBytes === "number",
+        );
+        assert(metadataPressureEvents.length > 0);
         assert(
-          pressureEvents.every(
+          metadataPressureEvents.every(
             (event) => event.metadata.metadataBytes <= 8 * 1024 * 1024,
           ),
+          JSON.stringify({
+            maximumMetadataBytes: Math.max(
+              ...metadataPressureEvents.map(
+                (event) => event.metadata.metadataBytes,
+              ),
+            ),
+            overBudget: metadataPressureEvents
+              .filter((event) => event.metadata.metadataBytes > 8 * 1024 * 1024)
+              .map((event) => ({
+                operation: event.operation,
+                phase: event.metadata.phase,
+                metadata: Object.fromEntries(
+                  Object.entries(event.metadata).filter(
+                    ([, value]) => typeof value === "number",
+                  ),
+                ),
+              })),
+          }),
         );
         assert(
           pressureEvents.some(
@@ -2598,6 +2623,186 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         childProcess.execFileSync = originalExec;
         syncBuiltinESMExports();
       }
+      // A current closure carries the original baseline plus only newly
+      // reachable Git objects. These are actual source observations, not work
+      // acceptance or invented provider evidence.
+      const baselinePacks = (await buildClosure()).files.filter(
+        (file) => file.kind === "git-pack",
+      );
+      assert.equal(baselinePacks.length, 1);
+      writeFileSync(join(checkout, "incremental.md"), "New retained source.\n");
+      git("add", "incremental.md");
+      git("commit", "-m", "Append retained source");
+      incrementalSourceCommit = git("rev-parse", "HEAD");
+      const observationRef = content.putBytes(
+        Buffer.from(
+          JSON.stringify({
+            executionBaseSha: cancelled.baseSha,
+            changeRef: incrementalSourceCommit,
+            treeSha: git("rev-parse", "HEAD^{tree}"),
+          }),
+        ),
+        { mediaType: "application/json" },
+      );
+      memory.retain({
+        ...record,
+        producer: {
+          ...record.producer,
+          identity: "actual-appended-git-source",
+        },
+        summary: "Observed an appended Git source commit",
+        bodies: [
+          {
+            role: "attempt-observation",
+            ref: observationRef,
+            availability: "retained",
+          },
+        ],
+        sources: [],
+        bindings: {},
+      });
+      // This new blob was never covered by the baseline. Its wrong-OID bytes
+      // must refuse even though every previously observed object is unchanged.
+      const newBlob = git(
+        "rev-parse",
+        `${incrementalSourceCommit}:incremental.md`,
+      );
+      const newObjectPath = join(
+        git("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        newBlob.slice(0, 2),
+        newBlob.slice(2),
+      );
+      const newObjectOriginal = readFileSync(newObjectPath);
+      const newObjectMode = statSync(newObjectPath).mode & 0o777;
+      const wrongNewBlob = Buffer.from("Changed retained source.\n");
+      try {
+        chmodSync(newObjectPath, 0o600);
+        writeFileSync(
+          newObjectPath,
+          deflateSync(
+            Buffer.concat([
+              Buffer.from(`blob ${wrongNewBlob.length}\0`),
+              wrongNewBlob,
+            ]),
+          ),
+        );
+        assert.equal(git("cat-file", "-t", newBlob), "blob");
+        await assert.rejects(
+          buildClosure(),
+          /pack union failed exact reachable-object verification|objects could not be packed/,
+        );
+      } finally {
+        writeFileSync(newObjectPath, newObjectOriginal);
+        chmodSync(newObjectPath, newObjectMode);
+      }
+      incrementalSourcePacks = (await buildClosure()).files.filter(
+        (file) => file.kind === "git-pack",
+      );
+      assert.equal(incrementalSourcePacks.length, 2);
+      assert.deepEqual(incrementalSourcePacks[0].ref, baselinePacks[0].ref);
+      assert.deepEqual(
+        (await buildClosure()).files.filter((file) => file.kind === "git-pack"),
+        incrementalSourcePacks,
+      );
+      t.diagnostic(
+        `Retained source baseline ${baselinePacks[0].ref.bytes} bytes; incremental ${incrementalSourcePacks[1].ref.bytes} bytes`,
+      );
+      const packedOnly = join(root, "incremental-pack-only.git");
+      execFileSync("git", ["init", "--bare", packedOnly], { stdio: "pipe" });
+      execFileSync("git", ["-C", packedOnly, "index-pack", "--stdin"], {
+        input: content.readBytes(incrementalSourcePacks[1].ref),
+        stdio: "pipe",
+      });
+      assert.equal(
+        execFileSync(
+          "git",
+          ["-C", packedOnly, "cat-file", "-t", incrementalSourceCommit],
+          { encoding: "utf8" },
+        ).trim(),
+        "commit",
+      );
+      assert.equal(
+        execFileSync("git", ["-C", packedOnly, "cat-file", "-t", newBlob], {
+          encoding: "utf8",
+        }).trim(),
+        "blob",
+      );
+      assert.throws(() =>
+        execFileSync(
+          "git",
+          ["-C", packedOnly, "cat-file", "-e", cancelled.baseSha],
+          { stdio: "pipe" },
+        ),
+      );
+      rmSync(packedOnly, { recursive: true });
+      incrementalSourceCheckpoint = (
+        await synchronizeRecoveryCheckpoint(config, {
+          reason: "explicit",
+          buildClosure,
+        })
+      ).lastAcknowledged.commitSha;
+      const baselineRef = baselinePacks[0].ref;
+      const baselinePath = join(
+        state,
+        "content",
+        baselineRef.digest.slice(0, 2),
+        baselineRef.digest,
+      );
+      const baselineOriginal = content.readBytes(baselineRef);
+      const alteredPack = Buffer.from(baselineOriginal);
+      alteredPack[0] ^= 1;
+      try {
+        writeFileSync(baselinePath, alteredPack);
+        await assert.rejects(buildClosure(), /failed digest verification/);
+        rmSync(baselinePath);
+        await assert.rejects(buildClosure(), /ENOENT/);
+      } finally {
+        content.putBytes(baselineOriginal, {
+          mediaType: baselineRef.mediaType,
+        });
+      }
+      // A valid compressed blob stored under the wrong OID still reports its
+      // type. A full capture must reject its changed content cryptographically.
+      const oldBlob = git("rev-parse", `${cancelled.baseSha}:api.md`);
+      const sourceObjectPath = join(
+        git("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        oldBlob.slice(0, 2),
+        oldBlob.slice(2),
+      );
+      const sourceObject = readFileSync(sourceObjectPath);
+      const sourceMode = statSync(sourceObjectPath).mode & 0o777;
+      const corruptBlob = Buffer.from(source);
+      corruptBlob[0] ^= 1;
+      try {
+        chmodSync(sourceObjectPath, 0o600);
+        writeFileSync(
+          sourceObjectPath,
+          deflateSync(
+            Buffer.concat([
+              Buffer.from(`blob ${corruptBlob.length}\0`),
+              corruptBlob,
+            ]),
+          ),
+        );
+        await assert.rejects(
+          buildClosure(),
+          /pack union failed exact reachable-object verification|objects could not be packed/,
+        );
+      } finally {
+        writeFileSync(sourceObjectPath, sourceObject);
+        chmodSync(sourceObjectPath, sourceMode);
+      }
+      // Changed material is not automatically corruption: real Git repacking
+      // takes a complete newly authenticated capture and remains usable.
+      git("repack", "-ad");
+      const repacked = (await buildClosure()).files.filter(
+        (file) => file.kind === "git-pack",
+      );
+      assert.equal(repacked.length, 1);
+      assert.deepEqual(
+        (await buildClosure()).files.filter((file) => file.kind === "git-pack"),
+        repacked,
+      );
     },
   );
   assert.deepEqual(verifierDirectories(), []);
@@ -3121,6 +3326,37 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     source,
   );
   assert.equal(gitPersistenceStatus(nextConfig).attemptedCommit, undefined);
+  // The earlier current manifest must stand alone on a cold host: all packs
+  // come from the selected archive, not earlier local snapshots or Git objects.
+  rmSync(nextCheckout, { recursive: true });
+  rmSync(state, { recursive: true });
+  const incrementalCheckout = join(root, "incremental-cold-checkout");
+  execFileSync("git", ["init", incrementalCheckout], { stdio: "pipe" });
+  const incrementalConfig = { ...config, checkout: incrementalCheckout };
+  const incrementalRestore = await restoreRecoveryCheckpoint({
+    config: incrementalConfig,
+    checkpoint: incrementalSourceCheckpoint,
+  });
+  assert.equal(incrementalRestore.disposition, "inspection");
+  const restoredContent = new LocalContentStore(join(state, "content"));
+  for (const pack of incrementalSourcePacks)
+    restoredContent.verifyPrivateBytes(pack.ref);
+  execFileSync(
+    "git",
+    [
+      "-C",
+      incrementalCheckout,
+      "checkout",
+      "--detach",
+      incrementalSourceCommit,
+    ],
+    { stdio: "pipe" },
+  );
+  assert.deepEqual(readFileSync(join(incrementalCheckout, "api.md")), source);
+  assert.equal(
+    readFileSync(join(incrementalCheckout, "incremental.md"), "utf8"),
+    "New retained source.\n",
+  );
 });
 
 test("selector-bound discovery retains exact bytes, distinguishes incomplete output, and transfers declared fields without delivery", async (t) => {
