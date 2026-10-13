@@ -271,9 +271,9 @@ export type ModelInvocationObserver = ((
 };
 
 export interface ModelInvocationContext {
-  /** Awaited controller admission after recording each native attempt, before submission; absent on cached decode. */
+  /** Record and validate each bounded attempt; facts may share the declared following dispatch checkpoint. Absent on cached decode. */
   beforeProviderAttempt?: () => void | Promise<void>;
-  /** Awaited dispatch intent after all attempt admission succeeds, immediately before transport submission. */
+  /** Awaited dispatch intent and all prior attempt facts after local attempt admission succeeds, immediately before transport submission. */
   beforeProviderDispatch?: () => void | Promise<void>;
   /** Exact native return retained before release. Confirm admission only after its durable checkpoint succeeds; void callers retain adapter admission. */
   retainNativeReturn?(receipt: {
@@ -693,7 +693,7 @@ export interface RetainedPlannerCheckpointCoverage {
 export interface PlanningModel {
   readonly retainedPlannerCheckpointCoverage?: RetainedPlannerCheckpointCoverage;
   readonly providerAttemptAdmission?: "controller-checkpoint-v1";
-  /** The model checkpoints dispatch only after the complete attempt-admission callback succeeds. */
+  /** Invoke the awaited dispatch callback immediately after complete local attempt admission, before any transport effect; their facts may share that checkpoint. */
   readonly providerDispatchAdmission?: "after-attempt-admission-v1";
   readonly sessionCapabilities?: AgentSessionCapabilities;
   reconcileSession?(
