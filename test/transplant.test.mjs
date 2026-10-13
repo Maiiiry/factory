@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdtempSync,
+  existsSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -17,6 +18,7 @@ import {
   renderDiagnosisCall,
   renderGraphReviewCall,
 } from "../dist/compiler/model.js";
+import { CodexPlanningTransport } from "../dist/compiler/codex-transport.js";
 import { renderPlanningInstructions } from "../dist/compiler/planning.js";
 import {
   deliveredPlanningSources,
@@ -387,7 +389,7 @@ test("independent prepared change is replayed on the observed integration head",
   }
 });
 
-test("retained graph amendments render exact pinned inputs once and keep canonical definitions", () => {
+test("retained graph amendments render exact pinned inputs once and keep canonical definitions", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-amendment-input-"));
   const privateSources = mkdtempSync(
     join(tmpdir(), "factory-planner-source-read-"),
@@ -622,6 +624,18 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
       expandedFiles.reusedSourceIndices,
       sourceFiles.reusedSourceIndices,
     );
+    // Old admitted receipts preserve their original mixed inline/reused
+    // presentation when reconstructing a response after recovery.
+    const { bodyDelivery: _presentation, ...historicalReceipt } = expandedFiles;
+    const historical = renderCompilationCall(
+      { ...request, sources: expanded },
+      historicalReceipt,
+    );
+    const historicalChoices = JSON.parse(
+      historical.call.prompt.split("Compiler choices (JSON data):\n")[1],
+    );
+    assert.ok(historicalChoices.sources.at(-2).lines);
+    assert.ok(historicalChoices.sources[0].contentFile);
     const expandedCall = renderCompilationCall(
       { ...request, sources: expanded },
       expandedFiles,
@@ -629,20 +643,13 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
     const expandedChoices = JSON.parse(
       expandedCall.call.prompt.split("Compiler choices (JSON data):\n")[1],
     );
-    assert.equal(
-      expandedChoices.sources
-        .at(-2)
-        .lines.map((line) => line.text)
-        .join("\n"),
-      additional[0].content,
-    );
-    assert.equal(
-      expandedChoices.sources
-        .at(-1)
-        .lines.map((line) => line.text)
-        .join("\n"),
-      "",
-    );
+    for (const [offset, source] of additional.entries()) {
+      const file = expandedChoices.sources.at(offset - 2).contentFile;
+      assert.equal(
+        readFileSync(join(expandedFiles.root, file.file), "utf8"),
+        source.content,
+      );
+    }
     assert.equal(expandedFiles.files.at(-1).bytes, 0);
     assert.equal(expandedFiles.files.at(-1).lineCount, 1);
     const diagnosis = renderDiagnosisCall(
@@ -795,10 +802,198 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
     );
     assert.deepEqual(
       changedChoices.sources.map((source) =>
-        source.lines.map((line) => line.text).join("\n"),
+        readFileSync(join(changedFiles.root, source.contentFile.file), "utf8"),
       ),
       changedSources.map((source) => source.content),
     );
+    // A fresh default exec call exports complete files before rendering, with
+    // no provider or repository access. Settlement owns their entire lifetime.
+    const selection = { model: "gpt-6.1", reasoningEffort: "medium" };
+    const transport = new CodexPlanningTransport(
+      root,
+      selection,
+      selection,
+      undefined,
+      [],
+    );
+    assert.equal(transport.settings("planner").sourceArtifacts, true);
+    let freshRoot;
+    await transport.withSourceDelivery(request, async (delivery) => {
+      freshRoot = delivery.root;
+      assert.deepEqual(delivery.reusedSourceIndices, []);
+      const fresh = renderCompilationCall(request, delivery);
+      assert.deepEqual(fresh.wire.schema, wire.schema);
+      assert.equal(fresh.call.sourcePacket, call.sourcePacket);
+      const choices = JSON.parse(
+        fresh.call.prompt.split("Compiler choices (JSON data):\n")[1],
+      );
+      assert.ok(
+        choices.sources.every(
+          (source) => source.contentFile && !Object.hasOwn(source, "lines"),
+        ),
+      );
+      assert.ok(!fresh.call.prompt.includes(content));
+      for (const file of delivery.files)
+        assert.equal(
+          readFileSync(join(delivery.root, file.file), "utf8"),
+          sources[file.sourceIndex].content,
+        );
+    });
+    assert.equal(existsSync(freshRoot), false);
+    // The actual native transport rebinds that same authenticated home before
+    // its already-aborted native admission. No provider or fake process runs.
+    const invocation = {
+      invocationId: "fresh-source-aborted",
+      phase: "compile",
+      ordinal: 1,
+    };
+    let abortedRoot;
+    const abortedTurn = { response: "", ended: false };
+    await assert.rejects(
+      transport.withSourceDelivery(request, async (delivery) => {
+        abortedRoot = delivery.root;
+        const { call } = renderCompilationCall(request, delivery);
+        await transport.run({
+          ...call,
+          invocation,
+          turn: abortedTurn,
+          signal: AbortSignal.abort(
+            new Error("Real before-dispatch cancellation"),
+          ),
+        });
+      }),
+      /before-dispatch cancellation/,
+    );
+    assert.equal(abortedTurn.stopped, true);
+    assert.equal(abortedTurn.nativeInvocationStarted, undefined);
+    assert.equal(existsSync(abortedRoot), false);
+    // Ordinary application composition supplies a private session root and a
+    // controller header. It adopts the same pre-render home, then records and
+    // releases the genuinely cancelled turn without reaching the provider.
+    const retainedTransport = new CodexPlanningTransport(
+      root,
+      selection,
+      selection,
+      undefined,
+      [],
+      join(privateSources, "sessions"),
+    );
+    let lastCheckpoint;
+    let retainedRoot;
+    const header = {
+      scope: {
+        repository: "factory-qualification/fresh-source",
+        objective: 1,
+        runId: "fresh-read",
+        configDigest: "f".repeat(64),
+        role: "planning",
+        planningInputDigest: "e".repeat(64),
+      },
+      identity: "fresh-planner",
+      checkpoint: (ref) => {
+        lastCheckpoint = ref;
+      },
+    };
+    await assert.rejects(
+      retainedTransport.withSourceDelivery(
+        { ...request, session: header },
+        async (delivery) => {
+          retainedRoot = delivery.root;
+          const { call } = renderCompilationCall(
+            { ...request, session: header },
+            delivery,
+          );
+          await retainedTransport.run({
+            ...call,
+            invocation,
+            turn: { response: "", ended: false },
+            signal: AbortSignal.abort(
+              new Error("Retained before-dispatch cancellation"),
+            ),
+          });
+        },
+      ),
+      /Retained before-dispatch cancellation/,
+    );
+    assert.equal(lastCheckpoint.status, "released");
+    assert.equal(lastCheckpoint.currentTurn.resources, "settled");
+    assert.equal(lastCheckpoint.data.sourceDelivery.bodyDelivery, "all-files");
+    assert.equal(existsSync(retainedRoot), false);
+    let refusedRoot;
+    await assert.rejects(
+      transport.withSourceDelivery(request, async (delivery) => {
+        refusedRoot = delivery.root;
+        throw new Error("Actual pre-admission refusal");
+      }),
+      /pre-admission refusal/,
+    );
+    assert.equal(existsSync(refusedRoot), false);
+    const explicitInline = new CodexPlanningTransport(
+      root,
+      selection,
+      selection,
+      undefined,
+      [],
+      undefined,
+      "exec",
+      false,
+    );
+    await explicitInline.withSourceDelivery(request, async (delivery) =>
+      assert.equal(delivery, undefined),
+    );
+    const toolFree = new CodexPlanningTransport(
+      root,
+      selection,
+      selection,
+      undefined,
+      [],
+      undefined,
+      "app-server",
+    );
+    await toolFree.withSourceDelivery(request, async (delivery) =>
+      assert.equal(delivery, undefined),
+    );
+    const graphRequest = {
+      reviewPacket: evidence,
+      objective: body,
+      baseSha,
+      sources,
+      graph: currentGraph,
+      commands: [],
+      finalCommands: [],
+      controllerCapabilities: installedControllerCapabilities(),
+      controllerCapabilitiesDigest: CONTROLLER_CAPABILITIES_DIGEST,
+    };
+    let graphRoot;
+    await transport.withGraphReviewFiles(evidence, async (files, directory) => {
+      graphRoot = directory;
+      assert.equal(files.length, evidence.evidence.length);
+      const byFile = renderGraphReviewCall(graphRequest, files, directory);
+      assert.deepEqual(
+        byFile.schema,
+        renderGraphReviewCall(graphRequest).schema,
+      );
+      assert.equal(
+        byFile.sourcePacket,
+        renderGraphReviewCall(graphRequest).sourcePacket,
+      );
+      assert.equal(byFile.tree, directory);
+      assert.ok(!existsSync(join(directory, ".git")));
+      assert.ok(!byFile.prompt.includes(content));
+      for (const file of files)
+        assert.equal(
+          readFileSync(join(directory, file.path), "utf8"),
+          evidence.evidence[file.evidenceIndex].content,
+        );
+      const first = files[0];
+      chmodSync(join(directory, first.path), 0o600);
+      writeFileSync(join(directory, first.path), "altered evidence");
+      assert.throws(
+        () => renderGraphReviewCall(graphRequest, files, directory),
+        /differs from its canonical evidence/,
+      );
+    });
+    assert.equal(existsSync(graphRoot), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(privateSources, { recursive: true, force: true });

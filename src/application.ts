@@ -48,8 +48,8 @@ import {
   ensureProjectObjective,
   type IntakeAuthorization,
   type IntakeStartupOptions,
-  type QueueCommandAcknowledgment,
   intakeControl,
+  type QueueCommandAcknowledgment,
   runIntake,
   watchIntake,
 } from "./intake.js";
@@ -385,7 +385,7 @@ export function composePlanningModel(config: FactoryConfig): PlanningModel {
       {
         redactionValues,
         transport: config.planning.codex?.transport ?? "exec",
-        sourceArtifacts: config.planning.codex?.sourceArtifacts === true,
+        sourceArtifacts: config.planning.codex?.sourceArtifacts,
         sessionRoot: join(stateRoot(config.repository), "review-sessions"),
       },
     ),

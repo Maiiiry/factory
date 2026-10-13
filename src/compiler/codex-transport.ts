@@ -1,6 +1,6 @@
-import { admitNativeReturn } from "./native-return.js";
-import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -34,41 +34,47 @@ import {
   ProviderTurnGuard,
   requireCompletedProviderTurn,
 } from "../provider-turn.js";
-import { stepCancellationSignal } from "../step.js";
 import {
   awaitCheckpointAdmission,
   isCheckpointAdmissionFailure,
   markCheckpointEffectDispatched,
 } from "../recovery-checkpoint.js";
+import {
+  materializeReviewBodies,
+  type ReviewBodyFile,
+  type ReviewPacket,
+} from "../review-evidence.js";
+import { stepCancellationSignal } from "../step.js";
 import { codexInvocationUsage, codexRawTokenUsage } from "../usage.js";
+import { admitNativeReturn } from "./native-return.js";
 import { observeModelInvocation } from "./observation.js";
 import {
-  CODEX_PLANNING_ADAPTER,
+  assertDeliveredPlanningSources,
+  assertPlanningSourceDelivery,
+  type DeliveredPlanningSources,
+  deliveredPlanningSources,
+  materializePlanningSources,
+  type PlanningSourceDelivery,
+  planningSourceDirectory,
+} from "./source-delivery.js";
+import {
+  assertReviewImages,
   CODEX_APP_SERVER_PLANNING_ADAPTER,
+  CODEX_PLANNING_ADAPTER,
   CODEX_PLANNING_PROVIDER,
   type PlanningRole,
   type PlanningTransport,
   type PlanningTurn,
   structuredRequestDigest,
-  assertReviewImages,
   unsupportedReviewImages,
 } from "./transport.js";
-import {
-  assertDeliveredPlanningSources,
-  assertPlanningSourceDelivery,
-  deliveredPlanningSources,
-  type DeliveredPlanningSources,
-  materializePlanningSources,
-  planningSourceDirectory,
-  type PlanningSourceDelivery,
-} from "./source-delivery.js";
 
 const LOWER_EFFORT_REVIEW_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 
 /**
  * Codex native transport with isolated review continuations. Compilation and
- * graph review remain fresh, tool-free turns; result reviews keep their own
- * conversation while reading only each invocation's exact candidate tree.
+ * graph review remain fresh turns with canonical files; result reviews keep
+ * their conversation while reading only each invocation's exact candidate tree.
  */
 export class CodexPlanningTransport implements PlanningTransport {
   readonly provider = CODEX_PLANNING_PROVIDER;
@@ -87,10 +93,93 @@ export class CodexPlanningTransport implements PlanningTransport {
     private redactionValues: string[],
     private sessionRoot?: string,
     private transport: "exec" | "app-server" = "exec",
-    private sourceArtifacts = false,
+    private sourceArtifacts = transport === "exec",
   ) {
     if (sourceArtifacts && transport !== "exec")
       throw new Error("Planning source artifacts require the exec transport");
+  }
+
+  private preparedSources = new Map<
+    string,
+    { home: string; owner: string; adopted: boolean; unsettled: boolean }
+  >();
+  private graphRoots = new Map<string, boolean>();
+
+  async withSourceDelivery<T>(
+    request: PlanningRequest<unknown>,
+    run: (delivery?: PlanningSourceDelivery) => Promise<T>,
+  ): Promise<T> {
+    if (!this.sourceArtifacts || this.transport !== "exec") return run();
+    if (request.purpose === "diagnosis")
+      return run(this.sourceDelivery(request));
+    if (request.session?.retained) return run(this.sourceDelivery(request));
+    const continuation = this.sessionRoot ? request.session : undefined;
+    if (this.sessionRoot && !continuation)
+      throw new Error(
+        "Retained planner requires its controller-owned checkpoint header",
+      );
+    const owner = continuation
+      ? this.sessionOwner({
+          scope: continuation.scope,
+          identity: continuation.identity,
+          adapter: this.adapter,
+          data: {
+            selectionDigest: this.selectionDigest("planner", false, true),
+          },
+        })
+      : createHash("sha256").update(randomUUID()).digest("hex");
+    if (continuation)
+      mkdirSync(this.sessionRoot!, { recursive: true, mode: 0o700 });
+    const home = createCodexHome({
+      ...(continuation && {
+        root: join(resolve(this.sessionRoot!), continuation.identity),
+      }),
+      owner,
+      config: CODEX_PLANNING_CONFIG,
+    });
+    const root = planningSourceDirectory(
+      home.root,
+      request.baseSha,
+      request.sources,
+    );
+    const prepared = {
+      home: home.root,
+      owner,
+      adopted: false,
+      unsettled: false,
+    };
+    this.preparedSources.set(root, prepared);
+    try {
+      return await run(
+        materializePlanningSources(root, request.baseSha, request.sources),
+      );
+    } finally {
+      this.preparedSources.delete(root);
+      // Retained native history follows the existing session disposal contract.
+      // Unsettled native groups keep their exact read root for supported recovery.
+      if (
+        (!continuation || !prepared.adopted) &&
+        !prepared.unsettled &&
+        lstatSync(home.root, { throwIfNoEntry: false })
+      )
+        releaseCodexHome(home.root, owner);
+    }
+  }
+
+  async withGraphReviewFiles<T>(
+    packet: ReviewPacket,
+    run: (files: ReviewBodyFile[], root: string) => Promise<T>,
+  ): Promise<T> {
+    if (this.transport !== "exec") return run([], "");
+    const root = mkdtempSync(join(tmpdir(), "factory-graph-evidence-"));
+    this.graphRoots.set(root, false);
+    try {
+      return await run(materializeReviewBodies(root, packet, -1), root);
+    } finally {
+      if (!this.graphRoots.get(root))
+        rmSync(root, { recursive: true, force: true });
+      this.graphRoots.delete(root);
+    }
   }
 
   get retainedPlannerCheckpointCoverage() {
@@ -108,7 +197,9 @@ export class CodexPlanningTransport implements PlanningTransport {
       : undefined;
   }
 
-  private sessionOwner(session: AgentSessionRef): string {
+  private sessionOwner(
+    session: Pick<AgentSessionRef, "scope" | "identity" | "adapter" | "data">,
+  ): string {
     return createHash("sha256")
       .update(
         JSON.stringify([
@@ -462,7 +553,10 @@ export class CodexPlanningTransport implements PlanningTransport {
       );
     const continuation =
       this.sessionRoot && args.session ? args.session : undefined;
-    let sourceRead = false;
+    const preparedSource = args.planningSources?.delivery
+      ? this.preparedSources.get(args.planningSources.delivery.root)
+      : undefined;
+    let sourceRead = Boolean(preparedSource);
     let session: AgentSessionRef | undefined;
     let sessionData:
       | ReturnType<CodexPlanningTransport["sessionData"]>
@@ -579,7 +673,7 @@ export class CodexPlanningTransport implements PlanningTransport {
       );
     const sourceDirectory = sourceRead
       ? planningSourceDirectory(
-          sessionData!.sessionRoot,
+          sessionData?.sessionRoot ?? preparedSource!.home,
           args.planningSources!.baseSha,
           args.planningSources!.sources,
         )
@@ -589,7 +683,7 @@ export class CodexPlanningTransport implements PlanningTransport {
           args.planningSources!.baseSha,
           args.planningSources!.sources,
           args.planningSources!.suppliedSourceIndices,
-          sessionData!.deliveredSources,
+          sessionData?.deliveredSources,
         )
       : undefined;
     const started = Date.now();
@@ -617,13 +711,19 @@ export class CodexPlanningTransport implements PlanningTransport {
             config: sourceRead
               ? CODEX_SOURCE_READ_CONFIG
               : CODEX_TREE_REVIEW_CONFIG,
-            ...(session && sessionData
+            ...(preparedSource
               ? {
-                  root: sessionData.sessionRoot,
-                  resume: Boolean(continuation?.retained),
-                  owner: this.sessionOwner(session),
+                  root: preparedSource.home,
+                  resume: true,
+                  owner: preparedSource.owner,
                 }
-              : {}),
+              : session && sessionData
+                ? {
+                    root: sessionData.sessionRoot,
+                    resume: Boolean(continuation?.retained),
+                    owner: this.sessionOwner(session),
+                  }
+                : {}),
             sandbox: {
               directory: args.tree ?? sourceDirectory!,
               workspace: "read",
@@ -662,7 +762,7 @@ export class CodexPlanningTransport implements PlanningTransport {
             canonical.sources,
           );
       } catch (error) {
-        if (!continuation?.retained)
+        if (!continuation?.retained && session)
           releaseCodexHome(home.root, this.sessionOwner(session!));
         throw error;
       }
@@ -705,6 +805,7 @@ export class CodexPlanningTransport implements PlanningTransport {
     try {
       checkpointSession("in-flight");
       initialCheckpointed = true;
+      if (preparedSource) preparedSource.adopted = true;
       await awaitCheckpointAdmission(
         continuation?.scope.repository,
         "before-effect",
@@ -980,6 +1081,9 @@ export class CodexPlanningTransport implements PlanningTransport {
       if (isCheckpointAdmissionFailure(error) && nativeDispatchObserved)
         markCheckpointEffectDispatched(error);
       retainHome = error instanceof UnsettledSubprocessError;
+      if (retainHome && preparedSource) preparedSource.unsettled = true;
+      if (retainHome && args.tree && this.graphRoots.has(args.tree))
+        this.graphRoots.set(args.tree, true);
       // runCodexExec throws ordinary failures only after the owned process group settles.
       state.stopped = !retainHome;
       observeModelInvocation(invocation, {

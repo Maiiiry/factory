@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 /** Current-call file bindings only; never persisted into canonical packets. */
 export interface ReviewBodyFile {
@@ -11,6 +11,41 @@ export interface ReviewBodyFile {
   encoding: "utf-8";
   bytes: number;
   digest: string;
+}
+
+/** Export literal packet bodies without changing their indices or provenance. */
+export function materializeReviewBodies(
+  root: string,
+  packet: ReviewPacket,
+  inlineBytes = 2_048,
+): ReviewBodyFile[] {
+  mkdirSync(join(root, "pinned"), { mode: 0o700 });
+  mkdirSync(join(root, "evidence"), { mode: 0o700 });
+  const files: ReviewBodyFile[] = [];
+  for (const [evidenceIndex, entry] of packet.evidence.entries()) {
+    if (Buffer.byteLength(entry.content) <= inlineBytes) continue;
+    const bytes = Buffer.from(entry.content, "utf8");
+    if (
+      bytes.toString("utf8") !== entry.content ||
+      createHash("sha256").update(bytes).digest("hex") !== entry.digest
+    )
+      throw new ReviewProtocolError(
+        "Review evidence bytes differ from canonical packet",
+      );
+    const path = `${entry.origin === "source" ? "pinned" : "evidence"}/${evidenceIndex}.txt`;
+    writeFileSync(join(root, path), bytes, { flag: "wx", mode: 0o400 });
+    files.push({
+      evidenceIndex,
+      root,
+      path,
+      encoding: "utf-8",
+      bytes: bytes.length,
+      digest: entry.digest,
+    });
+  }
+  // This also authenticates each on-disk body against its canonical entry.
+  renderReviewPacketChoices(packet, files);
+  return files;
 }
 
 /** Transient wire identities; labels and repository text never define authority. */
