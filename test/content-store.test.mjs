@@ -124,6 +124,7 @@ import { archiveAttempt, resolveAutonomy } from "../dist/repair-policy.js";
 import {
   LocalRepositoryMemory,
   retainPlanningSourceMemory,
+  retainStateMemory,
 } from "../dist/repository-memory.js";
 import { buildMemoryLearningClosure } from "../dist/repository-memory-transfer.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
@@ -541,6 +542,88 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     cancelledAt: new Date().toISOString(),
   };
   saveState(statePath(repository, 1), cancelled);
+  assert.deepEqual(
+    retainStateMemory(cancelled, state),
+    cancelled.memoryBindings,
+    "unchanged state reuses its authenticated original observation",
+  );
+  const laterObservation = {
+    ...cancelled,
+    cancelledAt: new Date(
+      Date.parse(cancelled.cancelledAt) + 1000,
+    ).toISOString(),
+  };
+  const unboundObservation = retainStateMemory(laterObservation, state);
+  const memoryOriginals = readdirSync(join(state, "memory", "records")).length;
+  assert.deepEqual(
+    retainStateMemory(laterObservation, state),
+    unboundObservation,
+    "a true state-binding miss finds the original in the complete repository scan",
+  );
+  assert.equal(
+    readdirSync(join(state, "memory", "records")).length,
+    memoryOriginals,
+  );
+  const originalObservation = cancelled.memoryBindings[0].manifestRef;
+  const originalObservationPath = join(
+    state,
+    "content",
+    originalObservation.digest.slice(0, 2),
+    originalObservation.digest,
+  );
+  const originalObservationBytes = store.readBytes(originalObservation);
+  const corruptObservationBytes = Buffer.from(originalObservationBytes);
+  corruptObservationBytes[0] ^= 1;
+  try {
+    writeFileSync(originalObservationPath, corruptObservationBytes);
+    assert.deepEqual(
+      retainStateMemory(laterObservation, state),
+      unboundObservation,
+      "an unavailable bound historical manifest does not hide other current observations",
+    );
+  } finally {
+    writeFileSync(originalObservationPath, originalObservationBytes);
+  }
+  const observationBody = JSON.parse(originalObservationBytes.toString("utf8"))
+    .bodies[0].ref;
+  const observationBodyPath = join(
+    state,
+    "content",
+    observationBody.digest.slice(0, 2),
+    observationBody.digest,
+  );
+  const observationBodyBytes = store.readBytes(observationBody);
+  const corruptedObservationBody = Buffer.from(observationBodyBytes);
+  corruptedObservationBody[0] ^= 1;
+  try {
+    writeFileSync(observationBodyPath, corruptedObservationBody);
+    assert.throws(
+      () => retainStateMemory(cancelled, state),
+      /failed digest verification/,
+      "a seeded manifest cannot authenticate corrupt supporting bytes",
+    );
+  } finally {
+    writeFileSync(observationBodyPath, observationBodyBytes);
+  }
+  assert.deepEqual(
+    retainStateMemory(
+      {
+        ...cancelled,
+        memoryBindings: [
+          {
+            ...cancelled.memoryBindings[0],
+            manifestRef: {
+              ...originalObservation,
+              bytes: originalObservation.bytes + 1,
+            },
+          },
+        ],
+      },
+      state,
+    ),
+    cancelled.memoryBindings,
+    "a mismatched binding cannot seed reuse; the full scan supplies the exact original",
+  );
   // These are observations of the actual local Git read, with no provider
   // accounting claimed. Optional text retention uses the existing capture budget.
   const observed = [];

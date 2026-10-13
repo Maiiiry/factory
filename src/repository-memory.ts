@@ -539,12 +539,14 @@ export class LocalRepositoryMemory {
   private readonly records: string;
   private readonly store: LocalContentStore;
   private retainedIdentities?: Map<string, RepositoryMemoryBinding>;
+  private retainedIdentitiesComplete = false;
   private readonly observedBodies = new Map<string, Buffer>();
   catalogStatus: "ready" | "unavailable" = "unavailable";
   constructor(
     root: string,
     readonly repository: string,
     store?: LocalContentStore,
+    stateBindings: RepositoryMemoryBinding[] = [],
   ) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository))
       throw new Error("Invalid memory repository scope");
@@ -554,6 +556,25 @@ export class LocalRepositoryMemory {
     privateDirectory(this.directory);
     privateDirectory(this.records);
     this.store = store ?? new LocalContentStore(join(root, "content"));
+    if (stateBindings.length) {
+      assertRepositoryMemoryBindings(stateBindings);
+      this.retainedIdentities = new Map();
+      for (const binding of [...stateBindings].sort((left, right) =>
+        left.id.localeCompare(right.id),
+      )) {
+        try {
+          const original = this.manifest(binding.id);
+          if (canonical(original.binding) !== canonical(binding)) continue;
+          this.retainedIdentities.set(
+            meaningfulRecord(original.record),
+            original.binding,
+          );
+        } catch (error) {
+          // Unavailable originals supply no reuse, just as in a full scan.
+          if (error instanceof MemoryStorageDenied) throw error;
+        }
+      }
+    }
   }
   /** Reuse already authenticated exact supplied bytes within this lookup instance. */
   suppliedContent(bytes: Uint8Array): void {
@@ -585,15 +606,20 @@ export class LocalRepositoryMemory {
       if (source.ref !== undefined && source.complete)
         this.store.readBytes(source.ref);
     const meaningful = meaningfulRecord(record);
-    // One verified metadata pass per producer batch; this cache is derived and is
-    // never used to authenticate reads or continuation state.
-    this.retainedIdentities ??= new Map(
-      this.retained().entries.map((entry) => [
-        meaningfulRecord(entry.record),
-        entry.binding,
-      ]),
-    );
-    const existing = this.retainedIdentities.get(meaningful);
+    // Verified state-bound originals cover unchanged observations. A genuine
+    // miss still acquires the complete repository inventory before retention.
+    // Neither map authenticates reads or supplies continuation authority.
+    let existing = this.retainedIdentities?.get(meaningful);
+    if (!existing && !this.retainedIdentitiesComplete) {
+      this.retainedIdentities = new Map(
+        this.retained().entries.map((entry) => [
+          meaningfulRecord(entry.record),
+          entry.binding,
+        ]),
+      );
+      this.retainedIdentitiesComplete = true;
+      existing = this.retainedIdentities.get(meaningful);
+    }
     if (existing) return existing;
     const manifestRef = this.store.putBytes(Buffer.from(canonical(record)), {
       mediaType: "application/json",
@@ -604,7 +630,7 @@ export class LocalRepositoryMemory {
       path: `memory/records/${binding.id}.json`,
       kind: "memory-binding",
     });
-    this.retainedIdentities.set(meaningful, binding);
+    this.retainedIdentities!.set(meaningful, binding);
     // A failed derived index never prevents retention or changes continuation.
     try {
       this.index(binding, record);
@@ -711,6 +737,7 @@ export class LocalRepositoryMemory {
       throw new Error("Imported memory reference changed during installation");
     append(join(this.records, `${binding.id}.json`), canonical(binding));
     this.retainedIdentities = undefined;
+    this.retainedIdentitiesComplete = false;
     this.catalogStatus = "unavailable";
   }
   private accessible(
@@ -1422,7 +1449,12 @@ export function retainStateMemory(
   root: string,
 ): RepositoryMemoryBinding[] {
   const store = new LocalContentStore(join(root, "content"));
-  const memory = new LocalRepositoryMemory(root, state.repository, store);
+  const memory = new LocalRepositoryMemory(
+    root,
+    state.repository,
+    store,
+    state.memoryBindings,
+  );
   const bindings: RepositoryMemoryBinding[] = [];
   const retain = (record: RepositoryMemoryRecord) => {
     const binding = memory.retain(record);
