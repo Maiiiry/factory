@@ -74,6 +74,7 @@ import {
 import { objectiveCandidate } from "./qa.js";
 import {
   awaitCheckpointAdmission,
+  CheckpointProducerInventoryChanged,
   isCheckpointAdmissionFailure,
   withQueueControlVerification,
   withRecoveryCheckpointScope,
@@ -2222,6 +2223,15 @@ async function checkpointController<T>(
       try {
         result = await task();
       } catch (error) {
+        // A refused inventory build needs an explicit complete observation.
+        // Do not turn cleanup into an immediate repetition that clears its
+        // dirty/error disposition before the caller can inspect it.
+        if (
+          error instanceof CheckpointProducerInventoryChanged ||
+          (isCheckpointAdmissionFailure(error) &&
+            error.cause instanceof CheckpointProducerInventoryChanged)
+        )
+          throw error;
         try {
           await awaitCheckpointAdmission(config.repository, "settled");
         } catch (settlement) {

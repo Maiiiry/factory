@@ -9,11 +9,27 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   factoryAuthorityDigest,
+  factoryConfigDigest,
   stateRoot,
   validateConfig,
 } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { diagnosticPath } from "../dist/diagnostics.js";
+import { RegularDelivery } from "../dist/delivery/regular.js";
+import { CodexPlanningModel } from "../dist/compiler/model.js";
+import { sealFinalAcceptance } from "../dist/completion.js";
+import { LocalExecutionDriver, CodexHarness } from "../dist/execution/local.js";
+import { graphDigest } from "../dist/graph-amendments.js";
+import {
+  enqueueIntake,
+  intakeControl,
+  runIntake,
+  watchIntake,
+} from "../dist/intake.js";
+import { LocalRepositoryMemory } from "../dist/repository-memory.js";
+import { resolveAutonomy } from "../dist/repair-policy.js";
+import { requestControl } from "../dist/coordinator-control.js";
+import { validateWorkItem } from "../dist/validation.js";
 import {
   createProjectQueuePlannedEffect,
   resolveProjectQueuePlannedEffect,
@@ -45,6 +61,7 @@ import {
 } from "../dist/project-queue-state.js";
 import {
   awaitCheckpointAdmission,
+  gitPersistenceStatus,
   markCheckpointDirty,
   readVerifiedRecoveryCheckpoint,
   withRecoveryCheckpointControllerVerification,
@@ -58,11 +75,460 @@ import {
   installationLockPath,
   objectiveLockPath,
   readControllerOwner,
+  readState,
   releaseControllerLock,
   statePath,
+  saveState,
 } from "../dist/state-store.js";
 
 const processUrl = new URL("../dist/process.js", import.meta.url).href;
+
+test("a terminal background watcher holds checkpoint failure while real control and explicit recovery remain usable", async (t) => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "factory-watcher-checkpoint-"),
+  );
+  const repository = `fixture/watcher-${randomUUID()}`;
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.after(() => rm(stateRoot(repository), { recursive: true, force: true }));
+  const checkout = join(directory, "target"),
+    remote = join(directory, "archive.git");
+  await mkdir(checkout);
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  git("init", "-b", "main");
+  git("remote", "add", "origin", `https://github.com/${repository}.git`);
+  await writeFile(join(checkout, "README.md"), "# Unchanged public fixture\n");
+  git("add", ".");
+  git(
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-m",
+    "baseline",
+  );
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  const selection = { model: "unused-local-check", reasoningEffort: "low" };
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    planning: { kind: "codex-sdk", planner: selection, reviewer: selection },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...selection },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    queue: {
+      pollSeconds: 1,
+      project: {
+        repository,
+        projectId: "PVT_fixture",
+        metadataFieldId: "PVTF_metadata",
+        orderFieldId: "PVTF_order",
+        controlItemId: "PVTI_control",
+        factoryManagedFields: true,
+      },
+    },
+    gitPersistence: {
+      remote,
+      ref: "refs/heads/factory-history",
+      visibility: "private",
+      scope: "private-history",
+      maxBytes: 16 * 1024 * 1024,
+      maxFiles: 4096,
+      timeoutMs: 1000,
+      coalesceMs: 0,
+    },
+  };
+  validateConfig(config);
+  const binding = config.queue.project;
+  const body =
+    "## Outcome\nVerify the unchanged fixture.\n\n## Acceptance\n- git diff is clean.\n\n## Validation\ngit diff --exit-code\n";
+  let controlMetadata = null;
+  const card = {
+    itemId: "PVTI_issue",
+    issueNodeId: "I_fixture",
+    objective: 1,
+    repository,
+    title: "Verify fixture",
+    body,
+    state: "open",
+    archived: false,
+    metadata: null,
+    order: null,
+  };
+  let reads = 0,
+    writes = 0;
+  // Only the remote Project contract is a fixture; actual receipt production,
+  // durable Git publication, runner completion and local control remain real.
+  const github = {
+    effectAdmission: "controller-checkpoint-v1",
+    projectionMutationAdmission: "controller-checkpoint-v1",
+    async projectQueueRead() {
+      reads++;
+      return {
+        binding,
+        actorId: 1,
+        owner: "fixture",
+        observedAt: new Date().toISOString(),
+        control: { itemId: binding.controlItemId, metadata: controlMetadata },
+        cards: card.metadata ? [structuredClone(card)] : [],
+        ignoredCards: [],
+      };
+    },
+    async projectQueueInspect(_binding, request) {
+      return {
+        scope: "target",
+        binding,
+        actorId: 1,
+        owner: "fixture",
+        observedAt: new Date().toISOString(),
+        control: { itemId: binding.controlItemId, metadata: controlMetadata },
+        ...(request?.itemId ? { target: structuredClone(card) } : {}),
+        ...(request?.objective
+          ? {
+              issue: structuredClone(card),
+              membership: card.metadata
+                ? [{ itemId: card.itemId, archived: false }]
+                : [],
+            }
+          : {}),
+      };
+    },
+    async projectQueueWrite(request) {
+      const resolved = resolveProjectQueuePlannedEffect(
+        binding,
+        request.plannedEffect,
+        request.dependencyReceipts ?? [],
+      );
+      const intent = {
+        ...resolved.action,
+        binding,
+        requestId: request.requestId,
+        actorId: 1,
+        observedAt: new Date().toISOString(),
+        request: resolved.request,
+        ...(resolved.action.action === "set-metadata"
+          ? { fieldId: binding.metadataFieldId }
+          : {}),
+      };
+      await request.beforeWrite(intent);
+      writes++;
+      const control = resolved.action.itemId === binding.controlItemId;
+      if (control) controlMetadata = resolved.action.metadata;
+      else {
+        if ("metadata" in resolved.action)
+          card.metadata = resolved.action.metadata;
+        if ("order" in resolved.action) card.order = resolved.action.order;
+      }
+      const target = {
+        id: control ? binding.controlItemId : card.itemId,
+        isArchived: false,
+        project: { id: binding.projectId },
+        content: control
+          ? { __typename: "DraftIssue", id: "D_control" }
+          : {
+              __typename: "Issue",
+              id: card.issueNodeId,
+              number: 1,
+              repository: { nameWithOwner: repository },
+            },
+        fieldValues: {
+          nodes: [
+            ...((control ? controlMetadata : card.metadata)
+              ? [
+                  {
+                    __typename: "ProjectV2ItemFieldTextValue",
+                    field: { id: binding.metadataFieldId },
+                    text: control ? controlMetadata : card.metadata,
+                  },
+                ]
+              : []),
+            ...(card.order !== null && !control
+              ? [
+                  {
+                    __typename: "ProjectV2ItemFieldNumberValue",
+                    field: { id: binding.orderFieldId },
+                    number: card.order,
+                  },
+                ]
+              : []),
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      };
+      const response = (clientMutationId) => ({
+        clientMutationId,
+        projectV2Item: structuredClone(target),
+      });
+      const original =
+        intent.action === "ensure-card"
+          ? {
+              addProjectV2ItemById: {
+                clientMutationId: intent.requestId,
+                item: target,
+              },
+            }
+          : intent.action === "set-admission-fields"
+            ? {
+                order: response(`${intent.requestId}:order`),
+                admission: response(`${intent.requestId}:metadata`),
+              }
+            : { updateProjectV2ItemFieldValue: response(intent.requestId) };
+      return {
+        intent,
+        itemId: target.id,
+        observedAt: new Date().toISOString(),
+        kind: "response",
+        original,
+      };
+    },
+    async objective() {
+      return structuredClone(card);
+    },
+    async closeIssue() {
+      card.state = "closed";
+    },
+  };
+  await watchIntake(config, github);
+  await enqueueIntake(config, github, [1]);
+  const commit = git("rev-parse", "HEAD"),
+    treeSha = git("rev-parse", "HEAD^{tree}");
+  const item = {
+    id: "qa",
+    kind: "qa",
+    title: "Verify unchanged fixture",
+    goal: "Verify clean Git state",
+    brief: "Verify only",
+    acceptance: ["git diff is clean."],
+    nonGoals: [],
+    citations: [{ path: "OBJECTIVE" }],
+    dependencies: [],
+    ownedPaths: [],
+    resources: [],
+    expectedOutputRoles: [],
+    sourceAssets: [],
+    minimumAssetSets: 0,
+    requiredLfsRoles: [],
+    validation: [
+      {
+        command: "git diff --exit-code",
+        provenance: "source-declared",
+        source: "OBJECTIVE",
+      },
+    ],
+  };
+  const graph = {
+    objective: 1,
+    baseSha: commit,
+    items: [item],
+    coverage: [
+      {
+        criterionId: createHash("sha256")
+          .update("git diff is clean.")
+          .digest("hex"),
+        itemId: item.id,
+        source: {
+          path: "OBJECTIVE",
+          digest: createHash("sha256").update(body).digest("hex"),
+          text: "git diff is clean.",
+        },
+        proof: { kind: "integrated-command", validationIndex: 0 },
+        environment: {
+          kind: "local",
+          readiness: "available",
+          probe: "",
+          preparedBy: "",
+        },
+      },
+    ],
+  };
+  const validation = await validateWorkItem(
+    checkout,
+    join(directory, "validation"),
+    item,
+    commit,
+    treeSha,
+    commit,
+  );
+  const state = {
+    schemaVersion: 7,
+    repository,
+    objective: 1,
+    runId: randomUUID(),
+    configDigest: factoryConfigDigest(config),
+    baseSha: commit,
+    objectiveBodyDigest: createHash("sha256").update(body).digest("hex"),
+    objectiveCommands: ["git diff --exit-code"],
+    graph,
+    planGraphDigest: graphDigest(graph),
+    issueByItemId: { qa: 2 },
+    work: {
+      qa: {
+        status: "done",
+        changeRef: commit,
+        treeSha,
+        githubClosure: "complete",
+        validation,
+      },
+    },
+    finalValidation: { ...validation, passed: true },
+    autonomy: resolveAutonomy({ allowances: { implementationRepairs: 0 } }),
+    capacity: { concurrency: 1 },
+    coordinator: {
+      mode: "running",
+      phase: "idle",
+      phaseStartedAt: new Date().toISOString(),
+      processes: [],
+    },
+  };
+  // Historical command-only acceptance is sealed from real clean-checkout
+  // receipts; this is no model response or claim of provider qualification.
+  sealFinalAcceptance(state);
+  saveState(statePath(repository, 1), state);
+  const sealed = JSON.stringify(state.finalAcceptance);
+  const contentStore = new LocalContentStore(
+    join(stateRoot(repository), "content"),
+  );
+  const memory = new LocalRepositoryMemory(
+    stateRoot(repository),
+    repository,
+    contentStore,
+  );
+  const source = contentStore.putBytes(
+    Buffer.from("Actual new public fixture observation\n"),
+    { mediaType: "text/plain" },
+  );
+  const originalReferences = LocalContentStore.prototype.checkpointReferences;
+  let injected = false;
+  let lateMemory;
+  let previousAck;
+  LocalContentStore.prototype.checkpointReferences = function (description) {
+    if (
+      !injected &&
+      card.state === "closed" &&
+      JSON.parse(description)[0] === "memory-learning-producer"
+    ) {
+      injected = true;
+      previousAck = gitPersistenceStatus(config).lastAcknowledged;
+      lateMemory = memory.retain({
+        schemaVersion: 1,
+        repository,
+        visibility: "repository",
+        kind: "reference",
+        producer: { objective: 1, runId: state.runId, status: "observed" },
+        createdAt: new Date().toISOString(),
+        authority: "observation",
+        summary: "A real late source original",
+        bodies: [{ role: "notes", ref: source, availability: "retained" }],
+        sources: [
+          { identity: "fixture:late-source", complete: true, ref: source },
+        ],
+        bindings: {},
+        validity: { state: "current", conditions: [] },
+        supersedes: [],
+      });
+    }
+    return Reflect.apply(originalReferences, this, [description]);
+  };
+  const services = {
+    github,
+    contentStore,
+    planningModel: new CodexPlanningModel(checkout, selection, selection),
+    driver: new LocalExecutionDriver(
+      checkout,
+      join(directory, "worktrees"),
+      new CodexHarness(join(directory, "credentials"), "off", selection),
+      1,
+      contentStore,
+      "codex",
+    ),
+    delivery: new RegularDelivery(checkout, github),
+  };
+  let running;
+  try {
+    running = runIntake(config, services, {
+      backgroundConfigurationPath: join(directory, "config.json"),
+    });
+    const deadline = Date.now() + 15_000;
+    let status;
+    do {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      status = await requestControl(repository, {
+        objective: 0,
+        action: "status",
+      }).catch((error) => {
+        if (error.code === "ENOENT") return { handled: false };
+        throw error;
+      });
+    } while (
+      (!status.handled || !status.result.observation?.error) &&
+      Date.now() < deadline
+    );
+    assert.equal(status.handled, true);
+    assert.match(status.result.observation.error, /memory \(memory\/records\)/);
+    assert.equal(status.result.localMode, "paused");
+    assert.equal(status.result.activeObjective, null);
+    assert.equal(injected, true);
+    assert.equal(readState(repository, 1).objectiveClosure, "complete");
+    assert.equal(
+      JSON.stringify(readState(repository, 1).finalAcceptance),
+      sealed,
+    );
+    const held = gitPersistenceStatus(config),
+      heldReads = reads,
+      heldWrites = writes;
+    assert.equal(held.pendingChanges, true);
+    assert.equal(held.protectedContinuation, false);
+    assert.equal(held.status, "failed");
+    assert.match(held.error, /memory \(memory\/records\)/);
+    assert.deepEqual(held.lastAcknowledged, previousAck);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(reads, heldReads);
+    assert.equal(writes, heldWrites);
+    assert.deepEqual(gitPersistenceStatus(config), held);
+    await intakeControl(config, "resume", undefined, github);
+    const recovered = gitPersistenceStatus(config);
+    assert.equal(recovered.protectedContinuation, true);
+    const archive = await readVerifiedRecoveryCheckpoint(config);
+    assert.equal(archive.commitSha, recovered.lastAcknowledged.commitSha);
+    assert(
+      archive.manifest.contentRefs.some(
+        (ref) => ref.digest === lateMemory.manifestRef.digest,
+      ),
+    );
+    assert.deepEqual(
+      Buffer.from(await archive.readVerifiedBlob(lateMemory.manifestRef)),
+      contentStore.readBytes(lateMemory.manifestRef),
+    );
+    const resumed = await requestControl(repository, {
+      objective: 0,
+      action: "status",
+    });
+    assert.equal(resumed.result.localMode, undefined);
+    assert.equal(resumed.result.observation?.error, undefined);
+    assert.equal(
+      JSON.stringify(readState(repository, 1).finalAcceptance),
+      sealed,
+    );
+    await intakeControl(config, "drain", undefined, github);
+    await running;
+    assert.equal(
+      readControllerOwner(installationLockPath(repository)),
+      undefined,
+    );
+  } finally {
+    LocalContentStore.prototype.checkpointReferences = originalReferences;
+    if (running) {
+      process.emit("SIGTERM");
+      await running.catch(() => undefined);
+    }
+  }
+});
 
 /** Another controller process: holds the lock in `mode` until told to let go. */
 async function holder(key, mode, publication = false) {
