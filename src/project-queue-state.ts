@@ -36,6 +36,7 @@ import type {
   ProjectQueueTarget,
   ProjectQueueExpectedTarget,
   ProjectQueueSnapshot,
+  ProjectQueueKnownTarget,
   ProjectQueueWriteReceipt,
   ProjectQueuePlannedEffect,
 } from "./contracts.js";
@@ -3186,6 +3187,36 @@ export function verifyQueueObservation(
     }),
   };
 }
+/** Original completed responses supply stable identities only, never live queue values. */
+export function queueObservationTargets(
+  history: QueueRecord[],
+): ProjectQueueKnownTarget[] {
+  const targets = new Map<string, ProjectQueueKnownTarget>();
+  for (const record of history) {
+    if (
+      record.kind !== "project-queue-operation" ||
+      !record.completed ||
+      record.scope === "control" ||
+      record.objective === undefined ||
+      record.issueNodeId === undefined
+    )
+      continue;
+    for (const effect of record.effects) {
+      if (!effect.receipt) continue;
+      const target = {
+        objective: record.objective,
+        issueNodeId: record.issueNodeId,
+        itemId: effect.receipt.itemId,
+      };
+      const previous = targets.get(target.itemId);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(target))
+        throw new Error("Original Project target identity mappings conflict");
+      targets.set(target.itemId, target);
+    }
+  }
+  return [...targets.values()].sort((a, b) => a.itemId.localeCompare(b.itemId));
+}
+
 export async function observeProjectQueue(
   config: FactoryConfig,
   github: GitHubGateway,
@@ -3196,11 +3227,15 @@ export async function observeProjectQueue(
     throw new Error(
       "The configured GitHub gateway cannot read the bound Project queue",
     );
-  const snapshot = await github.projectQueueRead(binding);
+  const history = await readQueueHistory(config);
+  const snapshot = await github.projectQueueRead(
+    binding,
+    queueObservationTargets(history),
+  );
   return verifyQueueObservation(
     config,
     snapshot,
-    await readQueueHistory(config),
+    history,
     authority === "explicit-operation",
   );
 }

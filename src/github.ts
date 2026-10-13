@@ -157,11 +157,15 @@ export class RealGitHubGateway implements GitHubGateway {
 
   projectQueueRead(
     binding: Parameters<NonNullable<GitHubGateway["projectQueueRead"]>>[0],
+    knownTargets: Parameters<
+      NonNullable<GitHubGateway["projectQueueRead"]>
+    >[1] = [],
   ) {
     return projectQueueReadOnGitHub(
       this.repository,
       binding,
       this.queueGraphql,
+      knownTargets,
     );
   }
 

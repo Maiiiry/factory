@@ -50,6 +50,7 @@ import {
   createQueueCommand,
   createQueueOperation,
   observeProjectQueue,
+  queueObservationTargets,
   retainedQueueEntry,
   nextProjectQueueOrder,
   verifyQueueInspection,
@@ -1392,17 +1393,21 @@ async function runIntakeOwned(
         throw new Error("GitHub gateway cannot read Project queue metadata");
       // Only the serial read-only GitHub leg is preemptible. Archive checking
       // keeps the original controller scope and its authenticated verifier.
+      const history = await readQueueHistory(config);
+      const targets = queueObservationTargets(history);
       const snapshot = await withProcessCancellation(
         signal,
         async () => {
-          const current = await services.github.projectQueueRead!(binding);
+          const current = await services.github.projectQueueRead!(
+            binding,
+            targets,
+          );
           signal.throwIfAborted();
           return current;
         },
         undefined,
         inheritedDeadline,
       );
-      const history = await readQueueHistory(config);
       inherited?.throwIfAborted();
       poll.signal.throwIfAborted();
       return verifyQueueObservation(config, snapshot, history);
