@@ -2252,6 +2252,35 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
         };
       },
       (value) => {
+        value.objectiveBodyDigest = createHash("sha256")
+          .update("refusal-only objective binding")
+          .digest("hex");
+        value.sourcePacketDigest = createHash("sha256")
+          .update(JSON.stringify(pinnedSources))
+          .digest("hex");
+        const session = agentSessionContinuation(
+          value,
+          "planning",
+          undefined,
+          () => undefined,
+        );
+        session.checkpoint({
+          scope: session.scope,
+          adapter: "unknown-turn-refusal-only",
+          identity: session.identity,
+          turn: 1,
+          status: "unavailable",
+          data: {},
+          currentTurn: {
+            invocationId: randomUUID(),
+            requestDigest: "b".repeat(64),
+            graphDigest: graphDigest(value.graph),
+            dispatch: "submitted",
+            resources: "settled",
+          },
+        });
+      },
+      (value) => {
         value.coordinator.deadlineAt = new Date(Date.now() - 1).toISOString();
       },
     ]) {

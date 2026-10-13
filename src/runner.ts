@@ -1844,6 +1844,10 @@ export function rereviewWorkItem(
         observation.postCommandStatus !== "unchanged" ||
         observation.selectedLfsMembers !== 0 ||
         observation.subprocessOwnership !== "settled" ||
+        [
+          ...Object.values(state.agentSessions ?? {}),
+          ...(state.agentSessionHistory ?? []),
+        ].some((ref) => ref.currentTurn && !ref.currentTurn.terminal) ||
         restoredContinuationOwnershipHold(state) ||
         (state.coordinator?.deadlineAt &&
           Date.now() >= Date.parse(state.coordinator.deadlineAt))
