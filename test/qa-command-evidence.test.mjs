@@ -24,11 +24,261 @@ import { readState, saveState, statePath } from "../dist/state-store.js";
 import { finalizeObjective } from "../dist/runner/finalization.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
 import { renderResultReviewCall } from "../dist/compiler/model.js";
-import { validateTree } from "../dist/validation.js";
+import { validateTree, validateWorkItem } from "../dist/validation.js";
 import { reviewTextArtifactEvidence } from "../dist/review-image-evidence.js";
-import { assertReviewArtifactSelection } from "../dist/review-artifacts.js";
+import {
+  assertReviewArtifactSelection,
+  assertReviewArtifacts,
+} from "../dist/review-artifacts.js";
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
+
+test("coding text capture follows producer ownership while final capture remains complete", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-coding-proof-"));
+  const checkout = join(root, "target");
+  mkdirSync(checkout);
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  try {
+    git("init", "-b", "main");
+    git("config", "user.name", "Integration");
+    git("config", "user.email", "integration@example.invalid");
+    writeFileSync(
+      join(checkout, "independent.cjs"),
+      "// Declares command stdout proof.\n",
+    );
+    writeFileSync(
+      join(checkout, "validate.cjs"),
+      "if(require('node:fs').existsSync('producer/report.cjs'))require('./producer/report.cjs');else console.log('Setup checks passed');\n",
+    );
+    writeFileSync(join(checkout, "setup.txt"), "Enable the later producer.\n");
+    git("add", ".");
+    git("commit", "-m", "Setup contract");
+    const base = git("rev-parse", "HEAD");
+    const baseTree = git("rev-parse", "HEAD^{tree}");
+    const store = new LocalContentStore(join(root, "objects"));
+    const command = (mode = "") =>
+      `${process.execPath} validate.cjs${mode ? ` ${mode}` : ""}`;
+    const selectors = (check = command()) => [
+      {
+        command: check,
+        text: { source: "independent.cjs", stdout: { maxBytes: 4096 } },
+      },
+      {
+        command: check,
+        text: {
+          source: "producer/report.cjs",
+          locator: {
+            stdoutPathPrefix: "Runtime evidence: ",
+            files: [
+              {
+                file: "proof.json",
+                mediaType: "application/json",
+                maxBytes: 1024,
+              },
+            ],
+          },
+        },
+      },
+    ];
+    const coding = (
+      name,
+      commit,
+      tree,
+      ownedPaths,
+      selected = selectors(),
+      check = command(),
+    ) =>
+      validateWorkItem(
+        checkout,
+        join(root, name),
+        {
+          id: name,
+          kind: "work",
+          ownedPaths,
+          validation: [{ command: check, provenance: "source-declared" }],
+        },
+        commit,
+        tree,
+        base,
+        undefined,
+        undefined,
+        undefined,
+        [],
+        store,
+        [],
+        undefined,
+        true,
+        selected,
+      );
+    const final = (name, commit, tree, check = command()) =>
+      validateTree(
+        checkout,
+        join(root, name),
+        commit,
+        tree,
+        [check],
+        undefined,
+        undefined,
+        [],
+        store,
+        base,
+        true,
+        { commands: [] },
+        selectors(check),
+      );
+
+    // The actual first candidate has no future producer or runtime reports.
+    const setup = await coding("setup", base, baseTree, ["setup.txt"]);
+    assert.equal(setup.commands[0].passed, true);
+    assert.equal(setup.reviewArtifacts, undefined);
+    // Non-text selectors remain required even without producer ownership.
+    await assert.rejects(
+      () =>
+        coding(
+          "image-selection",
+          base,
+          baseTree,
+          ["setup.txt"],
+          [
+            {
+              command: command(),
+              receipt: {
+                stdoutPathField: "receipt",
+                stdoutSha256Field: "sha256",
+                maxBytes: 4096,
+              },
+              image: {
+                file: "scene.png",
+                sha256Field: "imageSha256",
+                maxBytes: 65536,
+              },
+              candidate: {
+                file: "independent.cjs",
+                sha256Field: "candidateSha256",
+              },
+            },
+          ],
+        ),
+      /JSON|Unexpected token/,
+    );
+    await assert.rejects(
+      () => final("early-final", base, baseTree),
+      /tracked regular file/,
+    );
+    await assert.rejects(
+      () =>
+        coding(
+          "invalid-declaration",
+          base,
+          baseTree,
+          ["setup.txt"],
+          [
+            {
+              ...selectors()[1],
+              text: { ...selectors()[1].text, source: "../report.cjs" },
+            },
+          ],
+        ),
+      /contained and relative/,
+    );
+
+    mkdirSync(join(checkout, "producer"));
+    writeFileSync(
+      join(checkout, "producer/report.cjs"),
+      `const fs=require('node:fs'),os=require('node:os'),p=require('node:path');
+if(process.argv[2]==='missing')console.log('Command passed without a report');
+else {const dir=fs.mkdtempSync(p.join(os.tmpdir(),'proof-'));fs.writeFileSync(p.join(dir,'proof.json'),process.argv[2]==='oversized'?' '.repeat(1025):JSON.stringify({equal:true}));console.log('Runtime evidence: '+dir);}
+`,
+    );
+    git("add", ".");
+    git("commit", "-m", "Implement report producer");
+    const commit = git("rev-parse", "HEAD");
+    const tree = git("rev-parse", "HEAD^{tree}");
+    for (const [name, ownership] of [
+      ["file-owner", ["producer/report.cjs"]],
+      ["directory-owner", ["producer/"]],
+    ]) {
+      const proof = await coding(name, commit, tree, ownership);
+      assert.equal(proof.reviewArtifacts.length, 1);
+      const artifact = proof.reviewArtifacts[0];
+      assert.equal(artifact.selectorIndex, 1);
+      assert.equal(artifact.text.source.path, "producer/report.cjs");
+      assert.equal(artifact.treeSha, tree);
+      assert.deepEqual(
+        JSON.parse(
+          (await store.readBytes(artifact.text.bodies[0].ref)).toString(),
+        ),
+        { equal: true },
+      );
+      // The original selector index survives serialization and the actual
+      // review consumer authenticates the retained bytes and source binding.
+      const receipt = join(root, `${name}.validation.json`);
+      writeFileSync(receipt, JSON.stringify(proof));
+      const restored = JSON.parse(readFileSync(receipt, "utf8"));
+      assertReviewArtifacts(restored.reviewArtifacts, tree, restored.commands);
+      const evidence = await reviewTextArtifactEvidence(
+        checkout,
+        restored,
+        [],
+        store,
+      );
+      assert.ok(
+        evidence.some(
+          (entry) => entry.path === "Selected validation text 0/1 binding",
+        ),
+      );
+      assert.ok(
+        evidence.some(
+          (entry) => entry.content === '{"equal":true}' && entry.complete,
+        ),
+      );
+    }
+    const unowned = await coding("literal-prefix", commit, tree, [
+      "producer/report.cjsx",
+    ]);
+    assert.equal(unowned.reviewArtifacts, undefined);
+    for (const mode of ["missing", "oversized"]) {
+      const check = command(mode);
+      await assert.rejects(
+        () =>
+          coding(mode, commit, tree, ["producer/"], selectors(check), check),
+        mode === "missing" ? /one complete absolute path/ : /exceeds.*bound/,
+      );
+    }
+    await assert.rejects(
+      () =>
+        coding(
+          "unauthenticated",
+          commit,
+          tree,
+          ["producer/"],
+          [
+            {
+              ...selectors()[1],
+              text: { ...selectors()[1].text, source: "producer/absent.cjs" },
+            },
+          ],
+        ),
+      /tracked regular file/,
+    );
+    const complete = await final("final", commit, tree);
+    assert.deepEqual(
+      complete.reviewArtifacts.map((x) => x.selectorIndex),
+      [0, 1],
+    );
+    assert.equal(
+      complete.reviewArtifacts.every((x) => x.complete && x.treeSha === tree),
+      true,
+    );
+    await assert.rejects(
+      () => final("missing-final", commit, tree, command("missing")),
+      /one complete absolute path/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("QA rereview retains exact command, installed dependency and runtime proof through final review", async () => {
   const root = mkdtempSync(join(tmpdir(), "factory-qa-proof-"));
