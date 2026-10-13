@@ -1285,6 +1285,23 @@ async function runObjectiveOwned(
       try {
         if (
           controlReleased &&
+          !finalizationErrors.length &&
+          queueClaim &&
+          runFailed &&
+          !owner.snapshot
+        ) {
+          // Fresh source preparation can refuse before its first canonical
+          // snapshot. The creating owner still holds its lease here; the
+          // existing reservation seam independently refuses started work or
+          // uncertain subprocesses and acknowledges the original failure.
+          await settleFailedProjectQueueReservation(
+            config,
+            queueClaim,
+            lock.token,
+            runFailure,
+          );
+        } else if (
+          controlReleased &&
           queueClaim &&
           owner.snapshot &&
           (owner.snapshot.cancelledAt

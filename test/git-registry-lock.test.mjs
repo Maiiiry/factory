@@ -89,13 +89,14 @@ import {
   ITEMS,
   INSPECT,
 } from "../dist/github-project-queue-wire.js";
-import { controlObjective } from "../dist/runner.js";
+import { controlObjective, runObjective } from "../dist/runner.js";
 import {
   acquireInstallationLock,
   acquireObjectiveLock,
   installationLockPath,
   objectiveLockPath,
   readControllerOwner,
+  readContinuation,
   readState,
   releaseControllerLock,
   statePath,
@@ -105,6 +106,11 @@ import {
 const processUrl = new URL("../dist/process.js", import.meta.url).href;
 
 test("a terminal background watcher holds checkpoint failure while real control and explicit recovery remain usable", async (t) => {
+  await watcherWorkflow(t, true);
+  await watcherWorkflow(t, false);
+});
+
+async function watcherWorkflow(t, preSnapshotFailure) {
   const directory = await mkdtemp(
     join(tmpdir(), "factory-watcher-checkpoint-"),
   );
@@ -145,6 +151,7 @@ test("a terminal background watcher holds checkpoint failure while real control 
     policy: { network: "off", allowedSecretNames: [] },
     queue: {
       pollSeconds: 1,
+      ...(preSnapshotFailure ? { objectiveDeadlineSeconds: 60 } : {}),
       project: {
         repository,
         projectId: "PVT_fixture",
@@ -559,6 +566,161 @@ test("a terminal background watcher holds checkpoint failure while real control 
   );
   controlMetadata = originalControl;
 
+  if (preSnapshotFailure) {
+    const initial = git("rev-parse", "HEAD"),
+      sourceRemote = join(directory, "source.git");
+    execFileSync("git", ["init", "--bare", "-b", "main", sourceRemote], {
+      stdio: "ignore",
+    });
+    git("push", sourceRemote, "HEAD:main");
+    git("remote", "set-url", "origin", `git@github.com:${repository}.git`);
+    const ssh = join(directory, "source-ssh");
+    // A trusted operator transport executes the actual upload-pack against
+    // this owned bare repository. Git refs/objects/output remain genuine;
+    // no synthetic Git response or provider is involved.
+    await writeFile(
+      ssh,
+      `#!/bin/sh\nexec git-upload-pack '${sourceRemote}'\n`,
+      { mode: 0o700 },
+    );
+    const originalSsh = process.env.GIT_SSH_COMMAND,
+      originalVariant = process.env.GIT_SSH_VARIANT;
+    process.env.GIT_SSH_COMMAND = ssh;
+    process.env.GIT_SSH_VARIANT = "ssh";
+    const contentStore = new LocalContentStore(
+      join(stateRoot(repository), "content"),
+    );
+    const boundary = new Error(
+      "Observed actual preparation before compiler submission",
+    );
+    let planningBoundary = 0;
+    const services = {
+      github: {
+        ...github,
+        async defaultBranch() {
+          return "main";
+        },
+      },
+      contentStore,
+      planningModel: new CodexPlanningModel(checkout, selection, selection),
+      driver: new LocalExecutionDriver(
+        checkout,
+        join(directory, "worktrees"),
+        new CodexHarness(join(directory, "credentials"), "off", selection),
+        1,
+        contentStore,
+        "codex",
+      ),
+      delivery: new RegularDelivery(checkout, github),
+      reportRunStatus(message) {
+        if (!message.includes("compiling and independently reviewing")) return;
+        planningBoundary++;
+        throw boundary;
+      },
+    };
+    try {
+      await intakeControl(config, "resume", undefined, github);
+      await writeFile(
+        join(checkout, "diverged.txt"),
+        "actual retained user work\n",
+      );
+      git("add", "diverged.txt");
+      git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "diverged local source",
+      );
+      const diverged = git("rev-parse", "HEAD");
+      await assert.rejects(
+        runObjective(config, 1, services),
+        /fast-forward|diverg/i,
+      );
+      assert.equal(planningBoundary, 0);
+      assert.equal(git("rev-parse", "HEAD"), diverged);
+      assert.equal(
+        await readFile(join(checkout, "diverged.txt"), "utf8"),
+        "actual retained user work\n",
+      );
+      assert.equal(readState(repository, 1), undefined);
+      assert.equal(
+        readControllerOwner(objectiveLockPath(repository, 1)),
+        undefined,
+      );
+      const first = (await readQueueHistory(config)).filter(
+        (row) => row.kind === "project-queue-owner",
+      );
+      assert.equal(first.length, 1);
+      assert.equal(first[0].settled.disposition, "quiescent");
+      assert(first[0].settled.reservationFailure);
+      assert.equal(first[0].runBinding, undefined);
+      await authenticateQueueOwnerReferences(first[0], (ref) =>
+        contentStore.readBytes(ref),
+      );
+      const settledOriginal = JSON.stringify(first[0]);
+      const acknowledged = await withRecoveryCheckpointScope(
+        {
+          config,
+          buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+        },
+        () => readVerifiedRecoveryCheckpoint(config),
+      );
+      const archivedClaim = acknowledged.manifest.files.find(
+        (file) => file.path === `project-queue-history/${first[0].id}.json`,
+      );
+      assert(archivedClaim);
+      assert.deepEqual(
+        Buffer.from(await acknowledged.readVerifiedBlob(archivedClaim.ref)),
+        await readFile(
+          join(
+            stateRoot(repository),
+            "project-queue-history",
+            `${first[0].id}.json`,
+          ),
+        ),
+      );
+      // Repair only this disposable fixture by switching to a new branch;
+      // the divergent branch and its real original commit remain intact.
+      git("switch", "-c", "corrected-source", initial);
+      await assert.rejects(
+        runObjective(config, 1, services),
+        (error) => error === boundary,
+      );
+      assert.equal(planningBoundary, 1);
+      const prepared = readContinuation(repository, 1);
+      assert.equal(prepared.baseSha, initial);
+      const next = (await readQueueHistory(config)).filter(
+        (row) => row.kind === "project-queue-owner",
+      );
+      assert.equal(next.length, 2);
+      assert.equal(
+        JSON.stringify(next.find((row) => row.id === first[0].id)),
+        settledOriginal,
+      );
+      const admitted = next.find((row) => row.id !== first[0].id);
+      assert.equal(
+        admitted.deadlineAt,
+        first[0].deadlineAt,
+        "source correction cannot renew the original deadline",
+      );
+      assert.equal(admitted.settled.runId, prepared.runId);
+      assert.equal(admitted.runBinding.runId, prepared.runId);
+      assert.equal(
+        readControllerOwner(objectiveLockPath(repository, 1)),
+        undefined,
+      );
+      return;
+    } finally {
+      if (originalSsh === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = originalSsh;
+      if (originalVariant === undefined) delete process.env.GIT_SSH_VARIANT;
+      else process.env.GIT_SSH_VARIANT = originalVariant;
+    }
+  }
+
   const commit = git("rev-parse", "HEAD"),
     treeSha = git("rev-parse", "HEAD^{tree}");
   const item = {
@@ -842,7 +1004,7 @@ test("a terminal background watcher holds checkpoint failure while real control 
       await running.catch(() => undefined);
     }
   }
-});
+}
 
 /** Another controller process: holds the lock in `mode` until told to let go. */
 async function holder(key, mode, publication = false) {

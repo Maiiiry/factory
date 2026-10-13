@@ -4113,10 +4113,11 @@ export async function claimProjectQueueRun(
     throw new Error(
       "This Project admission has an unfinished or foreign owner; supported resource reconciliation is required before dispatch",
     );
+  const started = prior.filter((claim) => !claim.settled?.reservationFailure);
   if (
-    prior.length &&
+    started.length &&
     (!snapshot ||
-      prior.some(
+      started.some(
         (claim) =>
           (claim.settled?.runId ?? claim.priorRunId) !== snapshot.runId,
       ))
@@ -4216,7 +4217,7 @@ function creatingClaimOwner(
   return { ...identity, namespace: readlinkSync("/proc/self/ns/pid") };
 }
 
-/** The creating function has not returned to any provider/runner when this fails. */
+/** The creating controller has not started canonical work or any provider when this fails. */
 export async function settleFailedProjectQueueReservation(
   config: FactoryConfig,
   claim: QueueOwnerClaim,
