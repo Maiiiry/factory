@@ -752,6 +752,8 @@ export interface ExecutionRequest {
     configDigest?: string;
   };
   item: WorkItem;
+  /** Original accepted citation base, distinct from the integrated execution base. */
+  sourceBaseSha?: string;
   baseSha: string;
   attemptId?: string;
   sourceAssets?: { binding: SourceAssetBinding; ref: ContentRef }[];
@@ -947,6 +949,9 @@ export interface HarnessRequest {
   environment?: ExecutionProfileEnvironment;
   /** Exact Factory-owned worktree. The harness may operate only inside it. */
   item: WorkItem;
+  /** Original accepted source pin and current owned file presentation. */
+  sourceBaseSha?: string;
+  sourceDelivery?: import("./compiler/source-delivery.js").PlanningSourceDelivery;
   worktree: string;
   attemptId?: string;
   sourceAssets?: {

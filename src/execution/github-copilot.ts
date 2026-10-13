@@ -1,3 +1,4 @@
+import { assertWorkerSourceFiles } from "./harness-support.js";
 import { randomUUID } from "node:crypto";
 import { readWorkerJson, workFault } from "../fault.js";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -174,6 +175,7 @@ export class GitHubCopilotSdkHarness implements AgentHarness {
    * unrecorded start of it spawned is stopped first (#585).
    */
   async start(request: HarnessRequest): Promise<HarnessHandle> {
+    assertWorkerSourceFiles(request);
     if (request.discovery || request.item.kind === "discovery")
       throw new Error(
         "GitHub Copilot harness does not support enforced read-only discovery",

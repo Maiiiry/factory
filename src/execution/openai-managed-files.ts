@@ -1,3 +1,4 @@
+import { materializeWorkerSources } from "./harness-support.js";
 import { packageManagerUpdate } from "../package-manager-update.js";
 import { prepareManagedBase } from "./managed-base.js";
 import { createHash } from "node:crypto";
@@ -100,6 +101,11 @@ export async function prepareOpenAIInput(args: {
     await store.materialize(selected.ref, join(repo, relative));
     selectedAssets.push({ ...selected, path: `/workspace/repo/${relative}` });
   }
+  const sourceDelivery = materializeWorkerSources(
+    repo,
+    request,
+    "/workspace/repo",
+  );
   const file = join(root, "input.tar");
   await create({ cwd: root, file, portable: true, noMtime: true }, ["repo"]);
   const archive = readFileSync(file);
@@ -111,6 +117,10 @@ export async function prepareOpenAIInput(args: {
     archive,
     request: { ...request, sourceAssets },
     harnessRequest: {
+      ...(sourceDelivery && {
+        sourceBaseSha: request.sourceBaseSha,
+        sourceDelivery,
+      }),
       item: request.item,
       ...(request.handoffPeers && {
         handoffPeers: structuredClone(request.handoffPeers),

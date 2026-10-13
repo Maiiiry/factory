@@ -1,3 +1,4 @@
+import { assertWorkerSourceFiles } from "./harness-support.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
@@ -100,7 +101,11 @@ import { stoppedFault } from "./attempt.js";
 import { assertDurableValue } from "./checkpoint.js";
 import { ClaudeAgentSdkHarness } from "./claude.js";
 import { executionFault } from "./fault.js";
-import { readWorkHandoff } from "./harness-support.js";
+import {
+  materializeWorkerSources,
+  workerSourceDelivery,
+  readWorkHandoff,
+} from "./harness-support.js";
 import {
   checkStagedCandidate,
   scanCollectionObservation,
@@ -341,6 +346,7 @@ export class CodexHarness implements AgentHarness {
    * unrecorded start of it spawned is stopped first (#585).
    */
   async start(request: HarnessRequest): Promise<HarnessHandle> {
+    assertWorkerSourceFiles(request);
     if ((request.item.kind === "discovery") !== Boolean(request.discovery))
       throw new Error(
         "Codex discovery requires its explicit read-only execution input",
@@ -1360,6 +1366,15 @@ export async function collectWorktreeResult(
       source.ref,
     );
   }
+  if (request.sourceBaseSha && request.item.inputSources?.length) {
+    const delivery = workerSourceDelivery(request, worktree)!;
+    for (const source of delivery.files)
+      await verifyBoundInput(join(delivery.root, source.file), {
+        digest: source.digest,
+        bytes: source.bytes,
+        mediaType: "text/plain",
+      });
+  }
   const privateSources = (request.sourceAssets ?? []).filter(
     (source) =>
       source.binding.kind === "local" ||
@@ -2089,7 +2104,14 @@ export class LocalExecutionDriver implements ExecutionDriver {
         ...(workerReadiness && { receiptDigest: workerReadiness.digest }),
       });
       const managerUpdate = packageManagerUpdate(request.objectiveBody ?? "");
+      const sourceDelivery = request.discovery
+        ? undefined
+        : materializeWorkerSources(worktree, request);
       const preparedHarnessRequest: HarnessRequest = {
+        ...(sourceDelivery && {
+          sourceBaseSha: request.sourceBaseSha,
+          sourceDelivery,
+        }),
         ...(request.handoffPeers && {
           handoffPeers: structuredClone(request.handoffPeers),
         }),

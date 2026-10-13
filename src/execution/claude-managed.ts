@@ -62,7 +62,11 @@ import {
   parseClaudeResultSnapshot,
 } from "./claude-managed-transfer.js";
 import { executionFault } from "./fault.js";
-import { readProducedAssets, workItemPrompt } from "./harness-support.js";
+import {
+  workerSourceDelivery,
+  readProducedAssets,
+  workItemPrompt,
+} from "./harness-support.js";
 import {
   authenticateRejectedCollectionReceipt,
   collectWorktreeResult,
@@ -326,6 +330,7 @@ export class ClaudeManagedExecutionDriver implements ExecutionDriver {
         data.request.objectiveBody ?? "",
       ),
       worktree: workspace,
+      sourceDelivery: workerSourceDelivery(data.request, workspace),
       sourceAssets: sources.map((source) => ({
         ...source,
         ...((source.binding.kind === "local" ||

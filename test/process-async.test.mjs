@@ -61,7 +61,10 @@ import {
   summarizeFormalHistory,
   withDiagnosticSession,
 } from "../dist/diagnostics.js";
-import { workItemPrompt } from "../dist/execution/harness-support.js";
+import {
+  workItemPrompt,
+  materializeWorkerSources,
+} from "../dist/execution/harness-support.js";
 import {
   CodexHarness,
   checkpointWorkerSession,
@@ -3679,6 +3682,11 @@ test("source readiness prepares each real fresh checkout before its phase checks
       });
       const harnessRequest = {
         item,
+        sourceBaseSha: baseSha,
+        sourceDelivery: materializeWorkerSources(worker, {
+          item,
+          sourceBaseSha: baseSha,
+        }),
         worktree: worker,
         attemptId: "recorded-checkout",
         workerReadiness: receipt,
@@ -3740,6 +3748,8 @@ test("source readiness prepares each real fresh checkout before its phase checks
       assert.ok(
         !stalePrompt.includes("Controller readiness in this exact checkout"),
       );
+      // A fresh preparation precedes private worker input staging, as in the driver.
+      rmSync(join(worker, ".factory-inputs"), { recursive: true, force: true });
       // Restore only through the original real authorized sequence; setup refuses duplication.
       const refreshedReadiness = await validateCheckout(
         worker,
@@ -3748,6 +3758,10 @@ test("source readiness prepares each real fresh checkout before its phase checks
         baseTree,
         [setup, probe],
       );
+      harnessRequest.sourceDelivery = materializeWorkerSources(worker, {
+        item,
+        sourceBaseSha: baseSha,
+      });
       assert.equal(currentWorkerReadiness(harnessRequest), undefined);
       const refreshed = workerReadinessReceipt({
         request: receiptRequest,
