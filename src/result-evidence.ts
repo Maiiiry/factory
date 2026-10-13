@@ -884,44 +884,31 @@ export function unchangedResultByteEvidence(
   comparisonBaseSha: string,
   resultCommitSha: string,
   limit: number,
+  sourcePaths: readonly string[] = [],
 ): {
   sources: ResultReviewEvidenceSource[];
   textBytes: number;
   rawBytes: number;
 } {
-  const sources: ResultReviewEvidenceSource[] = [];
   const budget = Number.isSafeInteger(limit) && limit >= 0 ? limit : 0;
-  let remaining = budget;
   const rawBudget = configuredResultReviewRawBudget();
   let rawRemaining = rawBudget;
-  // Retain serialized room for an unavailable outcome after a bounded raw read.
-  const available = () => Math.max(0, remaining - 512);
-  const emit = (
-    path: string,
-    facts: Record<string, unknown>,
-    complete: boolean,
-    useReserve = false,
-  ) => {
-    const source = { path, content: JSON.stringify(facts), complete };
-    const bytes = Buffer.byteLength(JSON.stringify(source));
-    if (bytes > (useReserve ? remaining : available())) return false;
-    remaining -= bytes;
-    sources.push(source);
-    return true;
-  };
-  const unavailable = (reason: string) => {
-    emit(
-      "Named-base raw-byte comparison unavailable",
-      { availability: "unavailable", reason },
-      false,
-      true,
-    );
+  const source = (facts: Record<string, unknown>, complete: boolean) => ({
+    path: "Named-base raw-byte comparisons",
+    content: JSON.stringify(facts),
+    complete,
+  });
+  const finish = (facts: Record<string, unknown>, complete: boolean) => {
+    const entry = source(facts, complete);
+    const bytes = Buffer.byteLength(JSON.stringify(entry));
     return {
-      sources,
-      textBytes: budget - remaining,
+      sources: bytes <= budget ? [entry] : [],
+      textBytes: bytes <= budget ? bytes : 0,
       rawBytes: rawBudget - rawRemaining,
     };
   };
+  const unavailable = (reason: string) =>
+    finish({ availability: "unavailable", reason }, false);
   if (
     !/^[0-9a-f]{40}$/.test(comparisonBaseSha) ||
     !/^[0-9a-f]{40}$/.test(resultCommitSha)
@@ -929,12 +916,17 @@ export function unchangedResultByteEvidence(
     return unavailable(
       "Commit identities are not exact supported Git object names",
     );
-  const read = (args: string[], maximum: number): Buffer | undefined => {
+  const read = (
+    args: string[],
+    maximum: number,
+    input?: string,
+  ): Buffer | undefined => {
     maximum = Math.min(maximum, rawRemaining);
     if (maximum < 1) return undefined;
     const result = spawnSync("git", ["-C", checkout, ...args], {
       env: pinnedGitEnvironment(),
       maxBuffer: maximum,
+      ...(input === undefined ? {} : { input }),
     });
     const output = result.stdout ?? Buffer.alloc(0);
     rawRemaining -= Math.min(output.length, maximum);
@@ -942,12 +934,7 @@ export function unchangedResultByteEvidence(
       return undefined;
     return output;
   };
-  let identity: {
-    comparisonBaseCommitSha: string;
-    comparisonBaseTreeSha: string;
-    resultCommitSha: string;
-    resultTreeSha: string;
-  };
+  let identity;
   try {
     identity = {
       comparisonBaseCommitSha: pinnedGit(
@@ -974,11 +961,16 @@ export function unchangedResultByteEvidence(
   } catch {
     return unavailable("Named comparison base or result commit unavailable");
   }
-  type Entry = { mode: string; kind: string; blobOid: string };
+  type Entry = {
+    mode: string;
+    kind: string;
+    blobOid: string;
+    bytes: number | null;
+  };
   const entries = (tree: string): Map<string, Entry> | undefined => {
-    const output = read(["ls-tree", "-r", "-z", tree], rawRemaining);
+    const output = read(["ls-tree", "-r", "-l", "-z", tree], rawRemaining);
     if (!output || (output.length && output.at(-1) !== 0)) return undefined;
-    let text: string;
+    let text;
     try {
       text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
         output,
@@ -989,13 +981,17 @@ export function unchangedResultByteEvidence(
     const map = new Map<string, Entry>();
     for (const record of text.split("\0").slice(0, -1)) {
       const match = record.match(
-        /^([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/,
+        /^([0-7]{6}) (blob|commit) ([0-9a-f]{40}) +([0-9]+|-)\t([\s\S]+)$/,
       );
-      if (!match) return undefined;
-      map.set(match[4]!, {
+      if (!match || map.has(match[5]!)) return undefined;
+      const bytes = match[4] === "-" ? null : Number(match[4]);
+      if (bytes !== null && (!Number.isSafeInteger(bytes) || bytes < 0))
+        return undefined;
+      map.set(match[5]!, {
         mode: match[1]!,
         kind: match[2]!,
         blobOid: match[3]!,
+        bytes,
       });
     }
     return map;
@@ -1004,167 +1000,210 @@ export function unchangedResultByteEvidence(
   const result = entries(identity.resultTreeSha);
   if (!base || !result)
     return unavailable("Complete bounded tracked-object inventory unavailable");
-  for (const path of new Set([...base.keys(), ...result.keys()])) {
-    const before = base.get(path);
-    const after = result.get(path);
-    const facts = {
-      ...identity,
-      path,
-      base: before ?? null,
-      result: after ?? null,
-    };
-    const label = `Named-base raw-byte comparison: ${JSON.stringify(path)}`;
+  // Explicit pinned sources and the declared package/tool authorities get the
+  // finite raw budget first. This changes navigation, never canonical membership.
+  const pinned = new Set(
+    sourcePaths.map((path) =>
+      base.has(path) || result.has(path) ? path : path.split("#")[0]!,
+    ),
+  );
+  const authority = (path: string) =>
+    !path.includes("/") || path.split("/").at(-1) === "package.json";
+  const paths = [...new Set([...base.keys(), ...result.keys()])].sort(
+    (a, b) =>
+      Number(pinned.has(b)) - Number(pinned.has(a)) ||
+      Number(authority(b)) - Number(authority(a)) ||
+      (base.get(a)?.bytes ?? Number.MAX_SAFE_INTEGER) -
+        (base.get(b)?.bytes ?? Number.MAX_SAFE_INTEGER) ||
+      a.localeCompare(b),
+  );
+  const eligible = new Map<string, Entry>();
+  const dispositions = new Map<string, string>();
+  let plannedBytes = 0;
+  for (const path of paths) {
+    const before = base.get(path),
+      after = result.get(path);
     if (
       !before ||
       !after ||
       before.kind !== "blob" ||
       after.kind !== "blob" ||
       !["100644", "100755"].includes(before.mode) ||
-      !["100644", "100755"].includes(after.mode) ||
       before.mode !== after.mode ||
-      before.blobOid !== after.blobOid
+      before.blobOid !== after.blobOid ||
+      before.bytes !== after.bytes ||
+      before.bytes === null
     ) {
-      if (
-        !emit(
-          label,
-          {
-            ...facts,
-            availability: "unavailable",
-            reason:
-              "Not an unchanged regular tracked file; use separate exact change evidence. No symlink target or submodule content is compared.",
-          },
-          false,
-        )
-      )
-        return unavailable(
-          "Remaining serialized comparison evidence exceeds budget",
-        );
+      dispositions.set(path, "n");
       continue;
     }
-    const sizeOutput = read(
-      ["cat-file", "-s", before.blobOid],
-      Math.min(64, rawRemaining),
-    );
-    const size =
-      sizeOutput && /^\d+\n$/.test(sizeOutput.toString("ascii"))
-        ? Number(sizeOutput.toString("ascii"))
-        : NaN;
-    // Reserve receipt space before reading; serialized binary expansion is charged by emit.
+    const framedBytes =
+      2 *
+      (Buffer.byteLength(`${before.blobOid} blob ${before.bytes}\n`) +
+        before.bytes +
+        1);
     if (
-      !Number.isSafeInteger(size) ||
-      size < 0 ||
-      size * 2 > rawRemaining ||
-      1024 > available()
+      !Number.isSafeInteger(framedBytes) ||
+      framedBytes > rawRemaining - plannedBytes
     ) {
-      if (
-        !emit(
-          label,
-          {
-            ...facts,
-            availability: "unavailable",
-            reason:
-              "Complete raw blob reads or receipt exceed their bounded review budgets",
-          },
-          false,
-        )
-      )
-        return unavailable(
-          "Remaining serialized comparison evidence exceeds budget",
-        );
+      dispositions.set(path, "b");
       continue;
     }
-    const baseBytes = read(
-      ["cat-file", "blob", before.blobOid],
-      Math.max(1, size),
+    eligible.set(path, before);
+    plannedBytes += framedBytes;
+  }
+  const observed = new Map<string, Buffer>();
+  if (eligible.size) {
+    const output = read(
+      ["cat-file", "--batch"],
+      plannedBytes,
+      [...eligible.values()]
+        .flatMap((entry) => [entry.blobOid, entry.blobOid])
+        .join("\n") + "\n",
     );
-    const resultBytes = read(
-      ["cat-file", "blob", after.blobOid],
-      Math.max(1, size),
-    );
-    if (
-      !baseBytes ||
-      !resultBytes ||
-      baseBytes.length !== size ||
-      resultBytes.length !== size
-    ) {
-      if (
-        !emit(
-          label,
-          {
-            ...facts,
-            availability: "unavailable",
-            reason: "Complete raw blob bytes unavailable",
-          },
-          false,
-        )
-      )
-        return unavailable(
-          "Remaining serialized comparison evidence exceeds budget",
-        );
-      continue;
+    let cursor = 0,
+      valid = Boolean(output);
+    for (const [path, entry] of eligible) {
+      const sides: Buffer[] = [];
+      for (let side = 0; valid && side < 2; side++) {
+        const end = output!.indexOf(10, cursor);
+        if (
+          end === -1 ||
+          output!.subarray(cursor, end).toString("ascii") !==
+            `${entry.blobOid} blob ${entry.bytes}`
+        ) {
+          valid = false;
+          break;
+        }
+        cursor = end + 1;
+        const bytes = output!.subarray(cursor, cursor + entry.bytes!);
+        cursor += entry.bytes!;
+        if (
+          bytes.length !== entry.bytes ||
+          output![cursor++] !== 10 ||
+          createHash("sha1")
+            .update(`blob ${bytes.length}\0`)
+            .update(bytes)
+            .digest("hex") !== entry.blobOid
+        ) {
+          valid = false;
+          break;
+        }
+        sides.push(bytes);
+      }
+      if (valid && sides[0]!.equals(sides[1]!)) observed.set(path, sides[0]!);
+      else valid = false;
     }
-    let binary = baseBytes.includes(0);
+    if (!valid || cursor !== output?.length) observed.clear();
+  }
+  const positive: unknown[][] = [];
+  const negative: unknown[][] = paths.map((path) => [
+    path,
+    false,
+    dispositions.get(path) ?? "u",
+  ]);
+  let omittedPaths = 0;
+  const comparisonIdentity = createHash("sha256")
+    .update(JSON.stringify(identity))
+    .digest("hex");
+  const records = () => {
+    const entries: ResultReviewEvidenceSource[] = [];
+    if (positive.length)
+      entries.push(
+        source(
+          {
+            identity,
+            comparisonIdentity,
+            comparison: "complete-raw-Git-blob-Buffer.equals",
+            fields: [
+              "path",
+              "complete",
+              "mode",
+              "blobOid",
+              "byteCount",
+              "sha256",
+              "byteEqual",
+              "baselineContent",
+            ],
+            observations: positive,
+            scope:
+              "Only the named rows: both complete raw tracked Git blobs, including LFS pointers. No opaque semantics, host conditions, symlink/submodule targets or hydrated/uploaded/published media; no conclusion about unlisted paths.",
+          },
+          true,
+        ),
+      );
+    if (negative.length || omittedPaths)
+      entries.push({
+        path: "Named-base raw-byte comparisons unavailable",
+        content: JSON.stringify({
+          ...(positive.length
+            ? { comparisonIdentity }
+            : { identity, comparisonIdentity }),
+          fields: ["path", "complete", "reason"],
+          reasons: {
+            n: "Not an unchanged regular tracked file; use separate exact change evidence. No symlink target or submodule content is compared.",
+            b: "Complete raw blob reads exceed the remaining bounded raw budget.",
+            u: "Complete exact length-framed raw blob bytes unavailable.",
+            t: "Complete raw comparison observed but its serialized receipt or required lossless backing exceeds evidence budget.",
+          },
+          observations: negative,
+          omittedPaths,
+          scope:
+            "Incomplete evidence; these rows and omitted paths prove no observed raw-byte equality.",
+        }),
+        complete: false,
+      });
+    return entries;
+  };
+  const chargedBytes = () =>
+    records().reduce(
+      (total, entry) => total + Buffer.byteLength(JSON.stringify(entry)),
+      0,
+    );
+  while (negative.length && chargedBytes() + 64 > budget) {
+    negative.pop();
+    omittedPaths++;
+  }
+  if (chargedBytes() + 64 > budget)
+    return unavailable(
+      "Named comparison identity and observation fields exceed serialized evidence budget",
+    );
+  for (let index = 0; index < negative.length; index++) {
+    const path = negative[index]![0] as string,
+      bytes = observed.get(path),
+      entry = eligible.get(path);
+    if (!bytes || !entry) continue;
+    let binary = bytes.includes(0);
     try {
-      new TextDecoder("utf-8", { fatal: true }).decode(baseBytes);
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
       binary = true;
     }
-    const digest = (bytes: Buffer) =>
-      createHash("sha256").update(bytes).digest("hex");
-    const equal = baseBytes.equals(resultBytes);
-    if (
-      !emit(
-        label,
-        {
-          ...facts,
-          availability: "available",
-          comparison: "complete-raw-Git-blob-Buffer.equals",
-          byteEqual: equal,
-          base: {
-            ...before,
-            byteCount: baseBytes.length,
-            sha256: digest(baseBytes),
-          },
-          result: {
-            ...after,
-            byteCount: resultBytes.length,
-            sha256: digest(resultBytes),
-          },
-          ...(binary
-            ? {
-                baselineContent: {
-                  encoding: "base64",
-                  complete: true,
-                  content: baseBytes.toString("base64"),
-                },
-              }
-            : {}),
-          scope:
-            "Raw tracked blob bytes only, including LFS pointers; no opaque semantics, host conditions, symlink/submodule targets or hydrated/uploaded/published media.",
-        },
-        true,
-      )
-    ) {
-      if (
-        !emit(
-          label,
-          {
-            ...facts,
-            availability: "unavailable",
-            reason:
-              "Complete comparison observed but lossless binary bytes and serialized receipt exceed budget",
-          },
-          false,
-        )
-      )
-        return unavailable(
-          "Remaining serialized comparison evidence exceeds budget",
-        );
-    }
+    const row: unknown[] = [
+      path,
+      true,
+      entry.mode,
+      entry.blobOid,
+      bytes.length,
+      createHash("sha256").update(bytes).digest("hex"),
+      true,
+    ];
+    if (binary)
+      row.push({
+        encoding: "base64",
+        complete: true,
+        content: bytes.toString("base64"),
+      });
+    negative.splice(index, 1);
+    positive.push(row);
+    if (chargedBytes() + 64 > budget) {
+      positive.pop();
+      negative.splice(index, 0, [path, false, "t"]);
+    } else index--;
   }
   return {
-    sources,
-    textBytes: budget - remaining,
+    sources: records(),
+    textBytes: chargedBytes(),
     rawBytes: rawBudget - rawRemaining,
   };
 }

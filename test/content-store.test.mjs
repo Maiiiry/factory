@@ -13,6 +13,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -2626,10 +2627,33 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       // A current closure carries the original baseline plus only newly
       // reachable Git objects. These are actual source observations, not work
       // acceptance or invented provider evidence.
+      git("repack", "-a");
+      const sourcePackDirectory = join(
+        git("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        "pack",
+      );
+      const sourcePacks = readdirSync(sourcePackDirectory).filter((name) =>
+        name.endsWith(".pack"),
+      );
+      assert(sourcePacks.length > 0);
       const baselinePacks = (await buildClosure()).files.filter(
         (file) => file.kind === "git-pack",
       );
       assert.equal(baselinePacks.length, 1);
+      // Ordinary Git writers freshen existing packs without changing their
+      // bodies. Reproduce that exact storage change before adding a result.
+      for (const name of sourcePacks) {
+        const path = join(sourcePackDirectory, name);
+        const before = readFileSync(path);
+        const freshened = new Date(statSync(path).mtimeMs + 1000);
+        utimesSync(path, freshened, freshened);
+        assert.deepEqual(readFileSync(path), before);
+      }
+      assert.deepEqual(
+        (await buildClosure()).files.filter((file) => file.kind === "git-pack"),
+        baselinePacks,
+        "same-root pack freshening authenticates source without replacing the baseline",
+      );
       writeFileSync(join(checkout, "incremental.md"), "New retained source.\n");
       git("add", "incremental.md");
       git("commit", "-m", "Append retained source");
@@ -2689,7 +2713,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         assert.equal(git("cat-file", "-t", newBlob), "blob");
         await assert.rejects(
           buildClosure(),
-          /pack union failed exact reachable-object verification|objects could not be packed/,
+          /source failed exact reachable-object verification|pack union failed exact reachable-object verification|objects could not be packed/,
         );
       } finally {
         writeFileSync(newObjectPath, newObjectOriginal);
@@ -2786,22 +2810,38 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
         );
         await assert.rejects(
           buildClosure(),
-          /pack union failed exact reachable-object verification|objects could not be packed/,
+          /source failed exact reachable-object verification|pack union failed exact reachable-object verification|objects could not be packed/,
         );
       } finally {
         writeFileSync(sourceObjectPath, sourceObject);
         chmodSync(sourceObjectPath, sourceMode);
       }
       // Changed material is not automatically corruption: real Git repacking
-      // takes a complete newly authenticated capture and remains usable.
+      // reauthenticates the source and keeps the same retained pack union.
       git("repack", "-ad");
       const repacked = (await buildClosure()).files.filter(
         (file) => file.kind === "git-pack",
       );
-      assert.equal(repacked.length, 1);
+      assert.deepEqual(repacked, incrementalSourcePacks);
       assert.deepEqual(
         (await buildClosure()).files.filter((file) => file.kind === "git-pack"),
         repacked,
+      );
+      assert(
+        readFileSync(diagnosticPath(repository, 0), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .some(
+            (event) =>
+              event.operation === "recovery-checkpoint-source-pack" &&
+              event.outcome === "completed" &&
+              event.metadata.cache === "material-changed" &&
+              event.metadata.phase === "source-integrity" &&
+              event.metadata.baselinePacks > 0 &&
+              event.durationMs >= 0,
+          ),
+        "actual source-pack observations distinguish material reauthentication",
       );
     },
   );
