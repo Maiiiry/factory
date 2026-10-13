@@ -417,10 +417,14 @@ async function compilePlanAdmitted(
         lookup.providerCalls++;
         save();
       }
-      await awaitCheckpointAdmission(
-        context.sessionState?.repository,
-        "before-effect",
-      );
+      // The declared immediately following dispatch hook checkpoints these
+      // charged attempt facts together with its current logical intent. No
+      // transport effect can occur between the two controller callbacks.
+      if (model.providerDispatchAdmission !== "after-attempt-admission-v1")
+        await awaitCheckpointAdmission(
+          context.sessionState?.repository,
+          "before-effect",
+        );
     },
     ...(context.sessionState &&
     [17, 18, 19, 20].includes(context.sessionState.schemaVersion)

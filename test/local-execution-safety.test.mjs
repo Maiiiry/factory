@@ -1,4 +1,10 @@
-import { checkpointPlanningDispatch } from "../dist/compiler/recovery.js";
+import {
+  checkpointPlanningDispatch,
+  compilePlan,
+} from "../dist/compiler/recovery.js";
+import { paidPlanningModel } from "../dist/compiler/planning.js";
+import { planningSources } from "../dist/compiler/sources.js";
+import { step, repeatKey } from "../dist/step.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -25,6 +31,8 @@ import {
   awaitCheckpointAdmission,
   gitPersistenceStatus,
   CheckpointAdmissionFailure,
+  readVerifiedRecoveryCheckpoint,
+  withRecoveryCheckpointControllerVerification,
 } from "../dist/recovery-checkpoint.js";
 import {
   executionContext,
@@ -3703,4 +3711,231 @@ test("diagnosis dispatch intent follows complete admission before real process e
   );
   assert.equal(unknownNativeTurn.nativeInvocationStarted, undefined);
   assert.equal(existsSync(join(root, "native-sessions")), false);
+
+  // Exercise both composed admissions through the real compiler, continuation
+  // and private Git publisher. Cancellation inside the final ACK deterministically
+  // prevents an actual Codex process, without supplying any model response.
+  const checkout = join(root, "planning-target");
+  mkdirSync(checkout);
+  git(checkout, "init", "-b", "main");
+  writeFileSync(join(checkout, "README.md"), "# Public planning fixture\n");
+  git(checkout, "add", ".");
+  git(
+    checkout,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-m",
+    "baseline",
+  );
+  const baseSha = git(checkout, "rev-parse", "HEAD");
+  const repository = `fixture/planning-admission-${randomUUID()}`;
+  git(
+    checkout,
+    "remote",
+    "add",
+    "origin",
+    `https://github.com/${repository}.git`,
+  );
+  const remote = join(root, "planning-archive.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  const selection = { model: "unused-local-check", reasoningEffort: "low" };
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    planning: { kind: "codex-sdk", planner: selection, reviewer: selection },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...selection },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    gitPersistence: {
+      remote,
+      ref: "refs/heads/factory-history",
+      visibility: "private",
+      scope: "private-history",
+      maxBytes: 16 * 1024 * 1024,
+      maxFiles: 4096,
+      timeoutMs: 1000,
+      coalesceMs: 0,
+    },
+  };
+  validateConfig(config);
+  t.after(() =>
+    rmSync(stateRoot(repository), { recursive: true, force: true }),
+  );
+  const body =
+    "## Outcome\nUpdate the fixture README.\n\n## Acceptance\n- The README records the change.\n\n## Sources\n- README.md\n";
+  const preparation = {
+    schemaVersion: 18,
+    kind: "preparing",
+    repository,
+    objective: 1,
+    runId: randomUUID(),
+    configDigest: factoryConfigDigest(config),
+    baseSha,
+    objectiveBodyDigest: createHash("sha256").update(body).digest("hex"),
+    sourcePacketDigest: createHash("sha256")
+      .update(JSON.stringify(planningSources(body, baseSha, checkout)))
+      .digest("hex"),
+    issueByItemId: {},
+    autonomy: resolveAutonomy({ allowances: { planningRevisions: 0 } }),
+    capacity: { concurrency: 1 },
+    coordinator: {
+      mode: "running",
+      phase: "planning",
+      phaseStartedAt: new Date().toISOString(),
+      processes: [],
+    },
+  };
+  const save = () => saveState(statePath(repository, 1), preparation);
+  save();
+  const nativeModel = new CodexPlanningModel(
+    checkout,
+    selection,
+    selection,
+    undefined,
+    {
+      sessionRoot: join(stateRoot(repository), "planning-sessions"),
+      sourceArtifacts: false,
+    },
+  );
+  const stop = new AbortController();
+  const beforeNativeBuilds = [];
+  const buildClosure = async () => {
+    const session = Object.values(preparation.agentSessions ?? {})[0];
+    if (!session || session.currentTurn?.resources === "active") {
+      beforeNativeBuilds.push(structuredClone(preparation));
+      if (session) {
+        assert.equal(existsSync(session.data.sessionRoot), true);
+        stop.abort(
+          new Error("Cancelled during complete pre-native acknowledgment"),
+        );
+      }
+    }
+    return buildRecoveryCheckpointClosure({ config });
+  };
+  await withRecoveryCheckpointControllerVerification(
+    { config, buildClosure },
+    async () => {
+      await assert.rejects(
+        step(
+          preparation,
+          { scope: "objective", name: "plan", paid: true },
+          (context) =>
+            compilePlan(
+              1,
+              body,
+              baseSha,
+              checkout,
+              paidPlanningModel(nativeModel, context),
+              preparation.configDigest,
+              undefined,
+              undefined,
+              {
+                state: preparation,
+                sessionState: preparation,
+                save,
+                stopped: () => stop.signal.aborted,
+              },
+            ),
+          { save, signal: stop.signal },
+        ),
+      );
+    },
+  );
+  assert.equal(
+    beforeNativeBuilds.length,
+    2,
+    "one complete logical admission plus one complete native admission",
+  );
+  const [logical, native] = beforeNativeBuilds;
+  assert.equal(logical.planningRecovery.phase, "submitted");
+  assert.equal(logical.repeats[repeatKey("objective", "plan")].inFlight, true);
+  assert.equal(Object.keys(logical.agentSessions ?? {}).length, 0);
+  const session = Object.values(native.agentSessions)[0];
+  assert.equal(session.status, "in-flight");
+  assert.equal(session.currentTurn.dispatch, "submitted");
+  assert.equal(session.currentTurn.resources, "active");
+  assert.equal(
+    session.currentTurn.invocationId,
+    native.planningRecovery.invocation.id,
+  );
+  assert.equal(session.currentTurn.requestDigest.length, 64);
+  assert.equal(session.currentTurn.schemaDigest.length, 64);
+  assert.equal(session.currentTurn.evidenceDigest.length, 64);
+  assert.equal(session.scope.configDigest, preparation.configDigest);
+  assert.equal(session.scope.repository, repository);
+  assert.equal(session.scope.role, "planning");
+  assert.equal(session.data.transport, "exec");
+  assert.equal(session.data.selectionDigest.length, 64);
+  assert.equal(native.repeats[repeatKey("objective", "plan")].inFlight, true);
+  assert.equal(preparation.planningRecovery.invocations.length, 1);
+  assert.equal(preparation.planningRecovery.phase, "submitted");
+  const ack = gitPersistenceStatus(config).lastAcknowledged;
+  assert.ok(ack);
+  const archive = await readVerifiedRecoveryCheckpoint(config, ack.commitSha);
+  assert.equal(archive.payloadDigest, ack.payloadDigest);
+  assert.equal(archive.manifest.gaps.length, 0);
+  const acknowledgedStates = [];
+  const commits = execFileSync(
+    "git",
+    [
+      "--git-dir",
+      remote,
+      "rev-list",
+      "--first-parent",
+      config.gitPersistence.ref,
+    ],
+    { encoding: "utf8" },
+  )
+    .trim()
+    .split("\n");
+  for (const commit of commits) {
+    const retained = await readVerifiedRecoveryCheckpoint(config, commit);
+    const file = retained.manifest.files.find(
+      (entry) => entry.path === "objectives/1/state.json",
+    );
+    acknowledgedStates.push(
+      JSON.parse(
+        Buffer.from(await retained.readVerifiedBlob(file.ref)).toString("utf8"),
+      ),
+    );
+  }
+  assert.equal(
+    acknowledgedStates.filter(
+      (entry) => Object.keys(entry.agentSessions ?? {}).length === 0,
+    ).length,
+    1,
+  );
+  const activeAdmissions = acknowledgedStates.filter((entry) =>
+    Object.values(entry.agentSessions ?? {}).some(
+      (ref) => ref.currentTurn?.resources === "active",
+    ),
+  );
+  assert.equal(
+    activeAdmissions.length,
+    1,
+    "the final ACK contains the complete submitted native admission, without an earlier intent-only publication",
+  );
+  const archivedNative = Object.values(activeAdmissions[0].agentSessions)[0];
+  assert.deepEqual(archivedNative.currentTurn, session.currentTurn);
+  assert.equal(activeAdmissions[0].planningRecovery.phase, "submitted");
+  assert.equal(
+    activeAdmissions[0].repeats[repeatKey("objective", "plan")].inFlight,
+    true,
+  );
+  assert.equal(
+    Object.values(preparation.agentSessions)[0].currentTurn.resources,
+    "settled",
+  );
+  assert.equal(
+    Object.values(preparation.agentSessions)[0].currentTurn.terminal,
+    undefined,
+  );
 });
