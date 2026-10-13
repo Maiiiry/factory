@@ -162,10 +162,10 @@ export interface ClaudeModelSelection {
 export type PlanningConfig =
   | {
       kind: "codex-sdk";
-      /** Planning transport; tool-free by default. Tree reviews always use exec. */
+      /** Exec planning reads pinned sources by default; app-server is tool-free. Tree reviews use exec. */
       codex?: {
         transport?: "exec" | "app-server";
-        /** Opt-in source-only read profile; disabled unless explicitly true. */
+        /** Source-only read profile; enabled by default for exec planning. */
         sourceArtifacts?: boolean;
       };
       planner: CodexModelSelection;
