@@ -107,7 +107,7 @@ function help(): void {
       "Commands (every command also takes [--config PATH]):",
       `  setup --config-only ${INSTALL_OPTIONS}`,
       "      Write the configuration (first run) or verify it against the options given",
-      "      Codex tool-free planning defaults to exec; app-server is opt-in. Tree reviews use exec.",
+      "      Codex planning defaults to exec with source-only file reads; tool-free app-server is opt-in. Tree reviews use exec.",
       `  setup --background ${INSTALL_OPTIONS} [--outside-directory ABSOLUTE_EXISTING_DIRECTORY] [--credential-file NAME=ABSOLUTE_PRIVATE_FILE ...]`,
       "      Configure if needed, check readiness, then install and start the background service that runs the queue (this command is the consent)",
       "  propose --source DOC#HEADING [--output ABSOLUTE_NEW_FILE]",
