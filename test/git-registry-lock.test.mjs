@@ -801,6 +801,63 @@ bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmissio
     assert.equal(processGroupExists(worker.pid), false);
     const checkpoint = gitPersistenceStatus(config);
     assert.equal(checkpoint.sequence, checkpoint.acknowledgedSequence);
+    // Reuse the genuine pre-intent archive refusal producer from the existing
+    // reservation workflow: permanent failed control is inactive, not replayed.
+    await withRecoveryCheckpointScope(
+      {
+        config,
+        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+      },
+      async () => {
+        const operation = createQueueOperation(config, {
+          action: "control",
+          scope: "control",
+          previousReceiptId: JSON.parse(controlMetadata).receiptId,
+          approval: { kind: "queue-command" },
+        });
+        operation.metadata = JSON.stringify({
+          schemaVersion: 1,
+          kind: "control",
+          receiptId: operation.id,
+          mode: "paused",
+          watch: true,
+        });
+        const step = createProjectQueuePlannedEffect(binding, {
+          operationId: operation.id,
+          requestId: randomUUID(),
+          actorId: 1,
+          action: "set-metadata",
+          target: { itemId: binding.controlItemId },
+          fieldId: binding.metadataFieldId,
+          metadata: operation.metadata,
+          prior: {
+            target: {
+              itemId: binding.controlItemId,
+              metadata: controlMetadata,
+            },
+          },
+          control: { metadata: controlMetadata },
+        });
+        const command = createQueueCommand(config, {
+          operations: [operation],
+          effects: [step],
+          deadlineAt: null,
+        });
+        await rename(remote, `${remote}.unavailable`);
+        try {
+          await assert.rejects(admitQueueCommand(config, command), /ENOENT/);
+        } finally {
+          await rename(`${remote}.unavailable`, remote);
+        }
+        assert.equal(operation.effects.length, 0);
+        assert(operation.beforeEffectFailure);
+        await assert.rejects(
+          admitQueueCommand(config, command),
+          /never replay/,
+        );
+        await awaitCheckpointAdmission(repository, "explicit");
+      },
+    );
     const refusalLock = acquireObjectiveLock(repository, 1);
     try {
       await withRecoveryCheckpointScope(

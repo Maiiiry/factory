@@ -5480,7 +5480,9 @@ export async function settleStoppedProjectQueueRun(
   if (
     history.some(
       (record) =>
-        record.kind === "project-queue-operation" && !record.completed,
+        record.kind === "project-queue-operation" &&
+        !record.completed &&
+        !record.beforeEffectFailure,
     )
   )
     throw new Error(
