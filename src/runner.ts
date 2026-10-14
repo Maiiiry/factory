@@ -1866,6 +1866,9 @@ export async function collectCompletedWorker(
           "Local worker has no authenticated completed original; preserve its existing owner",
         );
       if (active.request.session) {
+        // The initial controller checkpoint records the pending worker owner;
+        // the original native wrapper admission supplies its concrete selection.
+        // A retained concrete selection must still match that original return.
         const returned = original.returned.session as
           | import("./contracts.js").AgentSessionRef
           | undefined;
@@ -1879,10 +1882,12 @@ export async function collectCompletedWorker(
           current.turn !== returned.turn ||
           current.identity !== returned.identity ||
           current.executionIdentity !== returned.executionIdentity ||
-          (current.data as { selectionDigest?: unknown } | undefined)
-            ?.selectionDigest !==
-            (returned.data as { selectionDigest?: unknown } | undefined)
-              ?.selectionDigest
+          ((current.data as { selectionDigest?: unknown } | undefined)
+            ?.selectionDigest !== undefined &&
+            (current.data as { selectionDigest?: unknown } | undefined)
+              ?.selectionDigest !==
+              (returned.data as { selectionDigest?: unknown } | undefined)
+                ?.selectionDigest)
         )
           throw new Error(
             "Completed worker native return differs from its current admitted session",

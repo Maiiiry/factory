@@ -6021,9 +6021,8 @@ test("stopped collection freezes a completed owned local return before restart a
   const { launchWorker, killGroup } = await import(
     "../dist/execution/worker-process.js"
   );
-  const { LocalExecutionDriver, CodexHarness } = await import(
-    "../dist/execution/local.js"
-  );
+  const { LocalExecutionDriver, CodexHarness, checkpointWorkerSession } =
+    await import("../dist/execution/local.js");
   const { collectCompletedWorker } = await import("../dist/runner.js");
   const { addWorktree, processGroupExists } = await import(
     "../dist/process.js"
@@ -6157,8 +6156,20 @@ test("stopped collection freezes a completed owned local return before restart a
     selection,
   );
   // Exercise the same adapter receipt producer used by start, without SDK execution.
+  checkpointWorkerSession(
+    request.session,
+    { adapter: "codex", supportsResume: true, executionIdentity: identity },
+    continuity.checkpoint,
+  );
   const admittedSession = await harness.workerSession(request);
-  continuity.checkpoint(admittedSession.ref);
+  assert.equal(
+    Object.values(state.agentSessions)[0].data.selectionDigest,
+    undefined,
+  );
+  assert.equal(
+    Object.values(state.agentSessions)[0].data.pendingWorkerIdentity,
+    identity,
+  );
   const input = {
     request: { ...request, worktree },
     release: join(temporary, "release"),
