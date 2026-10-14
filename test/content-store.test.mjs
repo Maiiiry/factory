@@ -6016,3 +6016,339 @@ test("checkpoint retains authenticated worker returns from a configured private 
     /outside its private root/,
   );
 });
+
+test("stopped collection freezes a completed owned local return before restart admission", async (t) => {
+  const { launchWorker, killGroup } = await import(
+    "../dist/execution/worker-process.js"
+  );
+  const { LocalExecutionDriver, CodexHarness, checkpointWorkerSession } =
+    await import("../dist/execution/local.js");
+  const { collectCompletedWorker } = await import("../dist/runner.js");
+  const { addWorktree, processGroupExists } = await import(
+    "../dist/process.js"
+  );
+  const { executionContext } = await import("../dist/execution/checkpoint.js");
+  const { readState } = await import("../dist/state-store.js");
+  const temporary = mkdtempSync(join(tmpdir(), "factory-stopped-collection-"));
+  const repository = `fixture/collection-${randomUUID()}`;
+  const privateRoot = stateRoot(repository),
+    checkout = join(temporary, "checkout");
+  mkdirSync(checkout);
+  mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  git("init", "-b", "main");
+  git("remote", "add", "origin", `https://github.com/${repository}.git`);
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.invalid");
+  writeFileSync(join(checkout, "README.md"), "# Original\n");
+  git("add", ".");
+  git("commit", "-m", "Original source");
+  const baseSha = git("rev-parse", "HEAD");
+  const remote = join(temporary, "archive.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  const selection = { model: "unused-local-check", reasoningEffort: "low" };
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    planning: { kind: "codex-sdk", planner: selection, reviewer: selection },
+    execution: {
+      kind: "local",
+      concurrency: 1,
+      harness: { kind: "codex-sdk", ...selection },
+    },
+    delivery: { kind: "regular" },
+    policy: { network: "off", allowedSecretNames: [] },
+    gitPersistence: {
+      remote,
+      ref: "refs/heads/history",
+      visibility: "private",
+      scope: "private-history",
+      maxBytes: 16 * 1024 * 1024,
+      maxFiles: 4096,
+      timeoutMs: 3000,
+      coalesceMs: 0,
+    },
+  };
+  const identity = randomUUID();
+  const item = {
+    id: "local",
+    title: "Preserve source",
+    goal: "Preserve source",
+    brief: "A local process result",
+    acceptance: ["Preserve source"],
+    dependencies: [],
+    ownedPaths: ["README.md"],
+    resources: [],
+    nonGoals: [],
+    validation: [],
+    citations: [],
+    sourceAssets: [],
+    expectedOutputRoles: [],
+    requiredLfsRoles: [],
+    minimumAssetSets: 0,
+  };
+  const graph = {
+    objective: 1,
+    baseSha,
+    items: [item],
+    coverage: [
+      {
+        criterionId: "b".repeat(64),
+        itemId: item.id,
+        source: {
+          path: "README.md",
+          digest: learningDigest("# Original\n"),
+          text: "# Original",
+        },
+        proof: { kind: "result-semantic", acceptanceIndex: 0 },
+        environment: {
+          kind: "local",
+          readiness: "available",
+          probe: "",
+          preparedBy: "",
+        },
+      },
+    ],
+  };
+  const state = {
+    schemaVersion: 17,
+    repository,
+    objective: 1,
+    runId: randomUUID(),
+    configDigest: factoryConfigDigest(config),
+    baseSha,
+    graph,
+    planGraphDigest: graphDigest(graph),
+    capacity: { concurrency: 1 },
+    autonomy: resolveAutonomy(),
+    issueByItemId: { local: 2 },
+    work: {
+      local: { status: "running", step: "execute", attempt: identity, baseSha },
+    },
+  };
+  const path = statePath(repository, 1);
+  const workRoot = join(privateRoot, "worktrees"),
+    worktree = join(workRoot, identity);
+  await addWorktree(checkout, worktree, baseSha);
+  const { workerAttemptItem } = await import("../dist/item-worker.js");
+  const { agentSessionContinuation } = await import("../dist/agent-session.js");
+  const attempted = workerAttemptItem(state, item, baseSha, {
+    knowledge: {},
+    discoveryInputs: [],
+  });
+  const continuity = agentSessionContinuation(
+    state,
+    "implementation",
+    item.id,
+    () => saveState(path, state),
+  );
+  const request = {
+    attemptId: identity,
+    baseSha,
+    item: attempted,
+    session: { scope: continuity.scope, identity: continuity.identity },
+  };
+  const harness = new CodexHarness(
+    join(privateRoot, "credentials"),
+    "off",
+    selection,
+  );
+  // Exercise the same adapter receipt producer used by start, without SDK execution.
+  checkpointWorkerSession(
+    request.session,
+    { adapter: "codex", supportsResume: true, executionIdentity: identity },
+    continuity.checkpoint,
+  );
+  const admittedSession = await harness.workerSession(request);
+  assert.equal(
+    Object.values(state.agentSessions)[0].data.selectionDigest,
+    undefined,
+  );
+  assert.equal(
+    Object.values(state.agentSessions)[0].data.pendingWorkerIdentity,
+    identity,
+  );
+  const input = {
+    request: { ...request, worktree },
+    release: join(temporary, "release"),
+    session: admittedSession,
+  };
+  const script = join(temporary, "owned-result.cjs");
+  // A real finite local process edits its checkout and records its own output.
+  // No SDK/model response or implementation acceptance is fabricated.
+  writeFileSync(
+    script,
+    `const fs=require('node:fs'),p=require('node:path');const input=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));const timer=setInterval(()=>{if(!fs.existsSync(input.release))return;clearInterval(timer);const bytes='# Actual local change\\n';fs.writeFileSync(p.join(input.request.worktree,'README.md'),bytes);fs.writeFileSync(process.argv[3],JSON.stringify({state:'complete',evidence:{localOutput:bytes,finalResponse:'INCOMPLETE: ordinary validation and review still required'},session:{...input.session.ref,status:'ready',data:{...input.session.ref.data,threadId:'owned-local-protocol-process',nativeEof:true}}}),{mode:0o600});},10);`,
+  );
+  const worker = await launchWorker({
+    root: join(privateRoot, "harness"),
+    identity,
+    input,
+    script,
+    env: process.env,
+    label: "Local integration process",
+  });
+  t.after(async () => {
+    if (processGroupExists(worker.pid))
+      await killGroup(worker.pid, "Local integration process");
+    rmSync(temporary, { recursive: true, force: true });
+    rmSync(privateRoot, { recursive: true, force: true });
+  });
+  state.work.local.execution = {
+    provider: "local",
+    identity,
+    data: {
+      request: structuredClone(request),
+      worktree,
+      adapterIdentity: "codex-sdk",
+      handle: { identity, data: worker },
+    },
+  };
+  saveState(path, state);
+  const store = new LocalContentStore(join(privateRoot, "content"));
+  const driver = new LocalExecutionDriver(
+    checkout,
+    workRoot,
+    harness,
+    1,
+    store,
+    "codex-sdk",
+  );
+  const decision = { runId: state.runId, item: item.id, attempt: identity };
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /no authenticated completed original/,
+  );
+  assert.equal(processGroupExists(worker.pid), true);
+  writeFileSync(input.release, "release\n");
+  for (let n = 0; n < 100 && !existsSync(worker.resultPath); n++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(existsSync(worker.resultPath), true);
+  const originalBytes = readFileSync(worker.resultPath);
+  writeFileSync(worker.resultPath, JSON.stringify({ state: "unknown" }), {
+    mode: 0o600,
+  });
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /no authenticated completed original/,
+  );
+  writeFileSync(worker.resultPath, originalBytes, { mode: 0o600 });
+  const foreign = structuredClone(state);
+  foreign.configDigest = "f".repeat(64);
+  for (const ref of Object.values(foreign.agentSessions))
+    ref.scope.configDigest = foreign.configDigest;
+  saveState(path, foreign);
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /stopped current source-host/,
+  );
+  saveState(path, state);
+  const unobserved = structuredClone(state);
+  unobserved.repeats = { "objective/review": { inFlight: true } };
+  saveState(path, unobserved);
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /paid call has no recorded settlement/,
+  );
+  saveState(path, state);
+  const newerTurn = structuredClone(state);
+  Object.values(newerTurn.agentSessions)[0].turn++;
+  saveState(path, newerTurn);
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /differs from its current admitted session/,
+  );
+  saveState(path, state);
+  const altered = structuredClone(state);
+  altered.work.local.execution.data.request.item.ownedPaths.push("outside.md");
+  saveState(path, altered);
+  await assert.rejects(
+    collectCompletedWorker(config, 1, decision, driver),
+    /differs from its retained/,
+  );
+  saveState(path, state);
+  const closure = await buildRecoveryCheckpointClosure({ config });
+  assert(closure.gaps.some((gap) => gap.reason.includes("not been frozen")));
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(config, { reason: "explicit" }),
+    /manifest is incomplete/,
+  );
+  await assert.rejects(
+    collectCompletedWorker(
+      config,
+      1,
+      { ...decision, attempt: randomUUID() },
+      driver,
+    ),
+    /differs from its retained/,
+  );
+  const configFile = join(temporary, "config.json");
+  writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
+  const command = execFileSync(
+    process.execPath,
+    [
+      new URL("../dist/cli.js", import.meta.url).pathname,
+      "collect",
+      "--config",
+      configFile,
+      "--objective",
+      "1",
+      "--item",
+      item.id,
+      "--run",
+      state.runId,
+      "--attempt",
+      identity,
+    ],
+    { encoding: "utf8", timeout: 10000 },
+  );
+  assert.match(command, /normal validation and review remain required/);
+  const collected = readState(repository, 1);
+  assert.equal(collected.work.local.attempt, identity);
+  assert.equal(collected.work.local.status, "running");
+  assert.equal(collected.work.local.step, "execute");
+  assert.equal(collected.finalAcceptance, undefined);
+  assert.match(
+    collected.work.local.execution.data.result.evidence.finalResponse,
+    /^INCOMPLETE:/,
+  );
+  const session = Object.values(collected.agentSessions)[0];
+  assert.equal(session.status, "ready");
+  assert.equal(session.data.nativeEof, true);
+  assert.equal(session.data.workerSettled, true);
+  assert.deepEqual(session, collected.work.local.execution.data.result.session);
+  assert.deepEqual(collected.autonomy, state.autonomy);
+  assert.equal(processGroupExists(worker.pid), false);
+  assert.equal(existsSync(worktree), false);
+  assert.deepEqual(readFileSync(worker.resultPath), originalBytes);
+  const frozen = collected.work.local.execution.data.result;
+  assert.equal(
+    git("show", `${frozen.changeRef}:README.md`),
+    "# Actual local change",
+  );
+  const completeClosure = await buildRecoveryCheckpointClosure({ config });
+  assert.equal(
+    completeClosure.gaps.some((gap) => gap.required !== false),
+    false,
+  );
+  const durable = gitPersistenceStatus(config);
+  assert.equal(durable.pendingChanges, false);
+  assert.equal(durable.sequence, durable.acknowledgedSequence);
+  assert(durable.lastAcknowledged);
+  // The normal continuation's existing find/collect path consumes the exact
+  // retained result, even after the original checkout has been removed.
+  const handle = await driver.find(
+    structuredClone(collected.work.local.execution),
+  );
+  const again = await driver.collect(
+    handle,
+    executionContext(
+      collected.work.local,
+      () => saveState(path, collected),
+      () => false,
+    ),
+  );
+  assert.deepEqual(again, frozen);
+});

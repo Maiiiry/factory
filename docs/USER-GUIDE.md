@@ -588,6 +588,8 @@ Runs repair and amend within bounded limits. The optional `autonomy` configurati
 
 ## Stopping and recovery
 
+If a stopped local worker completed while its controller was unavailable, checkpoint startup can report that its output has not yet been frozen. Use `factory collect --objective N --item ITEM --run RUN_ID --attempt ATTEMPT_ID` with the exact current snapshot bindings while the installation is stopped. This authenticates and collects the existing return, freezes its source/artifacts and acknowledges the checkpoint before cleanup. It starts no worker and grants no acceptance or extra attempt. Active, missing, stale or foreign/restored handles refuse. Continue with the ordinary run/resume path afterward; actual rejection, validation and review remain required.
+
 After an interruption, use `factory run` to reconcile the recorded state: Factory finds GitHub issues, pull requests and merges by stable identity and reattaches running workers. Unresolved external mutations stay stopped rather than being blindly repeated. A real failure keeps its evidence and stops until you `retry`, `repair` or `cancel`. Never delete state or start a new root to get past a stop. See [Architecture](ARCHITECTURE.md#state-and-recovery) for the recovery model.
 
 The same fence applies to retained model turns: an active or unknown submitted turn is not sent again. When the adapter recovers authenticated final response bytes, Factory still checks them against the original request and current evidence. Session readiness means context is available after settlement; it does not mean the work was accepted. Missing native receipts remain unknown even when a process has disappeared.

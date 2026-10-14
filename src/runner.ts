@@ -5,7 +5,10 @@ import {
 } from "./review-artifacts.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
-import { releaseAgentSessions } from "./agent-session.js";
+import {
+  agentSessionContinuation,
+  releaseAgentSessions,
+} from "./agent-session.js";
 import {
   bindPlanningPlaybook,
   resolvePlan,
@@ -34,6 +37,9 @@ import {
   withDiagnosticSession,
 } from "./diagnostics.js";
 import { executionContext } from "./execution/checkpoint.js";
+import { LocalExecutionDriver } from "./execution/local.js";
+import { workerIdentity } from "./item-steps.js";
+import { isDeepStrictEqual } from "node:util";
 import { assertFailedValidationRecord } from "./failed-validation.js";
 import { cancelledFault } from "./fault.js";
 import {
@@ -88,7 +94,10 @@ import {
   withQueueControlVerification,
   withRecoveryCheckpointScope,
 } from "./recovery-checkpoint.js";
-import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js";
+import {
+  buildRecoveryCheckpointClosure,
+  localWorkerReturn,
+} from "./recovery-checkpoint-closure.js";
 import {
   archiveAttempt,
   charge,
@@ -1765,6 +1774,142 @@ export function repairWorkItem(
     saveState(statePath(config.repository, objective), state);
   } finally {
     releaseMutationLock(config, objective, handle);
+  }
+}
+
+/** Freeze a completed current local return without starting or accepting work. */
+export async function collectCompletedWorker(
+  config: FactoryConfig,
+  objective: number,
+  input: { runId: string; item: string; attempt: string },
+  driver: ExecutionDriver,
+): Promise<void> {
+  const lockPath = installationLockPath(config.repository);
+  const lock = acquireInstallationLock(config.repository, objective);
+  try {
+    await checkpointController(config, async () => {
+      const state = mutationState(config, objective);
+      if (
+        !state ||
+        state.restoration ||
+        state.runId !== input.runId ||
+        state.cancelRequested ||
+        state.cancelledAt ||
+        state.finalAcceptance ||
+        state.objectiveClosure === "complete" ||
+        !continuationConfigurationMatches(state, config) ||
+        state.pendingAmendment ||
+        state.pendingExpansion ||
+        state.coordinator?.processes?.length ||
+        state.coordinator?.cancelError ||
+        !(driver instanceof LocalExecutionDriver)
+      )
+        throw new Error(
+          "Completed local collection requires a stopped current source-host Objective",
+        );
+      const work = state.work[input.item];
+      const item = state.graph.items.find((item) => item.id === input.item);
+      const handle = work?.execution;
+      const active = handle?.data as
+        | { request?: import("./contracts.js").ExecutionRequest }
+        | undefined;
+      if (
+        !work ||
+        work.attempt !== input.attempt ||
+        work.step !== "execute" ||
+        !["running", "waiting"].includes(work.status) ||
+        !item ||
+        handle?.provider !== "local" ||
+        handle.identity !== workerIdentity(work) ||
+        active?.request?.attemptId !== handle.identity ||
+        active.request.baseSha !== (work.executionBaseSha ?? work.baseSha) ||
+        // Advisory briefs are enriched by the producer. Their complete bytes
+        // are bound below to the authenticated original dispatch request;
+        // all graph authority fields remain exact.
+        !isDeepStrictEqual(active.request.item, {
+          ...item,
+          brief: active.request.item.brief,
+        })
+      )
+        throw new Error(
+          "Completed local collection differs from its retained item, attempt or request",
+        );
+      const save = () =>
+        saveState(statePath(config.repository, objective), state);
+      const context = executionContext(
+        work,
+        save,
+        () => false,
+        undefined,
+        undefined,
+        config.repository,
+        true,
+      );
+      if (driver.sessionCapabilities?.resumeRoles.includes("implementation")) {
+        const session = agentSessionContinuation(
+          state,
+          "implementation",
+          input.item,
+          save,
+        );
+        context.checkpointSession = (ref) => session.checkpoint(ref);
+      }
+      // The adapter authenticates its original return and settles its owned
+      // process group. Unknown/missing/live returns never reach collection.
+      const original = localWorkerReturn(
+        stateRoot(config.repository),
+        handle,
+        state,
+      );
+      if (original?.returned.state !== "complete")
+        throw new Error(
+          "Local worker has no authenticated completed original; preserve its existing owner",
+        );
+      if (active.request.session) {
+        // The initial controller checkpoint records the pending worker owner;
+        // the original native wrapper admission supplies its concrete selection.
+        // A retained concrete selection must still match that original return.
+        const returned = original.returned.session as
+          | import("./contracts.js").AgentSessionRef
+          | undefined;
+        const current = Object.values(state.agentSessions ?? {}).find((ref) =>
+          isDeepStrictEqual(ref.scope, active.request!.session!.scope),
+        );
+        if (
+          !returned ||
+          !current ||
+          current.adapter !== returned.adapter ||
+          current.turn !== returned.turn ||
+          current.identity !== returned.identity ||
+          current.executionIdentity !== returned.executionIdentity ||
+          ((current.data as { selectionDigest?: unknown } | undefined)
+            ?.selectionDigest !== undefined &&
+            (current.data as { selectionDigest?: unknown } | undefined)
+              ?.selectionDigest !==
+              (returned.data as { selectionDigest?: unknown } | undefined)
+                ?.selectionDigest)
+        )
+          throw new Error(
+            "Completed worker native return differs from its current admitted session",
+          );
+      }
+      const ownershipHold = restoredContinuationOwnershipHold(
+        state,
+        true,
+        input.item,
+      );
+      if (ownershipHold) throw new Error(ownershipHold);
+      const observed = await driver.observe(structuredClone(handle));
+      if (observed.state !== "complete")
+        throw new Error(
+          "Local worker has no authenticated completed return; preserve its existing owner",
+        );
+      await driver.collect(structuredClone(handle), context);
+      // The collector freezes originals and ACKs before removing the checkout.
+      // No Work Item acceptance or execution transition is synthesized here.
+    });
+  } finally {
+    releaseControllerLock(lockPath, lock);
   }
 }
 
