@@ -20,7 +20,7 @@ Ask questions and make human-owned decisions in your agent conversation, such as
 ## Requirements
 
 - Linux x64, including a Linux environment under WSL2; Node.js 22 or later for the published bundled Codex path.
-- Git 2.31 or later, authenticated GitHub CLI access to your target repository, and authenticated access for your configured providers: a Codex login for the default Codex planning and worker path, or a Claude Code login when planning, review or work use Claude (see the [user guide](docs/USER-GUIDE.md#models-network-and-delivery)). The plugin requires Codex or Claude Code with plugin support.
+- Git 2.31 or later, authenticated GitHub CLI access to your target repository, and authenticated access for your configured providers: a Codex login for the default Codex planning and worker path, or a Claude Code login when planning, review or work use Claude (see [providers](docs/USER-GUIDE.md#providers)). The plugin requires Codex or Claude Code with plugin support.
 - Your target's build and validation tools; Git LFS for LFS-backed media work.
 - A trusted repository with committed instructions and requirements. Local workers run under your OS account; they are not a security boundary for hostile code.
 
@@ -113,7 +113,9 @@ Open your target repository in Codex or Claude Code after loading the matching p
 
 > Use Factory to set up this repository with a concurrency limit of two. Do not start work.
 
-Factory's setup skill binds the checkout and reports the configuration. For background operation, ask:
+Factory's setup skill binds the checkout and reports the configuration. New work runs with the provider that matches the host you ask from, so the same repository can plan with Claude from Claude Code and with Codex from Codex; an Objective that has started keeps its provider. Add a second host's provider by asking that host to set it up. See [providers](https://github.com/clockgrove/factory/blob/main/docs/USER-GUIDE.md#providers).
+
+For background operation, ask:
 
 > Use Factory to set up this repository and keep watching for explicitly approved Objectives, with a concurrency limit of two.
 

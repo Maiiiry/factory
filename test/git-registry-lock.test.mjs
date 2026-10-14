@@ -105,6 +105,30 @@ import {
   saveState,
 } from "../dist/state-store.js";
 
+/** The configuration file for a flat test config: one provider in planning's place. */
+function toConfigFile(config) {
+  return Object.fromEntries(
+    Object.entries(config).flatMap(([key, value]) =>
+      key === "planning"
+        ? [
+            [
+              "providers",
+              {
+                test: {
+                  planning: config.planning,
+                  execution: config.execution,
+                },
+              },
+            ],
+            ["defaultProvider", "test"],
+          ]
+        : key === "execution"
+          ? []
+          : [[key, value]],
+    ),
+  );
+}
+
 const processUrl = new URL("../dist/process.js", import.meta.url).href;
 
 test("a terminal background watcher holds checkpoint failure while real control and explicit recovery remain usable", async (t) => {
@@ -2512,7 +2536,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       // These deliberately incomplete descriptors claim no operator observation,
       // provider response or permission to retire any of the preserved intents.
       const configPath = join(directory, "maintenance-config.json"),
-        configBytes = Buffer.from(JSON.stringify(config)),
+        configBytes = Buffer.from(JSON.stringify(toConfigFile(config))),
         refusedProofPath = join(directory, "not-an-operator-proof.json"),
         refusedProofBytes = Buffer.from("{}\n");
       await writeFile(configPath, configBytes, { mode: 0o600 });

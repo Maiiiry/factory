@@ -10,10 +10,15 @@ import { isAbsolute, join } from "node:path";
 import { runCaptureExportCommand } from "./capture-export-cli.js";
 import { assertKnownFlags, option } from "./cli-flags.js";
 import {
+  readSelectedConfig,
+  type SelectedConfig,
+} from "./provider-selection.js";
+import {
   configPath,
   type FactoryConfig,
   factoryConfigDigest,
   readConfig,
+  readConfigFile,
   stateRoot,
 } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
@@ -97,7 +102,7 @@ function controllerActive(
 }
 
 const INSTALL_OPTIONS =
-  "[--repository OWNER/REPO --checkout ABSOLUTE_PATH] [--concurrency N] [--capture-content --capture-max-bytes N] [--delivery regular|native-stack] [--network host|off] [--planning codex-sdk|claude-agent-sdk] [--planning-transport exec|app-server] [--planning-model MODEL] [--planning-reasoning EFFORT] [--review-model MODEL] [--review-reasoning EFFORT] [--harness codex-sdk|claude-agent-sdk|github-copilot-sdk] [--worker-model MODEL] [--worker-reasoning EFFORT] [--claude-max-turns N] [--claude-permission acceptEdits|dontAsk] [--claude-setting-source SOURCE ...] [--claude-tool TOOL ...] [--claude-allow-tool TOOL ...] [--copilot-timeout-seconds N] [--copilot-tool TOOL ...]";
+  "[--provider NAME] [--repository OWNER/REPO --checkout ABSOLUTE_PATH] [--concurrency N] [--capture-content --capture-max-bytes N] [--delivery regular|native-stack] [--network host|off] [--planning codex-sdk|claude-agent-sdk] [--planning-transport exec|app-server] [--planning-model MODEL] [--planning-reasoning EFFORT] [--review-model MODEL] [--review-reasoning EFFORT] [--harness codex-sdk|claude-agent-sdk|github-copilot-sdk] [--worker-model MODEL] [--worker-reasoning EFFORT] [--claude-max-turns N] [--claude-permission acceptEdits|dontAsk] [--claude-setting-source SOURCE ...] [--claude-tool TOOL ...] [--claude-allow-tool TOOL ...] [--copilot-timeout-seconds N] [--copilot-tool TOOL ...]";
 
 function help(): void {
   console.log(
@@ -106,11 +111,11 @@ function help(): void {
       "",
       "Commands (every command also takes [--config PATH]):",
       `  setup --config-only ${INSTALL_OPTIONS}`,
-      "      Write the configuration (first run) or verify it against the options given",
+      "      Write the configuration (first run), add a new --provider, or verify one against the options given",
       "      Codex planning defaults to exec with source-only file reads; tool-free app-server is opt-in. Tree reviews use exec.",
       `  setup --background ${INSTALL_OPTIONS} [--outside-directory ABSOLUTE_EXISTING_DIRECTORY] [--credential-file NAME=ABSOLUTE_PRIVATE_FILE ...]`,
       "      Configure if needed, check readiness, then install and start the background service that runs the queue (this command is the consent)",
-      "  propose --source DOC#HEADING [--output ABSOLUTE_NEW_FILE]",
+      "  propose --source DOC#HEADING [--output ABSOLUTE_NEW_FILE] [--provider NAME]",
       "  propose --file ABSOLUTE_FILE --approve SHA256 [--enqueue]",
       "      Draft and review Objectives, then explicitly approve their exact file before issue creation",
       "  dream [--input-budget-bytes N] [--budget-bytes N] [--preview] | --show | --record --objective N",
@@ -121,8 +126,8 @@ function help(): void {
       "  persistence status | sync | inspect | restore [--checkpoint SHA]",
       "  persistence reconcile --objective N",
       "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
-      "  run --objective N [--deadline ISO_TIMESTAMP]",
-      "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness",
+      "  run --objective N [--deadline ISO_TIMESTAMP] [--provider NAME]",
+      "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness and fixes its provider (--provider, else the calling host, else defaultProvider)",
       "  queue add N [N ...] | list | sync | remove N | pause | resume | drain",
       "      The Objectives the background service runs, in order",
       "  supervisor start | check | stop [--disable] | upgrade --cli ABSOLUTE_INSTALLED_CLI | uninstall",
@@ -384,6 +389,10 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
     queue,
     ...current,
     durability: gitPersistenceStatus(config),
+    provider: {
+      name: readConfigFile(path).defaultProvider,
+      selectedBy: "default",
+    },
   };
   if (json) console.log(JSON.stringify(document));
   else {
@@ -403,6 +412,9 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
         `Objective #${entry.objective}: ${entry.state}; remote submission ${entry.remoteSubmission}; permanently ineligible. Admission ${entry.admissionId}, card ${entry.itemId}, retirement operation ${entry.operationId}.`,
       );
     console.log(`Durability: ${JSON.stringify(document.durability)}`);
+    console.log(
+      `Provider for new queued work: ${document.provider.name} (${providerSummary(config)})`,
+    );
   }
 }
 type ServiceStatus = Parameters<typeof renderServiceStatus>[0];
@@ -440,6 +452,47 @@ async function decideCommand(
   );
 }
 
+/** The planner, reviewer and worker models a provider runs, for status. */
+function providerSummary(config: FactoryConfig): string {
+  const harness =
+    config.execution.kind === "local" ? config.execution.harness : undefined;
+  const worker =
+    config.execution.kind === "managed-agent"
+      ? config.execution.provider
+      : harness && "model" in harness
+        ? `${harness.kind} ${harness.model}`
+        : config.execution.profiles
+          ? `profiles ${Object.keys(config.execution.profiles).join(", ")}`
+          : (harness?.kind ?? "none");
+  return `planning ${config.planning.kind} ${config.planning.planner.model}, review ${config.planning.reviewer.model}, workers ${worker}`;
+}
+
+/**
+ * The provider a command runs with. Queue, service and persistence commands share the
+ * service's default provider; Objective commands keep the provider the Objective froze;
+ * new work follows --provider, then the calling agent host.
+ */
+function selectedForCommand(
+  command: string,
+  args: string[],
+  path: string,
+): SelectedConfig {
+  if (
+    ["queue", "supervisor", "persistence"].includes(command) ||
+    (command === "status" && option(args, "objective") === undefined) ||
+    (command === "diagnostics" && option(args, "scorecard") !== undefined)
+  )
+    return readSelectedConfig(path, { host: false });
+  const objective = option(args, "objective");
+  return readSelectedConfig(path, {
+    objective:
+      objective !== undefined && /^\d+$/.test(objective)
+        ? Number(objective)
+        : undefined,
+    flag: option(args, "provider"),
+  });
+}
+
 async function dispatchMain(): Promise<void> {
   const [, , command, ...args] = process.argv;
   if (!command || command === "help" || command === "--help") return help();
@@ -452,10 +505,22 @@ async function dispatchMain(): Promise<void> {
     return;
   }
   if (command === "propose")
-    return runProposeCommand(readConfig(path), args, path);
-  if (command === "dream") return runDreamCommand(readConfig(path), args, path);
+    return runProposeCommand(
+      selectedForCommand(command, args, path).config,
+      args,
+      path,
+    );
+  if (command === "dream")
+    return runDreamCommand(
+      selectedForCommand(command, args, path).config,
+      args,
+      path,
+    );
   if (command === "recipe")
-    return runWorkflowRecipePreview(readConfig(path), args);
+    return runWorkflowRecipePreview(
+      selectedForCommand(command, args, path).config,
+      args,
+    );
   if (command === "persistence") return persistenceCommand(args, path);
   if (command === "queue") return queueCommand(args, path);
   if (command === "supervisor") return supervisorCommand(args, path);
@@ -482,7 +547,8 @@ async function dispatchMain(): Promise<void> {
     ].includes(command)
   )
     throw new Error(`Unknown command: ${command}; see factory help`);
-  const config = readConfig(path);
+  const selected = selectedForCommand(command, args, path);
+  const { config } = selected;
   if (command === "diagnostics" && option(args, "scorecard") !== undefined)
     return runDiagnosticsScorecardCommand(config, args);
   const objective = Number(option(args, "objective"));
@@ -600,8 +666,15 @@ async function dispatchMain(): Promise<void> {
   }
   if (command === "status") {
     const { document, secrets } = statusDocument(config, objective);
-    if (args.includes("--json")) console.log(JSON.stringify(document));
-    else for (const line of statusLines(document, secrets)) console.log(line);
+    const provider = { name: selected.provider, selectedBy: selected.source };
+    if (args.includes("--json"))
+      console.log(JSON.stringify({ ...document, provider }));
+    else {
+      for (const line of statusLines(document, secrets)) console.log(line);
+      console.log(
+        `Provider: ${provider.name} (${providerSummary(config)}; selected by ${provider.selectedBy})`,
+      );
+    }
   } else if (command === "export-captures") {
     const result = await runCaptureExportCommand(config, objective, args);
     console.log(JSON.stringify(result, null, 2));
@@ -897,7 +970,11 @@ async function main(): Promise<void> {
   ]);
   if (!command || !mutating.has(command)) return dispatchMain();
   assertKnownFlags(command, args);
-  const config = readConfig(option(args, "config") ?? configPath());
+  const { config } = selectedForCommand(
+    command,
+    args,
+    option(args, "config") ?? configPath(),
+  );
   await withRecoveryCheckpointOperation(
     {
       config,

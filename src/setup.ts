@@ -14,12 +14,13 @@ import { composeIntake } from "./application.js";
 import {
   hostSchedulingDefaults,
   readConfig,
+  readConfigFile,
   resolveCapacity,
 } from "./config.js";
 import { requestControl } from "./coordinator-control.js";
 import { redactDiagnosticDetail } from "./diagnostics.js";
 import { sharedGitHubClient } from "./github-client.js";
-import { writeConfiguration } from "./install.js";
+import { addProvider, writeConfiguration } from "./install.js";
 import {
   type IntakeAuthorization,
   queuePollSeconds,
@@ -106,8 +107,22 @@ export async function setupTarget(
         );
       writeConfiguration(args, configPath);
       completed.push("configuration-created");
+    } else if (
+      option(args, "provider") !== undefined &&
+      !readConfigFile(configPath).providers[option(args, "provider")!]
+    ) {
+      addProvider(args, configPath);
+      completed.push("provider-added");
     }
-    const config = readConfig(configPath);
+    // The service runs the default provider; config-only setup verifies the one named.
+    const { defaultProvider } = readConfigFile(configPath);
+    const provider = option(args, "provider") ?? defaultProvider;
+    if (background && provider !== defaultProvider)
+      throw new Error(
+        `The background service runs defaultProvider ${defaultProvider}; change defaultProvider to switch the service's provider`,
+      );
+    const config = readConfig(configPath, provider);
+    result.provider = provider;
     result.repository = config.repository;
     result.requirements = {
       providerCredentials: requiredProviderCredentials(config),

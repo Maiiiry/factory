@@ -25,9 +25,46 @@ factory setup --background  --repository OWNER/REPO --checkout /abs/path/to/targ
 
 When a prerequisite needs you, Factory’s operator should collect all retained review findings, available readiness results and source-verified requirements into one checklist. Each missing or unknown item should include its reason, source, setup step and verification command; an unchecked stage remains unknown. Answer required choices together and put secrets only in the approved secret store or private credential file, never chat or issues. Verify the requirements before answering a decision. The checklist grants no new authority; independent work can continue only where already authorized and admitted by the current gates.
 
-Repeating setup with a matching binding reuses the configuration. A conflicting option stops, because Factory never changes an active binding.
+Repeating setup with a matching binding reuses the configuration. A conflicting option stops, because Factory never changes an active binding. Setup with a new `--provider NAME` adds that provider and leaves the others unchanged.
 
 Configuration lives under `$XDG_CONFIG_HOME/clockgrove-factory` and state under `$XDG_STATE_HOME/clockgrove-factory` (defaults `~/.config` and `~/.local/state`). Keep both, and all plan output and logs, outside the checkout.
+
+### Providers
+
+A provider is a named pair of `planning` and `execution` choices: which models plan, review and implement. One configuration holds any number of them; everything else (repository, checkout, policy, delivery, queue, persistence, capture) is shared:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "repository": "OWNER/REPO",
+  "checkout": "/abs/path/to/target",
+  "providers": {
+    "codex": { "planning": { "kind": "codex-sdk", … }, "execution": { … } },
+    "claude": { "planning": { "kind": "claude-agent-sdk", … }, "execution": { … } }
+  },
+  "defaultProvider": "codex",
+  …
+}
+```
+
+The first setup writes one provider, named by `--provider` or after its planning kind (`codex` or `claude`), and makes it the default. Add another with the same command and a new name:
+
+```sh
+factory setup --config-only --provider claude --planning claude-agent-sdk \
+  --planning-model claude-opus-5-5 --review-model claude-opus-5-5 \
+  --harness claude-agent-sdk --worker-model claude-sonnet-5-5 --claude-max-turns 12
+```
+
+Each command picks one provider:
+
+1. An Objective that has started keeps its provider. Its configuration digest is frozen, so resuming, deciding or retrying it from another host uses the same models. Editing that provider's settings strands the Objective until they are restored.
+2. `--provider NAME` on `run`, `propose`, `dream` or `recipe` chooses for new work.
+3. Otherwise the calling agent host chooses: Claude Code (`CLAUDECODE=1`) selects the provider that plans with `claude-agent-sdk`, Codex (`CODEX_THREAD_ID`) the one that plans with `codex-sdk`. If several match, the default wins, or `--provider` is required. A shell carrying both markers is ambiguous and needs `--provider`. A host with no matching provider stops with the setup command instead of falling back.
+4. Otherwise `defaultProvider`.
+
+Queue, service and persistence commands always use `defaultProvider`, because the background service runs one provider for new work. Queue approvals and their receipts bind the default provider whichever provider a command runs, so switching hosts keeps the queue readable. Changing `defaultProvider` changes the queue's authority, like any other change to queued settings; do it only with an empty queue. `factory status --objective N` ends with the provider it used and why.
+
+Use only one controller at a time; Factory's controller lock already enforces that for each repository.
 
 ### Models, network and delivery
 
@@ -43,12 +80,13 @@ A first quiet timeout of a Codex structured call stops unchanged automatic repla
 
 Choose these at setup. New Codex configurations default to `gpt-6.1-sol` for planner, reviewer and worker, with `high` reasoning for the planner and `medium` for the reviewer and worker. New Claude planning configurations also default review reasoning to `medium`, with `high` for planning; both models must be supplied explicitly. The reviewer setting covers graph, Work Item result and final Objective reviews. Explicit choices and existing configurations remain unchanged. Codex planner, reviewer and local harness selections also accept optional `serviceTier: "standard" | "fast"` in their configuration objects, including Codex execution profiles. Use `"standard"` for explicit native `default` routing or `"fast"` for native `priority`; omitting the field retains the native/catalog choice and does not establish Standard. The same model and reasoning effort are preserved. Fast availability and consumption follow the [Codex speed contract](https://developers.openai.com/codex/speed/). Requested tiers are recorded separately from reported native settings; an absent report supplies no effective-tier fact. Changing a configured tier changes the admitted configuration/session selection, so it cannot silently reconfigure a retained turn.
 
-For an explicit comparison, set `planning.planner` to `{ "model": "gpt-6.1-sol", "reasoningEffort": "high", "serviceTier": "standard" }` or the same object with `"serviceTier": "fast"`. The independent reviewer and `execution.harness` have their own selections; changing the planner does not change them.
+For an explicit comparison, set a provider's `planning.planner` to `{ "model": "gpt-6.1-sol", "reasoningEffort": "high", "serviceTier": "standard" }` or the same object with `"serviceTier": "fast"`. The independent reviewer and `execution.harness` have their own selections; changing the planner does not change them. A comparison is easiest as a second provider, for example `codex-fast`, chosen with `--provider codex-fast`.
 
-Your agent host loads the skills; it does not select Factory's providers. These defaults also apply when you use the plugin in Claude Code. Select Claude planning and/or workers explicitly when that is the intended configuration. Check the [CLI and plugin identities](../README.md#cli) before setup; their releases can differ even when both are installed.
+Check the [CLI and plugin identities](../README.md#cli) before setup; their releases can differ even when both are installed.
 
 | Option                                                      | Effect                                                                                                                                    |
 | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `--provider NAME`                                           | The provider these options create or verify. A new name adds a provider; the first one becomes `defaultProvider`.                         |
 | `--concurrency N`                                           | Worker ceiling. Omit it to size workers from the host; setup reports effective `capacity` and a local host recommendation.                |
 | `--planning-model` `--review-model` `--worker-model`        | Role models. Each has a matching `--*-reasoning`.                                                                                         |
 | `--planning claude-agent-sdk`                               | Plan and review with Claude. Pass both models. It uses `claude auth login`.                                                               |
@@ -105,7 +143,7 @@ Copilot retains only settled local implementation conversations. Each turn rebin
 
 Claude binds each continuation to its owned native ID, role, current selection and authenticated private transcript. Resumed queries rebuild current workspace and permission hooks and record new-turn usage from the retained baseline. Result and Objective reviewers remain separate from implementation. A settled conversation does not accept a result; active or unknown work cannot be replayed or replaced with a fresh attempt.
 
-Codex defaults to exec. `--planning-transport app-server` at setup, or setting `planning.codex.transport` to `"app-server"` in the configuration before starting an Objective, selects the app-server transport for tool-free compilation, graph review and diagnosis. Tree result and final Objective reviews remain explicitly on exec with their exact-candidate offline permission profile; SDK workers are unchanged. This is selected routing, never a fallback after an ambiguous dispatch. The [upstream app-server documentation](https://learn.chatgpt.com/docs/app-server) labels the command experimental and unsupported for production workloads. Opt-in does not establish improved latency or live qualification.
+Codex defaults to exec. `--planning-transport app-server` at setup, or setting a provider's `planning.codex.transport` to `"app-server"` in the configuration before starting an Objective, selects the app-server transport for tool-free compilation, graph review and diagnosis. Tree result and final Objective reviews remain explicitly on exec with their exact-candidate offline permission profile; SDK workers are unchanged. This is selected routing, never a fallback after an ambiguous dispatch. The [upstream app-server documentation](https://learn.chatgpt.com/docs/app-server) labels the command experimental and unsupported for production workloads. Opt-in does not establish improved latency or live qualification.
 
 Fresh Codex exec compilation reads complete authenticated Sources through a private read-only, offline file manifest by default. Graph review likewise retrieves canonical evidence bodies through its own file map, as result and Objective review already do. These directories expose no repository, Git, operator-home, parent-state, write or network access. Read tools inherit only the private home, temporary directory and selected toolchain/locale variables; provider credentials, proxies and shell startup files are excluded. File availability is not proof of reading. Retrieve relevant current evidence; dependency lockfiles remain available for targeted resolution, corruption, supply-chain or explicit lock requirements, rather than habitual whole-file reading. Canonical source bodies and literal citation validation remain complete. `planning.codex.sourceArtifacts: false` explicitly retains inline planner delivery; app-server remains tool-free. Existing retained tool-free conversations keep their admitted profile. Changing configuration still changes its binding and does not permit replay or policy changes in an active Objective.
 
@@ -194,7 +232,7 @@ Work Item review uses its candidate's observations. Final Objective review prefe
 
 ### Execution profiles and adapters
 
-To let planning select a harness per item, replace `execution.harness` with `execution.profiles` and an eligible `execution.defaultProfile`:
+To let planning select a harness per item, replace a provider's `execution.harness` with `execution.profiles` and an eligible `execution.defaultProfile`:
 
 ```json
 {
@@ -227,7 +265,7 @@ Continuity is optional: declare supported roles through `sessionCapabilities.res
 
 `execution.kind: "managed-agent"` runs Work Items with `claude-managed-agents` or `openai-agents`; planning, validation, review and delivery stay on the controller. Neither provider is live-qualified. First authorize the source leaving the host (pinned base and supplied assets), provider account, model, data handling and spending limit. Installation grants none of those permissions. The removed `sandbox` execution kind is refused.
 
-Edit the installation's `execution` object before starting an Objective. Set `policy.network` to `off` and `policy.allowedSecretNames` to `[]`; the controller still needs provider and GitHub connectivity. `execution.concurrency` bounds Factory’s workers, not provider capacity. Input is a shallow base snapshot without history or local Git configuration; symlinks and submodules are refused. Results pass the same path, digest, validation and review checks as local work.
+Edit a provider's `execution` object before starting an Objective, or add a provider for managed execution. Set `policy.network` to `off` and `policy.allowedSecretNames` to `[]`; the controller still needs provider and GitHub connectivity. `execution.concurrency` bounds Factory’s workers, not provider capacity. Input is a shallow base snapshot without history or local Git configuration; symlinks and submodules are refused. Results pass the same path, digest, validation and review checks as local work.
 
 ### OpenAI Agents API
 
@@ -236,7 +274,7 @@ This provider uses the [OpenAI Agents API](https://developers.openai.com/api/doc
 1. Sign in to [OpenAI Platform](https://platform.openai.com/), select the intended organization and project, and confirm that the project can use Agents API and the selected model. Set up [API billing](https://platform.openai.com/settings/organization/billing/overview) and record the account's actual resource and spending limits; credentials alone do not establish access or available credit.
 2. In the project's **API Keys**, select **Create new secret key**. For a user-owned application key, choose restricted permissions with `api.agents.read`, `api.agents.write` and `api.responses.write`, as required by the [Agents quickstart](https://developers.openai.com/api/docs/guides/agents-api/quickstart). Save the displayed key in an owner-private file outside the target checkout; do not put it in Factory JSON, an issue, a prompt or chat. See [project/key management](https://help.openai.com/en/articles/9186755-managing-projects-in-the-api-platform) and [key permissions](https://help.openai.com/en/articles/8867743-assign-api-key-permissions).
 3. Choose the model and container under those limits. The current quickstart uses `gpt-6-astra`; `medium` reasoning, a `small` container and a 600-second timeout are a starting configuration. Confirm model availability in the selected project. Factory creates a fresh hosted environment for each attempt; no saved OpenAI agent or environment ID is required.
-4. Replace the installation's `execution` object with the following. `apiKeyEnv` names the controller variable holding the key; it is not the key itself. The key's Platform project supplies the account binding—Factory accepts no additional `projectId` or `organizationId` fields here.
+4. Replace a provider's `execution` object with the following. `apiKeyEnv` names the controller variable holding the key; it is not the key itself. The key's Platform project supplies the account binding—Factory accepts no additional `projectId` or `organizationId` fields here.
 
 ```json
 {
@@ -499,7 +537,7 @@ factory status --objective N [--json]
 factory status
 ```
 
-The first line is the headline, for example `Objective #7: needs plan decision — plan review needs a human decision`. The next lines give `Next:`, the exact command that answers it. Then come the question, if any, and a table of Work Items. The phases are `not started`, `planning`, `needs plan decision`, `running`, `waiting`, `needs decision`, `failed`, `cancelled` and `complete`. `--json` carries the same summary plus the plan, graph, consumed allowances and failure identities. Without `--objective`, status shows the service and the queue.
+The first line is the headline, for example `Objective #7: needs plan decision — plan review needs a human decision`. The next lines give `Next:`, the exact command that answers it. Then come the question, if any, a table of Work Items and the provider line. The phases are `not started`, `planning`, `needs plan decision`, `running`, `waiting`, `needs decision`, `failed`, `cancelled` and `complete`. `--json` carries the same summary plus the plan, graph, consumed allowances, failure identities and `provider` (`name`, `selectedBy`). Without `--objective`, status shows the service and the queue.
 
 Local controller status does not wait for a new Project read. Its queue observation carries its actual freshness and availability; use `factory queue sync` for a current remote observation. Local readiness, a cached observation and a completed command each have distinct meanings and do not admit additional work.
 
