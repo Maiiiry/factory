@@ -100,7 +100,12 @@ export interface InteractionMetadata {
   kind: "request" | "interaction" | "response" | "usage" | "outcome";
   factoryVersion: string;
   adapter: string;
-  configured: { provider: string; model: string; reasoningEffort?: string };
+  configured: {
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+    serviceTier?: import("./config.js").CodexServiceTier;
+  };
   reportedModel?: string;
   providerEvent?: string;
   providerSessionId?: string;
@@ -199,6 +204,7 @@ export interface InteractionMetadata {
     modelProvider?: string;
     reportedModel?: string;
     reportedReasoningEffort?: string;
+    reportedServiceTier?: string;
     modelContextWindow?: number;
     status: "available" | "partial" | "unavailable";
     turnBoundaryBytes?: number;

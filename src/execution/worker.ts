@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type { ThreadEvent } from "@openai/codex-sdk";
-import { Codex } from "@openai/codex-sdk";
+import { Codex, type CodexOptions } from "@openai/codex-sdk";
 import {
   CODEX_TREE_REVIEW_CONFIG,
   createCodexHome,
 } from "../codex-planning-isolation.js";
 import { DISCOVERY_CLASSIFICATION_SCHEMA } from "../discovery.js";
 import type { CodexModelSelection } from "../config.js";
+import { nativeCodexServiceTier } from "../codex-exec.js";
 import type {
   AgentSessionRef,
   HarnessRequest,
@@ -93,6 +94,23 @@ function progressEvent(
   return base;
 }
 
+/** Exact SDK config, shared by fresh and resumed owned worker turns. */
+export function codexWorkerConfiguration(
+  model: CodexModelSelection,
+  childAgents?: HarnessRequest["childAgents"],
+): CodexOptions["config"] {
+  return {
+    ...(model.serviceTier && {
+      service_tier: nativeCodexServiceTier(model.serviceTier),
+    }),
+    ...(childAgents === "disabled" && {
+      // Explicit overrides retain the worker's existing child-agent prohibition.
+      agents: { enabled: false },
+      features: { multi_agent: false, multi_agent_v2: false },
+    }),
+  };
+}
+
 export async function runCodexWorker(
   inputPath: string,
   resultPath: string,
@@ -120,6 +138,7 @@ export async function runCodexWorker(
       provider: "codex",
       model: model.model,
       reasoningEffort: model.reasoningEffort,
+      ...(model.serviceTier && { serviceTier: model.serviceTier }),
     },
   );
   // A private HOME with only the Codex login; shell commands see the
@@ -159,14 +178,7 @@ export async function runCodexWorker(
       throw new Error("Unsupported native child-agent execution policy");
     const codex = new Codex({
       env: home.env,
-      ...(request.childAgents === "disabled" && {
-        // CLI overrides take precedence over repository configuration on both
-        // new and resumed turns. V2 must not supersede the ordinary flag.
-        config: {
-          agents: { enabled: false },
-          features: { multi_agent: false, multi_agent_v2: false },
-        },
-      }),
+      config: codexWorkerConfiguration(model, request.childAgents),
     });
     const options = {
       workingDirectory: request.worktree,
@@ -245,6 +257,7 @@ export async function runCodexWorker(
         provider: "codex",
         model: model.model,
         reasoningEffort: model.reasoningEffort,
+        ...(model.serviceTier && { serviceTier: model.serviceTier }),
         usage: invocationUsage(),
       };
       observe({
