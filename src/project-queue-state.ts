@@ -2998,7 +2998,9 @@ export function verifyQueueInspection(
     (!options.allowUninitializedControl ||
       history.some(
         (row) =>
-          row.kind === "project-queue-operation" && row.scope === "control",
+          row.kind === "project-queue-operation" &&
+          row.scope === "control" &&
+          !row.beforeEffectFailure,
       ) ||
       JSON.stringify(inspection.binding) !==
         JSON.stringify(config.queue?.project) ||

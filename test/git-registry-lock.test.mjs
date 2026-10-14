@@ -68,6 +68,7 @@ import {
   readQueueHistory,
   queueObservationTargets,
   verifyQueueObservation,
+  verifyQueueInspection,
   retainedQueueEntry,
   retireUnknownProjectAdmission,
   settleFailedProjectQueueReservation,
@@ -1226,6 +1227,37 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       assert.equal(
         retainedQueueEntry(config, await readQueueHistory(config), 1),
         undefined,
+      );
+      const inspection = {
+        scope: "target",
+        binding: config.queue.project,
+        observedAt: new Date().toISOString(),
+        actorId: 1,
+        owner: "Fixture",
+        control: { itemId: config.queue.project.controlItemId, metadata: null },
+      };
+      assert.equal(
+        verifyQueueInspection(
+          config,
+          inspection,
+          await readQueueHistory(config),
+          false,
+          { allowUninitializedControl: true },
+        ).uninitializedControl,
+        true,
+        "a positively failed initial control has no successful producer to supersede",
+      );
+      assert.throws(
+        () =>
+          verifyQueueInspection(
+            config,
+            inspection,
+            [parseQueueRecord(originalControl, repository, operation.id)],
+            false,
+            { allowUninitializedControl: true },
+          ),
+        /partial or unknown/,
+        "a historical empty header alone remains fenced",
       );
     },
   );
