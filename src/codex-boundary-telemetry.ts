@@ -45,6 +45,14 @@ function integer(values: Map<string, string>, key: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function identity(
+  values: Map<string, string>,
+  key: string,
+): string | undefined {
+  const value = values.get(key);
+  return value && /^[\w.-]{1,256}$/.test(value) ? value : undefined;
+}
+
 function project(values: Map<string, string>): Boundary | undefined {
   const durationMs = integer(values, "duration_ms");
   const nativeAttempt = integer(values, "attempt");
@@ -57,6 +65,36 @@ function project(values: Map<string, string>): Boundary | undefined {
       : {}),
   };
   switch (values.get("event.name")) {
+    case "codex.tool_result": {
+      const callId = identity(values, "call_id");
+      const name = identity(values, "tool_name");
+      const namespace = identity(values, "tool_namespace");
+      const sequence = integer(values, "tool_result_seq");
+      const origin = values.get("tool_origin");
+      const previewTruncated = values.get("output_truncated");
+      const argumentBytes = integer(values, "arguments_length");
+      const outputBytes = integer(values, "output_length");
+      const outputLines = integer(values, "output_line_count");
+      return {
+        event: "tool-result",
+        ...common,
+        ...(callId && { toolCallId: callId }),
+        ...(name && { toolName: name }),
+        ...(namespace && { toolNamespace: namespace }),
+        ...(sequence === undefined
+          ? {}
+          : { nativeToolResultSequence: sequence }),
+        ...(origin === "builtin" || origin === "mcp"
+          ? { toolOrigin: origin }
+          : {}),
+        ...(previewTruncated === "true" || previewTruncated === "false"
+          ? { outputPreviewTruncated: previewTruncated === "true" }
+          : {}),
+        ...(argumentBytes === undefined ? {} : { argumentBytes }),
+        ...(outputBytes === undefined ? {} : { outputBytes }),
+        ...(outputLines === undefined ? {} : { outputLines }),
+      };
+    }
     case "codex.api_request":
     case "codex.websocket_connect":
     case "codex.websocket_request": {
@@ -140,12 +178,18 @@ export function codexBoundaryTelemetry(
   let dropping = false;
   let finished = false;
   let observedBytes = 0;
-  let parsedBytes = 0;
+  let projectedBytes = 0;
   let traceSeen = false;
   let quarantinedRecords = 0;
   let parsedRecords = 0;
   let unparsedRecords = 0;
   let truncatedRecords = 0;
+  let detailDroppedRecords = 0;
+  let responseCompletedRecords = 0;
+  let zeroOutputResponseCompletedRecords = 0;
+  let toolResultRecords = 0;
+  let transportCompletedRecords = 0;
+  let retryRecords = 0;
   const emit = (event: Boundary) => {
     try {
       void Promise.resolve(observe(event)).catch(() => undefined);
@@ -164,11 +208,6 @@ export function codexBoundaryTelemetry(
       return;
     }
     traceSeen = true;
-    parsedBytes += Buffer.byteLength(text) + 1;
-    if (parsedBytes > limit) {
-      truncatedRecords++;
-      return;
-    }
     const prefix =
       /^(?:\S+\s+)?(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+codex_otel\.trace_safe:\s*/.exec(
         text,
@@ -184,6 +223,35 @@ export function codexBoundaryTelemetry(
       return;
     }
     parsedRecords++;
+    if (projected.event === "response-completed") {
+      responseCompletedRecords++;
+      if (projected.responseCounters?.outputTokens === 0)
+        zeroOutputResponseCompletedRecords++;
+    } else if (projected.event === "tool-result") toolResultRecords++;
+    else if (projected.event === "transport-completed")
+      transportCompletedRecords++;
+    else if (projected.event === "retry") retryRecords++;
+    const nativeAt = values!.get("event.timestamp");
+    if (
+      nativeAt &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(nativeAt) &&
+      Number.isFinite(Date.parse(nativeAt)) &&
+      new Date(nativeAt).toISOString() === nativeAt
+    )
+      projected.nativeAt = nativeAt;
+    const thread = values!.get("conversation.id");
+    if (thread && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(thread))
+      projected.nativeThreadId = thread;
+    // Budget only the allowlisted retained detail. Unknown noisy records and
+    // oversized lines cannot consume the budget of a later valid observation.
+    // Continue bounded per-line projection after detail fills to retain numeric
+    // observed-record counts, never raw text or inferred provider identities.
+    const bytes = Buffer.byteLength(JSON.stringify(projected));
+    if (projectedBytes + bytes > limit) {
+      detailDroppedRecords++;
+      return;
+    }
+    projectedBytes += bytes;
     emit(projected);
   };
   const consume = (text: string) => {
@@ -197,7 +265,6 @@ export function codexBoundaryTelemetry(
         if (pending.length > 8192) {
           pending = "";
           dropping = true;
-          parsedBytes = limit + 1;
           traceSeen = true;
           truncatedRecords++;
         }
@@ -219,7 +286,10 @@ export function codexBoundaryTelemetry(
       emit({
         event: "telemetry-coverage",
         status:
-          truncatedRecords || unparsedRecords || quarantinedRecords
+          truncatedRecords ||
+          unparsedRecords ||
+          quarantinedRecords ||
+          detailDroppedRecords
             ? "incomplete"
             : parsedRecords
               ? "observed"
@@ -229,6 +299,13 @@ export function codexBoundaryTelemetry(
         quarantinedRecords,
         truncatedRecords,
         observedBytes,
+        projectedBytes,
+        detailDroppedRecords,
+        responseCompletedRecords,
+        zeroOutputResponseCompletedRecords,
+        toolResultRecords,
+        transportCompletedRecords,
+        retryRecords,
         submission: "unsupported",
       });
     },

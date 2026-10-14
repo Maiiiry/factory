@@ -42,6 +42,7 @@ export interface ModelBoundaryObservation {
     | "retry"
     | "tool-start"
     | "tool-end"
+    | "tool-result"
     | "turn-completed"
     | "turn-failed"
     | "process-exit"
@@ -49,6 +50,9 @@ export interface ModelBoundaryObservation {
     | "cessation"
     | "telemetry-coverage";
   elapsedMs: number;
+  /** Actual pinned trace timestamp, distinct from the local parser observation time. */
+  nativeAt?: string;
+  nativeThreadId?: string;
   durationMs?: number;
   transport?: "http" | "websocket-connect" | "websocket-request";
   statusCode?: number;
@@ -59,6 +63,16 @@ export interface ModelBoundaryObservation {
   delayMs?: number;
   tool?: "shell" | "mcp";
   toolCallId?: string;
+  /** Native result sequence is completion order, not start order or a provider request ID. */
+  nativeToolResultSequence?: number;
+  toolName?: string;
+  toolNamespace?: string;
+  toolOrigin?: "builtin" | "mcp";
+  argumentBytes?: number;
+  outputBytes?: number;
+  outputLines?: number;
+  /** Native telemetry preview truncation, not proof of truncated model tool output. */
+  outputPreviewTruncated?: boolean;
   toolStatus?: "in_progress" | "completed" | "failed";
   exitCode?: number | null;
   observedBytes?: number;
@@ -66,6 +80,13 @@ export interface ModelBoundaryObservation {
   unparsedRecords?: number;
   quarantinedRecords?: number;
   parsedRecords?: number;
+  projectedBytes?: number;
+  detailDroppedRecords?: number;
+  responseCompletedRecords?: number;
+  zeroOutputResponseCompletedRecords?: number;
+  toolResultRecords?: number;
+  transportCompletedRecords?: number;
+  retryRecords?: number;
   status?: "observed" | "incomplete" | "unavailable" | "verified";
   /** Native response counters can include prewarm; never add them to outer usage. */
   responseCounters?: {
