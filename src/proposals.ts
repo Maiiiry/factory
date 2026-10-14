@@ -977,7 +977,7 @@ async function generate(
     issues: {},
   };
   save(path, journal);
-  const model = composePlanningModel(config);
+  const model = composePlanningModel(config, { retainedSessions: false });
   if (!(model instanceof StructuredPlanningModel))
     throw new Error(
       "Configured provider does not support structured proposals",

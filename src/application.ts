@@ -377,8 +377,15 @@ export function composeIntake(
   };
 }
 
-/** The configured PlanningModel; it authenticates with the operator's provider login. */
-export function composePlanningModel(config: FactoryConfig): PlanningModel {
+/**
+ * The configured PlanningModel; it authenticates with the operator's provider login.
+ * Proposals and dreams are standalone calls outside any Objective run, so they pass
+ * `retainedSessions: false` and get no controller-owned session storage.
+ */
+export function composePlanningModel(
+  config: FactoryConfig,
+  { retainedSessions = true }: { retainedSessions?: boolean } = {},
+): PlanningModel {
   const redactionValues = config.policy.allowedSecretNames.flatMap((name) =>
     process.env[name] ? [process.env[name]!] : [],
   );
@@ -386,10 +393,14 @@ export function composePlanningModel(config: FactoryConfig): PlanningModel {
     return composedPlanningModel(
       new ClaudePlanningModel(config.planning, {
         redactionValues,
-        sessionRoot: join(
-          stateRoot(config.repository),
-          "claude-planning-sessions",
-        ),
+        ...(retainedSessions
+          ? {
+              sessionRoot: join(
+                stateRoot(config.repository),
+                "claude-planning-sessions",
+              ),
+            }
+          : {}),
       }),
     );
   return composedPlanningModel(
@@ -402,7 +413,14 @@ export function composePlanningModel(config: FactoryConfig): PlanningModel {
         redactionValues,
         transport: config.planning.codex?.transport ?? "exec",
         sourceArtifacts: config.planning.codex?.sourceArtifacts,
-        sessionRoot: join(stateRoot(config.repository), "review-sessions"),
+        ...(retainedSessions
+          ? {
+              sessionRoot: join(
+                stateRoot(config.repository),
+                "review-sessions",
+              ),
+            }
+          : {}),
       },
     ),
   );
