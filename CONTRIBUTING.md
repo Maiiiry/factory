@@ -2,6 +2,8 @@
 
 Factory welcomes bug reports, documentation fixes, and focused pull requests. Search the [issue tracker](https://github.com/clockgrove/factory/issues) before opening a new issue. For a larger change, describe the outcome and agree on its scope in an issue before implementing it. The [public project](https://github.com/orgs/clockgrove/projects/2) tracks priorities.
 
+Set the native issue type: `Bug` for a defect, `Feature` for a requested capability, or `Task` for maintenance, investigation or qualification. Use labels for area, priority or other independent information; omit redundant `bug`, `enhancement`, `feature` and `task` labels. CLI/API authors must supply the type explicitly and verify the returned issue. See [issue metadata rules](AGENTS.md#issue-metadata) for Objective and Work Item roles.
+
 This guide is for developers adding features or fixing bugs in Factory itself. To use the plugin on your own repository, follow the [plugin user guide](docs/USER-GUIDE.md).
 
 ## Development setup

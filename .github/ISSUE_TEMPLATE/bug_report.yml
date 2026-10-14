@@ -1,5 +1,6 @@
 name: Bug report
 description: Report a Factory defect or documentation problem
+type: Bug
 body:
   - type: markdown
     attributes:
