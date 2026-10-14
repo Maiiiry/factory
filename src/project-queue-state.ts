@@ -1264,10 +1264,11 @@ export function parseQueueRecord(
       ]);
       if (
         row.completed ||
-        row.commandId ||
-        row.effects.length !== 1 ||
-        object(row.effects[0]).receipt ||
-        object(row.effects[0]).rejectedOriginal ||
+        (!zeroIntentControl(row as unknown as QueueOperation) &&
+          (row.commandId ||
+            row.effects.length !== 1 ||
+            object(row.effects[0]).receipt ||
+            object(row.effects[0]).rejectedOriginal)) ||
         proof.schemaVersion !== 1 ||
         !date(proof.at) ||
         Date.parse(proof.at) < Date.parse(String(row.at)) ||
@@ -1287,7 +1288,9 @@ export function parseQueueRecord(
           ![
             "project-queue-state.js",
             "github-project-queue.js",
-            "recovery-checkpoint.js",
+            zeroIntentControl(row as unknown as QueueOperation)
+              ? "intake.js"
+              : "recovery-checkpoint.js",
           ].includes(source.path) ||
           paths.has(source.path) ||
           !ref(source.ref)
@@ -2402,14 +2405,17 @@ export function assertQueueOperationReferenceBodies(
   const error = object(json(proof.error)),
     checkpoint = object(json(proof.checkpoint));
   if (
-    error.kind !== "typed-before-write-checkpoint-refusal" ||
+    (zeroIntentControl(operation)
+      ? error.kind !== "creating-owner-before-command-refusal"
+      : error.kind !== "typed-before-write-checkpoint-refusal") ||
     error.knownNotDispatched !== true ||
     error.boundary !== "before-effect" ||
     typeof error.message !== "string" ||
     object(checkpoint.binding).repository !== operation.repository ||
     !Number.isSafeInteger(checkpoint.sequence) ||
     !Number.isSafeInteger(checkpoint.acknowledgedSequence) ||
-    Number(checkpoint.acknowledgedSequence) >= Number(checkpoint.sequence)
+    (!zeroIntentControl(operation) &&
+      Number(checkpoint.acknowledgedSequence) >= Number(checkpoint.sequence))
   )
     throw new Error(
       "Positive original callback/publication failure is unavailable",
@@ -2992,7 +2998,9 @@ export function verifyQueueInspection(
     (!options.allowUninitializedControl ||
       history.some(
         (row) =>
-          row.kind === "project-queue-operation" && row.scope === "control",
+          row.kind === "project-queue-operation" &&
+          row.scope === "control" &&
+          !row.beforeEffectFailure,
       ) ||
       JSON.stringify(inspection.binding) !==
         JSON.stringify(config.queue?.project) ||
@@ -3595,6 +3603,79 @@ const queueCommandOwners = new WeakMap<
     stopped: boolean;
   }
 >();
+/** A planned singleton control write is not an actual intent. */
+function zeroIntentControl(operation: QueueOperation): boolean {
+  const recipe = operation.commandRecipe;
+  return (
+    operation.action === "control" &&
+    operation.scope === "control" &&
+    !operation.completed &&
+    operation.effects.length === 0 &&
+    operation.commandId === operation.id &&
+    recipe?.id === operation.id &&
+    recipe.operations.length === 1 &&
+    recipe.effects.length === 1 &&
+    JSON.stringify(recipe.operations[0]) ===
+      JSON.stringify(commandHeader(operation)) &&
+    recipe.effects[0]!.operationId === operation.id &&
+    recipe.effects[0]!.action === "set-metadata" &&
+    "itemId" in recipe.effects[0]!.target &&
+    recipe.effects[0]!.target.itemId === operation.binding.controlItemId
+  );
+}
+function retainUnadmittedControlFailure(
+  operation: QueueOperation,
+  error: Record<string, unknown>,
+): void {
+  if (!zeroIntentControl(operation) || operation.beforeEffectFailure)
+    throw new Error(
+      "Only an unchanged singleton unadmitted control may fail permanently",
+    );
+  const store = new LocalContentStore(
+    join(stateRoot(operation.repository), "content"),
+  );
+  const put = (bytes: Buffer) =>
+    store.putBytes(bytes, { mediaType: "application/json" });
+  const path = join(
+    stateRoot(operation.repository),
+    "project-queue-history",
+    `${operation.id}.json`,
+  );
+  const original = privateBytes(path);
+  if (
+    JSON.stringify(
+      parseQueueRecord(original, operation.repository, operation.id),
+    ) !== JSON.stringify(operation)
+  )
+    throw new Error("Stopped control differs from its original header");
+  const directory = dirname(fileURLToPath(import.meta.url));
+  operation.beforeEffectFailure = {
+    schemaVersion: 1,
+    at: new Date().toISOString(),
+    originalOperation: put(original),
+    checkpoint: put(
+      privateBytes(
+        join(stateRoot(operation.repository), "recovery", "checkpoint.json"),
+      ),
+    ),
+    error: put(Buffer.from(JSON.stringify(error))),
+    sources: [
+      "project-queue-state.js",
+      "github-project-queue.js",
+      "intake.js",
+    ].map((path) => ({
+      path,
+      ref: put(
+        Buffer.from(
+          JSON.stringify(readFileSync(join(directory, path), "utf8")),
+        ),
+      ),
+    })),
+  };
+  assertQueueOperationReferenceBodies(operation, (ref) => store.readBytes(ref));
+  save(operation);
+}
+
 export function createQueueCommand(
   config: FactoryConfig,
   input: {
@@ -3722,6 +3803,26 @@ export async function admitQueueCommand(
     owner.admitted = true;
   } catch (error) {
     owner.stopped = true;
+    if (
+      command.operations.length === 1 &&
+      zeroIntentControl(command.operations[0]!)
+    )
+      try {
+        retainUnadmittedControlFailure(command.operations[0]!, {
+          kind: "creating-owner-before-command-refusal",
+          boundary: "before-effect",
+          knownNotDispatched: true,
+          name: error instanceof Error ? error.name : "ThrownValue",
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? (error.stack ?? null) : null,
+        });
+      } catch (retentionError) {
+        throw new AggregateError(
+          [error, retentionError],
+          "Unadmitted control failure and its original retention remain unresolved",
+          { cause: error },
+        );
+      }
     throw error;
   }
 }
