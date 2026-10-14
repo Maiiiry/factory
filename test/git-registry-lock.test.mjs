@@ -63,6 +63,7 @@ import {
   createQueueCommand,
   createQueueOperation,
   nextProjectQueueOrder,
+  queueDigest,
   parseQueueRecord,
   performQueueCommandEffect,
   readQueueHistory,
@@ -105,6 +106,30 @@ import {
   saveState,
 } from "../dist/state-store.js";
 
+/** The configuration file for a flat test config: one provider in planning's place. */
+function toConfigFile(config) {
+  return Object.fromEntries(
+    Object.entries(config).flatMap(([key, value]) =>
+      key === "planning"
+        ? [
+            [
+              "providers",
+              {
+                test: {
+                  planning: config.planning,
+                  execution: config.execution,
+                },
+              },
+            ],
+            ["defaultProvider", "test"],
+          ]
+        : key === "execution"
+          ? []
+          : [[key, value]],
+    ),
+  );
+}
+
 const processUrl = new URL("../dist/process.js", import.meta.url).href;
 
 test("a terminal background watcher holds checkpoint failure while real control and explicit recovery remain usable", async (t) => {
@@ -112,7 +137,15 @@ test("a terminal background watcher holds checkpoint failure while real control 
   await watcherWorkflow(t, false);
 });
 
-async function watcherWorkflow(t, preSnapshotFailure) {
+test("normal run acknowledges a ceased Project owner after genuine local result collection", async (t) => {
+  await watcherWorkflow(t, false, true);
+});
+
+async function watcherWorkflow(
+  t,
+  preSnapshotFailure,
+  collectedExecution = false,
+) {
   const directory = await mkdtemp(
     join(tmpdir(), "factory-watcher-checkpoint-"),
   );
@@ -567,6 +600,364 @@ async function watcherWorkflow(t, preSnapshotFailure) {
     /differs from current full observation/,
   );
   controlMetadata = originalControl;
+
+  if (collectedExecution) {
+    const { addWorktree, processGroupExists } = await import(
+      "../dist/process.js"
+    );
+    const { launchWorker, killGroup } = await import(
+      "../dist/execution/worker-process.js"
+    );
+    const { checkpointWorkerSession } = await import(
+      "../dist/execution/local.js"
+    );
+    const { collectCompletedWorker } = await import("../dist/runner.js");
+    const { agentSessionContinuation } = await import(
+      "../dist/agent-session.js"
+    );
+    const { settleStoppedProjectQueueRun } = await import(
+      "../dist/project-queue-state.js"
+    );
+    const baseSha = git("rev-parse", "HEAD"),
+      attempt = randomUUID();
+    const item = {
+      id: "local",
+      title: "Local evidence",
+      goal: "Retain local evidence",
+      brief: "A finite local integration process",
+      acceptance: ["git diff is clean."],
+      dependencies: [],
+      ownedPaths: ["README.md"],
+      resources: [],
+      nonGoals: [],
+      validation: [],
+      citations: [],
+      sourceAssets: [],
+      expectedOutputRoles: [],
+      requiredLfsRoles: [],
+      minimumAssetSets: 0,
+    };
+    const graph = {
+      objective: 1,
+      baseSha,
+      items: [item],
+      coverage: [
+        {
+          criterionId: "b".repeat(64),
+          itemId: item.id,
+          source: {
+            path: "OBJECTIVE",
+            digest: queueDigest(body),
+            text: "git diff is clean.",
+          },
+          proof: { kind: "result-semantic", acceptanceIndex: 0 },
+          environment: {
+            kind: "local",
+            readiness: "available",
+            probe: "",
+            preparedBy: "",
+          },
+        },
+      ],
+    };
+    const state = {
+      schemaVersion: 17,
+      repository,
+      objective: 1,
+      runId: randomUUID(),
+      configDigest: factoryConfigDigest(config),
+      objectiveBodyDigest: queueDigest(body),
+      baseSha,
+      graph,
+      planGraphDigest: graphDigest(graph),
+      capacity: { concurrency: 1 },
+      autonomy: resolveAutonomy(),
+      issueByItemId: { local: 2 },
+      work: { local: { status: "pending", step: "execute", baseSha } },
+    };
+    const path = statePath(repository, 1),
+      privateRoot = stateRoot(repository),
+      store = new LocalContentStore(join(privateRoot, "content"));
+    saveState(path, state);
+    await intakeControl(config, "resume", undefined, github);
+    const inputs = join(directory, "old-owner-input.json");
+    await writeFile(
+      inputs,
+      JSON.stringify({
+        config,
+        state,
+        snapshot: await github.projectQueueRead(binding, hints),
+      }),
+      { mode: 0o600 },
+    );
+    const ownerScript = join(directory, "old-owner.mjs");
+    const dist = new URL("../dist/", import.meta.url).href;
+    await writeFile(
+      ownerScript,
+      `import {readFileSync} from 'node:fs';
+import {acquireObjectiveLock,releaseControllerLock,objectiveLockPath} from '${dist}state-store.js';
+import {claimProjectQueueRun,bindProjectQueueRun} from '${dist}project-queue-state.js';
+import {buildRecoveryCheckpointClosure} from '${dist}recovery-checkpoint-closure.js';
+import {withRecoveryCheckpointScope,awaitCheckpointAdmission} from '${dist}recovery-checkpoint.js';
+const {config,state,snapshot}=JSON.parse(readFileSync(process.argv[2],'utf8'));
+const lock=acquireObjectiveLock(config.repository,1);
+try {await withRecoveryCheckpointScope({config,buildClosure:()=>buildRecoveryCheckpointClosure({config})},async()=>{
+const gateway={effectAdmission:'controller-checkpoint-v1',projectQueueRead:async()=>snapshot};
+const claim=await claimProjectQueueRun(config,gateway,1,lock.token,state);
+bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmission(config.repository,'explicit');
+});}finally{releaseControllerLock(objectiveLockPath(config.repository,1),lock);}
+`,
+      { mode: 0o600 },
+    );
+    execFileSync(process.execPath, [ownerScript, inputs], {
+      env: process.env,
+      stdio: "pipe",
+      timeout: 15_000,
+    });
+    const originalClaim = (await readQueueHistory(config)).find(
+      (row) => row.kind === "project-queue-owner",
+    );
+    const originalClaimBytes = JSON.stringify(originalClaim);
+    const workRoot = join(privateRoot, "worktrees"),
+      worktree = join(workRoot, attempt);
+    await addWorktree(checkout, worktree, baseSha);
+    const harness = new CodexHarness(
+      join(privateRoot, "credentials"),
+      "off",
+      selection,
+    );
+    state.work.local = { status: "running", step: "execute", attempt, baseSha };
+    const continuity = agentSessionContinuation(
+      state,
+      "implementation",
+      item.id,
+      () => saveState(path, state),
+    );
+    const request = {
+      attemptId: attempt,
+      baseSha,
+      item,
+      session: { scope: continuity.scope, identity: continuity.identity },
+    };
+    checkpointWorkerSession(
+      request.session,
+      { adapter: "codex", supportsResume: true, executionIdentity: attempt },
+      continuity.checkpoint,
+    );
+    const session = await harness.workerSession(request);
+    const release = join(directory, "release-worker"),
+      script = join(directory, "owned-result.cjs");
+    // Same finite owned local protocol producer as the collection workflow:
+    // no inference, semantic verdict or provider response is fabricated.
+    await writeFile(
+      script,
+      `const fs=require('node:fs'),p=require('node:path');const input=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));const timer=setInterval(()=>{if(!fs.existsSync(input.release))return;clearInterval(timer);fs.writeFileSync(p.join(input.request.worktree,'README.md'),'# Local incomplete candidate\\n');fs.writeFileSync(process.argv[3],JSON.stringify({state:'complete',evidence:{finalResponse:'INCOMPLETE: normal validation and review required'},session:{...input.session.ref,status:'ready',data:{...input.session.ref.data,threadId:'owned-local-protocol-process',nativeEof:true}}}),{mode:0o600});},10);`,
+    );
+    const worker = await launchWorker({
+      root: join(privateRoot, "harness"),
+      identity: attempt,
+      input: { request: { ...request, worktree }, session, release },
+      script,
+      env: process.env,
+      label: "Local integration process",
+    });
+    t.after(async () => {
+      if (processGroupExists(worker.pid))
+        await killGroup(worker.pid, "Local integration process");
+    });
+    state.work.local.execution = {
+      provider: "local",
+      identity: attempt,
+      data: {
+        request: structuredClone(request),
+        worktree,
+        adapterIdentity: "codex-sdk",
+        handle: { identity: attempt, data: worker },
+      },
+    };
+    saveState(path, state);
+    const lock = acquireObjectiveLock(repository, 1);
+    try {
+      await withRecoveryCheckpointScope(
+        {
+          config,
+          buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+        },
+        () =>
+          assert.rejects(
+            settleStoppedProjectQueueRun(config, state, lock),
+            /collected local results/,
+          ),
+      );
+    } finally {
+      releaseControllerLock(objectiveLockPath(repository, 1), lock);
+    }
+    assert.equal(
+      JSON.stringify(
+        (await readQueueHistory(config)).find(
+          (row) => row.id === originalClaim.id,
+        ),
+      ),
+      originalClaimBytes,
+    );
+    await writeFile(release, "release");
+    const resultDeadline = Date.now() + 10_000;
+    while (!existsSync(worker.resultPath) && Date.now() < resultDeadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert(existsSync(worker.resultPath));
+    const driver = new LocalExecutionDriver(
+      checkout,
+      workRoot,
+      harness,
+      1,
+      store,
+      "codex-sdk",
+    );
+    await collectCompletedWorker(
+      config,
+      1,
+      { runId: state.runId, item: item.id, attempt },
+      driver,
+    );
+    const collected = readState(repository, 1),
+      frozen = JSON.stringify(collected.work.local.execution.data.result),
+      allowances = JSON.stringify(collected.autonomy);
+    assert.equal(processGroupExists(worker.pid), false);
+    const checkpoint = gitPersistenceStatus(config);
+    assert.equal(checkpoint.sequence, checkpoint.acknowledgedSequence);
+    // Reuse the genuine pre-intent archive refusal producer from the existing
+    // reservation workflow: permanent failed control is inactive, not replayed.
+    await withRecoveryCheckpointScope(
+      {
+        config,
+        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+      },
+      async () => {
+        const operation = createQueueOperation(config, {
+          action: "control",
+          scope: "control",
+          previousReceiptId: JSON.parse(controlMetadata).receiptId,
+          approval: { kind: "queue-command" },
+        });
+        operation.metadata = JSON.stringify({
+          schemaVersion: 1,
+          kind: "control",
+          receiptId: operation.id,
+          mode: "paused",
+          watch: true,
+        });
+        const step = createProjectQueuePlannedEffect(binding, {
+          operationId: operation.id,
+          requestId: randomUUID(),
+          actorId: 1,
+          action: "set-metadata",
+          target: { itemId: binding.controlItemId },
+          fieldId: binding.metadataFieldId,
+          metadata: operation.metadata,
+          prior: {
+            target: {
+              itemId: binding.controlItemId,
+              metadata: controlMetadata,
+            },
+          },
+          control: { metadata: controlMetadata },
+        });
+        const command = createQueueCommand(config, {
+          operations: [operation],
+          effects: [step],
+          deadlineAt: null,
+        });
+        await rename(remote, `${remote}.unavailable`);
+        try {
+          await assert.rejects(admitQueueCommand(config, command), /ENOENT/);
+        } finally {
+          await rename(`${remote}.unavailable`, remote);
+        }
+        assert.equal(operation.effects.length, 0);
+        assert(operation.beforeEffectFailure);
+        await assert.rejects(
+          admitQueueCommand(config, command),
+          /never replay/,
+        );
+        await awaitCheckpointAdmission(repository, "explicit");
+      },
+    );
+    const refusalLock = acquireObjectiveLock(repository, 1);
+    try {
+      await withRecoveryCheckpointScope(
+        {
+          config,
+          buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+        },
+        async () => {
+          const unknown = structuredClone(collected);
+          const native = Object.values(unknown.agentSessions)[0];
+          native.data.workerSettled = false;
+          unknown.work.local.execution.data.result.session.data.workerSettled = false;
+          await assert.rejects(
+            settleStoppedProjectQueueRun(config, unknown, refusalLock),
+            /collected local results/,
+          );
+          const foreign = structuredClone(collected);
+          foreign.restoration = { disposition: "reconciliation-required" };
+          await assert.rejects(
+            settleStoppedProjectQueueRun(config, foreign, refusalLock),
+            /collected local results/,
+          );
+        },
+      );
+    } finally {
+      releaseControllerLock(objectiveLockPath(repository, 1), refusalLock);
+    }
+    const boundary = new Error(
+      "Observed original run before new execution or inference",
+    );
+    const services = {
+      github,
+      contentStore: store,
+      driver,
+      planningModel: new CodexPlanningModel(checkout, selection, selection),
+      delivery: new RegularDelivery(checkout, github),
+      reportRunStatus(message) {
+        if (message.includes("resuming the existing run")) throw boundary;
+      },
+    };
+    await assert.rejects(
+      runObjective(config, 1, services),
+      (error) => error === boundary,
+    );
+    const owners = (await readQueueHistory(config)).filter(
+      (row) => row.kind === "project-queue-owner",
+    );
+    assert.equal(owners.length, 2);
+    const old = owners.find((row) => row.id === originalClaim.id),
+      current = owners.find((row) => row.id !== originalClaim.id);
+    assert.equal(old.settled.disposition, "quiescent");
+    assert.equal(old.settled.runId, collected.runId);
+    assert.equal(old.settled.handoff.owner.pid, process.pid);
+    assert.notEqual(
+      old.settled.handoff.owner.tokenDigest,
+      old.ownerTokenDigest,
+    );
+    const { settled, ...unchanged } = old;
+    assert.equal(JSON.stringify(unchanged), originalClaimBytes);
+    await authenticateQueueOwnerReferences(old, (ref) => store.readBytes(ref));
+    assert.equal(current.priorRunId, collected.runId);
+    assert.equal(current.deadlineAt, old.deadlineAt);
+    const resumed = readState(repository, 1);
+    assert.equal(resumed.runId, collected.runId);
+    assert.equal(
+      JSON.stringify(resumed.work.local.execution.data.result),
+      frozen,
+    );
+    assert.equal(JSON.stringify(resumed.autonomy), allowances);
+    assert.equal(resumed.finalAcceptance, undefined);
+    assert.match(
+      resumed.work.local.execution.data.result.evidence.finalResponse,
+      /^INCOMPLETE:/,
+    );
+    return;
+  }
 
   if (preSnapshotFailure) {
     const initial = git("rev-parse", "HEAD"),
@@ -2512,7 +2903,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       // These deliberately incomplete descriptors claim no operator observation,
       // provider response or permission to retire any of the preserved intents.
       const configPath = join(directory, "maintenance-config.json"),
-        configBytes = Buffer.from(JSON.stringify(config)),
+        configBytes = Buffer.from(JSON.stringify(toConfigFile(config))),
         refusedProofPath = join(directory, "not-an-operator-proof.json"),
         refusedProofBytes = Buffer.from("{}\n");
       await writeFile(configPath, configBytes, { mode: 0o600 });

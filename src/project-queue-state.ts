@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import {
   type FactoryConfig,
   factoryConfigDigest,
-  validateConfig,
+  resolveMatchingProvider,
   factoryAuthorityDigest,
   stateRoot,
 } from "./config.js";
@@ -75,6 +75,7 @@ import {
   type ControllerLock,
 } from "./state-store.js";
 import { canHandoff } from "./runner/ownership.js";
+import { collectedLocalWorkerSessionSettled } from "./execution/checkpoint.js";
 import { objectiveWorkflowRecipeSelector } from "./workflow-recipes.js";
 import { isExecutionState, isPreparationState } from "./state.js";
 import {
@@ -615,7 +616,7 @@ function assertReservationSourceReview(
       "The original claim and canonical provider-admission protocol were not reviewed",
     );
 }
-/** A new recovery owner proves only local cessation of the original stopped planning run. */
+/** A new recovery owner proves local cessation, never acceptance of the original run. */
 export interface QueueStoppedHandoffProof {
   schemaVersion: 1;
   originalClaim: ContentRef;
@@ -624,6 +625,43 @@ export interface QueueStoppedHandoffProof {
   owner: { pid: number; startTime: string; tokenDigest: string };
 }
 function assertStoppedClaimState(state: ContinuationState): void {
+  if (isExecutionState(state)) {
+    const work = Object.values(state.work);
+    const collected = (entry: (typeof work)[number]) => {
+      const execution = entry.execution;
+      const data = execution?.data as
+        | { result?: import("./contracts.js").ExecutionResult }
+        | undefined;
+      return !!(
+        execution?.provider === "local" &&
+        execution.identity === entry.attempt &&
+        data?.result?.collection &&
+        data.result.session &&
+        collectedLocalWorkerSessionSettled(execution, data.result.session)
+      );
+    };
+    if (
+      state.restoration ||
+      state.cancelRequested ||
+      state.cancelledAt ||
+      state.finalAcceptance ||
+      state.coordinator?.cancelError ||
+      state.coordinator?.processes?.length ||
+      restoredContinuationOwnershipHold(state, true) ||
+      !work.some(collected) ||
+      work.some(
+        (entry) =>
+          (entry.execution && entry.execution.provider !== "local") ||
+          entry.status === "published" ||
+          (entry.status === "running" &&
+            (entry.step !== "execute" || !collected(entry))),
+      )
+    )
+      throw new Error(
+        "Stopped Project execution handoff requires collected local results and settled source-host resources without unresolved effects",
+      );
+    return;
+  }
   if (
     !isPreparationState(state) ||
     state.cancelRequested ||
@@ -4162,6 +4200,7 @@ export async function claimProjectQueueRun(
   objective: number,
   ownerToken: string,
   snapshot?: ContinuationState,
+  recoveryLock?: ControllerLock,
 ): Promise<QueueOwnerClaim | undefined> {
   if (!config.queue?.project) return;
   assertProcessActive();
@@ -4170,11 +4209,11 @@ export async function claimProjectQueueRun(
   if (snapshot) assertRestoredContinuationReady(snapshot, config);
   if (snapshot && !continuationConfigurationMatches(snapshot, config))
     throw new Error(
-      "Existing execution configuration differs; use supported reconciliation without renewing admission or allowances",
+      "Existing execution configuration differs; if this Objective started with another provider, continue it from that provider's host or with its foreground run; otherwise use supported reconciliation without renewing admission or allowances",
     );
   // Existing archive without this host's verified baseline cannot be overwritten.
   await awaitCheckpointAdmission(config.repository, "explicit");
-  const observed = await observeProjectQueue(config, github);
+  let observed = await observeProjectQueue(config, github);
   if (
     observed.history.some(
       (row) =>
@@ -4186,22 +4225,44 @@ export async function claimProjectQueueRun(
     throw new Error(
       "Permanently retired uncertain admission can never dispatch a run",
     );
-  const entry = observed.entries.find(
-    (candidate) =>
-      candidate.objective === objective && candidate.state === "queued",
-  );
-  const card = observed.snapshot.cards.find(
-    (candidate) => !candidate.archived && candidate.objective === objective,
-  );
-  if (
-    observed.control.mode !== "running" ||
-    !entry ||
-    card?.state !== "open" ||
-    queueDigest(card.body) !== entry.bodyDigest
-  )
-    throw new Error(
-      `Foreground and queue dispatch require a current open, exact-content approved Project admission and running control; use factory queue add ${objective}, or factory queue resume for an intentionally paused queue`,
+  const approvedEntry = (current: typeof observed) => {
+    const entry = current.entries.find(
+      (candidate) =>
+        candidate.objective === objective && candidate.state === "queued",
     );
+    const card = current.snapshot.cards.find(
+      (candidate) => !candidate.archived && candidate.objective === objective,
+    );
+    if (
+      current.control.mode !== "running" ||
+      !entry ||
+      card?.state !== "open" ||
+      queueDigest(card.body) !== entry.bodyDigest
+    )
+      throw new Error(
+        `Foreground and queue dispatch require a current open, exact-content approved Project admission and running control; use factory queue add ${objective}, or factory queue resume for an intentionally paused queue`,
+      );
+    return entry;
+  };
+  let entry = approvedEntry(observed);
+  if (
+    snapshot &&
+    isExecutionState(snapshot) &&
+    recoveryLock &&
+    observed.history.some(
+      (record) => record.kind === "project-queue-owner" && !record.settled,
+    )
+  ) {
+    if (recoveryLock.token !== ownerToken)
+      throw new Error(
+        "Recovery owner differs from the current controller lock",
+      );
+    await settleStoppedProjectQueueRun(config, snapshot, recoveryLock);
+    // Settlement acknowledges only old ownership. Fresh Project authority is
+    // still required before a new claim for the exact same continuation.
+    observed = await observeProjectQueue(config, github);
+    entry = approvedEntry(observed);
+  }
   const prior = observed.history.filter(
     (record): record is QueueOwnerClaim =>
       record.kind === "project-queue-owner" && record.objective === objective,
@@ -4485,8 +4546,9 @@ export async function abandonFailedProjectQueueReservation(
   const originalConfigBytes = privateBytes(
     evidence.originalInstallation.configPath,
   );
-  const originalConfig = validateConfig(
+  const originalConfig = resolveMatchingProvider(
     JSON.parse(originalConfigBytes.toString("utf8")),
+    config,
   );
   if (
     createHash("sha256").update(originalConfigBytes).digest("hex") !==
@@ -4872,7 +4934,10 @@ async function retireUnknownProjectOperation(
       | RetiredWithdrawalEvidence
       | RetiredAdmissionEvidence,
     configBytes = privateBytes(evidence.originalInstallation.configPath),
-    originalConfig = validateConfig(JSON.parse(configBytes.toString("utf8")));
+    originalConfig = resolveMatchingProvider(
+      JSON.parse(configBytes.toString("utf8")),
+      config,
+    );
   if (
     queueDigest(configBytes.toString("utf8")) !==
       evidence.originalInstallation.configSha256 ||
@@ -5397,7 +5462,9 @@ export async function settleStoppedProjectQueueRun(
   const lockPath = objectiveLockPath(config.repository, state.objective);
   const assertOwner = () => {
     const identity = linuxProcessIdentity(process.pid);
-    const owner = readControllerOwner(lockPath);
+    const owner = [lockPath, installationLockPath(config.repository)]
+      .map((path) => readControllerOwner(path))
+      .find((candidate) => candidate?.token === lock.token);
     if (
       !identity ||
       !owner ||
@@ -5417,7 +5484,9 @@ export async function settleStoppedProjectQueueRun(
   if (
     history.some(
       (record) =>
-        record.kind === "project-queue-operation" && !record.completed,
+        record.kind === "project-queue-operation" &&
+        !record.completed &&
+        !record.beforeEffectFailure,
     )
   )
     throw new Error(
@@ -5431,6 +5500,46 @@ export async function settleStoppedProjectQueueRun(
   if (pending.length !== 1 || pending[0]!.objective !== state.objective)
     throw new Error("Stopped Project handoff has competing unfinished claims");
   const claim = pending[0]!;
+  if (isExecutionState(state)) {
+    const originalOwner = claim.ownerProcess;
+    if (
+      !originalOwner ||
+      originalOwner.namespace !== readlinkSync("/proc/self/ns/pid") ||
+      hasUnresolvedSubprocesses()
+    )
+      throw new Error(
+        "Stopped Project execution handoff requires the original source-host namespace and settled subprocess ownership",
+      );
+    const assertCeased = (pid: number, startTime: string) => {
+      const current = linuxProcessIdentity(pid);
+      if (
+        (current?.startTime === startTime && current.state !== "Z") ||
+        processGroupExists(pid)
+      )
+        throw new Error(
+          "Original Project controller or local worker remains active or uncertain",
+        );
+    };
+    assertCeased(originalOwner.pid, originalOwner.startTime);
+    for (const work of Object.values(state.work).flatMap((entry) => [
+      entry,
+      ...(entry.recovery?.history ?? []).map((history) => history.work),
+    ])) {
+      const data = work.execution?.data as
+        | { handle?: { data?: { pid?: number; startTime?: string } } }
+        | undefined;
+      if (!work.execution) continue;
+      if (
+        work.execution.provider !== "local" ||
+        !Number.isSafeInteger(data?.handle?.data?.pid) ||
+        !data?.handle?.data?.startTime
+      )
+        throw new Error(
+          "Stopped Project handoff has unsupported local resource ownership",
+        );
+      assertCeased(data.handle!.data!.pid!, data.handle!.data!.startTime!);
+    }
+  }
   if (
     !claim.runBinding ||
     claim.runBinding.runId !== state.runId ||

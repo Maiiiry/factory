@@ -1,25 +1,31 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import { option, options } from "./cli-flags.js";
 import {
   DEFAULT_PLANNER_MODEL_SELECTION,
   DEFAULT_REVIEWER_MODEL_SELECTION,
   DEFAULT_WORKER_MODEL_SELECTION,
+  type ProviderConfig,
   stateRoot,
-  validateConfig,
+  validateConfigFile,
 } from "./config.js";
 
-/**
- * Write a new configuration from the installation options (`factory setup`). It refuses to
- * replace an existing configuration or state root; a changed binding is a separately reviewed edit.
- */
-export function writeConfiguration(args: string[], path: string): string {
-  const repository = option(args, "repository");
-  const checkout = option(args, "checkout");
-  if (!repository || !checkout)
-    throw new Error(
-      "setup requires --repository and --checkout when no configuration exists",
-    );
+/** The provider name setup writes: --provider, or the planning provider's short name. */
+export function setupProviderName(args: string[]): string {
+  return (
+    option(args, "provider") ??
+    (option(args, "planning") === "claude-agent-sdk" ? "claude" : "codex")
+  );
+}
+
+/** One provider's planning and execution from the installation options. */
+function providerFromOptions(args: string[]): ProviderConfig {
   // An explicit worker ceiling is the operator's whole choice; otherwise every run sizes from its host.
   const concurrency = option(args, "concurrency")
     ? Number(option(args, "concurrency"))
@@ -76,10 +82,7 @@ export function writeConfiguration(args: string[], path: string): string {
     "grep",
     "glob",
   ];
-  const config = {
-    schemaVersion: 1,
-    repository,
-    checkout,
+  return {
     planning:
       planning === "claude-agent-sdk"
         ? {
@@ -157,6 +160,27 @@ export function writeConfiguration(args: string[], path: string): string {
                   DEFAULT_WORKER_MODEL_SELECTION.reasoningEffort,
               },
     },
+  } as unknown as ProviderConfig;
+}
+
+/**
+ * Write a new configuration from the installation options (`factory setup`). It refuses to
+ * replace an existing configuration or state root; a changed binding is a separately reviewed edit.
+ */
+export function writeConfiguration(args: string[], path: string): string {
+  const repository = option(args, "repository");
+  const checkout = option(args, "checkout");
+  if (!repository || !checkout)
+    throw new Error(
+      "setup requires --repository and --checkout when no configuration exists",
+    );
+  const name = setupProviderName(args);
+  const config = {
+    schemaVersion: 1,
+    repository,
+    checkout,
+    providers: { [name]: providerFromOptions(args) },
+    defaultProvider: name,
     delivery: { kind: option(args, "delivery") ?? "regular" },
     ...(args.includes("--capture-content")
       ? {
@@ -173,7 +197,7 @@ export function writeConfiguration(args: string[], path: string): string {
       allowedSecretNames: [],
     },
   };
-  validateConfig(config);
+  validateConfigFile(config);
   if (existsSync(path) || existsSync(stateRoot(repository))) {
     throw new Error(
       "Factory setup requires an empty configuration and state root",
@@ -184,5 +208,30 @@ export function writeConfiguration(args: string[], path: string): string {
     flag: "wx",
     mode: 0o600,
   });
-  return `Configured Factory for ${repository} at ${path} with ${concurrency === undefined ? "concurrency and scheduling sized from the host at run time" : `concurrency ${concurrency}`}`;
+  return `Configured Factory for ${repository} at ${path} with provider ${name}`;
+}
+
+/**
+ * Add a provider to an existing configuration. Other providers and shared choices are
+ * unchanged, so their Objectives keep their configuration digests.
+ */
+export function addProvider(args: string[], path: string): string {
+  const name = setupProviderName(args);
+  const file = JSON.parse(readFileSync(path, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  const providers = (file.providers ?? {}) as Record<string, unknown>;
+  if (providers[name])
+    throw new Error(`Provider ${name} is already configured`);
+  providers[name] = providerFromOptions(args);
+  file.providers = providers;
+  validateConfigFile(file);
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  renameSync(temporary, path);
+  return `Added provider ${name} to ${path}`;
 }

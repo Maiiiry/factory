@@ -151,6 +151,30 @@ import {
   statePath,
 } from "../dist/state-store.js";
 
+/** The configuration file for a flat test config: one provider in planning's place. */
+function toConfigFile(config) {
+  return Object.fromEntries(
+    Object.entries(config).flatMap(([key, value]) =>
+      key === "planning"
+        ? [
+            [
+              "providers",
+              {
+                test: {
+                  planning: config.planning,
+                  execution: config.execution,
+                },
+              },
+            ],
+            ["defaultProvider", "test"],
+          ]
+        : key === "execution"
+          ? []
+          : [[key, value]],
+    ),
+  );
+}
+
 test("disk content survives storage and materialization, and corruption is refused", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-content-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -6285,7 +6309,9 @@ test("stopped collection freezes a completed owned local return before restart a
     /differs from its retained/,
   );
   const configFile = join(temporary, "config.json");
-  writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
+  writeFileSync(configFile, JSON.stringify(toConfigFile(config)), {
+    mode: 0o600,
+  });
   const command = execFileSync(
     process.execPath,
     [
