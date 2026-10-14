@@ -1,6 +1,10 @@
 import { assertSkippedWork, assertWorkRoutingState } from "./runner/routing.js";
 import { createHash } from "node:crypto";
-import { graphDigest, amendmentBlocksDispatch } from "./graph-amendments.js";
+import {
+  graphDigest,
+  amendmentBlocksDispatch,
+  assertWorkerDiscoveryDisposition,
+} from "./graph-amendments.js";
 import { assertCompletedCoverage, objectiveCandidate } from "./qa.js";
 import { assertApprovedPlaybookAdmission } from "./contracts.js";
 import type { GitHubGateway } from "./contracts.js";
@@ -99,11 +103,13 @@ export function assertTerminalEligibility(state: FactoryState): void {
       (state.coordinator?.cancelError || state.coordinator?.processes?.length))
   )
     throw new Error("Objective terminal eligibility is unresolved");
-  for (const work of Object.values(state.work)) {
+  for (const [id, work] of Object.entries(state.work)) {
+    assertWorkerDiscoveryDisposition(state, id, work);
     if (
       work.status === "running" ||
       (work.discovery?.scope === "in-scope" &&
-        work.discoveryDisposition !== "accepted")
+        work.discoveryDisposition !== "accepted" &&
+        work.discoveryDisposition !== "declined")
     )
       throw new Error(
         "Owned attempt, submitted effect or discovery remains unresolved",

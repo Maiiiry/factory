@@ -48,6 +48,9 @@ import { projectGitHubProgress } from "./github-progress-projection.js";
 import { progressDigest } from "./github-progress-state.js";
 import { projectGitHubProjectStatus } from "./github-project-projection.js";
 import {
+  type WorkerDiscoveryDecision,
+  assertWorkerDiscoveryDisposition,
+  workerDiscoveryDigest,
   type AmendmentProposal,
   amendmentBlocksDispatch,
   graphDigest,
@@ -56,6 +59,7 @@ import {
 import { approvedPlaybook, observeRetrospective } from "./learning.js";
 import { assetSelectionDigest } from "./media.js";
 import { operatorName } from "./operator.js";
+import { refuseUnknownFields } from "./unknown-fields.js";
 import {
   currentProcessDeadlineAt,
   currentProcessSignal,
@@ -374,6 +378,7 @@ async function controlObjectiveUnscoped(
       "resume",
       "status",
       "propose-amendment",
+      "decline-discovery",
       "handoff",
     ].includes(request.action)
   )
@@ -385,6 +390,17 @@ async function controlObjectiveUnscoped(
     if (!state) throw new Error("Objective has no Factory state");
     if (request.action === "status") return state.coordinator;
     assertRestoredContinuationReady(state, config);
+    if (request.action === "decline-discovery") {
+      if (!isExecutionState(state))
+        throw new Error("Objective is still preparing");
+      applyWorkerDiscoveryDecline(
+        config,
+        state,
+        request.input as unknown as WorkerDiscoveryDecision,
+      );
+      saveState(statePath(config.repository, request.objective), state);
+      return "applied";
+    }
     if (request.action === "handoff") {
       await settleStoppedProjectQueueRun(config, state, lock);
       return { handedOff: true, runId: state.runId, projectClaim: "quiescent" };
@@ -851,6 +867,12 @@ async function runObjectiveOwned(
             config,
             objective,
             input as Parameters<typeof repairWorkItem>[2],
+          );
+        else if (request.action === "decline-discovery")
+          declineWorkerDiscovery(
+            config,
+            objective,
+            input as unknown as WorkerDiscoveryDecision,
           );
         else if (request.action === "rereview")
           rereviewWorkItem(
@@ -1744,6 +1766,108 @@ export function repairWorkItem(
   } finally {
     releaseMutationLock(config, objective, handle);
   }
+}
+
+/** Decline an unadmitted worker proposal without accepting or changing its result. */
+export function declineWorkerDiscovery(
+  config: FactoryConfig,
+  objective: number,
+  input: WorkerDiscoveryDecision,
+): void {
+  const lock = mutationLock(config, objective);
+  try {
+    const state = mutationState(config, objective);
+    if (!state) throw new Error("Objective has no Factory state");
+    applyWorkerDiscoveryDecline(config, state, input);
+    saveState(statePath(config.repository, objective), state);
+  } finally {
+    releaseMutationLock(config, objective, lock);
+  }
+}
+
+function applyWorkerDiscoveryDecline(
+  config: FactoryConfig,
+  state: import("./state.js").FactoryState,
+  input: WorkerDiscoveryDecision,
+): void {
+  if (
+    !state ||
+    state.cancelRequested ||
+    state.cancelledAt ||
+    state.finalValidation?.passed ||
+    state.finalAcceptance ||
+    state.objectiveClosure === "complete" ||
+    !continuationConfigurationMatches(state, config)
+  )
+    throw new Error("Objective is not available for worker discovery decline");
+  if (
+    (owners.has(ownerKey(config, state.objective)) &&
+      state.coordinator?.mode !== "paused") ||
+    !canHandoff(state) ||
+    restoredContinuationOwnershipHold(state) ||
+    Object.values(state.work).some((work) => work.status === "running")
+  )
+    throw new Error(
+      "Worker discovery decline requires paused or stopped settled owned work",
+    );
+  if (state.pendingAmendment || state.pendingExpansion)
+    throw new Error(
+      "Worker discovery decline cannot dispose an admitted graph change",
+    );
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new Error("Worker discovery decline requires an explicit decision");
+  refuseUnknownFields(
+    input as unknown as Record<string, unknown>,
+    [
+      "runId",
+      "item",
+      "attempt",
+      "resultCommitSha",
+      "resultTreeSha",
+      "graphDigest",
+      "discoveryDigest",
+      "actor",
+      "reason",
+    ],
+    "worker discovery decision",
+  );
+  const work = state.work[input.item];
+  if (
+    !work?.discovery ||
+    work.discovery.scope !== "in-scope" ||
+    work.discoveryDisposition ||
+    !work.changeRef ||
+    !work.treeSha ||
+    !["waiting", "failed", "done"].includes(work.status) ||
+    work.discovery.attempt !== work.attempt ||
+    input.runId !== state.runId ||
+    input.attempt !== work.attempt ||
+    input.resultCommitSha !== work.changeRef ||
+    input.resultTreeSha !== work.treeSha ||
+    input.graphDigest !== graphDigest(state.graph) ||
+    input.discoveryDigest !== workerDiscoveryDigest(work.discovery) ||
+    typeof input.actor !== "string" ||
+    !input.actor.trim() ||
+    typeof input.reason !== "string" ||
+    !input.reason.trim()
+  )
+    throw new Error(
+      "Worker discovery decline differs from the current undisposed proposal/result",
+    );
+  if (
+    pinnedGit(config.checkout, "rev-parse", `${work.changeRef}^{tree}`) !==
+    work.treeSha
+  )
+    throw new Error("Worker discovery decline result tree is not authentic");
+  work.discoveryDecline = {
+    ...structuredClone(input),
+    repository: state.repository,
+    objective: state.objective,
+    configDigest: state.configDigest,
+    declinedAt: new Date().toISOString(),
+  };
+  work.discoveryDisposition = "declined";
+  assertWorkerDiscoveryDisposition(state, input.item, work);
 }
 
 /**

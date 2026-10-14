@@ -69,6 +69,7 @@ import {
   decideObjective,
   decidePlan,
   decideResult,
+  declineWorkerDiscovery,
   exportAssetSetsForReview,
   planObjective,
   repairWorkItem,
@@ -149,6 +150,10 @@ export interface FactoryApplication {
   rereviewWorkItem(
     objective: number,
     input: Parameters<typeof rereviewWorkItem>[2],
+  ): void;
+  declineWorkerDiscovery(
+    objective: number,
+    input: Parameters<typeof declineWorkerDiscovery>[2],
   ): void;
   decideResult(
     objective: number,
@@ -314,6 +319,8 @@ export function createApplication(
       checkpoint.local(() => retryWorkItem(config, objective, itemId)),
     rereviewWorkItem: (objective, input) =>
       checkpoint.local(() => rereviewWorkItem(config, objective, input)),
+    declineWorkerDiscovery: (objective, input) =>
+      checkpoint.local(() => declineWorkerDiscovery(config, objective, input)),
     decideResult: (objective, input) =>
       checkpoint.local(() => decideResult(config, objective, input)),
     selectAssetSet: (objective, itemId, setId, decision) =>

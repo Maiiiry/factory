@@ -384,6 +384,16 @@ function continuationReferences(value: unknown): ContinuationReferences & {
       ["integration", entry.integratedSha],
     ] as const)
       git(sha, "commit", role);
+    git(
+      entry.discoveryDecline?.resultCommitSha,
+      "commit",
+      "declined-discovery-result",
+    );
+    git(
+      entry.discoveryDecline?.resultTreeSha,
+      "tree",
+      "declined-discovery-result-tree",
+    );
     for (const sha of entry.replacedHeads ?? [])
       git(sha, "commit", "replaced-head");
     git(entry.treeSha, "tree", "result-tree");

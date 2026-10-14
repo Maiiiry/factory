@@ -91,7 +91,8 @@ import {
   decodeGraphReview,
   reviewPacket,
 } from "./review-evidence.js";
-import type { FactoryState } from "./state.js";
+import type { FactoryState, WorkState } from "./state.js";
+import { refuseUnknownFields } from "./unknown-fields.js";
 import { clearRepeats, type StepOptions, step } from "./step.js";
 
 export interface AmendmentProposal extends WorkDiscovery {
@@ -573,6 +574,95 @@ export function recordWorkerDiscovery(
   const work = state.work[itemId]!;
   if (!work.attempt) throw new Error("Worker discovery lacks an attempt");
   work.discovery = { ...structuredClone(discovery), attempt: work.attempt };
+}
+
+/** An operator declines the proposal, not the implementation or its acceptance. */
+export interface WorkerDiscoveryDecision {
+  runId: string;
+  item: string;
+  attempt: string;
+  resultCommitSha: string;
+  resultTreeSha: string;
+  graphDigest: string;
+  discoveryDigest: string;
+  actor: string;
+  reason: string;
+}
+export interface WorkerDiscoveryDecline extends WorkerDiscoveryDecision {
+  repository: string;
+  objective: number;
+  configDigest: string;
+  declinedAt: string;
+}
+
+export const workerDiscoveryDigest = (
+  discovery: NonNullable<WorkState["discovery"]>,
+) => createHash("sha256").update(JSON.stringify(discovery)).digest("hex");
+
+/** Authenticate the original decision after restart, replay or graph succession. */
+export function assertWorkerDiscoveryDisposition(
+  state: FactoryState,
+  itemId: string,
+  work: WorkState,
+): void {
+  if (
+    work.discoveryDisposition !== undefined &&
+    !["proposed", "accepted", "declined"].includes(work.discoveryDisposition)
+  )
+    throw new Error("Invalid worker discovery disposition");
+  const declined = work.discoveryDecline;
+  if ((work.discoveryDisposition === "declined") !== (declined !== undefined))
+    throw new Error("Worker discovery decline lost its decision");
+  if (!declined) return;
+  refuseUnknownFields(
+    declined as unknown as Record<string, unknown>,
+    [
+      "runId",
+      "item",
+      "attempt",
+      "resultCommitSha",
+      "resultTreeSha",
+      "graphDigest",
+      "discoveryDigest",
+      "actor",
+      "reason",
+      "repository",
+      "objective",
+      "configDigest",
+      "declinedAt",
+    ],
+    "worker discovery decline",
+  );
+  const discovery = work.discovery;
+  if (!discovery || discovery.scope !== "in-scope")
+    throw new Error("Worker discovery decline lacks its original proposal");
+  assertDiscovery(discovery);
+  if (
+    declined.repository !== state.repository ||
+    declined.objective !== state.objective ||
+    declined.runId !== state.runId ||
+    declined.configDigest !== state.configDigest ||
+    declined.item !== itemId ||
+    declined.attempt !== work.attempt ||
+    discovery.attempt !== work.attempt ||
+    declined.discoveryDigest !== workerDiscoveryDigest(discovery) ||
+    !/^[a-f0-9]{40}$/.test(declined.resultCommitSha) ||
+    !/^[a-f0-9]{40}$/.test(declined.resultTreeSha) ||
+    ![
+      graphDigest(state.graph),
+      state.planGraphDigest,
+      ...(state.graphRevisions ?? []).map((revision) => revision.digest),
+    ].includes(declined.graphDigest) ||
+    typeof declined.actor !== "string" ||
+    !declined.actor.trim() ||
+    typeof declined.reason !== "string" ||
+    !declined.reason.trim() ||
+    typeof declined.declinedAt !== "string" ||
+    !Number.isFinite(Date.parse(declined.declinedAt))
+  )
+    throw new Error(
+      "Worker discovery decline differs from its retained binding",
+    );
 }
 
 /** Selection is from settled result evidence in the existing snapshot, not another work queue. */

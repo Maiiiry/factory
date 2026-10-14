@@ -70,6 +70,7 @@ const commandFlags: Record<string, string[]> = {
   ],
   select: ["objective", "item", "set", "output", "bind"],
   "propose-amendment": ["objective", "proposal"],
+  "decline-discovery": ["objective", "decision"],
   pause: ["objective"],
   drain: ["objective"],
   resume: ["objective"],
