@@ -1,5 +1,6 @@
 name: Feature request
 description: Propose an improvement to Factory
+type: Feature
 body:
   - type: markdown
     attributes:

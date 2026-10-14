@@ -8,8 +8,15 @@ These rules govern building Factory. The README and packaged skills govern using
 - Batch related fixes into a complete outcome. Merge with green CI and the maintainer’s read; independently review the completed milestone once. Credentials, isolation and persisted-state changes also need one focused independent review.
 - CI is the routine check. Run an affected local check only when it resolves an actual uncertainty; do not repeat full suites or add per-fix qualification.
 - Use meaningful affected tests, retained evidence, independent review and green CI to finish the product outcome. Add a live check only for a specific changed behavior that these facts do not prove. Reuse evidence where it still applies, and stop when the behavior works and the required checks pass.
-- Issues and pull requests record scope, decisions and results. Match current issue conventions for native issue type, existing labels, Project status and applicable relationships. Comment when a fix merges, an actual blocker appears or the plan changes. No separate status documents, per-PR changelog entries, mandatory issue-heading templates or label taxonomy.
+- Issues and pull requests record scope, decisions and results. Follow the issue metadata rules below, existing Project status and applicable relationships. Comment when a fix merges, an actual blocker appears or the plan changes. No separate status documents, per-PR changelog entries, mandatory issue-heading templates or new label taxonomy.
 - Follow [the release procedure](docs/RELEASING.md) and the release issue’s actual exits. Do not invent additional release gates. GitHub release notes record changes.
+
+## Issue metadata
+
+- Set the native issue type when creating an issue: `Bug` for a standalone defect, `Feature` for a requested capability or Objective, and `Task` for a Work Item, qualification, investigation or maintenance task. A corrective Work Item remains `Task`; its underlying standalone defect can be `Bug`.
+- Use labels only for information independent of type, such as area, priority, phase, scope or Factory role. Do not add `bug`, `enhancement`, `feature` or `task` labels as substitutes for, or duplicates of, native types. Preserve `factory:objective` and `factory:work-item` where required; they describe roles, not issue types.
+- CLI/API issue creation must explicitly supply the native type; issue forms must set their top-level `type`. Inspect the returned issue after creation or edits to verify its type and labels. Do not assume a template or title assigned the type, and do not leave an issue untyped when an appropriate native type is available.
+- On adopter targets, use available native types and existing labels. Do not create types, alter repository settings or invent fallback classification labels to enforce this convention; report unavailable types through the existing prerequisite guidance.
 
 ## Product boundaries
 
