@@ -576,6 +576,7 @@ async function runObjectiveOwned(
       objective,
       lock.token,
       snapshot,
+      lock,
     );
     if (queueClaim) {
       if (options.deadlineAt && options.deadlineAt !== queueClaim.deadlineAt)
