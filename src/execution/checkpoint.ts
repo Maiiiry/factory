@@ -1,5 +1,9 @@
+import { isDeepStrictEqual } from "node:util";
 import { retainWorkerAccounting } from "../accounting.js";
 import type {
+  AgentSessionRef,
+  ExecutionResult,
+  HarnessHandle,
   ExecutionContext,
   ExecutionHandle,
   ExecutionOrphan,
@@ -185,4 +189,40 @@ export function assertDurableValue(
   } finally {
     seen.delete(value);
   }
+}
+
+/** The adapter's collected source-host worker receipt, not a foreign process observation. */
+export function collectedLocalWorkerSessionSettled(
+  execution: ExecutionHandle | undefined,
+  ref: AgentSessionRef,
+): boolean {
+  if (
+    execution?.provider !== "local" ||
+    ref.scope.role !== "implementation" ||
+    ref.status !== "ready" ||
+    ref.currentTurn !== undefined ||
+    ref.executionIdentity !== execution.identity
+  )
+    return false;
+  const original = execution.data as
+    | {
+        result?: ExecutionResult;
+        handle?: HarnessHandle;
+      }
+    | undefined;
+  const native = ref.data as
+    | {
+        nativeEof?: unknown;
+        workerSettled?: unknown;
+        worker?: unknown;
+      }
+    | undefined;
+  return (
+    native?.nativeEof === true &&
+    native.workerSettled === true &&
+    ref.executionIdentity === original?.handle?.identity &&
+    !!native.worker &&
+    isDeepStrictEqual(native.worker, original?.handle?.data) &&
+    isDeepStrictEqual(ref, original?.result?.session)
+  );
 }
