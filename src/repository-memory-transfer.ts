@@ -255,7 +255,8 @@ export async function buildMemoryLearningClosure(
         bindings,
         learning,
       ])
-  )
+  ) {
+    const retained = new Set(result.contentRefs.map(refIdentity));
     store.retainCheckpointReferences(signature, {
       files: result.files,
       contentRefs: result.contentRefs,
@@ -267,12 +268,10 @@ export async function buildMemoryLearningClosure(
       typedGitObjects: result.typedGitObjects,
       gaps: result.gaps as import("./recovery-checkpoint-closure.js").RecoveryClosureGap[],
       originals: (checkpointClosureOriginals() ?? []).filter(
-        (ref) =>
-          !result.contentRefs.some(
-            (retained) => refIdentity(retained) === refIdentity(ref),
-          ),
+        (ref) => !retained.has(refIdentity(ref)),
       ),
     });
+  }
   return result;
 }
 
