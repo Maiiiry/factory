@@ -65,6 +65,7 @@ import { buildRecoveryCheckpointClosure } from "./recovery-checkpoint-closure.js
 import {
   type ApplicationServices,
   cancelObjective,
+  collectCompletedWorker,
   controlObjective,
   decideObjective,
   decidePlan,
@@ -141,6 +142,10 @@ export interface FactoryApplication {
     options?: { deadlineAt?: string },
   ): Promise<ContinuationState>;
   cancelObjective(objective: number): Promise<"requested" | "cancelled">;
+  collectCompletedWorker(
+    objective: number,
+    input: Parameters<typeof collectCompletedWorker>[2],
+  ): Promise<void>;
   /** Answer a step's decision or config fix, else retry a failed Work Item. */
   retryWorkItem(objective: number, itemId?: string): "step" | "attempt";
   repairWorkItem(
@@ -312,6 +317,10 @@ export function createApplication(
           services.github,
           services.planningModel,
         ),
+      ),
+    collectCompletedWorker: (objective, input) =>
+      checkpoint.async(() =>
+        collectCompletedWorker(config, objective, input, services.driver),
       ),
     repairWorkItem: (objective, input) =>
       checkpoint.local(() => repairWorkItem(config, objective, input)),

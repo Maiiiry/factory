@@ -622,6 +622,9 @@ export class DiagnosticEmitter {
               provider: observation.provider ?? "not-exposed",
               model: observation.model ?? "not-exposed",
               reasoningEffort: observation.reasoningEffort,
+              ...(observation.serviceTier && {
+                serviceTier: observation.serviceTier,
+              }),
             },
             configDigest: this.configDigest,
           },
@@ -720,6 +723,8 @@ export class DiagnosticEmitter {
         provider: observation.provider,
         model: observation.model,
         reasoningEffort: observation.reasoningEffort,
+        serviceTier: observation.serviceTier,
+        reportedServiceTier: observation.reportedServiceTier,
         providerThreadId: observation.providerThreadId,
         promptBytes: observation.promptBytes,
         promptDigest: observation.promptDigest,

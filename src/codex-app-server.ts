@@ -1,12 +1,14 @@
 import { existsSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { ThreadEvent, ThreadOptions, Usage } from "@openai/codex-sdk";
+import type { ThreadEvent, Usage } from "@openai/codex-sdk";
 import { codexRuntimeDirectory } from "./codex-planning-isolation.js";
 import { FACTORY_VERSION } from "./package-metadata.js";
 import {
   codexStderrCapture,
   type CodexStderrDiagnostic,
+  type CodexThreadOptions,
+  nativeCodexServiceTier,
 } from "./codex-exec.js";
 import {
   subprocessAsync,
@@ -37,12 +39,13 @@ export interface CodexAppServerProgress {
   itemType?: string;
   waiting?: "approval" | "user-input";
   usage?: Record<string, number>;
+  reportedServiceTier?: string | null;
 }
 
 export interface CodexAppServerOptions {
   /** Already isolated and authenticated by createCodexHome. */
   env: Record<string, string>;
-  options: ThreadOptions;
+  options: CodexThreadOptions;
   signal: AbortSignal;
   /** Generation admission only; read-only reconciliation has its own bound. */
   deadlineAt?: string;
@@ -415,7 +418,9 @@ class AppServerClient {
   }
 }
 
-function requestedSettings(options: ThreadOptions): ObjectValue {
+export function requestedCodexAppServerSettings(
+  options: CodexThreadOptions,
+): ObjectValue {
   if (
     !options.model ||
     !options.workingDirectory ||
@@ -437,6 +442,9 @@ function requestedSettings(options: ThreadOptions): ObjectValue {
   return {
     model: options.model,
     modelProvider: "openai",
+    ...(options.serviceTier !== undefined && {
+      serviceTier: nativeCodexServiceTier(options.serviceTier),
+    }),
     cwd: resolve(options.workingDirectory),
     approvalPolicy: "never",
     sandbox: "read-only",
@@ -450,7 +458,7 @@ function requestedSettings(options: ThreadOptions): ObjectValue {
 
 function verifySettings(
   reply: ObjectValue,
-  options: ThreadOptions,
+  options: CodexThreadOptions,
 ): ObjectValue {
   const thread = object(reply.thread);
   if (
@@ -460,7 +468,11 @@ function verifySettings(
     reply.approvalPolicy !== "never" ||
     object(reply.sandbox).type !== "readOnly" ||
     (options.modelReasoningEffort &&
-      reply.reasoningEffort !== options.modelReasoningEffort)
+      reply.reasoningEffort !== options.modelReasoningEffort) ||
+    (options.serviceTier === "fast" && reply.serviceTier !== "priority") ||
+    (options.serviceTier === "standard" &&
+      reply.serviceTier !== "default" &&
+      reply.serviceTier !== null)
   )
     throw new Error(
       "Codex app-server effective thread settings differ from the admitted selection",
@@ -476,7 +488,7 @@ export async function runCodexAppServer(
     throw unsupportedReviewImages("Codex app-server");
   assertProviderTurnDeadline(args.deadlineAt);
   args.signal.throwIfAborted();
-  const settings = requestedSettings(args.options);
+  const settings = requestedCodexAppServerSettings(args.options);
   const client = new AppServerClient(args);
   let threadId = args.threadId,
     turnId: string | undefined;
@@ -663,6 +675,14 @@ export async function runCodexAppServer(
         }),
       );
       const thread = verifySettings(response, args.options);
+      if (
+        response.serviceTier === null ||
+        typeof response.serviceTier === "string"
+      )
+        rpc.observe({
+          event: "thread-settings",
+          reportedServiceTier: response.serviceTier,
+        });
       const id = text(thread.id);
       if (threadId && threadId !== id)
         throw new Error("Codex app-server resumed another thread");
@@ -689,6 +709,9 @@ export async function runCodexAppServer(
           approvalPolicy: "never",
           model: args.options.model,
           effort: args.options.modelReasoningEffort,
+          ...(args.options.serviceTier !== undefined && {
+            serviceTier: nativeCodexServiceTier(args.options.serviceTier),
+          }),
           outputSchema: args.schema,
         }),
       );

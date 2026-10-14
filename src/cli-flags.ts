@@ -48,6 +48,7 @@ const commandFlags: Record<string, string[]> = {
   recipe: ["file"],
   persistence: ["checkpoint", "objective"],
   run: ["objective", "deadline"],
+  collect: ["objective", "item", "run", "attempt"],
   queue: [],
   supervisor: ["cli", "disable", "service-credential"],
   decide: ["objective", "item", "criterion", "outcome", "answer", "reason"],

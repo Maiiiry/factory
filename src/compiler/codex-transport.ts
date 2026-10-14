@@ -431,6 +431,9 @@ export class CodexPlanningTransport implements PlanningTransport {
             approvalPolicy: "never",
             model: selection.model,
             modelReasoningEffort: selection.reasoningEffort,
+            ...(selection.serviceTier && {
+              serviceTier: selection.serviceTier,
+            }),
           },
           threadId: data.threadId,
           turnId: data.turnId,
@@ -903,6 +906,9 @@ export class CodexPlanningTransport implements PlanningTransport {
                   providerThreadId: native.threadId,
                   providerItemId: native.itemId,
                   providerItemType: native.itemType,
+                  ...(native.reportedServiceTier !== undefined && {
+                    reportedServiceTier: native.reportedServiceTier,
+                  }),
                   capture: {
                     event: {
                       kind: "interaction",
@@ -944,6 +950,7 @@ export class CodexPlanningTransport implements PlanningTransport {
           approvalPolicy: "never",
           model: selection.model,
           modelReasoningEffort: selection.reasoningEffort,
+          ...(selection.serviceTier && { serviceTier: selection.serviceTier }),
         },
         prompt: args.prompt,
         schema: args.schema,

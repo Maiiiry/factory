@@ -1018,7 +1018,7 @@ function privateBytes(path: string, root: string): Buffer {
 }
 
 /** Authenticate one recorded worker return, never enumerate its native storage. */
-function localWorkerReturn(
+export function localWorkerReturn(
   root: string,
   execution: NonNullable<WorkState["execution"]>,
   scope: {

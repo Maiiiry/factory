@@ -4318,3 +4318,277 @@ test("source readiness prepares each real fresh checkout before its phase checks
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("explicit Codex tiers reach native exec, SDK and app-server without changing model or effort", async (t) => {
+  const { Codex } = await import("@openai/codex-sdk");
+  const { CaptureWriter } = await import("../dist/capture.js");
+  const { readAccountingRecords } = await import("../dist/accounting.js");
+  const { codexExecArguments, nativeCodexServiceTier } = await import(
+    "../dist/codex-exec.js"
+  );
+  const { requestedCodexAppServerSettings } = await import(
+    "../dist/codex-app-server.js"
+  );
+  const { codexWorkerConfiguration } = await import(
+    "../dist/execution/worker.js"
+  );
+  const { codexWorkerInput } = await import("../dist/execution/local.js");
+  const { CodexPlanningTransport } = await import(
+    "../dist/compiler/codex-transport.js"
+  );
+  const { codexRuntimeDirectory } = await import(
+    "../dist/codex-planning-isolation.js"
+  );
+  const { validateConfig } = await import("../dist/config.js");
+  const root = mkdtempSync(join(tmpdir(), "factory-codex-service-tier-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const checkout = join(root, "target");
+  mkdirSync(checkout);
+  execFileSync("git", ["init", "-b", "main", checkout], { stdio: "ignore" });
+  execFileSync("git", [
+    "-C",
+    checkout,
+    "remote",
+    "add",
+    "origin",
+    "https://github.com/fixture/codex-service-tier.git",
+  ]);
+  writeFileSync(join(checkout, "README.md"), "# Public tier fixture\n");
+  execFileSync("git", ["-C", checkout, "add", "."]);
+  execFileSync(
+    "git",
+    [
+      "-C",
+      checkout,
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      "commit",
+      "-m",
+      "Public fixture",
+    ],
+    { stdio: "ignore" },
+  );
+  const model = "gpt-6.1-sol",
+    schema = join(root, "output-schema.json");
+  writeFileSync(
+    schema,
+    JSON.stringify({
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    }),
+    { mode: 0o600 },
+  );
+  // This finite process records genuine SDK argv; it supplies no SDK/provider
+  // response and is never consumed as planning or implementation acceptance.
+  const recorder = join(root, "record-argv.cjs");
+  writeFileSync(
+    recorder,
+    "#!/usr/bin/env node\nprocess.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({argv:process.argv.slice(2)})));\n",
+    { mode: 0o700 },
+  );
+  const native = join(
+    codexRuntimeDirectory(),
+    "x86_64-unknown-linux-musl",
+    "bin",
+    "codex",
+  );
+  const nativeSchemaRoot = join(root, "native-schema");
+  const emittedSchema = await subprocessAsync(
+    native,
+    ["app-server", "generate-json-schema", "--out", nativeSchemaRoot],
+    { env: { ...process.env, CODEX_HOME: join(root, "home") } },
+  );
+  assert.equal(emittedSchema.status, 0);
+  for (const name of [
+    "ThreadStartParams",
+    "ThreadResumeParams",
+    "TurnStartParams",
+  ]) {
+    const shape = JSON.parse(
+      readFileSync(join(nativeSchemaRoot, "v2", `${name}.json`), "utf8"),
+    );
+    assert.deepEqual(shape.properties.serviceTier.type, ["string", "null"]);
+  }
+  const repository = `fixture/tier-observations-${randomUUID()}`;
+  t.after(() =>
+    rmSync(stateRoot(repository), { recursive: true, force: true }),
+  );
+  const selectionDigests = [];
+  for (const serviceTier of ["standard", "fast"]) {
+    const tier = serviceTier === "standard" ? "default" : "priority";
+    for (const reasoningEffort of ["medium", "high"]) {
+      const selection = { model, reasoningEffort, serviceTier };
+      const config = {
+        schemaVersion: 1,
+        repository: "fixture/codex-service-tier",
+        checkout,
+        planning: {
+          kind: "codex-sdk",
+          planner: selection,
+          reviewer: selection,
+        },
+        execution: {
+          kind: "local",
+          concurrency: 1,
+          harness: { kind: "codex-sdk", ...selection },
+        },
+        delivery: { kind: "regular" },
+        policy: { network: "off", allowedSecretNames: [] },
+      };
+      validateConfig(config);
+      const options = {
+        workingDirectory: checkout,
+        model,
+        modelReasoningEffort: reasoningEffort,
+        sandboxMode: "read-only",
+        approvalPolicy: "never",
+        serviceTier,
+      };
+      for (const thread of [undefined, "retained-thread"]) {
+        const argv = codexExecArguments(options, schema, thread);
+        assert(argv.includes(`service_tier=${JSON.stringify(tier)}`));
+        assert(
+          argv.includes(
+            `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`,
+          ),
+        );
+        assert.equal(argv[argv.indexOf("--model") + 1], model);
+        assert.equal(argv.includes("resume"), Boolean(thread));
+        // Actual pinned native parser, help only: no model/native turn is started.
+        const help = await subprocessAsync(native, [...argv, "--help"], {
+          env: { ...process.env, CODEX_HOME: join(root, "home") },
+        });
+        assert.equal(help.status, 0);
+      }
+      const settings = requestedCodexAppServerSettings(options);
+      assert.equal(settings.serviceTier, tier);
+      assert.equal(settings.model, model);
+      assert.equal(settings.config.model_reasoning_effort, reasoningEffort);
+      const workerConfig = codexWorkerConfiguration(selection, "disabled");
+      assert.equal(workerConfig.service_tier, tier);
+      assert.equal(workerConfig.features.multi_agent, false);
+      const sdk = new Codex({
+        codexPathOverride: recorder,
+        config: workerConfig,
+        env: process.env,
+      });
+      for (const threadId of [undefined, "retained-thread"]) {
+        const lines = [];
+        for await (const line of sdk.exec.run({
+          input: "",
+          workingDirectory: checkout,
+          model,
+          modelReasoningEffort: reasoningEffort,
+          approvalMode: "never",
+          threadId,
+        }))
+          lines.push(line);
+        const { argv } = JSON.parse(lines.join("\n"));
+        assert(argv.includes(`service_tier=${JSON.stringify(tier)}`));
+        assert(
+          argv.includes(
+            `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`,
+          ),
+        );
+        assert.equal(argv[argv.indexOf("--model") + 1], model);
+        assert.equal(argv.includes("resume"), Boolean(threadId));
+      }
+      assert.deepEqual(
+        codexWorkerInput({ worktree: checkout }, "off", [], selection).model,
+        selection,
+      );
+      const captured = [];
+      const invocationId = `native-arguments-${serviceTier}-${reasoningEffort}`;
+      const capture = new CaptureWriter(
+        {
+          repository,
+          objective: 1,
+          invocationId,
+          providerAttempt: 1,
+          phase: "native-argument-validation",
+          adapter: "local-process",
+          configured: { provider: "not-invoked", ...selection },
+        },
+        { enabled: false },
+        [],
+        (entry) => captured.push(entry),
+      );
+      capture.record({ kind: "request" });
+      assert.equal(captured[0].configured.serviceTier, serviceTier);
+      const accounting = readAccountingRecords(repository, 1).find(
+        (entry) => entry.capture?.invocationId === invocationId,
+      );
+      assert.equal(accounting.capture.configured.serviceTier, serviceTier);
+      assert.equal(accounting.capture.reportedServiceTier, undefined);
+      const transport = new CodexPlanningTransport(
+        checkout,
+        selection,
+        selection,
+        undefined,
+        [],
+      );
+      assert.equal(transport.selection("planner").serviceTier, serviceTier);
+      assert.equal(transport.selection("reviewer").serviceTier, serviceTier);
+      selectionDigests.push(transport.selectionDigest("planner", false));
+      const invalid = structuredClone(config);
+      invalid.planning.planner.serviceTier = "priority";
+      assert.throws(
+        () => validateConfig(invalid),
+        /serviceTier is unsupported/,
+      );
+      const foreignAdapter = structuredClone(config);
+      foreignAdapter.execution.harness.kind = "claude-agent-sdk";
+      assert.throws(() => validateConfig(foreignAdapter), /serviceTier/);
+    }
+  }
+  assert.equal(new Set(selectionDigests).size, 4);
+  const scope = {
+    repository,
+    objective: 1,
+    runId: "owned-selection-contract",
+    configDigest: "a".repeat(64),
+    graphDigest: "b".repeat(64),
+    role: "implementation",
+    itemId: "local",
+  };
+  const initial = {
+    attemptId: "same-owned-attempt",
+    item: { id: "local" },
+    session: { scope, identity: "same-owned-conversation" },
+  };
+  const standard = new CodexHarness(join(root, "credentials"), "off", {
+    model,
+    reasoningEffort: "high",
+    serviceTier: "standard",
+  });
+  const fast = new CodexHarness(join(root, "credentials"), "off", {
+    model,
+    reasoningEffort: "high",
+    serviceTier: "fast",
+  });
+  const admission = await standard.workerSession(initial);
+  await assert.rejects(
+    fast.workerSession({
+      ...initial,
+      session: { ...initial.session, retained: admission.ref },
+    }),
+    /continuation model or permission selection changed/,
+  );
+  assert.equal(admission.ref.status, "in-flight");
+  assert.equal(nativeCodexServiceTier(undefined), undefined);
+  assert.throws(
+    () => nativeCodexServiceTier("unknown"),
+    /Unsupported Codex service tier/,
+  );
+  const noTier = codexWorkerConfiguration({ model, reasoningEffort: "high" });
+  assert.equal(Object.hasOwn(noTier, "service_tier"), false);
+  assert.equal(
+    codexExecArguments({ model }, schema).some((arg) =>
+      arg.startsWith("service_tier="),
+    ),
+    false,
+  );
+});

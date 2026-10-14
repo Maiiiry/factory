@@ -210,6 +210,8 @@ export interface WorkerUsageObservation {
   provider?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: import("./config.js").CodexServiceTier;
+  reportedServiceTier?: string | null;
   usage?: ModelInvocationUsage;
 }
 
@@ -239,6 +241,8 @@ export interface ModelInvocationObservation {
   provider?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: import("./config.js").CodexServiceTier;
+  reportedServiceTier?: string | null;
   providerThreadId?: string;
   durationMs?: number;
   promptBytes?: number;
