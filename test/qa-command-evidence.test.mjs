@@ -6,11 +6,13 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { assertKnownFlags } from "../dist/cli-flags.js";
 import { planningSources } from "../dist/compiler/sources.js";
@@ -29,6 +31,7 @@ import { reviewTextArtifactEvidence } from "../dist/review-image-evidence.js";
 import {
   assertReviewArtifactSelection,
   assertReviewArtifacts,
+  captureReviewArtifacts,
 } from "../dist/review-artifacts.js";
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -271,6 +274,22 @@ else {const dir=fs.mkdtempSync(p.join(os.tmpdir(),'proof-'));fs.writeFileSync(p.
       complete.reviewArtifacts.every((x) => x.complete && x.treeSha === tree),
       true,
     );
+    const finalEvidence = await reviewTextArtifactEvidence(
+      checkout,
+      complete,
+      [],
+      store,
+    );
+    const finalBinding = JSON.parse(
+      finalEvidence.find(
+        (entry) => entry.path === "Selected validation text 0/1 binding",
+      ).content,
+    );
+    assert.deepEqual(
+      finalBinding.text.locator,
+      complete.reviewArtifacts[1].text.locator,
+    );
+    assert.equal(finalBinding.origin, undefined);
     await assert.rejects(
       () => final("missing-final", commit, tree, command("missing")),
       /one complete absolute path/,
@@ -303,7 +322,7 @@ test("QA rereview retains exact command, installed dependency and runtime proof 
       join(checkout, "proof.cjs"),
       `const fs=require('node:fs'),os=require('node:os'),p=require('node:path');
 if(process.argv[2]==='install') { fs.mkdirSync('node_modules/.store/dependency',{recursive:true}); fs.writeFileSync('node_modules/.store/dependency/package.json',JSON.stringify({version:'1.0.0',exports:'./api.js'})); fs.writeFileSync('node_modules/.store/dependency/api.js','exports.fromState = state => [...state];\\n'); fs.symlinkSync('.store/dependency','node_modules/dependency'); console.log('Dependency inspection ready'); }
-else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.TEMP) throw Error('temp not owned'); const dir=fs.mkdtempSync(p.join(os.tmpdir(),'runtime-')); fs.writeFileSync(p.join(dir,'node.json'),JSON.stringify({state:[1,2],restoration:true})); fs.writeFileSync(p.join(dir,'comparison.json'),JSON.stringify({equal:true})); console.log('runner prefix: Runtime evidence: '+dir); }
+else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.TEMP) throw Error('temp not owned'); const dir=fs.mkdtempSync(p.join(os.tmpdir(),'runtime-')); fs.writeFileSync(p.join(dir,'node.json'),JSON.stringify({state:[1,2],restoration:true})); fs.writeFileSync(p.join(dir,'comparison.json'),JSON.stringify({equal:true})); console.log('Owned temp: '+process.env.TMPDIR); console.log('runner prefix: Runtime evidence: '+dir); }
 `,
     );
     git("add", ".");
@@ -595,6 +614,35 @@ else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.
     assert.ok(events.some((x) => x.operation === "qa-validation-output"));
     const artifacts = resumed.work.qa.validation.reviewArtifacts;
     assert.equal(artifacts.length, 2);
+    const locator = artifacts[1].text.locator;
+    const stdout = (
+      await store.readBytes(artifacts[1].text.bodies[0].ref)
+    ).toString();
+    assert.equal(
+      locator.temporaryRoot,
+      stdout.split("Owned temp: ")[1].split("\n")[0],
+    );
+    assert.equal(
+      locator.directory,
+      stdout.split("Runtime evidence: ")[1].trimEnd(),
+    );
+    assert.equal(locator.resolvedTemporaryRoot, locator.temporaryRoot);
+    assert.equal(locator.resolvedDirectory, locator.directory);
+    assert.equal(
+      locator.stdoutPathPrefix,
+      selectors[1].text.locator.stdoutPathPrefix,
+    );
+    assert.equal(dirname(locator.directory), locator.temporaryRoot);
+    const resultBinding = captured.reviewPacket.evidence
+      .map((entry) => {
+        try {
+          return JSON.parse(entry.content);
+        } catch {
+          return undefined;
+        }
+      })
+      .find((entry) => entry?.text?.locator);
+    assert.deepEqual(resultBinding.text.locator, locator);
     assert.equal(
       artifacts[0].text.source.sha256,
       hash(readFileSync(join(checkout, "proof.cjs"))),
@@ -625,6 +673,21 @@ else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.
       candidateTreeSha: treeSha,
     });
     assert.equal(accepted.acceptedWorkItemImages.length, 1);
+    // Historical captures remain readable, but never gain inferred location facts.
+    const historical = structuredClone(resumed.work.qa.validation);
+    delete historical.reviewArtifacts[1].text.locator;
+    const historicalEvidence = await reviewTextArtifactEvidence(
+      checkout,
+      historical,
+      [],
+      store,
+    );
+    assert.equal(
+      historicalEvidence.some((entry) =>
+        entry.content.includes('"resolvedTemporaryRoot"'),
+      ),
+      false,
+    );
     const changed = structuredClone(resumed.work.qa.validation);
     changed.reviewArtifacts[0].text.bodies[0].ref.digest = "0".repeat(64);
     await assert.rejects(
@@ -662,6 +725,20 @@ else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.
                 request.reviewPacket.evidence.some(
                   (x) => x.content === '{"equal":true}',
                 ),
+              );
+              const finalBinding = request.reviewPacket.evidence
+                .map((entry) => {
+                  try {
+                    return JSON.parse(entry.content);
+                  } catch {
+                    return undefined;
+                  }
+                })
+                .find((entry) => entry?.text?.locator);
+              assert.deepEqual(finalBinding.text.locator, locator);
+              assert.equal(
+                finalBinding.origin.kind,
+                "accepted-work-item-validation",
               );
               assert.deepEqual(
                 request.commands.map((x) => x.command),
@@ -763,6 +840,73 @@ if(mode==='json') {const dir=fs.mkdtempSync(p.join(os.tmpdir(),'evidence-'));fs.
         { file: "proof.json", mediaType: "application/json", maxBytes: 1024 },
       ],
     };
+    // Both the supplied owned root and stdout directory may have contained
+    // aliases. Keep their literal identities distinct from verified realpaths.
+    const owned = join(root, "owned");
+    const directory = join(owned, "reports");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "proof.json"), '{"equal":true}');
+    const rootAlias = join(root, "owned-alias");
+    symlinkSync(owned, rootAlias);
+    symlinkSync("reports", join(owned, "report-alias"));
+    const markedDirectory = join(rootAlias, "report-alias");
+    const captured = await captureReviewArtifacts({
+      worktree: checkout,
+      treeSha: tree,
+      commandIndex: 0,
+      command: command("alias"),
+      stdout: `Runtime: ${markedDirectory}\n`,
+      stdoutBytes: Buffer.from(`Runtime: ${markedDirectory}\n`),
+      temporaryRoot: rootAlias,
+      selectors: [
+        { command: command("alias"), text: { source: "proof.cjs", locator } },
+      ],
+      contentStore: store,
+    });
+    assert.deepEqual(captured[0].text.locator, {
+      temporaryRoot: rootAlias,
+      resolvedTemporaryRoot: realpathSync(owned),
+      stdoutPathPrefix: "Runtime: ",
+      directory: markedDirectory,
+      resolvedDirectory: realpathSync(directory),
+    });
+    const receipts = [
+      {
+        index: 0,
+        command: command("alias"),
+        treeSha: tree,
+        passed: true,
+        exitCode: 0,
+      },
+    ];
+    assertReviewArtifacts(captured, tree, receipts);
+    for (const mutate of [
+      (value) => {
+        value.text.locator.temporaryRoot = "relative";
+      },
+      (value) => {
+        value.text.locator.directory = "relative";
+      },
+      (value) => {
+        value.text.locator.stdoutPathPrefix = "Runtime:\n";
+      },
+      (value) => {
+        value.text.locator.resolvedDirectory = foreign;
+      },
+      (value) => {
+        value.text.bodies[0].path = "other/proof.json";
+      },
+      (value) => {
+        value.text.bodies[0].resolvedPath = "../foreign/proof.json";
+      },
+    ]) {
+      const changed = structuredClone(captured);
+      mutate(changed[0]);
+      assert.throws(
+        () => assertReviewArtifacts(changed, tree, receipts),
+        /locator|contained and relative/,
+      );
+    }
     await assert.rejects(
       () => run("stale", { locator }),
       /contained and relative/,
