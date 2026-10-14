@@ -9,6 +9,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   writeFile,
@@ -1143,6 +1144,91 @@ test("the actual creating lease settles only a fresh failed reservation and arch
   };
   validateConfig(config);
   const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  // A genuine archive destination failure precedes admission and every Project
+  // intent. Retain its failed singleton recipe instead of poisoning later control.
+  await mkdir(stateRoot(repository), { recursive: true, mode: 0o700 });
+  const controlStore = new LocalContentStore(
+    join(stateRoot(repository), "content"),
+  );
+  await withRecoveryCheckpointScope(
+    { config, buildClosure: () => buildRecoveryCheckpointClosure({ config }) },
+    async () => {
+      const operation = createQueueOperation(config, {
+        action: "control",
+        scope: "control",
+        previousReceiptId: null,
+        approval: { kind: "queue-command" },
+      });
+      operation.metadata = JSON.stringify({
+        schemaVersion: 1,
+        kind: "control",
+        receiptId: operation.id,
+        mode: "paused",
+        watch: true,
+      });
+      const step = createProjectQueuePlannedEffect(config.queue.project, {
+        operationId: operation.id,
+        requestId: randomUUID(),
+        actorId: 1,
+        action: "set-metadata",
+        target: { itemId: config.queue.project.controlItemId },
+        fieldId: config.queue.project.metadataFieldId,
+        metadata: operation.metadata,
+        prior: {
+          target: {
+            itemId: config.queue.project.controlItemId,
+            metadata: null,
+          },
+        },
+        control: { metadata: null },
+      });
+      const command = createQueueCommand(config, {
+        operations: [operation],
+        effects: [step],
+        deadlineAt: null,
+      });
+      const originalControl = await readFile(
+        join(
+          stateRoot(repository),
+          "project-queue-history",
+          `${operation.id}.json`,
+        ),
+      );
+      await rename(remote, `${remote}.unavailable`);
+      try {
+        await assert.rejects(admitQueueCommand(config, command), /ENOENT/);
+      } finally {
+        await rename(`${remote}.unavailable`, remote);
+      }
+      assert.deepEqual(
+        Buffer.from(
+          controlStore.readBytes(
+            operation.beforeEffectFailure.originalOperation,
+          ),
+        ),
+        originalControl,
+      );
+      assert.equal(operation.effects.length, 0);
+      assert(operation.beforeEffectFailure);
+      assert.equal(
+        JSON.parse(
+          controlStore
+            .readBytes(operation.beforeEffectFailure.error)
+            .toString(),
+        ).kind,
+        "creating-owner-before-command-refusal",
+      );
+      await assert.rejects(admitQueueCommand(config, command), /never replay/);
+      await awaitCheckpointAdmission(repository, "explicit");
+      assertQueueOperationReferenceBodies(operation, (ref) =>
+        controlStore.readBytes(ref),
+      );
+      assert.equal(
+        retainedQueueEntry(config, await readQueueHistory(config), 1),
+        undefined,
+      );
+    },
+  );
   const lock = acquireObjectiveLock(repository, 1);
   let lockReleased = false;
   try {
@@ -1167,7 +1253,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       deadlineAt: new Date(Date.now() + 60_000).toISOString(),
     };
     const history = join(stateRoot(repository), "project-queue-history");
-    await mkdir(history, { mode: 0o700 });
+    await mkdir(history, { recursive: true, mode: 0o700 });
     const path = join(history, `${claim.id}.json`),
       original = Buffer.from(`${JSON.stringify(claim)}\n`);
     await writeFile(path, original, { mode: 0o600 });
