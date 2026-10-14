@@ -499,6 +499,13 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
     git(root, "init", "-b", "main");
     git(root, "config", "user.name", "Fixture");
     git(root, "config", "user.email", "fixture@example.test");
+    git(
+      root,
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/factory-qualification/compiler-inputs.git",
+    );
     const content =
       "# API\n\n" +
       readFileSync(new URL("../src/contracts.ts", import.meta.url), "utf8");
@@ -617,6 +624,78 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
         sourceFiles.files.length,
     );
     const resumed = renderCompilationCall(request, sourceFiles);
+    // The actual retained Git fixture keeps amendment rules, while an initial
+    // request omits only instructions whose typed capabilities are absent.
+    assert.match(call.prompt, /Retained amendments:/);
+    assert.doesNotMatch(call.prompt, /Execution profiles:/);
+    const initialRequest = {
+      ...request,
+      compileContext: {
+        objectiveNumber: 1,
+        instructions: renderPlanningInstructions(body, sources, []),
+      },
+    };
+    const initial = renderCompilationCall(initialRequest);
+    const initialFiles = renderCompilationCall(initialRequest, sourceFiles);
+    assert.doesNotMatch(initial.call.prompt, /Retained amendments:/);
+    assert.doesNotMatch(initial.call.prompt, /Execution profiles:/);
+    assert.match(initial.call.prompt, /No repository browsing is admitted/);
+    assert.match(
+      initialFiles.call.prompt,
+      /You may read the supplied immutable pinned source files, not a live repository checkout/,
+    );
+    assert.doesNotMatch(
+      initialFiles.call.prompt,
+      /You cannot read the repository/,
+    );
+    for (const emitted of [initial, initialFiles]) {
+      // Empty input assets do not make potential media or QA output illegal.
+      assert.match(emitted.call.prompt, /Media:/);
+      assert.match(emitted.call.prompt, /Read-only QA has no implementation/);
+      const kinds = emitted.wire.schema.properties.items.items.anyOf;
+      assert.ok(kinds.some((kind) => kind.properties.kind.enum.includes("qa")));
+      assert.ok(
+        kinds.some((kind) => kind.required.includes("minimumAssetSets")),
+      );
+    }
+    assert.deepEqual(initialFiles.wire.schema, initial.wire.schema);
+    assert.equal(initialFiles.wire.data.contextId, initial.wire.data.contextId);
+    const { validateConfig } = await import("../dist/config.js");
+    const { executionProfileChoices } = await import(
+      "../dist/execution-profiles.js"
+    );
+    const model = { model: "gpt-6.1-sol", reasoningEffort: "medium" };
+    const profileConfig = validateConfig({
+      schemaVersion: 1,
+      repository: "factory-qualification/compiler-inputs",
+      checkout: root,
+      planning: { kind: "codex-sdk", planner: model, reviewer: model },
+      execution: {
+        kind: "local",
+        concurrency: 1,
+        defaultProfile: "local",
+        profiles: {
+          local: {
+            description: "The approved local implementation profile",
+            harness: { kind: "codex-sdk", ...model },
+          },
+        },
+      },
+      delivery: { kind: "regular" },
+      policy: { network: "off", allowedSecretNames: [] },
+    });
+    const profiled = renderCompilationCall({
+      ...initialRequest,
+      executionProfiles: executionProfileChoices(profileConfig),
+    });
+    assert.match(profiled.call.prompt, /Execution profiles:/);
+    for (const kind of profiled.wire.schema.properties.items.items.anyOf.filter(
+      (kind) => kind.properties.kind.enum.includes("work"),
+    )) {
+      assert.deepEqual(kind.properties.executionProfile.properties.id.enum, [
+        "local",
+      ]);
+    }
     assert.equal(
       validPromptSections(
         resumed.call.promptSections,
