@@ -4,6 +4,8 @@ Factory welcomes bug reports, documentation fixes, and focused pull requests. Se
 
 Set the native issue type: `Bug` for a defect, `Feature` for a requested capability, or `Task` for maintenance, investigation or qualification. Use labels for area, priority or other independent information; omit redundant `bug`, `enhancement`, `feature` and `task` labels. CLI/API authors must supply the type explicitly and verify the returned issue. See [issue metadata rules](AGENTS.md#issue-metadata) for Objective and Work Item roles.
 
+Maintainers and agents must assign one priority when creating an issue or triaging a report: `P0` for urgent security/data loss, duplicate effects or stranded work; `P1` for current critical-path delivery or incorrect behavior with a supported workaround; `P2` for minor, optional or deferred work. Verify the label after creation. A blocked status does not by itself lower priority, and a priority label does not authorize execution.
+
 This guide is for developers adding features or fixing bugs in Factory itself. To use the plugin on your own repository, follow the [plugin user guide](docs/USER-GUIDE.md).
 
 ## Development setup
