@@ -1,3 +1,4 @@
+import { collectedLocalWorkerSessionSettled } from "./execution/checkpoint.js";
 import { isDeepStrictEqual } from "node:util";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -770,11 +771,21 @@ export function assertRestoredContinuationReady(
     );
 }
 
-/** A foreign resource is fenced by retained authority, never by destination PID absence. */
+/**
+ * Foreign resources remain fenced by retained authority, never destination PID absence.
+ * The source-host operator may authenticate an exact collected worker receipt;
+ * restoration never permits that exception to the portable ownership proof.
+ */
 export function restoredContinuationOwnershipHold(
   state: ContinuationState,
+  sourceHostCollectedWorkers = false,
 ): string | undefined {
-  return continuationOwnershipHold(state);
+  return continuationOwnershipHold(
+    state,
+    false,
+    false,
+    sourceHostCollectedWorkers,
+  );
 }
 
 /** Outcome uncertainty remains historical after permanent cancellation and positive scope disposal. */
@@ -846,6 +857,7 @@ function continuationOwnershipHold(
   state: ContinuationState,
   cancelledDiagnosis = false,
   cancelledPlanning = false,
+  sourceHostCollectedWorkers = false,
 ): string | undefined {
   if (Object.values(state.repeats ?? {}).some((record) => record.inFlight))
     return "Retained paid call has no recorded settlement";
@@ -858,6 +870,16 @@ function continuationOwnershipHold(
     if (
       ref.status === "in-flight" ||
       (ref.status === "ready" &&
+        !(
+          sourceHostCollectedWorkers &&
+          !state.restoration &&
+          isExecutionState(state) &&
+          ref.scope.role === "implementation" &&
+          collectedLocalWorkerSessionSettled(
+            state.work[ref.scope.itemId]?.execution,
+            ref,
+          )
+        ) &&
         (!ref.currentTurn?.terminal ||
           ref.currentTurn.resources !== "settled")) ||
       (ref.currentTurn && ref.currentTurn.resources !== "settled")
