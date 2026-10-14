@@ -2978,6 +2978,7 @@ function readArchive(
   commitSha: string,
   config: FactoryConfig,
   options: GitPersistenceConfig,
+  origin: "remote" | "prepared-publisher" = "remote",
 ): {
   manifest: RecoveryCheckpointManifest;
   readBlob(ref: ContentRef): Buffer | undefined;
@@ -3036,7 +3037,8 @@ function readArchive(
     oid: objectIds.get(`blobs/${ref.digest}`)!,
   }));
   const candidate = scopes.getStore()?.verification;
-  const context = candidate?.objects ? candidate : undefined;
+  const context =
+    origin === "remote" && candidate?.objects ? candidate : undefined;
   const assertMaterial = () => {
     if (!context) return;
     if (
@@ -5539,13 +5541,14 @@ function acknowledge(
   return status(
     mutate(config, options, (record) => {
       assertRetentionResolved(record);
-      const current = record.attempts.find(
-        (entry) => entry.candidate === attempt.candidate,
+      const matches = record.attempts.filter(
+        (entry) =>
+          entry.candidate === attempt.candidate &&
+          canonical({ ...entry, status: attempt.status }) ===
+            canonical(attempt),
       );
-      if (
-        !current ||
-        canonical({ ...current, status: attempt.status }) !== canonical(attempt)
-      )
+      const current = matches[0];
+      if (matches.length !== 1 || !current)
         throw new Error("Attempt changed before acknowledgement");
       current.status = "acknowledged";
       record.lastAcknowledged = {
@@ -5639,7 +5642,52 @@ async function publishCheckpoint(
         assertRetentionResolved(record);
       }
       const previous = record.attempts.at(-1);
-      if (previous && previous.status !== "acknowledged") {
+      const preparedOnly =
+        previous?.status === "prepared" &&
+        previous.transportOutcome === "not-dispatched" &&
+        previous.submittedAt === undefined;
+      if (preparedOnly) {
+        // A producer-recorded pre-dispatch cancellation has no submitted request
+        // to reconcile. Authenticate its historical original without granting
+        // publisher objects any independent remote-acknowledgment authority.
+        const commit = git(p.git, options, [
+          "cat-file",
+          "commit",
+          previous.candidate,
+        ]);
+        const parents = [
+          ...commit.toString("utf8").matchAll(/^parent ([a-f0-9]{40,64})$/gm),
+        ].map((match) => match[1]);
+        if (
+          createHash(previous.candidate.length === 40 ? "sha1" : "sha256")
+            .update(`commit ${commit.length}\0`)
+            .update(commit)
+            .digest("hex") !== previous.candidate ||
+          canonical(parents) !==
+            canonical(previous.base ? [previous.base] : []) ||
+          previous.base !== record.lastAcknowledged?.commitSha
+        )
+          throw new Error(
+            "Prepared checkpoint differs from its original commit or acknowledged base",
+          );
+        const retained = readArchive(
+          p.git,
+          previous.candidate,
+          config,
+          options,
+          "prepared-publisher",
+        );
+        if (
+          retained.payloadDigest !== previous.payloadDigest ||
+          retained.manifest.sequence !== previous.sequence
+        )
+          throw new Error(
+            "Prepared checkpoint differs from its original payload or sequence",
+          );
+        // Keep that receipt unchanged; the ordinary guarded producer below
+        // captures current facts and admits one separately recorded publication.
+      }
+      if (previous && previous.status !== "acknowledged" && !preparedOnly) {
         // Observation can establish an old submission. It never grants a second push.
         const recovered = await freshArchive(
           config,
