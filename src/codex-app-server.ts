@@ -456,7 +456,7 @@ export function requestedCodexAppServerSettings(
   };
 }
 
-function verifySettings(
+export function verifyCodexAppServerSettings(
   reply: ObjectValue,
   options: CodexThreadOptions,
 ): ObjectValue {
@@ -470,9 +470,7 @@ function verifySettings(
     (options.modelReasoningEffort &&
       reply.reasoningEffort !== options.modelReasoningEffort) ||
     (options.serviceTier === "fast" && reply.serviceTier !== "priority") ||
-    (options.serviceTier === "standard" &&
-      reply.serviceTier !== "default" &&
-      reply.serviceTier !== null)
+    (options.serviceTier === "standard" && reply.serviceTier !== "default")
   )
     throw new Error(
       "Codex app-server effective thread settings differ from the admitted selection",
@@ -674,7 +672,7 @@ export async function runCodexAppServer(
             : { ephemeral: false }),
         }),
       );
-      const thread = verifySettings(response, args.options);
+      const thread = verifyCodexAppServerSettings(response, args.options);
       if (
         response.serviceTier === null ||
         typeof response.serviceTier === "string"

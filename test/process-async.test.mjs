@@ -4279,9 +4279,8 @@ test("explicit Codex tiers reach native exec, SDK and app-server without changin
   const { codexExecArguments, nativeCodexServiceTier } = await import(
     "../dist/codex-exec.js"
   );
-  const { requestedCodexAppServerSettings } = await import(
-    "../dist/codex-app-server.js"
-  );
+  const { requestedCodexAppServerSettings, verifyCodexAppServerSettings } =
+    await import("../dist/codex-app-server.js");
   const { codexWorkerConfiguration } = await import(
     "../dist/execution/worker.js"
   );
@@ -4420,6 +4419,36 @@ test("explicit Codex tiers reach native exec, SDK and app-server without changin
       assert.equal(settings.serviceTier, tier);
       assert.equal(settings.model, model);
       assert.equal(settings.config.model_reasoning_effort, reasoningEffort);
+      // Settings decoder cases follow the pinned native thread/start contract.
+      // They prove binding/refusal, never provider generation or acceptance.
+      const reply = {
+        ...settings,
+        reasoningEffort,
+        serviceTier: tier,
+        approvalsReviewer: "user",
+        sandbox: { type: "readOnly" },
+        thread: { id: "public-settings-fixture", status: { type: "idle" } },
+      };
+      assert.deepEqual(
+        verifyCodexAppServerSettings(reply, options),
+        reply.thread,
+      );
+      for (const unknownTier of [null, undefined])
+        assert.throws(
+          () =>
+            verifyCodexAppServerSettings(
+              { ...reply, serviceTier: unknownTier },
+              options,
+            ),
+          /effective thread settings differ/,
+        );
+      assert.deepEqual(
+        verifyCodexAppServerSettings(
+          { ...reply, serviceTier: null },
+          { ...options, serviceTier: undefined },
+        ),
+        reply.thread,
+      );
       const workerConfig = codexWorkerConfiguration(selection, "disabled");
       assert.equal(workerConfig.service_tier, tier);
       assert.equal(workerConfig.features.multi_agent, false);
