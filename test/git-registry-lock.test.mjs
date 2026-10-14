@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, readlinkSync } from "node:fs";
+import { existsSync, readlinkSync, readFileSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -2536,6 +2536,100 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         (await readQueueHistory(config)).find((row) => row.id === admission.id)
           .completed,
         undefined,
+      );
+      // A real cancellation after immutable preparation interrupts the next
+      // visibility child before push. The remote-only reader cannot contain
+      // this producer's never-published candidate; fresh sync must not ask it to.
+      const journalPath = join(
+        stateRoot(repository),
+        "recovery",
+        "checkpoint.json",
+      );
+      const beforePrepared = JSON.parse(await readFile(journalPath));
+      markCheckpointDirty(repository, {
+        path: `project-queue-history/${operationId}.json`,
+        kind: "historical",
+      });
+      const cancellation = new AbortController();
+      let interruptedPrepared;
+      await assert.rejects(
+        withProcessCancellation(
+          cancellation.signal,
+          () =>
+            withRecoveryCheckpointScope({ config, buildClosure }, () =>
+              awaitCheckpointAdmission(repository, "explicit"),
+            ),
+          () => {
+            const recorded = JSON.parse(readFileSync(journalPath));
+            const latest = recorded.attempts.at(-1);
+            if (
+              latest?.status === "prepared" &&
+              latest.transportOutcome === "not-dispatched" &&
+              latest.submittedAt === undefined
+            ) {
+              interruptedPrepared = structuredClone(latest);
+              cancellation.abort(
+                new Error(
+                  "Actual operator cancellation before archive dispatch",
+                ),
+              );
+            }
+          },
+        ),
+        /cancel|abort|checkpoint|SIGTERM/i,
+      );
+      assert(interruptedPrepared);
+      assert.equal(
+        execFileSync(
+          "git",
+          [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+          { encoding: "utf8" },
+        ).trim(),
+        beforePrepared.lastAcknowledged.commitSha,
+      );
+      assert.throws(() =>
+        execFileSync(
+          "git",
+          [
+            `--git-dir=${remote}`,
+            "cat-file",
+            "-e",
+            interruptedPrepared.candidate,
+          ],
+          { stdio: "pipe" },
+        ),
+      );
+      await withRecoveryCheckpointControllerVerification(
+        { config, buildClosure },
+        async () => {
+          await readVerifiedRecoveryCheckpoint(config);
+          await awaitCheckpointAdmission(repository, "explicit");
+        },
+      );
+      const continued = JSON.parse(await readFile(journalPath));
+      assert.deepEqual(
+        continued.attempts.find(
+          (entry) => entry.candidate === interruptedPrepared.candidate,
+        ),
+        interruptedPrepared,
+      );
+      assert.equal(continued.attempts.at(-1).status, "acknowledged");
+      assert.equal(
+        continued.attempts.at(-1).transportOutcome,
+        "response-success",
+      );
+      assert.notEqual(
+        continued.attempts.at(-1).candidate,
+        interruptedPrepared.candidate,
+      );
+      assert.equal(continued.acknowledgedSequence, continued.sequence);
+      assert.equal(
+        execFileSync(
+          "git",
+          [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+          { encoding: "utf8" },
+        ).trim(),
+        continued.lastAcknowledged.commitSha,
       );
       await withRecoveryCheckpointControllerVerification(
         { config, buildClosure },
