@@ -3034,11 +3034,13 @@ export function verifyQueueInspection(
   if (
     uninitializedControl &&
     (!options.allowUninitializedControl ||
+      // A replacement control card under a new binding has no producer yet.
       history.some(
         (row) =>
           row.kind === "project-queue-operation" &&
           row.scope === "control" &&
-          !row.beforeEffectFailure,
+          !row.beforeEffectFailure &&
+          row.binding.controlItemId === inspection.binding.controlItemId,
       ) ||
       JSON.stringify(inspection.binding) !==
         JSON.stringify(config.queue?.project) ||

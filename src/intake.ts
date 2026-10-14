@@ -136,7 +136,7 @@ export interface IntakeAuthorization {
   };
 }
 export const DEFAULT_QUEUE_POLL_SECONDS = 30;
-export const QUEUE_COMMAND_TIMEOUT_MS = 30_000;
+export const QUEUE_COMMAND_TIMEOUT_MS = 60_000;
 const commandScopes = new AsyncLocalStorage<{
   deadlineAt: number;
   onAcknowledgment?: (value: unknown) => void;
