@@ -1,5 +1,3 @@
-import { compilePlan } from "../dist/compiler/recovery.js";
-import { prepareObjective } from "../dist/runner/planning.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { agentSessionContinuation } from "../dist/agent-session.js";
-import { analyzeInteractions } from "../dist/analysis.js";
+import { analyzeInteractions, renderAnalysis } from "../dist/analysis.js";
 import { runAnalysisCommand } from "../dist/analysis-cli.js";
 import { readInteractionContent } from "../dist/capture.js";
 import { runCodexAppServer } from "../dist/codex-app-server.js";
@@ -41,6 +39,7 @@ import {
   prepareCompilationRequest,
   validateCompiledGraph,
 } from "../dist/compiler/planning.js";
+import { compilePlan } from "../dist/compiler/recovery.js";
 import {
   hydrateWorkerInputSources,
   planningSources,
@@ -50,7 +49,6 @@ import {
   structuredRequestDigest,
 } from "../dist/compiler/transport.js";
 import { factoryConfigDigest, stateRoot } from "../dist/config.js";
-import { checkServiceState } from "../dist/supervision.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import { requestControl, serveControl } from "../dist/coordinator-control.js";
 import { NativeStackDelivery } from "../dist/delivery/native-stack.js";
@@ -63,8 +61,8 @@ import {
   withDiagnosticSession,
 } from "../dist/diagnostics.js";
 import {
-  workItemPrompt,
   materializeWorkerSources,
+  workItemPrompt,
 } from "../dist/execution/harness-support.js";
 import {
   CodexHarness,
@@ -127,9 +125,10 @@ import {
   releaseCancelledSessions,
   synchronizeWorkItemPause,
 } from "../dist/runner/ownership.js";
+import { prepareObjective } from "../dist/runner/planning.js";
 import {
-  cancelObjective,
   CoordinatorHandoff,
+  cancelObjective,
   decideResult,
   rereviewWorkItem,
   runObjective,
@@ -138,13 +137,13 @@ import { parseFactoryState, setCoordinatorMode } from "../dist/state.js";
 import {
   acquireInstallationLock,
   acquireObjectiveLock,
+  cancelledContinuationResourceHold,
   installationLockPath,
   objectiveLockPath,
   readContinuation,
-  cancelledContinuationResourceHold,
-  restoredContinuationOwnershipHold,
   readState,
   releaseControllerLock,
+  restoredContinuationOwnershipHold,
   saveState,
   statePath,
 } from "../dist/state-store.js";
@@ -154,6 +153,7 @@ import {
   step,
   stepCancellationSignal,
 } from "../dist/step.js";
+import { checkServiceState } from "../dist/supervision.js";
 import {
   validateCheckout,
   validateTree,
@@ -647,6 +647,10 @@ setTimeout(() => {
       `2026-10-10T05:59:52.510209Z INFO codex_otel.trace_safe: event.name="unknown" error.message=${JSON.stringify(secret + ' event.name="codex.turn_ttft" duration_ms=9999')} auth.account_id="excluded-account"`,
       '2026-10-10T05:59:52.510209Z INFO codex_otel.trace_safe: event.name="codex.turn_ttft" duration_ms=unsafe',
     ];
+    // Authentic pinned safe-target field shapes. Native tool_result carries
+    // wrapper duration/identity/sizes, not the omitted argument/output bodies.
+    const nativeToolResultLine =
+      '2026-10-10T05:59:53.000000Z INFO codex_otel.trace_safe: event.name="codex.tool_result" tool_result_seq=7 tool_name="exec" tool_namespace="functions" call_id="call_preserved_native_tool" duration_ms=220 success="true" output_truncated=false arguments_length=582 output_length=24579 output_line_count=32 tool_origin="builtin" event.timestamp="2026-10-10T05:59:53.000Z" conversation.id="01a1382e-ff76-72f3-827a-e8fa81a1c338" app.version="0.160.0"';
     const quiet = new ProviderTurnGuard(320);
     let childClosed = false;
     const telemetryChild = subprocessAsync(
@@ -666,6 +670,19 @@ setTimeout(() => {
         process.stderr.write('private multiline continuation excluded-account\\n');
       }, 15);
       setTimeout(() => process.stderr.write('INFO codex_otel.trace_safe: event.name="unknown" error.message="' + 'x'.repeat(70000) + '"\\n'), 60);
+      setTimeout(() => {
+        // Unknown noisy lines and a previous oversized line cannot suppress
+        // later valid metadata. No raw trace or bodies may reach the writer.
+        for (let i = 0; i < 160; i++) process.stderr.write('INFO codex_otel.trace_safe: event.name="unknown" padding="' + 'x'.repeat(512) + '"\\n');
+        process.stderr.write(${JSON.stringify(nativeToolResultLine)} + '\\n');
+        process.stderr.write(lines[2] + '\\n');
+      }, 80);
+      setTimeout(() => {
+        const tool = ${JSON.stringify(nativeToolResultLine)};
+        for (let i = 0; i < 400; i++) process.stderr.write(tool.replace('tool_result_seq=7', 'tool_result_seq=' + (i + 8)).replace('call_preserved_native_tool', 'call_bounded_native_' + i) + '\\n');
+        // Aggregate observation counts survive exhausted projected detail.
+        process.stderr.write(lines[2] + '\\n');
+      }, 120);
       setInterval(() => process.stderr.write(lines[1] + '\\n'), 25);
     `,
       ],
@@ -758,6 +775,36 @@ setTimeout(() => {
     assert.ok(coverage.truncatedRecords > 0);
     assert.ok(coverage.quarantinedRecords > 0);
     assert.equal(coverage.submission, "unsupported");
+    assert.equal(coverage.toolResultRecords, 401);
+    assert.equal(coverage.responseCompletedRecords, 3);
+    assert.equal(coverage.zeroOutputResponseCompletedRecords, 3);
+    assert.ok(coverage.detailDroppedRecords > 0);
+    assert.ok(coverage.projectedBytes <= 64 * 1024);
+    const nativeToolResult = boundaryView.find(
+      (event) => event.event === "tool-result",
+    );
+    assert.equal(nativeToolResult.toolCallId, "call_preserved_native_tool");
+    assert.equal(nativeToolResult.nativeToolResultSequence, 7);
+    assert.equal(nativeToolResult.toolName, "exec");
+    assert.equal(nativeToolResult.toolNamespace, "functions");
+    assert.equal(nativeToolResult.toolOrigin, "builtin");
+    assert.equal(nativeToolResult.durationMs, 220);
+    assert.equal(nativeToolResult.argumentBytes, 582);
+    assert.equal(nativeToolResult.outputBytes, 24579);
+    assert.equal(nativeToolResult.outputLines, 32);
+    assert.equal(nativeToolResult.outputPreviewTruncated, false);
+    assert.equal(nativeToolResult.nativeAt, "2026-10-10T05:59:53.000Z");
+    assert.equal(
+      nativeToolResult.nativeThreadId,
+      "01a1382e-ff76-72f3-827a-e8fa81a1c338",
+    );
+    const boundaryText = renderAnalysis(analyzeInteractions(boundaryRecords));
+    assert.ok(
+      boundaryText.includes("native timestamp 2026-10-10T05:59:53.000Z"),
+    );
+    assert.ok(boundaryText.includes("call call_preserved_native_tool"));
+    assert.ok(boundaryText.includes("supplied response TTFT 37 ms"));
+    assert.ok(boundaryText.includes("tool results 401"));
     assert.equal(
       boundaryView.some((event) => event.durationMs === 9999),
       false,

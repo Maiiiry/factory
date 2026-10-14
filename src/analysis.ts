@@ -1453,7 +1453,7 @@ export function renderAnalysis(
   for (const invocation of report.invocations) {
     for (const boundary of invocation.boundaryObservations) {
       lines.push(
-        `  ${invocation.identity.invocationId}/${invocation.identity.providerAttempt}: ${boundary.source} ${boundary.event} at +${Math.round(boundary.elapsedMs)} ms${boundary.durationMs === undefined ? "" : `; reported duration ${boundary.durationMs} ms`}${boundary.status ? `; ${boundary.status}` : ""}`,
+        `  ${invocation.identity.invocationId}/${invocation.identity.providerAttempt}: ${boundary.source} ${boundary.event} at +${Math.round(boundary.elapsedMs)} ms${boundary.durationMs === undefined ? "" : `; reported duration ${boundary.durationMs} ms`}${boundary.nativeAt ? `; native timestamp ${boundary.nativeAt}` : ""}${boundary.toolName ? `; tool ${boundary.toolName}` : ""}${boundary.toolCallId ? `; call ${boundary.toolCallId}` : ""}${boundary.nativeToolResultSequence === undefined ? "" : `; result sequence ${boundary.nativeToolResultSequence}`}${boundary.responseCounters?.ttftMs === undefined ? "" : `; supplied response TTFT ${boundary.responseCounters.ttftMs} ms (request start/ID unexposed)`}${boundary.responseCompletedRecords === undefined ? "" : `; response records ${boundary.responseCompletedRecords} (${boundary.zeroOutputResponseCompletedRecords} zero-output), tool results ${boundary.toolResultRecords}, transport records ${boundary.transportCompletedRecords}, retries ${boundary.retryRecords}, dropped detail ${boundary.detailDroppedRecords}`}${boundary.status ? `; ${boundary.status}` : ""}`,
       );
     }
   }
