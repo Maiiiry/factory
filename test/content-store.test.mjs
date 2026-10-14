@@ -103,6 +103,7 @@ import {
   acceptForwardedCheckpointCompletion,
   assertRecoveryCheckpointManifest,
   awaitCheckpointAdmission,
+  checkpointClosureOriginals,
   gitPersistenceStatus,
   inspectRecoveryCheckpoint,
   readRecoveryCheckpointBodies,
@@ -911,6 +912,60 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       contentRefs: [...actual.contentRefs, ...retainedCheckpointSources],
     };
   };
+  // Observe the actual producer's stored summary, without replacing its reads
+  // or responses. Exact digest/length/MIME membership preserves the original
+  // exclusion and ordering; a second owned build reuses that same summary.
+  const originalRetainSummary =
+    LocalContentStore.prototype.retainCheckpointReferences;
+  let memorySummaryCount = 0;
+  LocalContentStore.prototype.retainCheckpointReferences = function (
+    description,
+    summary,
+  ) {
+    if (description.includes('"memory-learning-producer"')) {
+      const originals = checkpointClosureOriginals();
+      assert.ok(originals.length > 1);
+      const identity = (ref) =>
+        JSON.stringify([ref.digest, ref.bytes, ref.mediaType]);
+      assert.deepEqual(
+        summary.originals,
+        originals.filter(
+          (ref) =>
+            !summary.contentRefs.some(
+              (retained) => identity(retained) === identity(ref),
+            ),
+        ),
+      );
+      memorySummaryCount++;
+    }
+    return originalRetainSummary.call(this, description, summary);
+  };
+  try {
+    await withRecoveryCheckpointControllerVerification(
+      { config, buildClosure },
+      async () => {
+        const memoryClosure = () =>
+          withRecoveryCheckpointClosureReads(
+            config,
+            () =>
+              buildMemoryLearningClosure({
+                repository,
+                access: privateAccess,
+                memoryIds: [binding.id, second.id],
+              }),
+            true,
+          );
+        const first = await memoryClosure();
+        assert.equal(memorySummaryCount, 1);
+        const reused = await memoryClosure();
+        assert.equal(memorySummaryCount, 1);
+        assert.deepEqual(reused, first);
+      },
+    );
+  } finally {
+    LocalContentStore.prototype.retainCheckpointReferences =
+      originalRetainSummary;
+  }
   const closure = await buildClosure();
   // A linked checkout has a .git file; packing uses its common object storage.
   const linkedCheckout = join(root, "linked-checkpoint");
