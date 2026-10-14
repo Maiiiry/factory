@@ -1,5 +1,6 @@
 /** The options each CLI command reads; shared by the CLI and guided setup. */
 export const installFlags = [
+  "provider",
   "repository",
   "checkout",
   "concurrency",
@@ -33,7 +34,7 @@ const commandFlags: Record<string, string[]> = {
     "credential-file",
     ...installFlags,
   ],
-  propose: ["source", "output", "file", "approve", "enqueue"],
+  propose: ["source", "output", "file", "approve", "enqueue", "provider"],
   dream: [
     "budget-bytes",
     "input-budget-bytes",
@@ -44,10 +45,11 @@ const commandFlags: Record<string, string[]> = {
     "show",
     "record",
     "objective",
+    "provider",
   ],
-  recipe: ["file"],
+  recipe: ["file", "provider"],
   persistence: ["checkpoint", "objective"],
-  run: ["objective", "deadline"],
+  run: ["objective", "deadline", "provider"],
   collect: ["objective", "item", "run", "attempt"],
   queue: [],
   supervisor: ["cli", "disable", "service-credential"],

@@ -239,6 +239,11 @@ export function hostSchedulingDefaults(host: HostFacts): {
 }
 
 export interface FactoryConfig {
+  /**
+   * The queue's (default) provider when this configuration resolved another one. It binds
+   * queue authority only; resolveProvider sets it and the configuration digest excludes it.
+   */
+  queueProvider?: { planning: PlanningConfig; execution: ExecutionConfig };
   /** Explicit Git destination and payload scope; omission is local-only retention. */
   gitPersistence?: GitPersistenceConfig;
   /** Explicit bounded retrieval admission; omission retains the static planner. */
@@ -655,9 +660,18 @@ export function validateConfig(value: unknown): FactoryConfig {
       "reviewArtifacts",
       "planningContext",
       "gitPersistence",
+      "queueProvider",
     ],
     "configuration",
   );
+  if (value.queueProvider !== undefined) {
+    assertObject(value.queueProvider, "queueProvider");
+    assertOnlyKeys(
+      value.queueProvider,
+      ["planning", "execution"],
+      "queueProvider",
+    );
+  }
   assertReviewArtifactSelectors(value.reviewArtifacts);
   if (value.gitPersistence !== undefined)
     assertGitPersistenceConfig(value.gitPersistence);
@@ -1172,17 +1186,33 @@ export function validateCapacity(value: Capacity): Capacity {
  * deadline is frozen in its queue admission before dispatch rather than renewed by config.
  */
 export function factoryConfigDigest(config: FactoryConfig): string {
-  const { autonomy: _autonomy, queue: _queue, ...bound } = config;
+  const {
+    autonomy: _autonomy,
+    queue: _queue,
+    queueProvider: _queueProvider,
+    ...bound
+  } = config;
   assertJsonValue(bound, "configuration");
   return createHash("sha256").update(JSON.stringify(bound)).digest("hex");
 }
 
-/** Queue approval and restore authority retain semantic choices without host layout or polling. */
+/**
+ * Queue approval and restore authority retain semantic choices without host layout or polling.
+ * They bind the queue's provider (the file's default), whichever provider the command runs,
+ * so switching hosts keeps the queue and its receipts readable.
+ */
 export function factoryAuthorityDigest(config: FactoryConfig): string {
-  const { checkout: _checkout, queue, autonomy, ...declared } = config;
+  const {
+    checkout: _checkout,
+    queue,
+    autonomy,
+    queueProvider,
+    ...declared
+  } = config;
   const { pollSeconds: _pollSeconds, ...queueAuthority } = queue ?? {};
   const bound = {
     ...declared,
+    ...queueProvider,
     autonomy: resolveAutonomy(autonomy),
     ...(Object.keys(queueAuthority).length ? { queue: queueAuthority } : {}),
   };
@@ -1213,8 +1243,110 @@ export function stateRoot(repository: string): string {
   return resolve(root, "clockgrove-factory", "repositories", owner!, repo!);
 }
 
-export function readConfig(path = configPath()): FactoryConfig {
-  return validateConfig(JSON.parse(readFileSync(path, "utf8")) as unknown);
+/** One named model provider: the planning and execution choices an Objective runs with. */
+export interface ProviderConfig {
+  planning: PlanningConfig;
+  execution: ExecutionConfig;
+}
+
+/**
+ * The configuration file: shared installation choices plus named providers. Commands
+ * resolve one provider into a FactoryConfig; see provider-selection.ts.
+ */
+export type FactoryConfigFile = Omit<
+  FactoryConfig,
+  "planning" | "execution"
+> & {
+  defaultProvider: string;
+  providers: Record<string, ProviderConfig>;
+};
+
+const providerName = /^[a-z][a-z0-9-]{0,31}$/;
+
+/**
+ * The FactoryConfig for one provider. Its planning and execution take the place of
+ * `providers` in the file's key order, so a file converted from the flat layout keeps
+ * the configuration digest its Objectives froze.
+ */
+export function resolveProvider(
+  file: FactoryConfigFile,
+  name: string,
+): FactoryConfig {
+  const provider = file.providers[name];
+  if (!provider)
+    throw new Error(
+      `No provider ${JSON.stringify(name)} is configured; configured: ${Object.keys(file.providers).join(", ")}`,
+    );
+  const resolved: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(file)) {
+    if (key === "defaultProvider") continue;
+    if (key === "providers") {
+      resolved.planning = provider.planning;
+      resolved.execution = provider.execution;
+    } else resolved[key] = value;
+  }
+  if (name !== file.defaultProvider)
+    resolved.queueProvider = file.providers[file.defaultProvider];
+  return validateConfig(resolved);
+}
+
+export function validateConfigFile(value: unknown): FactoryConfigFile {
+  assertObject(value, "configuration");
+  if ("planning" in value || "execution" in value)
+    throw new Error(
+      'Configuration planning and execution belong to a named provider: move them under "providers": { "NAME": { "planning", "execution" } } and set "defaultProvider": "NAME"',
+    );
+  const providers = value.providers;
+  assertObject(providers, "providers");
+  const names = Object.keys(providers);
+  if (!names.length) throw new Error("providers requires at least one entry");
+  for (const name of names) {
+    if (!providerName.test(name))
+      throw new Error(
+        `Provider name ${JSON.stringify(name)} must be lowercase letters, digits and hyphens`,
+      );
+    const provider = providers[name];
+    assertObject(provider, `providers.${name}`);
+    assertOnlyKeys(provider, ["planning", "execution"], `providers.${name}`);
+  }
+  if (
+    typeof value.defaultProvider !== "string" ||
+    !names.includes(value.defaultProvider)
+  )
+    throw new Error("defaultProvider must name a configured provider");
+  const file = value as unknown as FactoryConfigFile;
+  for (const name of names) resolveProvider(file, name);
+  return file;
+}
+
+/**
+ * The provider of a configuration file that resolves to `config`, or its default provider
+ * when none does, so a caller's digest comparison names the difference.
+ */
+export function resolveMatchingProvider(
+  value: unknown,
+  config: FactoryConfig,
+): FactoryConfig {
+  const file = validateConfigFile(value);
+  const digest = factoryConfigDigest(config);
+  for (const name of Object.keys(file.providers)) {
+    const resolved = resolveProvider(file, name);
+    if (factoryConfigDigest(resolved) === digest) return resolved;
+  }
+  return resolveProvider(file, file.defaultProvider);
+}
+
+export function readConfigFile(path = configPath()): FactoryConfigFile {
+  return validateConfigFile(JSON.parse(readFileSync(path, "utf8")) as unknown);
+}
+
+/** The FactoryConfig for one provider, or the default provider. */
+export function readConfig(
+  path = configPath(),
+  provider?: string,
+): FactoryConfig {
+  const file = readConfigFile(path);
+  return resolveProvider(file, provider ?? file.defaultProvider);
 }
 
 export function validateLocalHarness(

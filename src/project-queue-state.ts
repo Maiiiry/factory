@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import {
   type FactoryConfig,
   factoryConfigDigest,
-  validateConfig,
+  resolveMatchingProvider,
   factoryAuthorityDigest,
   stateRoot,
 } from "./config.js";
@@ -4209,7 +4209,7 @@ export async function claimProjectQueueRun(
   if (snapshot) assertRestoredContinuationReady(snapshot, config);
   if (snapshot && !continuationConfigurationMatches(snapshot, config))
     throw new Error(
-      "Existing execution configuration differs; use supported reconciliation without renewing admission or allowances",
+      "Existing execution configuration differs; if this Objective started with another provider, continue it from that provider's host or with its foreground run; otherwise use supported reconciliation without renewing admission or allowances",
     );
   // Existing archive without this host's verified baseline cannot be overwritten.
   await awaitCheckpointAdmission(config.repository, "explicit");
@@ -4546,8 +4546,9 @@ export async function abandonFailedProjectQueueReservation(
   const originalConfigBytes = privateBytes(
     evidence.originalInstallation.configPath,
   );
-  const originalConfig = validateConfig(
+  const originalConfig = resolveMatchingProvider(
     JSON.parse(originalConfigBytes.toString("utf8")),
+    config,
   );
   if (
     createHash("sha256").update(originalConfigBytes).digest("hex") !==
@@ -4933,7 +4934,10 @@ async function retireUnknownProjectOperation(
       | RetiredWithdrawalEvidence
       | RetiredAdmissionEvidence,
     configBytes = privateBytes(evidence.originalInstallation.configPath),
-    originalConfig = validateConfig(JSON.parse(configBytes.toString("utf8")));
+    originalConfig = resolveMatchingProvider(
+      JSON.parse(configBytes.toString("utf8")),
+      config,
+    );
   if (
     queueDigest(configBytes.toString("utf8")) !==
       evidence.originalInstallation.configSha256 ||
