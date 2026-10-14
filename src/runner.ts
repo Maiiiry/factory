@@ -1804,7 +1804,7 @@ function applyWorkerDiscoveryDecline(
     (owners.has(ownerKey(config, state.objective)) &&
       state.coordinator?.mode !== "paused") ||
     !canHandoff(state) ||
-    restoredContinuationOwnershipHold(state) ||
+    restoredContinuationOwnershipHold(state, true) ||
     Object.values(state.work).some((work) => work.status === "running")
   )
     throw new Error(

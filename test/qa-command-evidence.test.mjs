@@ -43,12 +43,20 @@ import {
   acquireObjectiveLock,
   releaseControllerLock,
   objectiveLockPath,
+  restoredContinuationOwnershipHold,
 } from "../dist/state-store.js";
 import { finalizeObjective } from "../dist/runner/finalization.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
 import { renderResultReviewCall } from "../dist/compiler/model.js";
-import { parseFactoryState } from "../dist/state.js";
-import { linuxProcessIdentity } from "../dist/process.js";
+import {
+  parseFactoryState,
+  assertContinuationRestoration,
+} from "../dist/state.js";
+import {
+  linuxProcessIdentity,
+  subprocessAsync,
+  withProcessCancellation,
+} from "../dist/process.js";
 import { validateTree, validateWorkItem } from "../dist/validation.js";
 import { reviewTextArtifactEvidence } from "../dist/review-image-evidence.js";
 import {
@@ -470,6 +478,103 @@ test("an exact operator decline preserves a real result and permits ordinary com
         processes: [],
       },
     };
+    // Current worker receipts intentionally have no planner currentTurn.
+    // Their original adapter output records EOF and exact owned-worker settlement.
+    let probeOwner;
+    let probeSettled = false;
+    const probe = await withProcessCancellation(
+      undefined,
+      () => subprocessAsync(process.execPath, ["proof.cjs"], { cwd: checkout }),
+      (owned, settled) => {
+        probeOwner = owned;
+        probeSettled = settled;
+      },
+    );
+    assert.equal(probe.status, 0);
+    assert.equal(probeSettled, true);
+    const worker = {
+      ...probeOwner,
+      requestPath: join(root, "request.json"),
+      resultPath: join(root, "result.json"),
+      logPath: join(root, "worker.log"),
+    };
+    const session = {
+      scope: {
+        repository: state.repository,
+        objective: 1,
+        runId: state.runId,
+        configDigest: state.configDigest,
+        graphDigest: state.planGraphDigest,
+        role: "implementation",
+        itemId: item.id,
+      },
+      adapter: "codex",
+      identity: "completed-native-worker",
+      turn: 1,
+      status: "ready",
+      executionIdentity: discovery.attempt,
+      data: {
+        selectionDigest: hash("public fixture selection"),
+        threadId: "public-fixture-thread",
+        nativeEof: true,
+        workerSettled: true,
+        worker,
+      },
+    };
+    const key = JSON.stringify([
+      "implementation",
+      item.id,
+      state.planGraphDigest,
+    ]);
+    state.agentSessions = { [key]: session };
+    state.work.implementation.execution.data.handle.data = worker;
+    state.work.implementation.execution.data.result.session =
+      structuredClone(session);
+    assert.match(
+      restoredContinuationOwnershipHold(state),
+      /Foreign native session/,
+    );
+    assert.equal(restoredContinuationOwnershipHold(state, true), undefined);
+    // This ownership-only preflight supplies no archive acceptance or restore;
+    // even a typed restoration context must retain the portable fence.
+    const originalBytes = Buffer.from(JSON.stringify(state));
+    const snapshot = {
+      digest: hash(originalBytes),
+      bytes: originalBytes.length,
+      mediaType: "application/json",
+    };
+    const layout = {
+      configDigest: state.configDigest,
+      authorityDigest: hash(JSON.stringify(config)),
+      checkout,
+      stateRoot: stateRoot(config.repository),
+    };
+    const foreign = {
+      ...structuredClone(state),
+      schemaVersion: 19,
+      restoration: {
+        schemaVersion: 1,
+        checkpoint: {
+          commitSha: integrated,
+          payloadDigest: snapshot.digest,
+        },
+        archive: snapshot,
+        original: {
+          snapshot,
+          configDigest: state.configDigest,
+          schemaVersion: 7,
+        },
+        source: layout,
+        installation: { ...layout, identity: "restored-fixture-owner" },
+        status: "held",
+        reason: "Foreign source ownership remains unresolved",
+      },
+    };
+    assertContinuationRestoration(foreign);
+    assert.match(
+      restoredContinuationOwnershipHold(foreign, true),
+      /Foreign native session/,
+    );
     const path = statePath(config.repository, 1);
     saveState(path, state);
     const original = readState(config.repository, 1);
@@ -527,6 +632,40 @@ test("an exact operator decline preserves a real result and permits ordinary com
     const unknown = structuredClone(original);
     delete unknown.work.implementation.execution.data.result;
     saveState(path, unknown);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    // Exact typed originals remain mandatory; false flags or a different
+    // collected receipt cannot turn a ready label into settlement proof.
+    const falseSettlement = structuredClone(original);
+    falseSettlement.agentSessions[key].data.workerSettled = false;
+    falseSettlement.agentSessions[key].data.nativeEof = false;
+    falseSettlement.work.implementation.execution.data.result.session =
+      structuredClone(falseSettlement.agentSessions[key]);
+    saveState(path, falseSettlement);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    const changedHandle = structuredClone(original);
+    changedHandle.work.implementation.execution.data.handle.data.resultPath =
+      join(root, "different-result.json");
+    saveState(path, changedHandle);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    const staleSession = structuredClone(original);
+    staleSession.agentSessions[key].identity = "different-native-worker";
+    saveState(path, staleSession);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    const uncertain = structuredClone(original);
+    uncertain.agentSessions[key].status = "in-flight";
+    saveState(path, uncertain);
     assert.throws(
       () => declineWorkerDiscovery(config, 1, decision),
       /settled owned work/,
