@@ -156,6 +156,7 @@ function retainedHarnessDiscovery(state: FactoryState, item: WorkItem) {
     resultTreeSha: current.treeSha,
     contentOrigin: "harness-declared-proposal",
     proposal,
+    operatorDecline: current.discoveryDecline ?? null,
     acceptedAmendment:
       revision && previous
         ? {

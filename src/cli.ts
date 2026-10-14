@@ -135,6 +135,8 @@ function help(): void {
       "      Answer a step's decision or configuration fix, start a failed Work Item's new attempt, or (--item --rereview) validate and review the same pending or settled command-failure result within resultRereviews limits",
       "  repair --objective N --proposal FILE",
       "      Record a diagnosed correction for a failed Work Item",
+      "  decline-discovery --objective N --decision FILE",
+      "      Decline an obsolete settled worker proposal; preserves its result and ordinary acceptance",
       "  propose-amendment --objective N --proposal FILE",
       "      Submit a graph amendment (or a replacement for a rejected one)",
       "  diagnostics --objective N [--follow | --summary | --analyze | --logs ITEM [--follow] | --captures [--content RECORD_ID]]",
@@ -468,6 +470,7 @@ async function dispatchMain(): Promise<void> {
       "cancel",
       "handoff",
       "propose-amendment",
+      "decline-discovery",
       "pause",
       "drain",
       "resume",
@@ -541,6 +544,18 @@ async function dispatchMain(): Promise<void> {
     return;
   }
   if (command === "decide") return decideCommand(config, objective, args);
+  if (command === "decline-discovery") {
+    const decisionPath = option(args, "decision");
+    if (!decisionPath)
+      throw new Error("decline-discovery requires --decision FILE");
+    const input = JSON.parse(readFileSync(decisionPath, "utf8"));
+    const request = { objective, action: "decline-discovery" as const, input };
+    const remote = await requestControl(config.repository, request);
+    if (!remote.handled)
+      requireApplication().declineWorkerDiscovery(objective, input);
+    console.log(JSON.stringify(remote.handled ? remote.result : "applied"));
+    return;
+  }
   if (command === "propose-amendment") {
     const proposalPath = option(args, "proposal");
     if (!proposalPath)
@@ -854,6 +869,7 @@ async function main(): Promise<void> {
     "repair",
     "select",
     "propose-amendment",
+    "decline-discovery",
     "pause",
     "drain",
     "resume",

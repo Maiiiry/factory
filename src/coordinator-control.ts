@@ -32,6 +32,7 @@ export interface ControlRequest {
     | "decide"
     | "select"
     | "propose-amendment"
+    | "decline-discovery"
     | "dequeue"
     | "enqueue"
     | "watch"

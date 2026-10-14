@@ -51,7 +51,11 @@ import {
 import { assertGitHubPlanDecision } from "./github-plan-decisions.js";
 import { assertGitHubProgressProjection } from "./github-progress-state.js";
 import { assertGitHubProjectStatusProjection } from "./github-project-state.js";
-import { assertGraphRevisions, graphDigest } from "./graph-amendments.js";
+import {
+  assertGraphRevisions,
+  assertWorkerDiscoveryDisposition,
+  graphDigest,
+} from "./graph-amendments.js";
 import { assertGraphProjectionIntents } from "./graph-projection-control.js";
 import { assertExpansionState } from "./runner/expansion.js";
 import {
@@ -140,7 +144,8 @@ export interface WorkState {
   requestedPhase?: import("./config.js").ResourcePhase;
   graphRevisionDigest?: string;
   discovery?: import("./contracts.js").WorkDiscovery & { attempt: string };
-  discoveryDisposition?: "proposed" | "accepted";
+  discoveryDisposition?: "proposed" | "accepted" | "declined";
+  discoveryDecline?: import("./graph-amendments.js").WorkerDiscoveryDecline;
   discoveryOutput?: import("./discovery.js").DiscoveryOutputManifest;
   qaChecks?: NamedCheckEvidence[];
   /** Exact-head successful named checks observed before submitting integration. */
@@ -599,6 +604,7 @@ export function assertWorkDiscoveryOutput(
   id: string,
   work: WorkState,
 ): void {
+  assertWorkerDiscoveryDisposition(state, id, work);
   const attemptGraph =
     work.graphRevisionDigest === undefined
       ? state.graph

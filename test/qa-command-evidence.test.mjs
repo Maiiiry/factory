@@ -14,16 +14,39 @@ import { join } from "node:path";
 import test from "node:test";
 import { assertKnownFlags } from "../dist/cli-flags.js";
 import { planningSources } from "../dist/compiler/sources.js";
-import { factoryConfigDigest } from "../dist/config.js";
+import { factoryConfigDigest, stateRoot } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
-import { graphDigest } from "../dist/graph-amendments.js";
+import {
+  graphDigest,
+  selectWorkerAmendment,
+  workerDiscoveryDigest,
+} from "../dist/graph-amendments.js";
+import {
+  assertTerminalEligibility,
+  sealFinalAcceptance,
+  objectiveComplete,
+} from "../dist/completion.js";
+import { describeContinuationReferences } from "../dist/recovery-checkpoint-closure.js";
 import { runQaItem } from "../dist/qa-execution.js";
 import { resolveAutonomy, consumption } from "../dist/repair-policy.js";
-import { rereviewWorkItem } from "../dist/runner.js";
-import { readState, saveState, statePath } from "../dist/state-store.js";
+import {
+  rereviewWorkItem,
+  declineWorkerDiscovery,
+  controlObjective,
+} from "../dist/runner.js";
+import {
+  readState,
+  saveState,
+  statePath,
+  acquireObjectiveLock,
+  releaseControllerLock,
+  objectiveLockPath,
+} from "../dist/state-store.js";
 import { finalizeObjective } from "../dist/runner/finalization.js";
 import { objectiveReviewEvidence } from "../dist/result-evidence.js";
 import { renderResultReviewCall } from "../dist/compiler/model.js";
+import { parseFactoryState } from "../dist/state.js";
+import { linuxProcessIdentity } from "../dist/process.js";
 import { validateTree, validateWorkItem } from "../dist/validation.js";
 import { reviewTextArtifactEvidence } from "../dist/review-image-evidence.js";
 import {
@@ -274,6 +297,312 @@ else {const dir=fs.mkdtempSync(p.join(os.tmpdir(),'proof-'));fs.writeFileSync(p.
     await assert.rejects(
       () => final("missing-final", commit, tree, command("missing")),
       /one complete absolute path/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an exact operator decline preserves a real result and permits ordinary completion", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-discovery-decline-"));
+  const checkout = join(root, "target");
+  mkdirSync(checkout);
+  const git = (...args) =>
+    execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+  try {
+    git("init", "-b", "main");
+    git("config", "user.name", "Integration");
+    git("config", "user.email", "integration@example.invalid");
+    writeFileSync(join(checkout, "README.md"), "# Result contract\n");
+    git("add", ".");
+    git("commit", "-m", "Contract");
+    const base = git("rev-parse", "HEAD");
+    git("checkout", "-b", "implementation");
+    writeFileSync(
+      join(checkout, "proof.cjs"),
+      "require('node:assert/strict').equal(1+1,2);console.log('Current command proof');\n",
+    );
+    git("add", ".");
+    git("commit", "-m", "Factory: Implement command proof");
+    const commit = git("rev-parse", "HEAD"),
+      tree = git("rev-parse", "HEAD^{tree}");
+    git("checkout", "main");
+    git("merge", "--no-ff", "implementation", "-m", "Integrate command proof");
+    const integrated = git("rev-parse", "HEAD");
+    const command = `${process.execPath} proof.cjs`;
+    const item = {
+      id: "implementation",
+      kind: "work",
+      title: "Implement command proof",
+      goal: "Complete current proof",
+      brief: "Implement the exact owned producer",
+      acceptance: ["`" + command + "`"],
+      nonGoals: [],
+      dependencies: [],
+      ownedPaths: ["proof.cjs"],
+      resources: [],
+      expectedOutputRoles: [],
+      requiredLfsRoles: [],
+      sourceAssets: [],
+      minimumAssetSets: 0,
+      citations: [{ path: "README.md", heading: "" }],
+      inputSources: [
+        { path: "README.md", heading: "", content: "# Result contract\n" },
+      ],
+      validation: [{ command, provenance: "source-declared" }],
+    };
+    const graph = {
+      objective: 1,
+      baseSha: base,
+      items: [item],
+      coverage: [
+        {
+          criterionId: hash(item.acceptance[0]),
+          source: {
+            path: "OBJECTIVE",
+            digest: hash(item.acceptance[0]),
+            text: item.acceptance[0],
+          },
+          itemId: item.id,
+          proof: { kind: "result-command", validationIndex: 0 },
+          environment: {
+            kind: "local",
+            readiness: "available",
+            probe: "",
+            preparedBy: "",
+          },
+        },
+      ],
+    };
+    const config = {
+      repository: `integration/discovery-${root.split("/").at(-1)}`,
+      checkout,
+      delivery: { kind: "regular" },
+      capture: {
+        enabled: false,
+        maxBytesPerInvocation: 1024,
+        retainInRecovery: false,
+      },
+    };
+    const validation = await validateWorkItem(
+      checkout,
+      join(root, "validation"),
+      item,
+      commit,
+      tree,
+      base,
+    );
+    const discovery = {
+      scope: "in-scope",
+      reason: "Request obsolete extra ownership",
+      evidence: ["Worker hypothesis"],
+      ownership: ["config.json"],
+      acceptance: ["Current command passes"],
+      dependencies: [],
+      attempt: "actual-worker",
+    };
+    const state = {
+      schemaVersion: 7,
+      publicationContract: "exact-request-v1",
+      repository: config.repository,
+      objective: 1,
+      runId: "decline-real-result",
+      baseSha: base,
+      graph,
+      planGraphDigest: graphDigest(graph),
+      capacity: { concurrency: 1 },
+      issueByItemId: { implementation: 2 },
+      configDigest: factoryConfigDigest(config),
+      integratedSha: integrated,
+      work: {
+        implementation: {
+          status: "done",
+          attempt: discovery.attempt,
+          baseSha: base,
+          executionBaseSha: base,
+          changeRef: commit,
+          treeSha: tree,
+          integratedSha: integrated,
+          validation,
+          githubClosure: "complete",
+          discovery,
+          execution: {
+            provider: "local",
+            identity: "actual-worker",
+            data: {
+              request: { item, baseSha: base, sourceBaseSha: base },
+              worktree: join(
+                stateRoot(config.repository),
+                "worktrees",
+                "actual-worker",
+              ),
+              adapterIdentity: "@clockgrove/factory/local-test",
+              handle: { identity: "actual-worker" },
+              result: { changeRef: commit, treeSha: tree },
+            },
+          },
+        },
+      },
+      autonomy: resolveAutonomy({ allowances: { planningRevisions: 0 } }),
+      coordinator: {
+        mode: "paused",
+        phase: "waiting",
+        phaseStartedAt: new Date().toISOString(),
+        processes: [],
+      },
+    };
+    const path = statePath(config.repository, 1);
+    saveState(path, state);
+    const original = readState(config.repository, 1);
+    assert.throws(
+      () => selectWorkerAmendment(structuredClone(original)),
+      /allowance|planningRevisions/,
+    );
+    const decision = {
+      runId: state.runId,
+      item: item.id,
+      attempt: discovery.attempt,
+      resultCommitSha: commit,
+      resultTreeSha: tree,
+      graphDigest: graphDigest(graph),
+      discoveryDigest: workerDiscoveryDigest(discovery),
+      actor: "integration-operator",
+      reason: "Exact current command disproves the worker hypothesis",
+    };
+    assertKnownFlags("decline-discovery", [
+      "--objective",
+      "1",
+      "--decision",
+      "decision.json",
+    ]);
+    assert.throws(
+      () =>
+        declineWorkerDiscovery(config, 1, {
+          ...decision,
+          resultTreeSha: "0".repeat(40),
+        }),
+      /current undisposed/,
+    );
+    const unchanged = readFileSync(path);
+    const active = acquireObjectiveLock(config.repository, 1);
+    try {
+      assert.throws(
+        () => declineWorkerDiscovery(config, 1, decision),
+        /owns Objective/,
+      );
+    } finally {
+      releaseControllerLock(objectiveLockPath(config.repository, 1), active);
+    }
+    const withProcess = structuredClone(original);
+    withProcess.coordinator.processes = [
+      {
+        pid: process.pid,
+        startTime: linuxProcessIdentity(process.pid).startTime,
+      },
+    ];
+    saveState(path, withProcess);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    const unknown = structuredClone(original);
+    delete unknown.work.implementation.execution.data.result;
+    saveState(path, unknown);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /settled owned work/,
+    );
+    const pending = structuredClone(original);
+    pending.autonomy.allowances.planningRevisions = 1;
+    selectWorkerAmendment(pending);
+    saveState(path, pending);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /admitted graph change/,
+    );
+    saveState(path, original);
+    assert.deepEqual(readFileSync(path), unchanged);
+    // The stopped controller route uses the same operation under its actual lock.
+    await controlObjective(config, {
+      objective: 1,
+      action: "decline-discovery",
+      input: decision,
+    });
+    const declined = readState(config.repository, 1);
+    const actualWork = declined.work.implementation;
+    assert.equal(actualWork.discoveryDisposition, "declined");
+    assert.deepEqual(actualWork.discovery, discovery);
+    assert.deepEqual(
+      actualWork.validation,
+      original.work.implementation.validation,
+    );
+    assert.deepEqual(
+      actualWork.execution,
+      original.work.implementation.execution,
+    );
+    assert.deepEqual(declined.graph, original.graph);
+    assert.deepEqual(consumption(declined), consumption(original));
+    const onlyDecision = structuredClone(declined);
+    delete onlyDecision.work.implementation.discoveryDisposition;
+    delete onlyDecision.work.implementation.discoveryDecline;
+    // Optional memory observations do not change the continuation contract.
+    delete onlyDecision.memoryBindings;
+    const beforeDecision = structuredClone(original);
+    delete beforeDecision.memoryBindings;
+    assert.deepEqual(onlyDecision, beforeDecision);
+    selectWorkerAmendment(declined);
+    assert.equal(declined.pendingAmendment, undefined);
+    const evidence = objectiveReviewEvidence({
+      state: declined,
+      checkout,
+      candidateCommitSha: integrated,
+      candidateTreeSha: tree,
+    });
+    const discovered =
+      evidence.observations +
+      evidence.evidence.map((x) => x.content).join("\n");
+    assert.ok(discovered.includes('"operatorDecline"'));
+    assert.ok(discovered.includes(decision.reason));
+    assert.ok(discovered.includes('"acceptedAmendment":null'));
+    assert.ok(
+      describeContinuationReferences(declined).gitObjects.some(
+        (x) => x.sha === commit && x.kind === "commit",
+      ),
+    );
+    const forged = structuredClone(declined);
+    forged.work.implementation.discoveryDecline.attempt = "foreign";
+    assert.throws(
+      () => parseFactoryState(forged, config.repository, 1),
+      /decline differs/,
+    );
+    const missing = structuredClone(declined);
+    delete missing.work.implementation.discoveryDecline;
+    assert.throws(
+      () => parseFactoryState(missing, config.repository, 1),
+      /lost its decision/,
+    );
+    // The decline itself creates no final acceptance; normal current command proof is still required.
+    assert.throws(
+      () => assertTerminalEligibility(declined),
+      /terminal eligibility/,
+    );
+    const final = await validateTree(
+      checkout,
+      join(root, "final"),
+      integrated,
+      tree,
+      [command],
+    );
+    declined.objectiveCommands = [command];
+    declined.finalValidation = { ...final, passed: true };
+    assertTerminalEligibility(declined);
+    sealFinalAcceptance(declined);
+    declined.objectiveClosure = "complete";
+    saveState(path, declined);
+    assert.equal(objectiveComplete(readState(config.repository, 1)), true);
+    assert.throws(
+      () => declineWorkerDiscovery(config, 1, decision),
+      /not available/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
