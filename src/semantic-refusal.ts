@@ -25,6 +25,8 @@ export type SemanticRefusalEvidence = {
       source: "model";
       finding: ReviewFinding;
       evidence: ReviewEvidenceReference[];
+      /** Every further criterion the same review refused, so one repair sees them all. */
+      others?: { criterion: string; finding: ReviewFinding }[];
     }
   | { source: "operator"; decision: AcceptanceDecision }
 );
@@ -41,6 +43,23 @@ export class SemanticAcceptanceFailure extends StepFault {
     this.semanticRefusal = structuredClone(evidence);
   }
 }
+const disproved = (criterion: string, finding: { detail: string }) =>
+  `Acceptance criterion disproved: ${criterion}: ${finding.detail}`;
+
+/** The failure detail for a model refusal: every criterion that review refused. */
+export function semanticRefusalDetail(value: {
+  criterion: string;
+  finding: { detail: string };
+  others?: { criterion: string; finding: { detail: string } }[];
+}): string {
+  return [
+    disproved(value.criterion, value.finding),
+    ...(value.others ?? []).map((other) =>
+      disproved(other.criterion, other.finding),
+    ),
+  ].join("\n\n");
+}
+
 export const semanticValidationDigest = (value: ValidationEvidence) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
@@ -76,6 +95,7 @@ export function assertSemanticRefusalRecord(
       "evidence",
       "decision",
       "validationDigest",
+      "others",
     ],
     "Semantic refusal",
   );
@@ -131,10 +151,37 @@ export function assertSemanticRefusalRecord(
         finding.evidenceIds,
         value.evidence.map((entry) => entry.id),
       ) ||
-      failure.detail !==
-        `Acceptance criterion disproved: ${value.criterion}: ${finding.detail}`
+      failure.detail !== semanticRefusalDetail(value)
     )
       throw new Error("Semantic refusal lacks its exact rejected finding");
+    if (value.others !== undefined) {
+      const seen = new Set([value.criterion]);
+      if (!Array.isArray(value.others) || !value.others.length)
+        throw new Error("Semantic refusal lists no further refusals");
+      for (const other of value.others) {
+        object(other, ["criterion", "finding"], "Further refusal");
+        object(
+          other.finding,
+          ["criterionId", "verdict", "evidenceIds", "detail", "question"],
+          "Further refused finding",
+        );
+        if (
+          seen.has(other.criterion) ||
+          !item.acceptance.includes(other.criterion) ||
+          other.finding.verdict !== "refuse" ||
+          typeof other.finding.criterionId !== "string" ||
+          !other.finding.criterionId ||
+          typeof other.finding.detail !== "string" ||
+          !other.finding.detail.trim() ||
+          typeof other.finding.question !== "string" ||
+          !Array.isArray(other.finding.evidenceIds) ||
+          new Set(other.finding.evidenceIds).size !==
+            other.finding.evidenceIds.length
+        )
+          throw new Error("Semantic refusal has an invalid further refusal");
+        seen.add(other.criterion);
+      }
+    }
     for (const reference of value.evidence) {
       object(
         reference,
@@ -153,7 +200,7 @@ export function assertSemanticRefusalRecord(
         throw new Error("Semantic refusal review reference is invalid");
     }
   } else if (value.source === "operator") {
-    if ("finding" in value || "evidence" in value)
+    if ("finding" in value || "evidence" in value || "others" in value)
       throw new Error("Semantic refusal has conflicting producers");
     const decision = value.decision;
     object(
