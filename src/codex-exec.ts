@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ThreadEvent, ThreadOptions } from "@openai/codex-sdk";
+import type { CodexServiceTier } from "./config.js";
 import { codexRuntimeDirectory } from "./codex-planning-isolation.js";
 import { attachFault } from "./fault.js";
 import { subprocessAsync, UnsettledSubprocessError } from "./process.js";
@@ -24,6 +25,20 @@ export interface CodexStderrDiagnostic {
   truncated: boolean;
   redacted: boolean;
   completeLinesOnly: true;
+}
+
+export interface CodexThreadOptions extends ThreadOptions {
+  serviceTier?: CodexServiceTier;
+}
+
+/** Pinned native sentinel for explicit Standard, or the Fast request tier. */
+export function nativeCodexServiceTier(
+  value: CodexServiceTier | undefined,
+): "default" | "priority" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "standard") return "default";
+  if (value === "fast") return "priority";
+  throw new Error("Unsupported Codex service tier");
 }
 
 /** One bounded observation per native attempt, never provider progress. */
@@ -70,10 +85,38 @@ export function codexStderrCapture(
   };
 }
 
+/** The exact native exec arguments used by initial and resumed planning turns. */
+export function codexExecArguments(
+  options: CodexThreadOptions,
+  schemaPath: string,
+  threadId?: string,
+  reviewImages?: ReviewImageInput[],
+): string[] {
+  const command = ["exec", "--experimental-json"];
+  if (options.model) command.push("--model", options.model);
+  if (options.sandboxMode) command.push("--sandbox", options.sandboxMode);
+  if (options.workingDirectory) command.push("--cd", options.workingDirectory);
+  if (options.skipGitRepoCheck) command.push("--skip-git-repo-check");
+  command.push("--output-schema", schemaPath);
+  if (options.modelReasoningEffort)
+    command.push(
+      "--config",
+      `model_reasoning_effort=${JSON.stringify(options.modelReasoningEffort)}`,
+    );
+  const tier = nativeCodexServiceTier(options.serviceTier);
+  if (tier !== undefined)
+    command.push("--config", `service_tier=${JSON.stringify(tier)}`);
+  command.push("--config", 'approval_policy="never"');
+  if (threadId) command.push("resume", threadId);
+  // Same native input contract as SDK 0.160 local_image, including resumed turns.
+  for (const image of reviewImages ?? []) command.push("--image", image.path);
+  return command;
+}
+
 /** The installed SDK's native JSON protocol, with Factory-owned cessation. */
 export async function runCodexExec(args: {
   env: Record<string, string>;
-  options: ThreadOptions;
+  options: CodexThreadOptions;
   prompt: string;
   schema: unknown;
   reviewImages?: ReviewImageInput[];
@@ -119,23 +162,12 @@ export async function runCodexExec(args: {
   if (existsSync(path)) env.PATH = `${path}${delimiter}${env.PATH ?? ""}`;
   const schema = join(env.TMPDIR!, "output-schema.json");
   writeFileSync(schema, JSON.stringify(args.schema), { mode: 0o600 });
-  const options = args.options;
-  const command = ["exec", "--experimental-json"];
-  if (options.model) command.push("--model", options.model);
-  if (options.sandboxMode) command.push("--sandbox", options.sandboxMode);
-  if (options.workingDirectory) command.push("--cd", options.workingDirectory);
-  if (options.skipGitRepoCheck) command.push("--skip-git-repo-check");
-  command.push("--output-schema", schema);
-  if (options.modelReasoningEffort)
-    command.push(
-      "--config",
-      `model_reasoning_effort=${JSON.stringify(options.modelReasoningEffort)}`,
-    );
-  command.push("--config", 'approval_policy="never"');
-  if (args.threadId) command.push("resume", args.threadId);
-  // Same native input contract as SDK 0.160 local_image, including resumed turns.
-  for (const image of args.reviewImages ?? [])
-    command.push("--image", image.path);
+  const command = codexExecArguments(
+    args.options,
+    schema,
+    args.threadId,
+    args.reviewImages,
+  );
   const stop = new AbortController();
   const signal = AbortSignal.any([args.signal, stop.signal]);
   const decoder = new StringDecoder("utf8");

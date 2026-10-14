@@ -816,7 +816,9 @@ export class StructuredPlanningModel implements PlanningModel {
   ): Promise<T> {
     const invocation = args.invocation;
     const provider = this.transport.provider;
-    const { model, reasoningEffort } = this.transport.selection(args.role);
+    const { model, reasoningEffort, serviceTier } = this.transport.selection(
+      args.role,
+    );
     const schema = JSON.stringify(args.schema);
     const started = Date.now();
     const turn: PlanningTurn = { response: "", ended: false };
@@ -871,6 +873,7 @@ export class StructuredPlanningModel implements PlanningModel {
       provider,
       model,
       reasoningEffort,
+      ...(serviceTier && { serviceTier }),
       promptBytes: Buffer.byteLength(args.prompt),
       promptDigest: digest(args.prompt),
       schemaBytes: Buffer.byteLength(schema),
@@ -925,6 +928,7 @@ export class StructuredPlanningModel implements PlanningModel {
           provider,
           model,
           reasoningEffort,
+          ...(serviceTier && { serviceTier }),
           providerThreadId: turn.providerThreadId,
           durationMs: Date.now() - started,
           responseBytes,
@@ -950,6 +954,7 @@ export class StructuredPlanningModel implements PlanningModel {
         provider,
         model,
         reasoningEffort,
+        ...(serviceTier && { serviceTier }),
         providerThreadId: turn.providerThreadId,
         durationMs: Date.now() - started,
         responseBytes,
@@ -999,6 +1004,7 @@ export class StructuredPlanningModel implements PlanningModel {
           provider,
           model,
           reasoningEffort,
+          ...(serviceTier && { serviceTier }),
           providerThreadId: turn.providerThreadId,
           durationMs: Date.now() - started,
           ...(turn.response

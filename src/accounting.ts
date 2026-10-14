@@ -106,6 +106,8 @@ const observationScalars = [
   "provider",
   "model",
   "reasoningEffort",
+  "serviceTier",
+  "reportedServiceTier",
   "providerThreadId",
   "durationMs",
   "usageAvailable",
@@ -186,7 +188,7 @@ const captureScalars = [
   "coverage",
 ];
 const nestedCaptureFields: Record<string, string[]> = {
-  configured: ["provider", "model", "reasoningEffort"],
+  configured: ["provider", "model", "reasoningEffort", "serviceTier"],
   visible: [
     "source",
     "textBytes",
@@ -316,6 +318,7 @@ function safeCapture(value: unknown): InteractionMetadata {
         "modelProvider",
         "reportedModel",
         "reportedReasoningEffort",
+        "reportedServiceTier",
         "modelContextWindow",
         "status",
         "turnBoundaryBytes",

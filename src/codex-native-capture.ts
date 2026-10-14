@@ -419,6 +419,7 @@ export function captureOwnedRollout(
   let turnId: string | null = null;
   let reportedModel: string | undefined;
   let reportedReasoningEffort: string | undefined;
+  let reportedServiceTier: string | undefined;
   let modelContextWindow: number | undefined;
   const children = new Set<string>();
   const spawnCalls = new Set<string>();
@@ -637,6 +638,7 @@ export function captureOwnedRollout(
       turnId = identifier(payload.turn_id);
       reportedModel = label(payload.model);
       reportedReasoningEffort = label(payload.effort);
+      reportedServiceTier = label(payload.service_tier);
     }
     if (row.type === "event_msg" && payload.type === "task_started")
       turnId = identifier(payload.turn_id);
@@ -876,6 +878,7 @@ export function captureOwnedRollout(
         : {}),
       ...(reportedModel ? { reportedModel } : {}),
       ...(reportedReasoningEffort ? { reportedReasoningEffort } : {}),
+      ...(reportedServiceTier ? { reportedServiceTier } : {}),
       ...(modelContextWindow !== undefined ? { modelContextWindow } : {}),
       ...(boundary ? { turnBoundaryBytes: boundary.bytes } : {}),
       readBytes: bytes,

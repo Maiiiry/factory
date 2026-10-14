@@ -40,9 +40,12 @@ export type CodexReasoningEffort =
   | "ultra"
   | "persistent";
 
+export type CodexServiceTier = "standard" | "fast";
+
 export interface CodexModelSelection {
   model: string;
   reasoningEffort: CodexReasoningEffort;
+  serviceTier?: CodexServiceTier;
 }
 
 export const DEFAULT_PLANNER_MODEL_SELECTION: CodexModelSelection = {
@@ -382,7 +385,7 @@ function assertJsonValue(
 function assertCodexModelSelection(
   value: unknown,
   name: string,
-  allowed = ["model", "reasoningEffort"],
+  allowed = ["model", "reasoningEffort", "serviceTier"],
 ): asserts value is CodexModelSelection {
   assertObject(value, name);
   assertOnlyKeys(value, allowed, name);
@@ -393,6 +396,11 @@ function assertCodexModelSelection(
     !codexReasoningEfforts.has(value.reasoningEffort as CodexReasoningEffort)
   )
     throw new Error(`${name}.reasoningEffort is unsupported`);
+  if (
+    value.serviceTier !== undefined &&
+    !["standard", "fast"].includes(value.serviceTier as string)
+  )
+    throw new Error(`${name}.serviceTier is unsupported`);
 }
 
 function assertClaudeModelSelection(
@@ -1218,6 +1226,7 @@ export function validateLocalHarness(
       "kind",
       "model",
       "reasoningEffort",
+      "serviceTier",
     ]);
   } else if (harness.kind === "claude-agent-sdk") {
     assertOnlyKeys(

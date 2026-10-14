@@ -110,7 +110,11 @@ export interface PlanningTransport {
     packet: ReviewPacket,
     run: (files: ReviewBodyFile[], root: string) => Promise<T>,
   ): Promise<T>;
-  selection(role: PlanningRole): { model: string; reasoningEffort?: string };
+  selection(role: PlanningRole): {
+    model: string;
+    reasoningEffort?: string;
+    serviceTier?: import("../config.js").CodexServiceTier;
+  };
   /** Provider settings recorded with opt-in request capture content. */
   settings(role: PlanningRole, tree?: string): Record<string, unknown>;
   /**

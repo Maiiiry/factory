@@ -575,6 +575,7 @@ export function codexWorkerInput(
     model: {
       model: model.model,
       reasoningEffort: model.reasoningEffort,
+      ...(model.serviceTier && { serviceTier: model.serviceTier }),
     },
     providerTurnIdleTimeoutMs,
     ...(session && { session }),
