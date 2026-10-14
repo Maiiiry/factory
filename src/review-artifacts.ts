@@ -71,6 +71,14 @@ export interface ReviewTextArtifactEvidence {
   treeSha: string;
   text: {
     source: { path: string; sha256: string };
+    /** Controller-observed locator facts; absent in historical captures. */
+    locator?: {
+      temporaryRoot: string;
+      resolvedTemporaryRoot: string;
+      stdoutPathPrefix: string;
+      directory: string;
+      resolvedDirectory: string;
+    };
     bodies: {
       origin: "stdout" | "stderr" | "checkout-file" | "temporary-file";
       path: string;
@@ -115,6 +123,30 @@ function path(value: unknown): asserts value is string {
 function digest(value: unknown): asserts value is string {
   if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value))
     throw new Error("Review artifact SHA-256 is invalid");
+}
+function absolutePath(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    !isAbsolute(value) ||
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    )
+  )
+    throw new Error("Text artifact locator requires an absolute path");
+}
+function locatorPrefix(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+    )
+  )
+    throw new Error(
+      "Text artifact locator requires an explicit literal stdout prefix",
+    );
 }
 function field(value: unknown): void {
   if (typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value))
@@ -268,17 +300,7 @@ function assertTextSelector(selector: Record<string, unknown>): void {
       ["stdoutPathPrefix", "files"],
       "text artifact locator",
     );
-    if (
-      typeof locator.stdoutPathPrefix !== "string" ||
-      !locator.stdoutPathPrefix ||
-      [...locator.stdoutPathPrefix].some(
-        (character) =>
-          character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
-      )
-    )
-      throw new Error(
-        "Text artifact locator requires an explicit literal stdout prefix",
-      );
+    locatorPrefix(locator.stdoutPathPrefix);
     files(locator.files);
     selected = true;
   }
@@ -349,7 +371,7 @@ export function assertReviewArtifacts(
       const text = object(artifact.text);
       refuseUnknownFields(
         text,
-        ["source", "bodies"],
+        ["source", "bodies", "locator"],
         "retained text artifact selection",
       );
       const source = object(text.source);
@@ -360,6 +382,35 @@ export function assertReviewArtifacts(
       );
       path(source.path);
       digest(source.sha256);
+      let directoryPath: string | undefined;
+      if (text.locator !== undefined) {
+        const locator = object(text.locator);
+        refuseUnknownFields(
+          locator,
+          [
+            "temporaryRoot",
+            "resolvedTemporaryRoot",
+            "stdoutPathPrefix",
+            "directory",
+            "resolvedDirectory",
+          ],
+          "retained text artifact locator",
+        );
+        for (const key of [
+          "temporaryRoot",
+          "resolvedTemporaryRoot",
+          "directory",
+          "resolvedDirectory",
+        ])
+          absolutePath(locator[key]);
+        locatorPrefix(locator.stdoutPathPrefix);
+        const root = locator.resolvedTemporaryRoot as string;
+        const directory = locator.resolvedDirectory as string;
+        if (resolve(root) !== root || resolve(directory) !== directory)
+          throw new Error("Retained text locator resolved paths are invalid");
+        directoryPath = relative(root, directory);
+        path(directoryPath);
+      }
       if (!Array.isArray(text.bodies) || !text.bodies.length)
         throw new Error("Retained text artifact has no complete bodies");
       const seen = new Set<string>();
@@ -378,6 +429,15 @@ export function assertReviewArtifacts(
           throw new Error("Retained text artifact origin is invalid");
         path(body.path);
         if (body.resolvedPath !== undefined) path(body.resolvedPath);
+        if (directoryPath !== undefined && body.origin === "temporary-file") {
+          if (
+            !(body.path as string).startsWith(`${directoryPath}/`) ||
+            body.resolvedPath === undefined
+          )
+            throw new Error(
+              "Retained text body differs from its locator directory",
+            );
+        }
         const reference = object(body.ref);
         refuseUnknownFields(
           reference,
@@ -400,6 +460,11 @@ export function assertReviewArtifacts(
           throw new Error("Retained text artifact body is duplicated");
         seen.add(key);
       }
+      if (
+        directoryPath !== undefined &&
+        !text.bodies.some((body) => object(body).origin === "temporary-file")
+      )
+        throw new Error("Retained text artifact locator has no located bodies");
       if (totalImageBytes > MAX_REVIEW_TOTAL_IMAGE_BYTES)
         throw new Error(
           "Retained review artifacts exceed their aggregate byte bound",
@@ -625,6 +690,7 @@ async function captureTextArtifact(
     selector.text.source,
   );
   const bodies: ReviewTextArtifactEvidence["text"]["bodies"] = [];
+  let locator: ReviewTextArtifactEvidence["text"]["locator"];
   const append = async (
     body: Omit<(typeof bodies)[number], "ref">,
     bytes: Buffer,
@@ -697,6 +763,15 @@ async function captureTextArtifact(
     path(directoryPath);
     if (!lstatSync(directory).isDirectory())
       throw new Error("Text artifact locator is not a directory");
+    absolutePath(args.temporaryRoot);
+    absolutePath(matches[0]);
+    locator = {
+      temporaryRoot: args.temporaryRoot,
+      resolvedTemporaryRoot: temporaryRoot,
+      stdoutPathPrefix: prefix,
+      directory: matches[0]!,
+      resolvedDirectory: directory,
+    };
     for (const selected of selector.text.locator.files) {
       const { bytes, resolvedPath } = readSelectedText(
         temporaryRoot,
@@ -720,7 +795,7 @@ async function captureTextArtifact(
     commandIndex: args.commandIndex,
     command: args.command,
     treeSha: args.treeSha,
-    text: { source, bodies },
+    text: { source, bodies, ...(locator && { locator }) },
     complete: true,
   };
 }
