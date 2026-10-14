@@ -1007,6 +1007,7 @@ main().catch((error: unknown) => {
         submission: error.submission,
         deadlineAt: error.deadlineAt ?? null,
         completion: "not-established",
+        ...(error.cause instanceof Error ? { cause: error.cause.message } : {}),
         nextAction:
           "Inspect retained status; do not replay an unknown mutation",
       }),
