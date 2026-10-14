@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readAccountingRecords } from "../dist/accounting.js";
 import { agentSessionContinuation } from "../dist/agent-session.js";
 import { analyzeInteractions, renderAnalysis } from "../dist/analysis.js";
 import { runAnalysisCommand } from "../dist/analysis-cli.js";
@@ -797,6 +798,28 @@ setTimeout(() => {
     assert.equal(
       nativeToolResult.nativeThreadId,
       "01a1382e-ff76-72f3-827a-e8fa81a1c338",
+    );
+    const durableBoundaries = readAccountingRecords(repository, 3)
+      .filter(
+        (record) => record.kind === "interaction" && record.capture.boundary,
+      )
+      .map((record) => record.capture.boundary);
+    assert.deepEqual(
+      durableBoundaries.find((event) => event.event === "tool-result"),
+      boundaryRecords.find((record) => record.boundary?.event === "tool-result")
+        .boundary,
+    );
+    assert.deepEqual(
+      durableBoundaries.find(
+        (event) =>
+          event.event === "telemetry-coverage" &&
+          event.source === "codex-trace-safe",
+      ),
+      boundaryRecords.find(
+        (record) =>
+          record.boundary?.event === "telemetry-coverage" &&
+          record.boundary.source === "codex-trace-safe",
+      ).boundary,
     );
     const boundaryText = renderAnalysis(analyzeInteractions(boundaryRecords));
     assert.ok(
