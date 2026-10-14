@@ -4637,6 +4637,8 @@ test("explicit Codex tiers reach native exec, SDK and app-server without changin
   );
   const noTier = codexWorkerConfiguration({ model, reasoningEffort: "high" });
   assert.equal(Object.hasOwn(noTier, "service_tier"), false);
+  assert.equal(Object.hasOwn(noTier, "instructions"), false);
+  assert.equal(Object.hasOwn(noTier, "model_instructions_file"), false);
   assert.equal(
     codexExecArguments({ model }, schema).some((arg) =>
       arg.startsWith("service_tier="),
