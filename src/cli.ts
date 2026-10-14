@@ -137,6 +137,8 @@ function help(): void {
       "      Record a diagnosed correction for a failed Work Item",
       "  decline-discovery --objective N --decision FILE",
       "      Decline an obsolete settled worker proposal; preserves its result and ordinary acceptance",
+      "  collect --objective N --item ITEM --run RUN_ID --attempt ATTEMPT_ID",
+      "      Freeze an existing completed local return; ordinary validation and review remain required",
       "  propose-amendment --objective N --proposal FILE",
       "      Submit a graph amendment (or a replacement for a rejected one)",
       "  diagnostics --objective N [--follow | --summary | --analyze | --logs ITEM [--follow] | --captures [--content RECORD_ID]]",
@@ -471,6 +473,7 @@ async function dispatchMain(): Promise<void> {
       "handoff",
       "propose-amendment",
       "decline-discovery",
+      "collect",
       "pause",
       "drain",
       "resume",
@@ -544,6 +547,22 @@ async function dispatchMain(): Promise<void> {
     return;
   }
   if (command === "decide") return decideCommand(config, objective, args);
+  if (command === "collect") {
+    const item = option(args, "item"),
+      runId = option(args, "run"),
+      attempt = option(args, "attempt");
+    if (!item || !runId || !attempt)
+      throw new Error("collect requires --item, --run and --attempt");
+    await requireApplication().collectCompletedWorker(objective, {
+      item,
+      runId,
+      attempt,
+    });
+    console.log(
+      "Completed worker evidence collected; normal validation and review remain required",
+    );
+    return;
+  }
   if (command === "decline-discovery") {
     const decisionPath = option(args, "decision");
     if (!decisionPath)
@@ -870,6 +889,7 @@ async function main(): Promise<void> {
     "select",
     "propose-amendment",
     "decline-discovery",
+    "collect",
     "pause",
     "drain",
     "resume",

@@ -779,12 +779,14 @@ export function assertRestoredContinuationReady(
 export function restoredContinuationOwnershipHold(
   state: ContinuationState,
   sourceHostCollectedWorkers = false,
+  collectingLocalItem?: string,
 ): string | undefined {
   return continuationOwnershipHold(
     state,
     false,
     false,
     sourceHostCollectedWorkers,
+    collectingLocalItem,
   );
 }
 
@@ -858,7 +860,27 @@ function continuationOwnershipHold(
   cancelledDiagnosis = false,
   cancelledPlanning = false,
   sourceHostCollectedWorkers = false,
+  collectingLocalItem?: string,
 ): string | undefined {
+  // Only the explicit stopped source-host collector supplies this scope,
+  // after authenticating its completed original. Every other current and
+  // historical resource follows the unchanged ownership walk.
+  const collecting =
+    sourceHostCollectedWorkers &&
+    !state.restoration &&
+    isExecutionState(state) &&
+    collectingLocalItem
+      ? state.work[collectingLocalItem]
+      : undefined;
+  const collectingExecution =
+    collecting?.execution?.provider === "local"
+      ? collecting.execution
+      : undefined;
+  const collectingRequest = (
+    collectingExecution?.data as
+      | { request?: import("./contracts.js").ExecutionRequest }
+      | undefined
+  )?.request;
   if (Object.values(state.repeats ?? {}).some((record) => record.inFlight))
     return "Retained paid call has no recorded settlement";
   if (state.coordinator?.processes?.length)
@@ -867,6 +889,17 @@ function continuationOwnershipHold(
     ...Object.values(state.agentSessions ?? {}),
     ...(state.agentSessionHistory ?? []),
   ]) {
+    if (
+      collectingExecution &&
+      collectingRequest?.session &&
+      Object.values(state.agentSessions ?? {}).includes(ref) &&
+      ref.currentTurn === undefined &&
+      ref.scope.role === "implementation" &&
+      ref.executionIdentity === collectingExecution.identity &&
+      ref.identity === collectingRequest.session.identity &&
+      isDeepStrictEqual(ref.scope, collectingRequest.session.scope)
+    )
+      continue;
     if (
       ref.status === "in-flight" ||
       (ref.status === "ready" &&
@@ -921,6 +954,7 @@ function continuationOwnershipHold(
         return "Foreign execution adapter has no supported portable settlement contract";
       const data = work.execution.data as Record<string, unknown> | undefined;
       if (
+        work !== collecting &&
         !data?.result &&
         !data?.rejectedCollection &&
         data?.stopped === undefined
