@@ -2220,7 +2220,7 @@ async function dream(
   };
   const { composePlanningModel } = await import("./application.js");
   const { StructuredPlanningModel } = await import("./compiler.js");
-  const model = composePlanningModel(config);
+  const model = composePlanningModel(config, { retainedSessions: false });
   if (!(model instanceof StructuredPlanningModel))
     throw new Error("Configured provider does not support dreaming");
   const diagnostics = new DiagnosticEmitter(

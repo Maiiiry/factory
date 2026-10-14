@@ -48,7 +48,7 @@ Generated from the production dependencies in `package-lock.json` and their inst
 | `@koromix/koffi-win32-arm64` | 3.3.1 | MIT | `koffi@3.3.1/LICENSE.txt (same published package family)` |
 | `@koromix/koffi-win32-ia32` | 3.3.1 | MIT | `koffi@3.3.1/LICENSE.txt (same published package family)` |
 | `@koromix/koffi-win32-x64` | 3.3.1 | MIT | `koffi@3.3.1/LICENSE.txt (same published package family)` |
-| `@modelcontextprotocol/sdk` | 1.30.1 | MIT | `node_modules/@modelcontextprotocol/sdk/LICENSE` |
+| `@modelcontextprotocol/sdk` | 1.32.1 | MIT | `node_modules/@modelcontextprotocol/sdk/LICENSE` |
 | `@octokit/auth-token` | 6.0.0 | MIT | `node_modules/@octokit/auth-token/LICENSE` |
 | `@octokit/core` | 7.0.8 | MIT | `node_modules/@octokit/core/LICENSE` |
 | `@octokit/endpoint` | 11.0.5 | MIT | `node_modules/@octokit/endpoint/LICENSE` |
@@ -1269,7 +1269,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 ````
 
-### @modelcontextprotocol/sdk@1.30.1
+### @modelcontextprotocol/sdk@1.32.1
 
 Source: `node_modules/@modelcontextprotocol/sdk/LICENSE`
 
