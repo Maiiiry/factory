@@ -19,13 +19,20 @@ import test from "node:test";
 import { deflateSync } from "node:zlib";
 import {
   CODEX_PLANNING_CONFIG,
+  CODEX_READONLY_BASE_INSTRUCTIONS,
   CODEX_SOURCE_READ_CONFIG,
   CODEX_TREE_REVIEW_CONFIG,
   createCodexHome,
+  codexRuntimeDirectory,
 } from "../dist/codex-planning-isolation.js";
 import { renderResultReviewCall } from "../dist/compiler/model.js";
 import { deliveryDescription } from "../dist/delivery/description.js";
-import { gitAsync, pinnedGit, pinnedGitCommand } from "../dist/process.js";
+import {
+  gitAsync,
+  pinnedGit,
+  pinnedGitCommand,
+  subprocessAsync,
+} from "../dist/process.js";
 import {
   configuredResultReviewRawBudget,
   materializeResultTree,
@@ -650,14 +657,119 @@ test("controller Git ignores executable configuration shared by a worker worktre
       assert.ok(profile.includes("ignore_default_excludes = false"));
       assert.ok(profile.includes('"PATH" = "include"'));
       assert.ok(profile.includes('"LC_*" = "include"'));
+      // Actual pinned native config/start decoding, with no turn submission and
+      // no credentials or network route. The common isolated config is consumed
+      // by both native exec and app-server; coding workers use no such override.
+      assert.ok(
+        profile.includes(
+          `instructions = ${JSON.stringify(CODEX_READONLY_BASE_INSTRUCTIONS)}`,
+        ),
+      );
+      assert.equal(
+        CODEX_PLANNING_CONFIG.includes(
+          "include_permissions_instructions = false",
+        ),
+        false,
+      );
+      const native = join(
+        codexRuntimeDirectory(),
+        "x86_64-unknown-linux-musl",
+        "bin",
+        "codex",
+      );
+      let pending = "",
+        nextReply;
+      const reply = () =>
+        new Promise((resolve, reject) => {
+          nextReply = { resolve, reject };
+        });
+      const result = await subprocessAsync(
+        native,
+        ["app-server"],
+        {
+          env: {
+            ...home.env,
+            OPENAI_API_KEY: "factory-noncredential-canary",
+            HTTPS_PROXY: "http://127.0.0.1:9",
+            HTTP_PROXY: "http://127.0.0.1:9",
+            ALL_PROXY: "http://127.0.0.1:9",
+            NO_PROXY: "",
+          },
+          signal: AbortSignal.timeout(15_000),
+        },
+        {
+          async run(channel) {
+            const send = async (id, method, params) => {
+              const answer = reply();
+              await channel.write(
+                `${JSON.stringify({ id, method, params })}\n`,
+              );
+              return answer;
+            };
+            await send(1, "initialize", {
+              clientInfo: { name: "factory-offline-role", version: "1" },
+              capabilities: { experimentalApi: true },
+            });
+            await channel.write(
+              `${JSON.stringify({ method: "initialized" })}\n`,
+            );
+            const observed = await send(2, "config/read", {
+              includeLayers: false,
+              cwd: call.tree,
+            });
+            assert.equal(
+              observed.config.instructions,
+              CODEX_READONLY_BASE_INSTRUCTIONS,
+            );
+            assert.equal(
+              observed.config.include_permissions_instructions,
+              true,
+            );
+            assert.equal(observed.config.features.multi_agent, false);
+            assert.equal(observed.config.features.hooks, false);
+            assert.equal(observed.config.default_permissions, "factory");
+            const started = await send(3, "thread/start", {
+              model: "gpt-6.1-sol",
+              modelProvider: "openai",
+              cwd: call.tree,
+              approvalPolicy: "never",
+              permissions: "factory",
+              ephemeral: true,
+            });
+            assert.equal(started.model, "gpt-6.1-sol");
+            assert.equal(started.approvalPolicy, "never");
+            assert.deepEqual(started.thread.turns, []);
+            assert.equal(started.thread.ephemeral, true);
+            channel.end();
+          },
+        },
+        (stream, bytes) => {
+          if (stream !== "stdout") return;
+          pending += bytes.toString();
+          for (
+            let end = pending.indexOf("\n");
+            end >= 0;
+            end = pending.indexOf("\n")
+          ) {
+            const frame = JSON.parse(pending.slice(0, end));
+            pending = pending.slice(end + 1);
+            if (frame.id !== undefined) {
+              if (frame.error)
+                nextReply.reject(new Error(JSON.stringify(frame.error)));
+              else nextReply.resolve(frame.result);
+            }
+          }
+        },
+      );
+      assert.equal(result.status, 0);
       assert.equal(CODEX_TREE_REVIEW_CONFIG, CODEX_SOURCE_READ_CONFIG);
       assert.equal(
         createHash("sha256").update(CODEX_SOURCE_READ_CONFIG).digest("hex"),
-        "c55ca9a5b35dba5da4f2ce16293c0d9ce127a6e47f7041284ee62761142f49be",
+        "d2cbbca9482395d859ac961d61f247c88b0a383ff5532088975711bb835f98c2",
       );
       assert.equal(
         createHash("sha256").update(CODEX_PLANNING_CONFIG).digest("hex"),
-        "a6809a714dae357ee257a90a4381c2651d9e9e3c37725d66bb0a156adbf40c80",
+        "5196668761afc31ce4d152aaacc251bc2adb468e70e47770470de8eebc571590",
       );
     } finally {
       home.dispose();

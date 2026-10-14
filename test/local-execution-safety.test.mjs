@@ -155,6 +155,7 @@ import { materializeResultTree } from "../dist/result-evidence.js";
 import {
   createCodexHome,
   CODEX_PLANNING_CONFIG,
+  CODEX_TREE_REVIEW_CONFIG,
 } from "../dist/codex-planning-isolation.js";
 import {
   CLAUDE_EXPORT_SCRIPT,
@@ -3539,10 +3540,10 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       // An actual pre-admission receipt supplies the binding shape; no native
       // READY/terminal response is fabricated. Recreate only an owned old-policy
       // home to prove refusal before reconfiguration and original-owner disposal.
-      const legacyConfig = CODEX_PLANNING_CONFIG.replace(
-        "shell_tool = false",
-        "shell_tool = true",
-      ).replace("code_mode_host = false", "code_mode_host = true");
+      const legacyConfig = CODEX_TREE_REVIEW_CONFIG.replace(
+        /^instructions =.*\n/m,
+        "",
+      );
       const legacyReview = structuredClone(disposedReview);
       legacyReview.data.selectionDigest = createHash("sha256")
         .update(
