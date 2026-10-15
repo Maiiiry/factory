@@ -107,14 +107,45 @@ export function checkpointExecutionState(
   owner.recordSnapshot?.(state);
 }
 
-/** Draining finishes admitted work; a plain pause still stops its next step. */
+/**
+ * Draining finishes admitted work; a plain pause still stops its next step. A
+ * handoff whose items hold no effect in flight stops them at their next safe
+ * point (#1289); a plain drain keeps retrying them.
+ */
 export function workItemPauseSignal(
-  owner: Pick<LocalOwner, "snapshot" | "pause" | "workPause">,
+  owner: Pick<
+    LocalOwner,
+    "snapshot" | "pause" | "workPause" | "handoff" | "activeItems"
+  >,
 ): AbortSignal {
-  return owner.snapshot?.coordinator?.mode === "draining" &&
-    canHandoff(owner.snapshot)
+  return owner.handoff &&
+    owner.snapshot?.coordinator?.mode === "draining" &&
+    canHandoff(owner.snapshot, owner.activeItems)
     ? owner.pause.signal
     : owner.workPause.signal;
+}
+
+/**
+ * The pause an Objective step honors. Pause, drain and handoff stop it waiting
+ * between tries only at a safe point (no running item depends on it); a drain
+ * that must still drive running items keeps it going. Only a handoff counts
+ * items no step of this pass runs (`active`) as idle (#1289): a plain drain
+ * never stops while an item is running.
+ */
+export function objectiveStepPause(
+  owner: Pick<LocalOwner, "snapshot" | "pause" | "handoff">,
+  active?: ReadonlyMap<string, unknown>,
+): AbortSignal | undefined {
+  const snapshot = owner.snapshot;
+  if (!snapshot) return owner.pause.signal;
+  if (owner.handoff)
+    return canHandoff(snapshot, active) ? owner.pause.signal : undefined;
+  if (
+    isExecutionState(snapshot) &&
+    Object.values(snapshot.work).some((work) => work.status === "running")
+  )
+    return undefined;
+  return canHandoff(snapshot) ? owner.pause.signal : undefined;
 }
 
 export async function runObjectivePass(
@@ -168,6 +199,7 @@ export async function runObjectivePass(
   };
   owner.save = save;
   const active = new Map<string, Promise<void>>();
+  owner.activeItems = active;
   const {
     driver,
     github,
@@ -178,14 +210,10 @@ export async function runObjectivePass(
   } = services;
   let stateForSignal: FactoryState | undefined;
   const cancellationRequested = () => Boolean(owner.snapshot?.cancelRequested);
-  // Cancel stops every step. Pause, drain and handoff stop an Objective step
-  // waiting between tries only at a safe point (no running item depends on
-  // it); a drain that must still drive running items keeps them going.
+  // Cancel stops every step; pause, drain and handoff stop an Objective step
+  // only at a safe point (see objectiveStepPause).
   const objectiveSignal = () => owner.abort.signal;
-  const objectivePause = () =>
-    owner.snapshot && !canHandoff(owner.snapshot)
-      ? undefined
-      : owner.pause.signal;
+  const objectivePause = () => objectiveStepPause(owner, active);
   /** Stop a pass the operator cancelled: a `cancelled` fault, never a failure. */
   const stopIfCancelled = () => {
     if (cancellationRequested())
@@ -674,11 +702,12 @@ export async function runObjectivePass(
     if (
       owner.handoff &&
       (owner.snapshot
-        ? canHandoff(owner.snapshot)
+        ? canHandoff(owner.snapshot, active)
         : paused && !cancellationRequested())
     ) {
       // No item step may outlive ownership: a sibling sleeping between tries
       // stops at that safe point, and every active item settles first (#1268).
+      owner.handoffStopped = true;
       owner.workPause.abort(new Error("Coordinator handoff requested"));
       await Promise.allSettled(active.values());
       if (owner.snapshot?.coordinator) {
