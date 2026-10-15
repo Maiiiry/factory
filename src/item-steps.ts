@@ -14,7 +14,10 @@ import type {
 } from "./contracts.js";
 import type { DiagnosticEmitter } from "./diagnostics.js";
 import { isDeepStrictEqual } from "node:util";
-import { awaitCheckpointAdmission } from "./recovery-checkpoint.js";
+import {
+  awaitCheckpointAdmission,
+  trackCollection,
+} from "./recovery-checkpoint.js";
 import { workerContext } from "./execution/checkpoint.js";
 import { cancelledFault, faultOf, workFault } from "./fault.js";
 import { repeatKey, StepPaused, step } from "./step.js";
@@ -253,7 +256,9 @@ export async function executeItem(
         await driver.cancel(current, context());
         throw cancelledFault();
       }
-      const result = await driver.collect(current, context());
+      const result = await trackCollection(current.identity, () =>
+        driver.collect(current, context()),
+      );
       ctx.progress();
       return result;
     },

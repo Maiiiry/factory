@@ -20,7 +20,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import {
   type FactoryConfig,
   factoryAuthorityDigest,
@@ -320,16 +327,50 @@ export class CheckpointAdmissionFailure extends Error {
 }
 /**
  * A completed local worker return is not yet frozen by its collector, so no
- * checkpoint can be published until collection: the controller collects before
- * its own admissions, while a concurrent presentation admission waits a tick.
+ * checkpoint can be published until collection. A collector freezes its own
+ * return before it admits; another admission waits for an active collector in
+ * this process (#1281), and presentation skips a tick.
  */
 export class CheckpointCollectionPending extends Error {
-  constructor(paths: string[]) {
+  constructor(readonly paths: string[]) {
     super(
       `Checkpoint manifest is incomplete until completed worker output is collected: ${paths.join(", ")}`,
     );
   }
 }
+/** Worker returns this process is collecting now, by attempt identity. */
+const activeCollections = new Map<string, number>();
+/** Mark a worker's collection as active while `task` runs. */
+export async function trackCollection<T>(
+  identity: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  activeCollections.set(identity, (activeCollections.get(identity) ?? 0) + 1);
+  try {
+    return await task();
+  } finally {
+    const remaining = activeCollections.get(identity)! - 1;
+    if (remaining) activeCollections.set(identity, remaining);
+    else activeCollections.delete(identity);
+  }
+}
+/** A pending return whose collector is running here will be frozen shortly. */
+function collectingHere(error: unknown): boolean {
+  const pending =
+    error instanceof CheckpointCollectionPending
+      ? error
+      : error instanceof CheckpointAdmissionFailure &&
+          error.cause instanceof CheckpointCollectionPending
+        ? error.cause
+        : undefined;
+  return !!pending?.paths.some((path) =>
+    [...activeCollections.keys()].some(
+      (identity) => basename(path) === `${identity}.result.json`,
+    ),
+  );
+}
+/** Safety bound on waiting for an active collector; then the refusal stands. */
+const COLLECTION_WAIT_MS = 5 * 60_000;
 export function isCheckpointCollectionPending(error: unknown): boolean {
   return (
     error instanceof CheckpointCollectionPending ||
@@ -2362,10 +2403,22 @@ export async function awaitCheckpointAdmission(
     settings(scope.config)?.scope === "repository-knowledge"
   )
     return;
-  const acknowledged = await synchronizeRecoveryCheckpoint(scope.config, {
-    reason,
-    buildClosure: scope.buildClosure,
-  });
+  let acknowledged: RecoveryCheckpointStatus;
+  const deadline = Date.now() + COLLECTION_WAIT_MS;
+  for (;;) {
+    try {
+      acknowledged = await synchronizeRecoveryCheckpoint(scope.config, {
+        reason,
+        buildClosure: scope.buildClosure,
+      });
+      break;
+    } catch (error) {
+      // Another Work Item's collector is freezing its return: wait for it,
+      // outside the publication queue, instead of stopping for a decision.
+      if (!collectingHere(error) || Date.now() >= deadline) throw error;
+      await new Promise<void>((done) => setTimeout(done, 1000));
+    }
+  }
   const fingerprint = checkpointCompletionFingerprint(scope.config);
   const persistence = settings(scope.config);
   const current = persistence

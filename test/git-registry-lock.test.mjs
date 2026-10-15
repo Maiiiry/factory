@@ -82,6 +82,7 @@ import {
   awaitCheckpointAdmission,
   gitPersistenceStatus,
   isCheckpointCollectionPending,
+  trackCollection,
   markCheckpointDirty,
   readVerifiedRecoveryCheckpoint,
   synchronizeRecoveryCheckpoint,
@@ -843,12 +844,24 @@ bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmissio
       store,
       "codex-sdk",
     );
-    await collectCompletedWorker(
-      config,
-      1,
-      { runId: state.runId, item: item.id, attempt },
-      driver,
+    // With its collector active here, another admission waits for the freeze
+    // and then publishes instead of stopping for a decision (#1281).
+    const admitted = withRecoveryCheckpointScope(
+      {
+        config,
+        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
+      },
+      () => awaitCheckpointAdmission(repository, "explicit"),
     );
+    await trackCollection(attempt, () =>
+      collectCompletedWorker(
+        config,
+        1,
+        { runId: state.runId, item: item.id, attempt },
+        driver,
+      ),
+    );
+    await admitted;
     const collected = readState(repository, 1),
       frozen = JSON.stringify(collected.work.local.execution.data.result),
       allowances = JSON.stringify(collected.autonomy);
