@@ -305,6 +305,48 @@ export function clearWait(state: StepState, scope: StepScope): boolean {
   return true;
 }
 
+/** Steps sleeping between tries, by the state whose records they read. */
+const retrySleepers = new WeakMap<object, Set<AbortController>>();
+
+/**
+ * The operator says a provider's usage limit is lifted (#1267): end the
+ * scope's waits for a provider reset time, so its steps try again now. The
+ * fault history stays out of the record; paid counts and questions stay. A
+ * step sleeping on those records in this process wakes and rereads them.
+ * The caller saves. False when no such wait exists.
+ */
+export function endProviderLimitWaits(
+  state: StepState,
+  scope: StepScope,
+  now = time.now(),
+): boolean {
+  let ended = false;
+  for (const [key, record] of Object.entries(state.repeats ?? {})) {
+    const last = record.faults?.last;
+    if (
+      !inScope(key, scope) ||
+      last?.kind !== "transient" ||
+      !last.retryAt ||
+      !record.nextAt ||
+      !(Date.parse(record.nextAt) > now)
+    )
+      continue;
+    const {
+      nextAt: _nextAt,
+      scheduledAt: _scheduledAt,
+      faults: _faults,
+      ...kept
+    } = record;
+    if (Object.keys(kept).length) state.repeats![key] = kept;
+    else delete state.repeats![key];
+    ended = true;
+  }
+  if (state.repeats && !Object.keys(state.repeats).length) delete state.repeats;
+  if (ended)
+    for (const sleeper of retrySleepers.get(state) ?? []) sleeper.abort();
+  return ended;
+}
+
 /**
  * The operator's retry: delete every repeat record of the scope (an item
  * runs one step at a time, so that is the waiting step) and the wait its
@@ -534,10 +576,28 @@ async function repeat<T>(
       if (delay > 0) {
         // A wait between tries is a safe point: pause stops here.
         stopWaiting();
-        await clock.sleep(delay, waitSignal).catch((error: unknown) => {
-          stopWaiting();
-          throw error;
-        });
+        // `factory retry` can end a provider-limit wait (#1267).
+        const retried = new AbortController();
+        const sleepers = retrySleepers.get(state) ?? new Set();
+        retrySleepers.set(state, sleepers);
+        sleepers.add(retried);
+        try {
+          await clock
+            .sleep(
+              delay,
+              waitSignal
+                ? AbortSignal.any([waitSignal, retried.signal])
+                : retried.signal,
+            )
+            .catch((error: unknown) => {
+              stopWaiting();
+              if (!retried.signal.aborted) throw error;
+            });
+        } finally {
+          sleepers.delete(retried);
+        }
+        // Read the record again: the retry may have ended this wait.
+        if (retried.signal.aborted) continue;
       }
       stopWaiting();
     }
