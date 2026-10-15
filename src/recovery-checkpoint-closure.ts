@@ -1404,9 +1404,12 @@ async function buildRecoveryCheckpointClosureLocal(input: {
                     active.result === undefined &&
                     rejected === undefined
                   )
+                    // Required until its collector freezes it; transient marks
+                    // that publication can follow collection (#1276).
                     gaps.push({
                       path: relative(root, resultPath),
-                      availability: "unavailable",
+                      availability: "transient",
+                      required: true,
                       reason:
                         "Authenticated completed worker output has not been frozen by its existing collector; source changes and staged bodies remain in the preserved owned checkout",
                     });
