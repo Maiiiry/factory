@@ -1,5 +1,11 @@
+import { displayDateTime } from "./display-time.js";
+import { attemptKindLabel } from "./repair-policy.js";
 import { PROGRESS_ITEM_ID, progressMarker } from "./github-progress-state.js";
-import { summarizeStatus, type StatusView } from "./status-summary.js";
+import {
+  itemAttempt,
+  summarizeStatus,
+  type StatusView,
+} from "./status-summary.js";
 
 /** Text explicitly cleared for the target issue's existing disclosure scope. */
 export interface GitHubProgressDecision {
@@ -120,7 +126,7 @@ export function objectiveStatusLines(
             .slice(0, 12)
             .map(
               (item) =>
-                `- ${compact(item.id)} · ${compact(item.status)}${item.step && ACTIVE_STEPS.includes(item.step) ? ` (${item.step})` : ""}${item.pullRequest ? ` · ${pullLink(input.repository, item.pullRequest)}` : ""}${options.activeNote?.(item.id) ?? ""}`,
+                `- ${compact(item.id)} · ${compact(item.status)}${item.step && ACTIVE_STEPS.includes(item.step) ? ` (${item.step})` : ""}${itemAttempt(item)}${item.pullRequest ? ` · ${pullLink(input.repository, item.pullRequest)}` : ""}${options.activeNote?.(item.id) ?? ""}`,
             ),
           ...(active.length > 12 ? [`- ${active.length - 12} more`] : []),
         ]
@@ -208,7 +214,7 @@ export function renderObjectiveNotification(
     }),
     ...objectiveStatusLines(input, { items: false }),
     "",
-    `<sub>Observed ${shortTime(input.observedAt)} · Factory keeps its Live status comment on this issue current</sub>`,
+    `<sub>Observed ${displayDateTime(input.observedAt)} · Factory keeps its Live status comment on this issue current</sub>`,
     "",
     ...runDetailsLines(input),
   ];
@@ -218,9 +224,12 @@ export function renderObjectiveNotification(
   return body;
 }
 
-/** A compact UTC time such as `2026-10-16 05:04Z`. */
-function shortTime(iso: string): string {
-  return `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z`;
+/** `attempt 2 (1a2b3c4d) · retry`, or `attempt 1a2b3c4d` without an ordinal. */
+function attemptText(id: string, number?: number, kind?: string): string {
+  const short = compact(id.slice(0, 8));
+  if (!number) return `attempt ${short}`;
+  const label = number > 1 && kind ? attemptKindLabel(kind) : undefined;
+  return `attempt ${number} (${short})${label ? ` · ${label}` : ""}`;
 }
 
 /** One Work Item's public facts: structured fields only, never logs or exception text. */
@@ -229,6 +238,9 @@ export interface WorkItemFacts {
   step?: import("./state.js").WorkStep;
   /** The current attempt's identity. */
   attempt?: string;
+  /** The current attempt's ordinal and how it started. */
+  attemptNumber?: number;
+  attemptKind?: string;
   pullRequest?: number;
   /** A provider outage the item's step is waiting out. */
   outage?: { step: string; retryAt?: string };
@@ -296,10 +308,10 @@ export function workItemStatusLines(input: WorkItemStatusInput): string[] {
                 : compact(input.status);
   return [
     `### ${headline} · ${compact(input.item.id)}`,
-    `Objective ${issueLink(input.repository, input.objective)}${input.attempt ? ` · attempt ${compact(input.attempt.slice(0, 8))}` : ""}`,
+    `Objective ${issueLink(input.repository, input.objective)}${input.attempt ? ` · ${attemptText(input.attempt, input.attemptNumber, input.attemptKind)}` : ""}`,
     ...(input.outage
       ? [
-          `Waiting out a provider outage in ${compact(input.outage.step)}${input.outage.retryAt ? `; next try after ${compact(input.outage.retryAt)}` : ""}.`,
+          `Waiting out a provider outage in ${compact(input.outage.step)}${input.outage.retryAt ? `; next try after ${displayDateTime(input.outage.retryAt)}` : ""}.`,
         ]
       : []),
     ...(input.failure ? [`Last failure: ${compact(input.failure)}.`] : []),
@@ -347,7 +359,7 @@ export function renderWorkItemNotification(
     }),
     ...workItemStatusLines(input),
     "",
-    `<sub>Observed ${shortTime(input.observedAt)} · Factory keeps its Live status comment on this issue current</sub>`,
+    `<sub>Observed ${displayDateTime(input.observedAt)} · Factory keeps its Live status comment on this issue current</sub>`,
     "",
     ...runDetailsLines(input),
   ].join("\n");

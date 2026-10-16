@@ -5,6 +5,8 @@
  */
 
 import { type Refusal, settlesFirst } from "./amendment-admission.js";
+import { displayDateTime } from "./display-time.js";
+import { attemptLabel } from "./repair-policy.js";
 import type { Wait } from "./fault.js";
 import type { PrerequisiteGuidance } from "./prerequisite-guidance.js";
 
@@ -77,6 +79,9 @@ export interface StatusItemView extends WaitView {
    * or `asset-selection`. Steps' waits are on `wait`.
    */
   blockedReason: string | null;
+  /** The current attempt's ordinal and how it started (`attemptOrigin`). */
+  attemptNumber?: number | null;
+  attemptKind?: string | null;
   pullRequest: number | null;
   acceptancePending: PendingDecisionView | null;
   candidateAssetSets: string[];
@@ -334,11 +339,22 @@ interface ShownWait {
   escalated?: boolean;
 }
 
-const when = (time: string) => `${time.slice(0, 16).replace("T", " ")}Z`;
+/** ` · attempt 2 · retry` for a later attempt, or nothing. */
+export function itemAttempt(item: {
+  attemptNumber?: number | null;
+  attemptKind?: string | null;
+}): string {
+  const label = attemptLabel(
+    item.attemptNumber
+      ? { number: item.attemptNumber, kind: item.attemptKind ?? "" }
+      : undefined,
+  );
+  return label ? ` · ${label}` : "";
+}
 
 /** "(step): since … (N tries, last: …)" for a step in a run of faults. */
 function outageText(outage: OutageView): string {
-  return `(${outage.step}): since ${when(outage.since)} (${outage.tries} ${outage.tries === 1 ? "try" : "tries"}, last: ${short(outage.last, 60)})${outage.retryAt ? `; retry after ${when(outage.retryAt)}` : ""}`;
+  return `(${outage.step}): since ${displayDateTime(outage.since)} (${outage.tries} ${outage.tries === 1 ? "try" : "tries"}, last: ${short(outage.last, 60)})${outage.retryAt ? `; retry after ${displayDateTime(outage.retryAt)}` : ""}`;
 }
 
 /**
@@ -975,7 +991,7 @@ function progress(view: ExecutionStatusView): StatusSummary {
       .slice(0, 3)
       .map(
         (item) =>
-          `${item.id} (${item.status === "pending" ? "ready" : (item.step ?? item.status)})`,
+          `${item.id}${itemAttempt(item)} (${item.status === "pending" ? "ready" : (item.step ?? item.status)})`,
       )
       .join(", ");
     return {
@@ -1358,12 +1374,12 @@ export function renderStatusText(
       (entry) => entry.scope === "progress-publication",
     );
     lines.push(
-      `GitHub progress: ${awaiting ? "comment awaiting response" : (view.githubProgress.failure ?? "projected")}; ${view.githubProgress.snapshots} notification comments${view.githubProgress.lastObservedAt ? `; last observed ${view.githubProgress.lastObservedAt}` : ""}${view.githubProgress.lastComment ? `; comment ${view.githubProgress.lastComment}` : ""}${view.githubProgress.unresolved && !awaiting ? "; publication outcome unknown; reconciliation only" : ""}`,
+      `GitHub progress: ${awaiting ? "comment awaiting response" : (view.githubProgress.failure ?? "projected")}; ${view.githubProgress.snapshots} notification comments${view.githubProgress.lastObservedAt ? `; last observed ${displayDateTime(view.githubProgress.lastObservedAt)}` : ""}${view.githubProgress.lastComment ? `; comment ${view.githubProgress.lastComment}` : ""}${view.githubProgress.unresolved && !awaiting ? "; publication outcome unknown; reconciliation only" : ""}`,
     );
   }
   if (view.githubProjectTracking)
     lines.push(
-      `GitHub Project tracking: ${view.githubProjectTracking.failure ?? "observed"}; ${view.githubProjectTracking.retainedUpdates} retained update requests${view.githubProjectTracking.observedAt ? `; last observed ${view.githubProjectTracking.observedAt}` : ""}${view.githubProjectTracking.unknownUpdate ? "; update outcome unknown; managed field held read-only" : ""}`,
+      `GitHub Project tracking: ${view.githubProjectTracking.failure ?? "observed"}; ${view.githubProjectTracking.retainedUpdates} retained update requests${view.githubProjectTracking.observedAt ? `; last observed ${displayDateTime(view.githubProjectTracking.observedAt)}` : ""}${view.githubProjectTracking.unknownUpdate ? "; update outcome unknown; managed field held read-only" : ""}`,
     );
   const items = "githubWorkItemTracking" in view && view.githubWorkItemTracking;
   if (items)
@@ -1426,7 +1442,7 @@ export function renderStatusText(
             : (wait?.detail ?? "");
       return [
         item.id,
-        `${item.status}${item.step ? ` (${item.step})` : ""}`,
+        `${item.status}${item.step ? ` (${item.step})` : ""}${itemAttempt(item)}`,
         item.pullRequest ? `#${item.pullRequest}` : "-",
         reason,
       ];
