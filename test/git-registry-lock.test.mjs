@@ -103,6 +103,7 @@ import { controlObjective, runObjective } from "../dist/runner.js";
 import {
   acquireInstallationLock,
   acquireObjectiveLock,
+  asInstallationOwner,
   installationLockPath,
   objectiveLockPath,
   readControllerOwner,
@@ -1408,6 +1409,21 @@ bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmissio
     assert.match(status.result.observation.error, /memory \(memory\/records\)/);
     assert.equal(status.result.localMode, "paused");
     assert.equal(status.result.activeObjective, null);
+    // `factory decide` reaches the held service (#1290): it checks the
+    // forwarded input before any state, then applies the ordinary decision
+    // checks itself instead of refusing a stopped Objective's lifecycle.
+    await assert.rejects(
+      requestControl(repository, { objective: 1, action: "decide", input: {} }),
+      /Forwarded decision lacks its outcome, actor or reason/,
+    );
+    await assert.rejects(
+      requestControl(repository, {
+        objective: 1,
+        action: "decide",
+        input: { outcome: "accept", actor: "fixture", reason: "fixture" },
+      }),
+      /Objective is not awaiting a result decision/,
+    );
     assert.equal(injected, true);
     assert.equal(readState(repository, 1).objectiveClosure, "complete");
     assert.equal(
@@ -3006,6 +3022,20 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       lockReleased = true;
       const maintenanceLock = acquireInstallationLock(repository, 4);
       try {
+        // The live installation owner may lock a stopped Objective only while
+        // it decides that Objective itself (#1290); anyone else stays refused.
+        assert.throws(
+          () => acquireObjectiveLock(repository, 5),
+          /already owns this installation/,
+        );
+        const decided = await asInstallationOwner(maintenanceLock, async () =>
+          acquireObjectiveLock(repository, 5),
+        );
+        releaseControllerLock(objectiveLockPath(repository, 5), decided);
+        assert.throws(
+          () => acquireObjectiveLock(repository, 5),
+          /already owns this installation/,
+        );
         await assert.rejects(
           retireUnknownProjectAdmission(
             config,

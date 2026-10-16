@@ -89,6 +89,8 @@ import { checkRequiredEnvironment } from "./repair-policy.js";
 import {
   type ApplicationServices,
   CoordinatorHandoff,
+  decideStoppedObjective,
+  parseDecisionInput,
   runObjective,
 } from "./runner.js";
 import { type ContinuationState, isExecutionState } from "./state.js";
@@ -98,6 +100,7 @@ import {
 } from "./supervision.js";
 import {
   acquireInstallationLock,
+  asInstallationOwner,
   assertRestoredInstallationDispatchReady,
   readContinuation,
   releaseControllerLock,
@@ -1569,6 +1572,44 @@ async function runIntakeOwned(
     if (request.objective !== 0) {
       if (request.objective === activeObjective && objectiveControl)
         return objectiveControl(request);
+      if (request.action === "decide") {
+        // The Objective's run registers its control late and clears it early;
+        // in those windows it may be writing state it has not saved yet.
+        if (request.objective === activeObjective)
+          throw new Error(
+            `Objective #${request.objective} is starting or settling under the service; retry the decision`,
+          );
+        // A queued Objective stopped for a person: the service owns the
+        // installation, so it records the decision itself, on the provider the
+        // Objective froze. This request is pending control, which holds new
+        // dispatch until it settles (#1290).
+        if (record.objectives.includes(request.objective)) {
+          const input = parseDecisionInput(request.input);
+          const objectiveConfig = options.backgroundConfigurationPath
+            ? queuedObjectiveConfig(
+                config,
+                request.objective,
+                options.backgroundConfigurationPath,
+              )
+            : config;
+          let objectiveServices = services;
+          if (objectiveConfig !== config) {
+            if (!options.servicesFor)
+              throw new Error(
+                `Objective #${request.objective} runs with another provider, and this service cannot compose it`,
+              );
+            objectiveServices = options.servicesFor(objectiveConfig);
+          }
+          return asInstallationOwner(lock, () =>
+            decideStoppedObjective(
+              objectiveConfig,
+              request.objective,
+              objectiveServices,
+              input,
+            ),
+          );
+        }
+      }
       const state = readContinuation(config.repository, request.objective);
       if (
         request.action === "status" &&
