@@ -3112,6 +3112,105 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     1,
     "this caller's later write still needs its own barrier",
   );
+  // A real receiving Git process is still running when the bounded client
+  // wait ends; the update never lands (#1301). Exact remote observation finds
+  // the archive still at the attempt's base, records the attempt as not landed
+  // and publishes current state as a fast-forward.
+  const refuseHook = join(remote, "hooks", "pre-receive");
+  writeFileSync(refuseHook, "#!/bin/sh\nsleep 3\nexit 1\n", { mode: 0o700 });
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "unlanded-local-source-read" },
+    summary: "An unlanded read confirms the orchard API reference",
+  });
+  const remoteRef = () =>
+    execFileSync(
+      "git",
+      [`--git-dir=${remote}`, "rev-parse", config.gitPersistence.ref],
+      { encoding: "utf8" },
+    ).trim();
+  const landedBefore = remoteRef();
+  await assert.rejects(
+    synchronizeRecoveryCheckpoint(
+      {
+        ...config,
+        gitPersistence: { ...config.gitPersistence, timeoutMs: 1000 },
+      },
+      { reason: "explicit", buildClosure },
+    ),
+    /publication outcome is unknown/,
+  );
+  const unlanded = gitPersistenceStatus(config);
+  assert.equal(unlanded.status, "unknown");
+  assert.equal(unlanded.attemptedBase, landedBefore);
+  await new Promise((resolve) => setTimeout(resolve, 3200));
+  assert.equal(remoteRef(), landedBefore);
+  rmSync(refuseHook);
+  const attemptStatus = (candidate) =>
+    JSON.parse(
+      readFileSync(join(state, "recovery", "checkpoint.json"), "utf8"),
+    ).attempts.find((attempt) => attempt.candidate === candidate).status;
+  // Inside its coalescing window a settled synchronization only reconciles:
+  // the attempt is recorded as not landed and nothing is published yet.
+  await synchronizeRecoveryCheckpoint(
+    {
+      ...config,
+      gitPersistence: { ...config.gitPersistence, coalesceMs: 600000 },
+    },
+    { reason: "settled", buildClosure },
+  );
+  assert.equal(attemptStatus(unlanded.attemptedCommit), "not-landed");
+  assert.equal(remoteRef(), landedBefore);
+  // The refused push arrives late after all. The next publication finds the
+  // remote at that not-landed candidate, acknowledges it and builds on it
+  // instead of holding a conflict.
+  execFileSync(
+    "git",
+    [
+      `--git-dir=${join(state, "recovery", "git.git")}`,
+      "push",
+      "--quiet",
+      remote,
+      `${unlanded.attemptedCommit}:${config.gitPersistence.ref}`,
+    ],
+    { stdio: "pipe" },
+  );
+  new LocalRepositoryMemory(state, repository).retain({
+    ...record,
+    createdAt: new Date().toISOString(),
+    producer: { ...record.producer, identity: "after-late-landing-read" },
+    summary: "A read after the late landing confirms the orchard API reference",
+  });
+  const republished = await synchronizeRecoveryCheckpoint(config, {
+    reason: "explicit",
+    buildClosure,
+  });
+  assert.equal(republished.status, "acknowledged");
+  assert.equal(attemptStatus(unlanded.attemptedCommit), "acknowledged");
+  assert.notEqual(
+    republished.lastAcknowledged.commitSha,
+    unlanded.attemptedCommit,
+  );
+  assert.equal(remoteRef(), republished.lastAcknowledged.commitSha);
+  assert.equal(
+    execFileSync(
+      "git",
+      [
+        `--git-dir=${remote}`,
+        "rev-parse",
+        `${republished.lastAcknowledged.commitSha}^`,
+      ],
+      { encoding: "utf8" },
+    ).trim(),
+    unlanded.attemptedCommit,
+  );
+  assert.equal(
+    readdirSync(join(state, "recovery")).filter((name) =>
+      name.startsWith("verify-"),
+    ).length,
+    0,
+  );
   // A real receiving Git process updates the ref, then outlives the bounded
   // client wait. Reconciliation observes that exact publication without replay.
   const received = join(root, "received.txt");
