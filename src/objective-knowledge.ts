@@ -44,6 +44,7 @@ interface KnowledgeViewEntry {
   producerDisposition: string;
   authority: string;
   kind: WorkHandoffNote["kind"];
+  criterionIndex?: number;
   summary: string;
   sources: { path: string; ref?: ContentRef; availability: string }[];
 }
@@ -61,6 +62,14 @@ const filePath = (value: unknown): value is string =>
   !value.split("/").some((part) => part.toLowerCase() === ".git") &&
   !value.startsWith(".factory-");
 
+/**
+ * Learnings are short; a verification map names every sub-clause of one
+ * acceptance criterion with its proof locations, so it gets more room.
+ */
+const LEARNING_LIMIT = { notes: 16, summary: 1024, paths: 8 };
+/** One verification note per acceptance criterion; the manifest size bounds the rest. */
+const VERIFICATION_LIMIT = { summary: 4096, paths: 16 };
+
 /** Reject malformed optional data; the controller never repairs model claims. */
 export function parseWorkHandoffNotes(value: unknown): WorkHandoffNote[] {
   const declaration = value as { notes?: unknown } | null;
@@ -69,25 +78,36 @@ export function parseWorkHandoffNotes(value: unknown): WorkHandoffNote[] {
     typeof declaration !== "object" ||
     Array.isArray(value) ||
     Object.keys(declaration).some((key) => key !== "notes") ||
-    !Array.isArray(declaration.notes) ||
-    declaration.notes.length > 16
+    !Array.isArray(declaration.notes)
   )
-    throw new Error("Handoff must be an object with at most 16 notes");
-  return declaration.notes.map((raw: unknown) => {
+    throw new Error("Handoff must be an object with a notes array");
+  const notes = declaration.notes.map((raw: unknown) => {
     const note = raw as WorkHandoffNote | null;
+    const verification = note?.kind === "verification";
+    const limit = verification ? VERIFICATION_LIMIT : LEARNING_LIMIT;
     if (
       !note ||
       typeof note !== "object" ||
       Array.isArray(note) ||
       Object.keys(note).some(
-        (key) => !["kind", "summary", "paths", "consumers"].includes(key),
+        (key) =>
+          !["kind", "summary", "paths", "consumers", "criterionIndex"].includes(
+            key,
+          ),
       ) ||
-      !["interface", "pitfall", "hypothesis"].includes(note.kind) ||
+      !["interface", "pitfall", "hypothesis", "verification"].includes(
+        note.kind,
+      ) ||
+      (verification
+        ? !Number.isSafeInteger(note.criterionIndex) ||
+          (note.criterionIndex as number) < 0 ||
+          note.consumers?.length !== 0
+        : note.criterionIndex !== undefined) ||
       typeof note.summary !== "string" ||
       !note.summary.trim() ||
-      note.summary.length > 1024 ||
+      note.summary.length > limit.summary ||
       !Array.isArray(note.paths) ||
-      note.paths.length > 8 ||
+      note.paths.length > limit.paths ||
       !note.paths.every(filePath) ||
       new Set(note.paths).size !== note.paths.length ||
       !Array.isArray(note.consumers) ||
@@ -102,19 +122,83 @@ export function parseWorkHandoffNotes(value: unknown): WorkHandoffNote[] {
       new Set(note.consumers).size !== note.consumers.length
     )
       throw new Error(
-        "Handoff note has invalid kind, summary, source paths or consumers",
+        "Handoff note has invalid kind, summary, source paths, consumers or criterion",
       );
     return {
       kind: note.kind,
       summary: note.summary,
       paths: [...note.paths],
       consumers: [...note.consumers],
+      ...(verification ? { criterionIndex: note.criterionIndex } : {}),
     };
   });
+  const verifications = notes.filter((note) => note.kind === "verification");
+  if (
+    notes.length - verifications.length > LEARNING_LIMIT.notes ||
+    new Set(verifications.map((note) => note.criterionIndex)).size !==
+      verifications.length
+  )
+    throw new Error(
+      `Handoff must hold at most ${LEARNING_LIMIT.notes} learning notes and one verification note per criterion`,
+    );
+  return notes;
 }
 
 /** Models choose recipients; the controller owns their identities. */
-export function workHandoffSchema(peerCount: number): Record<string, unknown> {
+export function workHandoffSchema(
+  peerCount: number,
+  criterionCount: number,
+): Record<string, unknown> {
+  const paths = (maxItems: number) => ({
+    type: "array",
+    maxItems,
+    uniqueItems: true,
+    items: { type: "string", minLength: 1, maxLength: 512 },
+  });
+  const learning = {
+    type: "object",
+    additionalProperties: false,
+    required: ["kind", "summary", "paths", "consumerIndices"],
+    properties: {
+      kind: { type: "string", enum: ["interface", "pitfall", "hypothesis"] },
+      summary: {
+        type: "string",
+        minLength: 1,
+        maxLength: LEARNING_LIMIT.summary,
+      },
+      paths: paths(LEARNING_LIMIT.paths),
+      consumerIndices: {
+        type: "array",
+        maxItems: peerCount === 0 ? 0 : 16,
+        uniqueItems: true,
+        items: {
+          type: "integer",
+          minimum: 0,
+          ...(peerCount > 0 ? { maximum: peerCount - 1 } : {}),
+        },
+      },
+    },
+  };
+  const verification = {
+    type: "object",
+    additionalProperties: false,
+    required: ["kind", "summary", "paths", "consumerIndices", "criterionIndex"],
+    properties: {
+      kind: { type: "string", const: "verification" },
+      summary: {
+        type: "string",
+        minLength: 1,
+        maxLength: VERIFICATION_LIMIT.summary,
+      },
+      paths: paths(VERIFICATION_LIMIT.paths),
+      criterionIndex: {
+        type: "integer",
+        minimum: 0,
+        maximum: criterionCount - 1,
+      },
+      consumerIndices: { type: "array", maxItems: 0 },
+    },
+  };
   return {
     type: "object",
     additionalProperties: false,
@@ -122,35 +206,9 @@ export function workHandoffSchema(peerCount: number): Record<string, unknown> {
     properties: {
       notes: {
         type: "array",
-        maxItems: 16,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["kind", "summary", "paths", "consumerIndices"],
-          properties: {
-            kind: {
-              type: "string",
-              enum: ["interface", "pitfall", "hypothesis"],
-            },
-            summary: { type: "string", minLength: 1, maxLength: 1024 },
-            paths: {
-              type: "array",
-              maxItems: 8,
-              uniqueItems: true,
-              items: { type: "string", minLength: 1, maxLength: 512 },
-            },
-            consumerIndices: {
-              type: "array",
-              maxItems: peerCount === 0 ? 0 : 16,
-              uniqueItems: true,
-              items: {
-                type: "integer",
-                minimum: 0,
-                ...(peerCount > 0 ? { maximum: peerCount - 1 } : {}),
-              },
-            },
-          },
-        },
+        maxItems: LEARNING_LIMIT.notes + criterionCount,
+        items:
+          criterionCount > 0 ? { oneOf: [learning, verification] } : learning,
       },
     },
   };
@@ -160,6 +218,7 @@ export function workHandoffSchema(peerCount: number): Record<string, unknown> {
 export function decodeWorkHandoffNotes(
   value: unknown,
   peers: readonly { id: string; title: string }[] = [],
+  criterionCount?: number,
 ): WorkHandoffNote[] {
   if (
     !peers.every(
@@ -180,19 +239,39 @@ export function decodeWorkHandoffNotes(
     Array.isArray(declaration) ||
     Object.keys(declaration).some((key) => key !== "notes") ||
     !Array.isArray(declaration.notes) ||
-    declaration.notes.length > 16
+    (criterionCount !== undefined &&
+      declaration.notes.length > LEARNING_LIMIT.notes + criterionCount)
   )
-    throw new Error("Handoff must be an object with at most 16 notes");
+    throw new Error(
+      `Handoff must be an object with at most ${LEARNING_LIMIT.notes} learning notes and one verification note per criterion`,
+    );
   const notes = declaration.notes.map((raw) => {
     if (
       !raw ||
       typeof raw !== "object" ||
       Array.isArray(raw) ||
       Object.keys(raw).some(
-        (key) => !["kind", "summary", "paths", "consumerIndices"].includes(key),
+        (key) =>
+          ![
+            "kind",
+            "summary",
+            "paths",
+            "consumerIndices",
+            "criterionIndex",
+          ].includes(key),
       )
     )
       throw new Error("Handoff note differs from the indexed declaration");
+    const criterionIndex = (raw as { criterionIndex?: unknown }).criterionIndex;
+    if (
+      criterionIndex !== undefined &&
+      (!Number.isSafeInteger(criterionIndex) ||
+        (criterionCount !== undefined &&
+          (criterionIndex as number) >= criterionCount))
+    )
+      throw new Error(
+        "Handoff verification note names a criterion absent from this Work Item",
+      );
     const note = raw as Record<string, unknown>,
       indices = note.consumerIndices;
     if (
@@ -212,6 +291,7 @@ export function decodeWorkHandoffNotes(
       summary: note.summary,
       paths: note.paths,
       consumers: indices.map((index) => peers[index]!.id),
+      ...(criterionIndex === undefined ? {} : { criterionIndex }),
     };
   });
   return parseWorkHandoffNotes({ notes });
@@ -331,6 +411,13 @@ export function assertObjectiveKnowledge(
         (id) => !knownGraph?.items.some((peer) => peer.id === id),
       ),
     ) ||
+    record.notes.some(
+      (note) =>
+        note.criterionIndex !== undefined &&
+        note.criterionIndex >=
+          (knownGraph?.items.find((peer) => peer.id === itemId)?.acceptance
+            .length ?? 0),
+    ) ||
     !contentRef(record.recordRef) ||
     record.recordRef.mediaType !== "application/json" ||
     record.recordRef.digest !== digest(body(record)) ||
@@ -441,6 +528,13 @@ export function objectiveKnowledgeView(
     assertObjectiveKnowledge(state, peer.id);
     const record = work.knowledge;
     for (const note of record.notes) {
+      // A verification map indexes its own item's review, not other workers.
+      if (
+        note.kind === "verification" &&
+        !ownClaim &&
+        !options?.objectiveReview
+      )
+        continue;
       if (
         !options?.objectiveReview &&
         !ownClaim &&
@@ -495,6 +589,9 @@ export function objectiveKnowledgeView(
           : "settled-result-claims-without-inherited-verdict",
         authority: "advisory-agent-claim",
         kind: note.kind,
+        ...(note.criterionIndex === undefined
+          ? {}
+          : { criterionIndex: note.criterionIndex }),
         summary: note.summary,
         sources,
       };
