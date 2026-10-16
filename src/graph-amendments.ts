@@ -79,6 +79,7 @@ import {
   attachFault,
   cancelledFault,
   decision,
+  plannerDecisionOf,
   StepFault,
   transient,
 } from "./fault.js";
@@ -135,8 +136,21 @@ export interface PendingAmendment {
   reviewRejectedResponses?: Awaited<ReturnType<PlanningModel["reviewGraph"]>>[];
   reviewDigest?: string;
   issueByItemId: Record<string, number>;
+  /**
+   * Questions the planner asked about this amendment (#1296), oldest first.
+   * The last one, while unanswered, holds the amendment at its phase; answers
+   * reach the next compilation as operator findings.
+   */
+  decisions?: {
+    question: string;
+    answer?: { actor: string; answer: string; reason: string };
+    /** The completed compilation that asked, retained as its original. */
+    invocation?: PendingAmendment["planningInvocation"];
+  }[];
   error?: string;
+  /** `decision`: the operator refused it at the planner's question (#1296). */
   rejectionStage?:
+    | "decision"
     | "compilation"
     | "validation"
     | "review"
@@ -250,6 +264,7 @@ export function assertGraphRevisions(state: FactoryState): void {
       ...(original.planningInvocation?.nativeReturns ?? []),
       ...(original.reviewInvocation?.nativeReturns ?? []),
       ...(original.reviewRejectedNativeReturns ?? []),
+      ...amendmentDecisionReturns(original),
     ]) {
       if (
         ![17, 19].includes(state.schemaVersion) ||
@@ -354,6 +369,7 @@ export function assertGraphRevisions(state: FactoryState): void {
         !/^[a-f0-9]{64}$/.test(pending.reviewDigest)) ||
       (pending.rejectionStage !== undefined &&
         ![
+          "decision",
           "compilation",
           "validation",
           "review",
@@ -369,6 +385,26 @@ export function assertGraphRevisions(state: FactoryState): void {
       !pending.graph
     )
       throw new Error("Pending amendment lacks candidate graph");
+    const decisions = pending.decisions;
+    if (
+      decisions !== undefined &&
+      (!Array.isArray(decisions) ||
+        !decisions.length ||
+        decisions.some(
+          (entry, index) =>
+            !entry ||
+            typeof entry.question !== "string" ||
+            !entry.question.trim() ||
+            (entry.answer === undefined
+              ? index !== decisions.length - 1
+              : ![
+                  entry.answer.actor,
+                  entry.answer.answer,
+                  entry.answer.reason,
+                ].every((text) => typeof text === "string" && text.trim())),
+        ))
+    )
+      throw new Error("Pending amendment has invalid operator decisions");
   }
   for (const proposal of [
     ...(state.graphRevisions ?? []).flatMap((revision) =>
@@ -398,13 +434,14 @@ export function assertGraphRevisions(state: FactoryState): void {
         "Amendment replacement lost its diagnosed rejection binding",
       );
   }
-  // Each started amendment was charged once, by its own id.
+  // Each started amendment was charged once, by its own id. One the operator
+  // refused at its question gave its charge back (#1296).
   const started = [
     ...(state.rejectedAmendments ?? []),
     ...(pending && !["ready", "backlog"].includes(pending.phase)
       ? [pending]
       : []),
-  ];
+  ].filter((entry) => entry.rejectionStage !== "decision");
   const charged = Object.keys(state.charges ?? {}).filter((event) =>
     event.startsWith(objectiveEvent("amend", "")),
   ).length;
@@ -836,6 +873,81 @@ export function validateAmendment(
   }
 }
 
+/** The pending amendment's result was refused; the operator submits a replacement. */
+export class AmendmentRejection extends Error {
+  override readonly name = "AmendmentRejection";
+}
+
+/** The rejected amendment's wait for the operator's replacement. */
+function rejectionWait(pending: PendingAmendment): Error {
+  return attachFault(
+    new AmendmentRejection(pending.error ?? "Amendment rejected"),
+    {
+      kind: "work",
+      evidence: { detail: pending.error || "Amendment rejected" },
+    },
+  );
+}
+
+/** Native originals the planner's question-asking compilations retained. */
+export function amendmentDecisionReturns(original: object): ContentRef[] {
+  const decisions =
+    "decisions" in original
+      ? (original as PendingAmendment).decisions
+      : undefined;
+  return (decisions ?? []).flatMap(
+    (entry) => entry.invocation?.nativeReturns ?? [],
+  );
+}
+
+/** The operator's question about the pending amendment and how to answer it. */
+function amendmentQuestion(state: FactoryState, question: string): string {
+  return `${question} Answer with factory decide --objective ${state.objective} --outcome accept --answer "..." --reason "...", or refuse the amendment with --outcome refuse --reason "...".`;
+}
+
+/**
+ * `factory decide` for the pending amendment's open question (#1296). Accept
+ * records the answer, and the next run compiles the amendment with it; refuse
+ * rejects the amendment and gives back its planning revision, so a corrected
+ * replacement stays possible. The caller holds the mutation lock and saves.
+ */
+export function decideAmendment(
+  state: FactoryState,
+  input: {
+    actor: string;
+    outcome: "accept" | "refuse";
+    answer?: string;
+    reason: string;
+  },
+): void {
+  const pending = state.pendingAmendment;
+  const open = pending?.decisions?.at(-1);
+  if (!pending || pending.phase === "rejected" || !open || open.answer)
+    throw new Error("No amendment decision is pending");
+  if (!input.actor.trim() || !input.reason.trim())
+    throw new Error("An amendment decision needs actor and reason");
+  if (input.outcome === "accept") {
+    if (!input.answer?.trim())
+      throw new Error("Accepting an amendment decision requires --answer");
+    open.answer = {
+      actor: input.actor,
+      answer: input.answer,
+      reason: input.reason,
+    };
+  } else {
+    pending.phase = "rejected";
+    pending.rejectionStage = "decision";
+    pending.error = `The operator refused the amendment: ${input.reason}`;
+    releaseCharge(state, amendmentEvent(pending), "planningRevisions");
+    if (state.coordinator) {
+      state.coordinator.mode = "paused";
+      state.coordinator.waitReason = pending.error;
+    }
+    refreshBlameDecisions(state, graphDigest(state.graph));
+  }
+  clearRepeats(state, "objective");
+}
+
 /**
  * Advance the pending amendment as the Objective's `amend` step: its compile
  * and review are paid calls, and a call that ended without a completed
@@ -856,6 +968,21 @@ export function applyPendingAmendment(
         args.state.pendingAmendment.phase === "backlog"
       )
         return false;
+      // An unanswered planner question holds the amendment: asking again
+      // needs no planner admission, charge or model call (#1296).
+      const open = args.state.pendingAmendment.decisions?.at(-1);
+      if (
+        open &&
+        !open.answer &&
+        args.state.pendingAmendment.phase !== "rejected"
+      )
+        throw new StepFault(
+          decision(amendmentQuestion(args.state, open.question)),
+        );
+      // A rejected amendment still waits for the operator's replacement: a
+      // blind rerun names that wait again instead of failing the run.
+      if (args.state.pendingAmendment.phase === "rejected")
+        throw rejectionWait(args.state.pendingAmendment);
       let workflowRecipe: WorkflowRecipeInput | undefined;
       if (args.state.workflowRecipePin) {
         try {
@@ -998,6 +1125,7 @@ async function advanceAmendment(args: {
   const { state, config, save } = args;
   const pending = state.pendingAmendment;
   if (!pending || pending.phase === "backlog") return false;
+
   if (
     Object.values(state.work).some(
       (work) => work.status === "running" || work.status === "published",
@@ -1005,6 +1133,7 @@ async function advanceAmendment(args: {
     state.coordinator?.processes?.length
   )
     return false;
+  if (pending.phase === "rejected") throw rejectionWait(pending);
   if (!["ready", "compiled", "reviewed", "projected"].includes(pending.phase))
     throw new Error(
       `Amendment ${pending.phase} cannot be replayed; inspect preserved evidence`,
@@ -1247,7 +1376,11 @@ async function advanceAmendment(args: {
             reviewGraph: (request) => args.model.reviewGraph(request),
           },
           [],
-          [],
+          (pending.decisions ?? []).map((entry) => ({
+            source: "operator" as const,
+            question: entry.question,
+            detail: `${entry.answer!.answer} (${entry.answer!.reason})`,
+          })),
           {
             ...amendmentNativeHooks(
               args,
@@ -1569,10 +1702,33 @@ async function advanceAmendment(args: {
     // configuration fix, and stops on cancellation or a defect.
     // A compiled graph that fails Factory's checks is an answered,
     // refused result even before it carries a fault.
+    // The planner asked the operator (#1296): the amendment waits at its
+    // compilation for the answer, with no rejection and no new charge.
+    const asked = plannerDecisionOf(error);
+    if (asked && !pending.proposal.graph) {
+      pending.decisions = [
+        ...(pending.decisions ?? []),
+        {
+          question: asked.question,
+          ...(pending.planningInvocation && {
+            invocation: structuredClone(pending.planningInvocation),
+          }),
+        },
+      ];
+      delete pending.planningInvocation;
+      delete pending.graph;
+      pending.phase = "ready";
+      save();
+      throw new StepFault(decision(amendmentQuestion(state, asked.question)), {
+        cause: error,
+      });
+    }
     const fault = attachedFault(error);
     const refusedResult =
       fault?.kind === "work" ||
-      (!fault && calling === "compile" && compilationResponseObserved);
+      (!fault && calling === "compile" && compilationResponseObserved) ||
+      // An operator-supplied graph cannot take an answer: it is refused.
+      !!asked;
     if (!refusedResult) throw error;
     pending.rejectionStage = stage;
     pending.phase = "rejected";
@@ -1585,7 +1741,7 @@ async function advanceAmendment(args: {
     refreshBlameDecisions(state, graphDigest(state.graph));
     save();
     // The amendment's result is refused, whatever the call reported.
-    throw attachFault(new Error(pending.error, { cause: error }), {
+    throw attachFault(new AmendmentRejection(pending.error, { cause: error }), {
       kind: "work",
       evidence: { detail: pending.error || "Amendment rejected" },
     });
