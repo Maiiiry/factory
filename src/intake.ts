@@ -144,7 +144,9 @@ export interface IntakeAuthorization {
   };
 }
 export const DEFAULT_QUEUE_POLL_SECONDS = 30;
-export const QUEUE_COMMAND_TIMEOUT_MS = 60_000;
+export const QUEUE_COMMAND_TIMEOUT_MS = 180_000;
+/** The archive holds this installation's publication; only the operator can resolve it. */
+export class ColdPublicationHeld extends Error {}
 const commandScopes = new AsyncLocalStorage<{
   deadlineAt: number;
   onAcknowledgment?: (value: unknown) => void;
@@ -1790,6 +1792,27 @@ async function runIntakeOwned(
     assertRestoredInstallationDispatchReady(config);
     // Cold preparation owns the existing lease and exposes no readiness or
     // dispatch until the controller's remote-only verifier is authenticated.
+    // Queue receipts are read only from the authenticated archive. This
+    // installation's own unacknowledged changes complete first, as before any
+    // queue command's read: a queue command whose deadline cut off its final
+    // checkpoint (durability-pending), or a submitted attempt not yet
+    // acknowledged, is reconciled and published before the tip check and the
+    // queue observation (#1298). A held archive needs the operator.
+    try {
+      await awaitCheckpointAdmission(config.repository, "before-effect");
+    } catch (error) {
+      const message = `Cold controller cannot publish this installation's pending checkpoint: ${error instanceof Error ? error.message : String(error)}`;
+      if (
+        ["conflict", "needs-restore"].includes(
+          gitPersistenceStatus(config).status,
+        )
+      )
+        throw new ColdPublicationHeld(
+          `${message}; inspect factory persistence status and restore or reconcile the archive before starting the service`,
+          { cause: error },
+        );
+      throw new Error(message, { cause: error });
+    }
     // An installation without an acknowledged archive keeps its initial path.
     const persistence = gitPersistenceStatus(config);
     const acknowledged = persistence.lastAcknowledged;
