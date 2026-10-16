@@ -50,6 +50,11 @@ import {
   type FactoryConfig,
 } from "./config.js";
 import {
+  ARCHIVED_EVIDENCE,
+  recordRetirement,
+  terminalContinuation,
+} from "./checkpoint-retention.js";
+import {
   assertApprovedPlaybookPin,
   assertPlanningExecutionBounds,
 } from "./contracts.js";
@@ -1115,7 +1120,12 @@ export async function restoreRecoveryCheckpoint(args: {
       return data;
     };
     const replicaFiles: typeof checkpoint.manifest.files = [];
-    const originals: { state: ContinuationState; ref: ContentRef }[] = [];
+    const originals: {
+      state: ContinuationState;
+      ref: ContentRef;
+      /** The evidence commit of a retired terminal Objective. */
+      retired: string | undefined;
+    }[] = [];
     const gitObjects = new Map<string, { sha: string; kind: string }>();
     for (const file of checkpoint.manifest.files) {
       if (file.kind === "continuation") {
@@ -1131,17 +1141,31 @@ export async function restoreRecoveryCheckpoint(args: {
           config.repository,
           Number(match[1]),
         );
-        const closure = await verifyContinuationReferenceClosure(
-          state,
-          { readBytes },
-          config.gitPersistence,
-        );
-        if (closure.gaps.some((gap) => gap.required !== false))
-          throw new Error(
-            "Recovery continuation has an unresolved required original",
+        // A retired terminal Objective keeps only its snapshot; its evidence
+        // is in the archive history at the recorded commit (#1307).
+        const archived = terminalContinuation(state)
+          ? checkpoint.manifest.gaps.find(
+              (gap) =>
+                gap.path === file.path &&
+                gap.availability === ARCHIVED_EVIDENCE &&
+                gap.required === false &&
+                typeof gap.evidenceCommit === "string",
+            )
+          : undefined;
+        const retired = archived?.evidenceCommit;
+        if (!retired) {
+          const closure = await verifyContinuationReferenceClosure(
+            state,
+            { readBytes },
+            config.gitPersistence,
           );
-        for (const object of closure.gitObjects)
-          gitObjects.set(`${object.kind}:${object.sha}`, object);
+          if (closure.gaps.some((gap) => gap.required !== false))
+            throw new Error(
+              "Recovery continuation has an unresolved required original",
+            );
+          for (const object of closure.gitObjects)
+            gitObjects.set(`${object.kind}:${object.sha}`, object);
+        }
         const current = readContinuation(config.repository, state.objective);
         if (
           current &&
@@ -1163,7 +1187,7 @@ export async function restoreRecoveryCheckpoint(args: {
               "Restored continuation changed after installation; preserve its exact local history",
             );
         }
-        originals.push({ state, ref: file.ref });
+        originals.push({ state, ref: file.ref, retired });
       } else if (file.path.startsWith("accounting/")) {
         decodeAccountingRecord(
           config.repository,
@@ -1348,7 +1372,7 @@ export async function restoreRecoveryCheckpoint(args: {
       disposition: "held";
       reason: string;
     }[] = [];
-    for (const { state, ref } of originals) {
+    for (const { state, ref, retired } of originals) {
       const previous = readContinuation(
         config.repository,
         state.objective,
@@ -1412,6 +1436,16 @@ export async function restoreRecoveryCheckpoint(args: {
       saveState(statePath(config.repository, state.objective), state, {
         observeMemory: false,
       });
+      // Its evidence stays in the archive history; this installation keeps
+      // only the snapshot, as the source did (#1307).
+      if (retired)
+        recordRetirement(
+          config.repository,
+          state.objective,
+          readFileSync(statePath(config.repository, state.objective)),
+          retired,
+          [],
+        );
       objectives.push({
         objective: state.objective,
         runId: state.runId,

@@ -841,8 +841,14 @@ function retainedPayload(
   store.readBytes(payload);
   return payload;
 }
+/**
+ * Accounting originals for the recovery checkpoint. `archived` names the exact
+ * digest-named originals that retired Objectives' evidence commits hold; only
+ * those stay out (#1307).
+ */
 export function accountingPersistenceClosure(
   repository: string,
+  archived: ReadonlySet<string> = new Set(),
 ): RecoveryCheckpointClosure {
   for (const pending of [...failed.values()])
     if (pending.record.binding.repository === repository) {
@@ -919,6 +925,15 @@ export function accountingPersistenceClosure(
   }[] = [];
   for (const entry of originals) {
     const source = "source" in entry ? entry.source : undefined;
+    if (
+      archived.size &&
+      archived.has(
+        source
+          ? `accounting/${basename(source.path)}`
+          : `accounting/${digest((entry as { original: { bytes: Buffer } }).original.bytes)}.json`,
+      )
+    )
+      continue;
     const signature =
       source && JSON.stringify(["accounting-original", repository, source]);
     const cached = signature
