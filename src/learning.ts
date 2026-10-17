@@ -228,6 +228,41 @@ function append(path: string, text: string, repository?: string): void {
     });
 }
 
+/**
+ * The terminal state a snapshot record names, read from the content store
+ * (which verifies its exact bytes). A legacy snapshot is the state itself.
+ */
+function snapshotState(
+  store: LocalContentStore,
+  raw: string,
+): { stateRef?: ContentRef; state: Record<string, unknown> } {
+  const value = record(JSON.parse(raw));
+  const stateRef = snapshotStateRef(value);
+  if (!stateRef) return { state: value };
+  return {
+    stateRef,
+    state: record(JSON.parse(store.readBytes(stateRef).toString("utf8"))),
+  };
+}
+
+/** A decoded snapshot original's state reference; undefined for a legacy inline state. */
+export function snapshotStateRef(
+  value: Record<string, unknown>,
+): ContentRef | undefined {
+  if (value.stateRef === undefined) return undefined;
+  const ref = record(value.stateRef);
+  if (
+    Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
+    typeof ref.digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(ref.digest) ||
+    !Number.isSafeInteger(ref.bytes) ||
+    Number(ref.bytes) < 0 ||
+    ref.mediaType !== "application/json"
+  )
+    throw new Error("Invalid learning snapshot state reference");
+  return ref as unknown as ContentRef;
+}
+
 function encoded(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -347,9 +382,11 @@ export function retainLearningMemory(
       const snapshot = privateRead(snapshotPath);
       if (learningDigest(snapshot) !== episode.snapshotDigest)
         throw new Error("Retrospective memory snapshot changed");
-      snapshotRef = store.putBytes(Buffer.from(snapshot), {
-        mediaType: "application/json",
-      });
+      snapshotRef =
+        snapshotState(store, snapshot).stateRef ??
+        store.putBytes(Buffer.from(snapshot), {
+          mediaType: "application/json",
+        });
       bodies.push({
         role: "original-snapshot",
         ref: snapshotRef,
@@ -489,8 +526,20 @@ export function recordRetrospective(
     directory(config.repository, "snapshots"),
     `${id}.json`,
   );
-  if (!existsSync(snapshot)) append(snapshot, raw, config.repository);
-  else if (privateRead(snapshot) !== raw)
+  // The terminal state is retained by reference in the content store; the
+  // snapshot record names it, so the original is never copied by value.
+  const snapshotRecord = encoded({
+    schemaVersion: 1,
+    repository: config.repository,
+    objective,
+    runId: state.runId,
+    stateRef: new LocalContentStore(
+      join(stateRoot(config.repository), "content"),
+    ).putBytes(Buffer.from(raw), { mediaType: "application/json" }),
+  });
+  if (!existsSync(snapshot))
+    append(snapshot, snapshotRecord, config.repository);
+  else if (privateRead(snapshot) !== snapshotRecord)
     throw new Error(
       "Retrospective snapshot identity already exists with other bytes",
     );
@@ -543,7 +592,7 @@ export function recordRetrospective(
       ? (state.objectiveClosure ?? "unobserved")
       : "unobserved",
     sourceLinks: [...new Set(links)],
-    snapshotDigest: learningDigest(raw),
+    snapshotDigest: learningDigest(snapshotRecord),
     experiences: {
       items: experiences,
       planning: state.planningRecovery ?? null,
@@ -1086,6 +1135,7 @@ export function decodeLearningOriginal(
       learningDigest(JSON.stringify([repository, value.objective, value.runId]))
     )
       throw new Error("Learning original producer identity changed");
+    if (kind === "snapshots") snapshotStateRef(value);
     if (kind === "episodes") {
       hash(value.snapshotDigest);
       if (!["accepted", "cancelled"].includes(String(value.outcome)))
@@ -2012,14 +2062,15 @@ export async function prepareDreamInput(
         continue;
       }
       const supporting: ContentRef[] = [];
-      const snapshot = JSON.parse(
+      const snapshot = snapshotState(
+        store,
         privateRead(
           join(
             directory(config.repository, "snapshots"),
             `${source.episodeId}.json`,
           ),
         ),
-      ) as {
+      ).state as {
         workflowReflection?: {
           records?: import("./workflow-reflection.js").WorkflowReflectionRecord[];
         };
