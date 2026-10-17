@@ -2,7 +2,8 @@ import { ownsPath } from "./ownership.js";
 import { isDeepStrictEqual } from "node:util";
 import { isScalar, parseDocument, visit } from "yaml";
 import type { WorkGraph } from "./contracts.js";
-import { markdownLines } from "./markdown.js";
+import { resolveWorkItemSources } from "./compiler/sources.js";
+import { githubEmptyField, markdownLines } from "./markdown.js";
 import { pinnedGit, pinnedGitRaw } from "./process.js";
 
 const heading = "workspace package additions";
@@ -27,8 +28,7 @@ export function workspacePackageAdditions(body: string): string[] {
   for (const line of lines.slice(start + 1)) {
     if (line.heading && line.heading.level <= level) break;
     if (!line.text.trim()) continue;
-    // GitHub renders an unanswered optional form field this way.
-    if (!line.fenced && line.text.trim() === "_No response_") {
+    if (githubEmptyField(line)) {
       noResponse = true;
       continue;
     }
@@ -229,9 +229,11 @@ export function validateWorkspacePackagePlan(
       !owners.some(
         (item) =>
           (item.brief.includes(entry) ||
-            item.inputSources?.some((source) =>
-              source.content.includes(entry),
-            )) &&
+            resolveWorkItemSources(item.inputSources ?? [], {
+              checkout,
+              baseSha: graph.baseSha,
+              objectiveBody: body,
+            }).some((source) => source.content.includes(entry))) &&
           ownsPath(manifest, item.ownedPaths),
       )
     )

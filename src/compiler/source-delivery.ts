@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { PlanningRequest } from "../contracts.js";
+import { REPOSITORY_DIRECTORY } from "./repository-tree.js";
 
 type Sources = PlanningRequest<unknown>["sources"];
 
@@ -23,7 +24,8 @@ export interface PlanningSourceDelivery {
     encoding: "utf-8";
     bytes: number;
     digest: string;
-    lineCount: number;
+    /** Planner deliveries count lines; worker deliveries derive from references alone. */
+    lineCount?: number;
     complete: true;
   }[];
   reusedSourceIndices: number[];
@@ -143,7 +145,12 @@ export function materializePlanningSources(
     sources.map(({ content }) => `${digest(content)}.txt`),
   );
   if (
-    readdirSync(root).some((entry) => entry !== "pinned") ||
+    readdirSync(root).some(
+      (entry) =>
+        entry !== "pinned" &&
+        entry !== REPOSITORY_DIRECTORY &&
+        entry !== `${REPOSITORY_DIRECTORY}.partial`,
+    ) ||
     readdirSync(pinned).some((entry) => !expectedFiles.has(entry))
   )
     throw new Error("Planning source directory contains noncanonical data");
