@@ -36,6 +36,7 @@ import { LocalContentStore } from "./content/local.js";
 import { DiagnosticEmitter } from "./diagnostics.js";
 import { secrets } from "./learning.js";
 import {
+  acknowledgedArchiveOriginal,
   awaitCheckpointAdmission,
   markCheckpointDirty,
   synchronizeRecoveryCheckpoint,
@@ -199,6 +200,55 @@ function fields(
     )
   )
     throw new Error("Unsupported proposal original fields");
+}
+/**
+ * The journal's references, or undefined for one whose shape this version
+ * does not decode, with no submission pending, whose exact bytes the
+ * acknowledged archive already holds: history an earlier version wrote,
+ * which this version never reads or acts on (#1457). Its originals stay in
+ * that archive history. A live journal this version wrote always decodes, a
+ * changed one is not the archived bytes, and a missing or changed original
+ * is a read failure, not a shape: each still fails loudly.
+ */
+function retainedProposalReferences(
+  config: FactoryConfig,
+  name: string,
+  bytes: Uint8Array,
+  store: LocalContentStore,
+): ReturnType<typeof proposalPersistenceReferences> | undefined {
+  const read = originalReader((ref) => store.readBytes(ref));
+  try {
+    return proposalPersistenceReferences(bytes, config.repository, name, read);
+  } catch (error) {
+    if (
+      !read.failed &&
+      noPendingSubmission(bytes) &&
+      acknowledgedArchiveOriginal(config, `proposals/${name}.json`, bytes)
+    )
+      return undefined;
+    throw error;
+  }
+}
+/** A reader that records whether any original read failed. */
+export function originalReader(
+  readBytes: (ref: ContentRef) => Uint8Array,
+): ((ref: ContentRef) => Uint8Array) & { failed: boolean } {
+  const read = Object.assign(
+    (ref: ContentRef) => {
+      try {
+        return readBytes(ref);
+      } catch (error) {
+        read.failed = true;
+        throw error;
+      }
+    },
+    { failed: false },
+  );
+  return read;
+}
+/** A journal with no submission pending, read without decoding its shape. */
+export function noPendingSubmission(bytes: Uint8Array): boolean {
+  return record(jsonOriginal(bytes), "journal").pending === undefined;
 }
 function jsonOriginal(bytes: Uint8Array): unknown {
   const value = new TextDecoder("utf-8", {
@@ -711,12 +761,6 @@ export function proposalPersistenceClosure(
         .sort()
     : []) {
     const bytes = privateOriginal(join(directory, name));
-    const description = proposalPersistenceReferences(
-      bytes,
-      config.repository,
-      name.slice(0, -5),
-      (ref) => store.readBytes(ref),
-    );
     const ref = store.putBytes(bytes, { mediaType: "application/json" });
     closure.files.push({
       kind: "historical",
@@ -724,7 +768,15 @@ export function proposalPersistenceClosure(
       ref,
       visibility: "private",
     });
-    closure.contentRefs.push(ref, ...description.contentRefs);
+    closure.contentRefs.push(ref);
+    const description = retainedProposalReferences(
+      config,
+      name.slice(0, -5),
+      bytes,
+      store,
+    );
+    if (!description) continue;
+    closure.contentRefs.push(...description.contentRefs);
     closure.gitObjects!.push({
       commitSha: description.baseSha,
       role: "proposal-source",
@@ -966,9 +1018,12 @@ export function refuseUnknownProviderSubmissions(repository: string): void {
   for (const name of readdirSync(directory).filter((name) =>
     /^[0-9a-f-]{36}\.json$/.test(name),
   )) {
-    const path = join(directory, name);
+    const bytes = privateOriginal(join(directory, name));
+    // Only a pending submission can be unknown; a journal without one, which
+    // may be in an earlier version's shape, is not read (#1457).
+    if (noPendingSubmission(bytes)) continue;
     const retained = proposalPersistenceReferences(
-      privateOriginal(path),
+      bytes,
       repository,
       name.slice(0, -5),
       (ref) => store.readBytes(ref),
