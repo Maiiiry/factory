@@ -45,6 +45,7 @@ import { assertKnownCheckNames, workflowCheckNames } from "../check-names.js";
 import { validateAndOrderGraph } from "../scheduler.js";
 import { assertCoverageSources, coverageObligations } from "../qa.js";
 import { assertGraphExpansions } from "../graph-expansion.js";
+import { verifySplitGraph } from "./split.js";
 
 export interface PlanCandidate {
   workflowRecipe?: WorkflowRecipeInput;
@@ -64,6 +65,11 @@ export interface PlanCandidate {
   controllerCapabilitiesDigest: string;
   graph: WorkGraph;
   graphDigest: string;
+  /**
+   * A ready child Objective's graph, reviewed with its parent's split rather
+   * than by its own graph review. The bytes still verify against the child.
+   */
+  adoptedFrom?: { objective: number; key: string; reviewDigest: string };
   commands: PlanCommandAuthorization[];
   finalCommands: string[];
   /** Digest of the complete immutable packet supplied to independent review. */
@@ -317,24 +323,50 @@ export function verifyPlanCandidate(
     );
   assertPreIntegrationCheckSources(candidate.graph, expectedSources);
   assertKnownCheckNames(candidate.graph, workflowCheckNames(checkout, baseSha));
-  // Verify already reviewed bytes, including historical aggregate acceptance.
-  // New compilation and amendments enforce controller derivation before review.
-  validateAndOrderGraph(
+  if (candidate.graph.split) {
+    verifySplitGraph(candidate.graph, objective, body, baseSha, checkout);
+    return;
+  }
+  verifyReviewedGraph(
     candidate.graph,
     objective,
     baseSha,
-    new Set(candidate.sourceDigests.map((source) => source.path)),
+    expectedSources,
+    body,
+    candidate.finalCommands,
+    checkout,
+  );
+}
+
+/**
+ * Verify already reviewed bytes, including historical aggregate acceptance.
+ * New compilation and amendments enforce controller derivation before review.
+ */
+export function verifyReviewedGraph(
+  graph: WorkGraph,
+  objective: number,
+  baseSha: string,
+  sources: ReturnType<typeof planningSources>,
+  body: string,
+  finalCommands: string[],
+  checkout: string,
+): void {
+  validateAndOrderGraph(
+    graph,
+    objective,
+    baseSha,
+    new Set(sources.map((source) => source.path)),
   );
   assertCoverageSources(
-    candidate.graph,
-    expectedSources,
+    graph,
+    sources,
     coverageObligations(body, objectiveCriteria(body)),
-    candidate.finalCommands,
+    finalCommands,
     commandAuthority(body),
   );
-  validateCitations(candidate.graph, expectedSources, checkout);
-  assertWorkerInputSources(candidate.graph, expectedSources, checkout);
-  validateCommandProvenance(candidate.graph, expectedSources, checkout);
+  validateCitations(graph, sources, checkout);
+  assertWorkerInputSources(graph, sources, checkout);
+  validateCommandProvenance(graph, sources, checkout);
 }
 
 /** Bind a specific human fallback to the exact reviewed plan packet. */

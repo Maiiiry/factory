@@ -36,6 +36,8 @@ import {
   projectQueueReceiptTarget,
 } from "./github-project-queue.js";
 import { planningPrerequisites } from "./objective-prerequisites.js";
+import { expandSplitPredecessors, splitSettled } from "./objective-split.js";
+import { settleSplitParent, splitReadyToClose } from "./runner/split.js";
 import {
   currentProcessSignal,
   currentProcessDeadlineAt,
@@ -101,6 +103,7 @@ import {
   queuedObjectiveConfig,
 } from "./supervision.js";
 import {
+  acquireControllerLock,
   acquireInstallationLock,
   asInstallationOwner,
   assertRestoredInstallationDispatchReady,
@@ -359,7 +362,9 @@ function terminal(state: ContinuationState | undefined): boolean {
   return (
     !!state &&
     (!!state.cancelledAt ||
-      (isExecutionState(state) && objectiveComplete(state)))
+      (isExecutionState(state) && objectiveComplete(state)) ||
+      // A split parent's run is over; its children carry the work.
+      splitSettled(state))
   );
 }
 export async function intakeSettled(config: FactoryConfig): Promise<boolean> {
@@ -1002,6 +1007,41 @@ async function enqueueIntakeCommand(
   return locked(config, () =>
     enqueueOwned(config, github, objectives, options),
   );
+}
+/**
+ * A foreground run admits its reviewed split's children itself: while it
+ * owns its Objective no installation controller can hold the queue, so it
+ * uses the same owned admission a controller's queue command would.
+ */
+export async function admitChildObjectives(
+  config: FactoryConfig,
+  github: GitHubGateway,
+  objectives: number[],
+  expectedBodyDigests: Record<string, string>,
+): Promise<void> {
+  // Foreground owners of different Objectives can run side by side, so their
+  // admissions take turns: each allocates queue order from the same history.
+  const path = join(stateRoot(config.repository), "child-admission.lock");
+  let lock: ReturnType<typeof acquireControllerLock> | undefined;
+  for (let waited = 0; !lock; waited += 1) {
+    try {
+      lock = acquireControllerLock(path, objectives[0]!, {
+        owned: "a child Objective admission",
+      });
+    } catch (error) {
+      if (waited >= 120) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  try {
+    await queueOperation(config, () =>
+      scoped(config, () =>
+        enqueueOwned(config, github, objectives, { expectedBodyDigests }),
+      ),
+    );
+  } finally {
+    releaseControllerLock(path, lock);
+  }
 }
 export async function ensureProjectObjective(
   config: FactoryConfig,
@@ -1951,7 +1991,24 @@ async function runIntakeOwned(
           (entry) => entry.state === "queued",
         )) {
           const state = readContinuation(config.repository, entry.objective);
-          if (terminal(state)) continue;
+          if (terminal(state)) {
+            // A split parent whose last child settle failed closes here; it
+            // needs only local state and the parent's own provider.
+            if (splitReadyToClose(config.repository, state))
+              try {
+                const runtime = objectiveRuntime(entry.objective);
+                await settleSplitParent({
+                  config: runtime.config,
+                  github: runtime.services.github,
+                  parent: entry.objective,
+                  lockParent: false,
+                });
+              } catch (error) {
+                reasons[entry.objective] =
+                  `Closing the split Objective failed: ${error instanceof Error ? error.message : String(error)}`;
+              }
+            continue;
+          }
           const card = observed.snapshot.cards.find(
             (candidate) => candidate.objective === entry.objective,
           )!;
@@ -1972,8 +2029,9 @@ async function runIntakeOwned(
             if (!state) {
               if (!services.github.objectiveDependencies)
                 throw new Error("Native dependency observation unavailable");
-              const predecessors = await services.github.objectiveDependencies(
-                entry.objective,
+              const predecessors = expandSplitPredecessors(
+                config.repository,
+                await services.github.objectiveDependencies(entry.objective),
               );
               const missing = predecessors.find((id) => {
                 const before = readContinuation(config.repository, id);
@@ -2025,6 +2083,12 @@ async function runIntakeOwned(
               selected,
               objectiveServices,
               {
+                // Children of a split are admitted through this controller's
+                // own authenticated queue command path.
+                admitChildObjectives: (objectives, expectedBodyDigests) =>
+                  enqueueIntake(config, services.github, objectives, {
+                    expectedBodyDigests,
+                  }).then(() => undefined),
                 ownerLock: lock,
                 observeControl: async (handler) => {
                   objectiveControl = handler;

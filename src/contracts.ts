@@ -236,6 +236,11 @@ export interface WorkGraph {
   objective: number;
   baseSha: string;
   items: WorkItem[];
+  /**
+   * Child Objectives instead of this Objective's own Work Items: items and
+   * coverage are then empty, and each ready child carries its own graph.
+   */
+  split?: { children: import("./objective-split.js").ChildObjectiveSpec[] };
 }
 
 export type ModelInvocationPhase =
@@ -1381,6 +1386,18 @@ export interface GraphProjection {
   beforeCreate?: (itemId: string) => void | Promise<void>;
   projected?: (itemId: string, issue: number) => void;
 }
+/** A reviewed split's child Objective issues, created and linked under its parent. */
+export interface ChildObjectiveProjection {
+  parent: number;
+  /** In dependency order: a child's dependencies come before it. */
+  children: { key: string; title: string; body: string; dependsOn: string[] }[];
+  knownIssues?: Record<string, number>;
+  author?: string;
+  authored?: (login: string) => void;
+  beforeCreate?: (key: string) => void | Promise<void>;
+  projected?: (key: string, issue: number) => void;
+  control?: GraphProjection["expansionControl"];
+}
 export interface ProjectedGraph {
   issueByItemId: Record<string, number>;
 }
@@ -1691,6 +1708,9 @@ export interface GitHubGateway {
     },
   ): Promise<void>;
   projectGraph(request: GraphProjection): Promise<ProjectedGraph>;
+  projectChildObjectives?(
+    request: ChildObjectiveProjection,
+  ): Promise<Record<string, number>>;
   /** Observe the pushed branch first; create only after its one-shot durable owner callback. */
   publish(request: PullRequestPublication): Promise<PullRequestIdentity>;
   observe(identity: PullRequestIdentity): Promise<PullRequestObservation>;

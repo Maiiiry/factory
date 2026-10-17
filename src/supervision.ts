@@ -1,3 +1,4 @@
+import { recordedSplitParent, splitSettled } from "./objective-split.js";
 import {
   credentialFileBindings,
   optionalProviderCredentials,
@@ -485,14 +486,17 @@ function checkObjectiveServiceState(
   const state = readContinuation(config.repository, objective);
   if (
     state?.restoration &&
-    (state.cancelledAt || (isExecutionState(state) && objectiveComplete(state)))
+    (state.cancelledAt ||
+      (isExecutionState(state) && objectiveComplete(state)) ||
+      splitSettled(state))
   )
     return;
   if (state && !continuationConfigurationMatches(state, config)) {
     if (
       !state.restoration &&
       (state.cancelledAt ||
-        (isExecutionState(state) && objectiveComplete(state))) &&
+        (isExecutionState(state) && objectiveComplete(state)) ||
+        splitSettled(state)) &&
       canHandoff(state) &&
       !restoredContinuationOwnershipHold(state)
     )
@@ -515,7 +519,14 @@ export function queuedObjectiveConfig(
   configPath: string,
 ): FactoryConfig {
   const state = readContinuation(config.repository, objective);
-  if (!state || continuationConfigurationMatches(state, config)) return config;
+  // A child Objective without state of its own runs on its parent's provider.
+  if (!state) {
+    const parent = recordedSplitParent(config.repository, objective);
+    return parent === undefined
+      ? config
+      : queuedObjectiveConfig(config, parent, configPath);
+  }
+  if (continuationConfigurationMatches(state, config)) return config;
   return selectProvider(readConfigFile(configPath), { objective }).config;
 }
 function hasOwner(config: FactoryConfig): boolean {
