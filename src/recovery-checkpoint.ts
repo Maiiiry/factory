@@ -773,6 +773,8 @@ const scopes = new AsyncLocalStorage<{
     closed: boolean;
   };
   verification?: QueueVerificationContext;
+  /** See withCheckpointDisposals. */
+  disposals?: { covered: boolean };
   closureReads?: {
     publicationLocal: boolean;
     scope: object;
@@ -2619,6 +2621,21 @@ export function acceptForwardedCheckpointCompletion(
       receipt,
     ) as RecoveryCheckpointCommandCompletion;
 }
+/**
+ * Dispose local material that was already frozen when this call began, such
+ * as the native storage of settled sessions, behind one acknowledgment. Each
+ * disposal admits `explicit` first. Once an admission inside this call has
+ * acknowledged a closure it captured itself, that closure holds every material
+ * still to be disposed here, so later `explicit` admissions inside the call
+ * return at once. Their local records are published by the next ordinary
+ * admission; until then a lost host restores the archived material, whose
+ * disposal is safe to repeat.
+ */
+export function withCheckpointDisposals<T>(task: () => Promise<T>): Promise<T> {
+  const scope = scopes.getStore();
+  if (!scope) return task();
+  return scopes.run({ ...scope, disposals: { covered: false } }, task);
+}
 export async function awaitCheckpointAdmission(
   repository: string | undefined,
   reason: "before-effect" | "settled" | "explicit",
@@ -2629,6 +2646,7 @@ export async function awaitCheckpointAdmission(
     throw new CheckpointAdmissionFailure(
       "Checkpoint scope differs from external-effect repository",
     );
+  if (reason === "explicit" && scope.disposals?.covered) return;
   if (
     reason === "before-effect" &&
     settings(scope.config)?.scope === "repository-knowledge"
@@ -5232,6 +5250,18 @@ async function freshArchiveOwnedStrict(
       );
     const negotiationTip = priorObjects ? context?.negotiationTip : undefined;
     hintUsed = Boolean(negotiationTip);
+    // An owned verifier with no object files yet receives its whole store from
+    // the strict fetch below. That fetch already authenticates every received
+    // object and its links (index-pack --strict plus the connectivity check),
+    // exactly as a disposable verifier's read is authenticated. Only material
+    // that predates the fetch needs the full strict fsck.
+    const before =
+      context && !priorObjects
+        ? scanVerifierObjects(directory, options)
+        : undefined;
+    const emptyBeforeFetch =
+      before !== undefined &&
+      [...before.values()].every((identity) => identity.startsWith("d:"));
     // The successful exact-ref fetch is the independent observation boundary.
     // Do not observe a tip separately and require it to survive another remote
     // round trip. A failed or missing-ref fetch never grants access to an old
@@ -5272,9 +5302,10 @@ async function freshArchiveOwnedStrict(
       assertRemoteOnlyVerifier(directory, options);
       const objects = scanVerifierObjects(directory, options);
       if (priorObjects) assertVerifierUnchanged(objects, priorObjects, true);
-      if (!priorObjects || !objects) {
-        // Authenticate the original complete cache once. Later strict fetches
-        // authenticate additions; altered/missing prior material refuses reuse.
+      if ((!priorObjects || !objects) && !emptyBeforeFetch) {
+        // Authenticate material the strict fetch did not deliver once. Later
+        // strict fetches authenticate additions; altered/missing prior material
+        // refuses reuse.
         observed.start("strict-fsck");
         await gitRemote(directory, options, [
           "fsck",
@@ -5990,7 +6021,25 @@ export async function inspectRecoveryCheckpoint(
     },
   };
 }
-const acknowledgedHistory = new Map<string, boolean>();
+/** Per local replica: the commits proven ancestors (or not) of one acknowledged tip. */
+const acknowledgedHistory = new Map<
+  string,
+  { tip: string; ancestors: Set<string>; refused: Set<string> }
+>();
+/** Exit 1 is git's definite "not an ancestor"; anything else is unknown. */
+function replicaAncestor(
+  directory: string,
+  options: GitPersistenceConfig,
+  commit: string,
+  tip: string,
+): boolean | undefined {
+  try {
+    git(directory, options, ["merge-base", "--is-ancestor", commit, tip]);
+    return true;
+  } catch (error) {
+    return (error as { status?: unknown }).status === 1 ? false : undefined;
+  }
+}
 /**
  * Whether `commit` is this installation's last acknowledged checkpoint or one
  * of its ancestors in the local replica (#1307 retention hardening).
@@ -6004,24 +6053,28 @@ export function acknowledgedArchiveCommit(
   const last = journal(config, options).lastAcknowledged?.commitSha;
   if (!last) return false;
   if (last === commit) return true;
-  const key = `${commit}:${last}`;
-  const cached = acknowledgedHistory.get(key);
-  if (cached !== undefined) return cached;
-  let ancestor = false;
-  try {
-    git(paths(config.repository).git, options, [
-      "merge-base",
-      "--is-ancestor",
-      commit,
-      last,
-    ]);
-    ancestor = true;
-  } catch (error) {
-    // Exit 1 is git's definite "not an ancestor"; anything else (an absent
-    // object, a stopped process) is not acknowledged now and is not cached.
-    if ((error as { status?: unknown }).status !== 1) return false;
+  const directory = paths(config.repository).git;
+  let known = acknowledgedHistory.get(directory);
+  if (known?.tip !== last) {
+    // Ancestry is transitive: when the earlier tip is an ancestor of the new
+    // one, every commit proven its ancestor is one of the new tip's too. One
+    // check per new acknowledgment replaces one per retired Objective.
+    const carried =
+      known !== undefined &&
+      replicaAncestor(directory, options, known.tip, last) === true;
+    known = {
+      tip: last,
+      ancestors: carried ? known!.ancestors.add(known!.tip) : new Set(),
+      refused: new Set(),
+    };
+    acknowledgedHistory.set(directory, known);
   }
-  acknowledgedHistory.set(key, ancestor);
+  if (known.ancestors.has(commit)) return true;
+  if (known.refused.has(commit)) return false;
+  const ancestor = replicaAncestor(directory, options, commit, last);
+  // An absent object or a stopped process is not acknowledged now and is not cached.
+  if (ancestor === undefined) return false;
+  (ancestor ? known.ancestors : known.refused).add(commit);
   return ancestor;
 }
 /**
@@ -6294,6 +6347,14 @@ async function serializePublication<T>(
   }
 }
 const publications = new Map<string, Promise<void>>();
+/**
+ * This admission acknowledged a closure it built itself, inside any active
+ * withCheckpointDisposals call, so that closure holds the call's material.
+ */
+function coverDisposals(): void {
+  const disposals = scopes.getStore()?.disposals;
+  if (disposals) disposals.covered = true;
+}
 async function publishCheckpoint(
   config: FactoryConfig,
   input: {
@@ -6416,6 +6477,12 @@ async function publishCheckpoint(
       // The exact pre-push check below still precedes the push.
       await verifyDestination(config, options);
       let sequence = record.sequence;
+      const closureObservation = checkpointObservation(
+        config,
+        "recovery-checkpoint-closure",
+        () => ({ reason: input.reason }),
+      );
+      closureObservation.start("build-and-verify");
       const local = await withFiniteCheckpointReads(
         config,
         async () => {
@@ -6453,7 +6520,11 @@ async function publishCheckpoint(
         true,
         scopes.getStore() ?? { config, buildClosure: build },
         true,
-      );
+      ).catch((error: unknown) => {
+        closureObservation.fail(error);
+        throw error;
+      });
+      closureObservation.complete();
       const { closure, manifest, refs, store } = local;
       record = local.record;
       if (
@@ -6506,6 +6577,7 @@ async function publishCheckpoint(
                   delete latest.error;
               })
             : journal(config, options);
+          coverDisposals();
           return status(current, options);
         }
         let observedSequence: number | undefined;
@@ -6736,6 +6808,7 @@ async function publishCheckpoint(
         config,
         "recovery-checkpoint-submission",
         () => ({
+          reason: input.reason,
           sequence: attempt.sequence,
           candidate: attempt.candidate,
         }),
@@ -6794,6 +6867,7 @@ async function publishCheckpoint(
         verified,
         acknowledged.lastAcknowledged,
       );
+      coverDisposals();
       return acknowledged;
     } catch (error) {
       if (error instanceof CheckpointLateLandingSettled) throw error;
