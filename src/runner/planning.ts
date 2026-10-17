@@ -4,10 +4,16 @@ import {
   assertRestoredContinuationReady,
 } from "../state-store.js";
 import { markCheckpointDirty } from "../recovery-checkpoint.js";
-import { settleRefusedProjectQueueRun } from "../project-queue-state.js";
+import {
+  handOffStoppedRefusal,
+  settleRefusedProjectQueueRun,
+} from "../project-queue-state.js";
 import { createHash, randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
-import { releaseAgentSessions } from "../agent-session.js";
+import {
+  releaseAgentSessions,
+  settleAbandonedPlanningTurn,
+} from "../agent-session.js";
 import { adaptiveWorkflowEnabled } from "../adaptive-workflow.js";
 import {
   bindPlanningPlaybook,
@@ -483,6 +489,13 @@ export async function decidePlan(
         throw new Error(
           "Work Item projection has started; cancel the Objective instead",
         );
+      // A stopped run's original controller must have ceased before any effect.
+      await handOffStoppedRefusal(config, preparation, lock, true);
+      await settleAbandonedPlanningTurn(
+        preparation,
+        services.planningModel,
+        () => saveState(path, preparation),
+      );
       if (!canHandoff(preparation))
         throw new Error(
           "Planning owns an unsettled invocation or resource; use supported cancellation before refusing the preparation",
@@ -501,6 +514,7 @@ export async function decidePlan(
         throw new Error(
           "Retained planner disposal requires its authenticated planning adapter",
         );
+      await handOffStoppedRefusal(config, preparation, lock);
       await releaseAgentSessions(
         preparation,
         undefined,

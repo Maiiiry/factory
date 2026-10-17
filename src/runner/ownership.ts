@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   agentSessionContinuation,
   releaseAgentSessions,
+  settleAbandonedPlanningTurn,
 } from "../agent-session.js";
 import { closeCancelledWorkItems } from "../completion.js";
 import type { FactoryConfig } from "../config.js";
@@ -459,6 +460,26 @@ export async function releaseCancelledSessions(
       );
   };
   assertCurrent();
+  // Without recognized coverage, a planning turn its adapter settled without
+  // a native outcome is abandoned, then disposed like any other. Covered
+  // adapters keep cancelling without a provider call (#1308); a failed
+  // reconciliation mutates nothing and falls through to the coverage check.
+  let covered = true;
+  try {
+    assertRetainedPlannerCheckpointCoverage(
+      model?.retainedPlannerCheckpointCoverage,
+    );
+  } catch {
+    covered = false;
+  }
+  if (!covered) {
+    try {
+      await settleAbandonedPlanningTurn(state, model, save);
+    } catch {
+      // The turn stays held; the coverage check below refuses it.
+    }
+    assertCurrent();
+  }
   const planning = state.planningRecovery;
   const unresolvedPlanning =
     planning?.phase === "submitted" &&
