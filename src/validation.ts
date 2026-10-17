@@ -343,7 +343,6 @@ export async function validateTree(
   retainFailedValidation = true,
   preparation: ValidationPreparation = { commands: [] },
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
-  freshTemporaryDirectory = false,
 ): Promise<ValidationEvidence> {
   const worktree = join(root, "worktree");
   try {
@@ -370,7 +369,6 @@ export async function validateTree(
       retainFailedValidation,
       preparation,
       reviewArtifacts,
-      freshTemporaryDirectory,
     );
     evidence.worktreeObservation!.checkoutPreparation = {
       kind: "fresh-detached-worktree",
@@ -399,8 +397,6 @@ export async function validateCheckout(
   retainFailedValidation = true,
   preparation: ValidationPreparation = { commands: [] },
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
-  /** Give the run its own empty TMPDIR even without a locator selector. */
-  freshTemporaryDirectory = false,
 ): Promise<ValidationEvidence> {
   assertReviewArtifactSelectors(reviewArtifacts);
   if (reviewArtifacts.length && !contentStore)
@@ -473,13 +469,17 @@ export async function validateCheckout(
       : ("modified" as const);
   if (preparation.commands.length) evidence.preparation = [];
   const sequence = [...preparation.commands, ...commands];
-  const temporaryRoot = reviewArtifacts.some(
-    (selector) => "text" in selector && selector.text.locator,
-  )
-    ? mkdtempSync(join(root, "validation-artifacts-"))
-    : freshTemporaryDirectory
-      ? mkdtempSync(join(tmpdir(), "factory-validation-"))
-      : undefined;
+  // Every run gets its own empty TMPDIR, which a locator's files stay inside:
+  // no other run's temporary files reach the commands. Under tmpdir(), not
+  // the state root, so socket paths inside it stay short.
+  let temporaryRoot: string;
+  try {
+    temporaryRoot = mkdtempSync(join(tmpdir(), "factory-validation-"));
+  } catch (error) {
+    throw new CandidateEnvironmentFailure(
+      `Validation environment unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   try {
     for (const [sequenceIndex, check] of sequence.entries()) {
       const preparing = sequenceIndex < preparation.commands.length;
@@ -549,11 +549,9 @@ export async function validateCheckout(
           cwd: worktree,
           env: {
             ...localValidationEnvironment(emptyCredentials),
-            ...(temporaryRoot && {
-              TMPDIR: temporaryRoot,
-              TMP: temporaryRoot,
-              TEMP: temporaryRoot,
-            }),
+            TMPDIR: temporaryRoot,
+            TMP: temporaryRoot,
+            TEMP: temporaryRoot,
           },
         },
         undefined,
@@ -702,7 +700,7 @@ export async function validateCheckout(
     };
     return evidence;
   } finally {
-    if (temporaryRoot && !hasUnresolvedSubprocesses())
+    if (!hasUnresolvedSubprocesses())
       rmSync(temporaryRoot, { recursive: true, force: true });
   }
 }
