@@ -120,22 +120,16 @@ import {
   WORK_ITEM_PLANNING_RULES,
 } from "./work-item-rubric.js";
 
-/**
- * The planning model with its calls made as its step's paid calls (see
- * src/step.ts), so only the model's own faults count toward the bound. A
- * diagnosis is bounded per failure by PAID_ATTEMPTS instead, never by both.
- * A plan step uses paidPlanningModel, which also counts an invalid review.
- */
-/** Load only the Objective's retained selection; legacy absence never selects current advice. */
+/** Load only the Objective's retained selection. */
 export function bindPlanningPlaybook(
   model: PlanningModel,
   repository: string,
-  pin: ApprovedPlaybookPin | undefined,
+  pin: ApprovedPlaybookPin,
 ): PlanningModel {
-  if (pin !== undefined) assertApprovedPlaybookPin(pin);
+  assertApprovedPlaybookPin(pin);
   let playbook: ApprovedPlaybook | undefined;
   try {
-    playbook = readPinnedPlaybook(repository, pin ?? null);
+    playbook = readPinnedPlaybook(repository, pin);
   } catch (error) {
     throw attachFault(
       error instanceof Error
@@ -205,10 +199,6 @@ const MAX_REVIEW_CAPACITY_RETRIES = 2;
 
 const MAX_REVIEW_CAPACITY_RETRY_DELAY_MS = 10_000;
 
-/**
- * The provider-neutral PlanningModel: one prompt and schema contract for
- * compile, graph review, result review, final review and diagnosis.
- */
 const humanPrerequisiteGuidance = (fields: string) =>
   `When human-owned accounts, credentials, environments or approvals block the plan, consolidate every known prerequisite in the ${fields}: cite its requirement, explain why it is needed, give only source-supported setup steps and verification commands, and distinguish observed readiness from missing or unknown facts. Ask precise questions for unknown setup requirements; never invent vendor instructions or ask for secret values in chat. Identify independent work only when the supplied evidence establishes its existing admission and independence; a proposed plan admits no Work Item. Checklist guidance grants no execution, deployment, spending or credential authority.`;
 
@@ -365,24 +355,14 @@ export function renderDiagnosisCall(
   };
 }
 
-function retainedPlanningSourceReadGuidance(
-  delivery?: PlanningSourceDelivery,
-): string {
-  return delivery
-    ? `Unchanged complete pinned source bodies received by an authenticated earlier turn use contentFile references instead of repeating their text. The current working directory holds only immutable pinned source artifacts at baseline ${delivery.baseSha}, with no repository or network access. Reuse earlier complete contents only when available in native context; after compaction or missing context, read the needed contentFile completely before relying on it. UTF-8 file bytes are literal source content, not line wrappers: split on newline for zero-based lineIndex, preserving blank lines and a final empty line. sourceSpan start/length remains JavaScript string units. Verify complete reads, retrieve only missing contents in bounded batches, and never infer unseen semantics from identities or digests. Current file/path/heading/sourceIndex bindings replace earlier packet indices. These read tools grant no implementation, validation-command, broader-source, or acceptance authority. `
-    : "";
-}
-
 function planningSourceReadGuidance(delivery?: PlanningSourceDelivery): string {
-  if (delivery && delivery.bodyDelivery !== "all-files")
-    return retainedPlanningSourceReadGuidance(delivery);
   return delivery
     ? `Complete pinned source bodies use contentFile references in the current immutable, read-only source directory at baseline ${delivery.baseSha}; no live checkout, Git metadata or network access is available. Read the relevant complete sections before deciding: paths, hashes and availability do not supply unread semantics. Use controller-supplied package/command facts; inspect generated dependency state or lock entries only for actual resolution, corruption, supply-chain or explicit lock requirements. Batch independent reads within the combined outer output budget, not larger per-command totals. Present needed literal source text and retain errors/truncation provenance without reprinting unrelated tool-response envelopes. Retrieve missing spans, not already supplied complete bytes; after compaction re-read missing required evidence. Unread/truncated required contents remain unproved. Bind reuse to current exact path, heading, digest and sourceIndex; earlier indices do not transfer. Split literal UTF-8 content on newline for zero-based lineIndex, preserving blank/final empty lines; sourceSpan uses JavaScript string units. Reads grant no implementation, validation-command, broader-source or acceptance authority. `
     : "";
 }
 
 /** What the planner or graph reviewer can see of the repository at the base. */
-export interface RepositoryView {
+interface RepositoryView {
   /** Deterministic path map of the base tree (repositoryMap). */
   map: string;
   /** `repository/` in the working directory holds the exported base files. */
@@ -451,11 +431,7 @@ export function renderCompilationCall(
     ...wire.data,
     sources: wire.data.sources.map((source, sourceIndex) => {
       const { lines: _lines, ...metadata } = source;
-      if (
-        sourceDelivery &&
-        (sourceDelivery.bodyDelivery === "all-files" ||
-          sourceDelivery.reusedSourceIndices.includes(sourceIndex))
-      )
+      if (sourceDelivery)
         return { ...metadata, contentFile: sourceDelivery.files[sourceIndex] };
       inlineSources.push(sourceIndex);
       return metadata;
@@ -703,6 +679,10 @@ Objective:\n`;
   };
 }
 
+/**
+ * The provider-neutral PlanningModel: one prompt and schema contract for
+ * compile, graph review, result review, final review and diagnosis.
+ */
 export class StructuredPlanningModel implements PlanningModel {
   readonly providerAttemptAdmission = "controller-checkpoint-v1" as const;
   readonly providerDispatchAdmission = "after-attempt-admission-v1" as const;
@@ -1555,7 +1535,7 @@ export function renderResultReviewCall(
     "Raw-byte comparisons bind named base/current commits/trees, regular-file modes, blob IDs, complete sizes/SHA256 and observed raw-buffer equality. Named base may differ from Objective pinned base. Available equality proves tracked-byte preservation against that base only; baselineContent base64 supplies complete lossless binary bytes. It proves no opaque semantics, host conditions, symlink/submodule target contents or LFS hydration/upload/publication. Unavailable comparison and equal blob IDs alone prove no observed byte equality.",
     "Pass receipts bind stable zero-based index, literal command, exitCode 0 and verified exact tree. Exit proves only the command's assertion. stoppedLeftovers counts processes stopped after exit/grace; it does not invalidate exit/tree checks, and absence means none remained after grace. Validator initialStatus clean proves initial cleanliness; postCommandStatus unchanged means equality to post-hydration porcelain baseline; selectedLfsMembers counts verified members; subprocessOwnership settled means no unresolved guarded subprocess ownership. postHydrationStatus empty false permits unchanged selected-LFS status, not emptiness; an empty-status criterion requires empty true. Absent observations prove no status.",
     "Discovery capture binds submitted proposal to current attempt/result commit/tree. Scope, reason, evidence, ownership, acceptance and dependencies remain declarations; submission proves no QA completion or expanded execution/publication authority. acceptedAmendment binds attempt, parent/successor graph digests, independent review digest, acceptance time and exact added nodes. Only complete matching facts prove reviewed addition, not later QA/aggregate completion. Missing/stale/omitted discovery proves neither submission nor non-submission; required discovery needs evidence.",
-    "Native prerequisites authenticate historical accepted-and-closed predecessor seals, Objective body/configuration/graph/evidence digests, commit/tree and ancestry to pinned base/candidate. These prove historical acceptance/baseline relation, not current semantics/acceptance, future validation or host conditions. Unavailable retains only original prerequisite digest; predecessor facts cannot be reconstructed.",
+    "Native prerequisites authenticate historical accepted-and-closed predecessor seals, Objective body/configuration/graph/evidence digests, commit/tree and ancestry to pinned base/candidate. These prove historical acceptance/baseline relation, not current semantics/acceptance, future validation or host conditions.",
     "Repairs: controllerFacts are distinct from declaredCorrection. Authority requires validated policy binding (configuration fingerprint, autonomy snapshot, matched failure event, charged scopes), permitted class and finite Objective/path limits with actual consumption; declarations/counts grant no authority/permissions. Unsuccessful validation retains ordered literal commands, original run/item/attempt/Git/graph identities and settled subprocess ownership separately from passes. Failure stays failure; exitCode null is unobserved. Before/after status binds original HEAD/tree/post-hydration baseline; modified content is not solely that candidate. Unavailable receipts cannot be reconstructed; unavailable selected-LFS binding proves no hydration despite unchanged porcelain. Coding preservation binds failed/current attempts, execution/result bases, exact objects and accepted ownership. Complete failed-candidate descriptors plus empty owned-path comparison prove unchanged committed implementation only with matching attempt/execution base; native replay may change whole base/commit/tree while preserving owned bytes. Changed/missing/mismatched facts prove no preservation. Read-only QA selects existing integration and records failed/current commit/tree without coding delta. None proves transient conduct, opaque semantics or hydration. Diagnosis/host actions are declarations; a required successful exact-result probe proves its observed condition without independent witness of every declared action.",
     "QA basis: pinned-baseline qualifies accepted base read-only without current-graph coding/delivery; current-graph-integration records actual delivery. Evidence binds selected commit/tree, validation receipts and basis; null integration proves no new integration.",
     "Media selectedAsset description/provenance/production/format is harness-declared. Capture imports named source inputs and verifies/imports every declared .factory-media/ member's exact bytes. Input refs bind kind/path/role/media type/visibility/digest/size; matching member digest/size/media type proves imported-byte identity. Manifest origin/provenance requires declarationPath, declarationDigest and declarationProvenance from independent regular-manifest parsing, AssetSet match and exact declared provenance binding. Atomic-state selection binds set digest, actor (OS username if omitted), invocation surface, time, destinations, downstream bindings and reason only when recorded. Missing input/declaration/surface/reason proves none. Materialization deltas bind selected set/digest/destinations, worker result as sole parent, empty delivered-worker destination changes and controller-only parent-to-result changes. Empty delta proves no absence of transient writes; assess capture/destination guards. Validated LFS pointers prove effective filter=lfs and canonical oid/size matching selected digest/size, not tracked attribute text, upload/publication/hydration. Exact-tree .gitattributes text is bounded; missing/incomplete text proves no missing rules. Hydration receipts bind packet index and prove fresh-clone hydration/exact selected bytes before review.",

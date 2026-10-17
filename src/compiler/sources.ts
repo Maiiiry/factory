@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { githubEmptyField, markdownLines } from "../markdown.js";
 import type {
+  RequiredPreIntegrationCheck,
   WorkGraph,
   WorkItemSource,
   WorkItemSourceRef,
@@ -374,20 +375,17 @@ export function planningGraphView(
     ...(graph.requiredPreIntegrationChecks && {
       requiredPreIntegrationChecks: graph.requiredPreIntegrationChecks.map(
         (check) => {
-          const text =
-            check.source.text ??
-            sources.find(
-              (source) =>
-                source.path === check.source.path &&
-                createHash("sha256").update(source.content).digest("hex") ===
-                  check.source.digest,
-            )?.content;
+          const text = sources.find(
+            (source) =>
+              source.path === check.source.path &&
+              createHash("sha256").update(source.content).digest("hex") ===
+                check.source.digest,
+          )?.content;
           const sourceSpan =
             text !== undefined && span(check.source.path, text);
           if (!sourceSpan || sourceSpan.sourceDigest !== check.source.digest)
             return check;
-          const { text: _text, ...identity } = check.source;
-          return { ...check, source: { ...identity, sourceSpan } };
+          return { ...check, source: { ...check.source, sourceSpan } };
         },
       ),
     }),
@@ -460,8 +458,13 @@ export function reviewGraphView(
     ...(view.requiredPreIntegrationChecks && {
       requiredPreIntegrationChecks: view.requiredPreIntegrationChecks.map(
         (check) => {
-          if (!("sourceSpan" in check.source)) return check;
-          const { sourceSpan, ...identity } = check.source;
+          const {
+            sourceSpan,
+            ...identity
+          }: RequiredPreIntegrationCheck["source"] & {
+            sourceSpan?: SourceSpan;
+          } = check.source;
+          if (!sourceSpan) return check;
           return {
             ...check,
             source: {
@@ -606,7 +609,7 @@ const REMOVED_OBJECTIVE_FIELDS: Record<string, string> = {
 };
 
 /** Refuse an Objective whose structured content sits under a retired heading. */
-export function assertObjectiveTemplate(body: string): void {
+function assertObjectiveTemplate(body: string): void {
   for (const { heading } of markdownLines(body)) {
     if (!heading || ![2, 3].includes(heading.level)) continue;
     const advice = REMOVED_OBJECTIVE_FIELDS[heading.text.toLowerCase()];
@@ -781,10 +784,7 @@ function authorizedCommand(
       return false;
     }
   }
-  if (
-    check.provenance === "source-declared" &&
-    check.source !== "OPERATOR_DECISION"
-  )
+  if (check.provenance === "source-declared")
     return sources.some(
       (source) =>
         source.path === check.source &&
@@ -1099,11 +1099,6 @@ export function validateGraphSources(
         `Work Item ${item.id} requires LFS for an unknown output role`,
       );
     for (const source of item.sourceAssets ?? []) {
-      if (typeof source === "string")
-        throw new GraphValidationError(
-          item.id,
-          `Work Item ${item.id} needs a structured source asset`,
-        );
       const { path, role, mediaType, visibility } = source;
       const kind = source.kind ?? "repository";
       const repositoryPath =

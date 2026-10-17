@@ -1,12 +1,6 @@
 #!/usr/bin/env node
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  openSync,
-  readFileSync,
-} from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { runCaptureExportCommand } from "./capture-export-cli.js";
 import { assertKnownFlags, option } from "./cli-flags.js";
 import { itemActivities, renderWatch } from "./worker-activity.js";
@@ -29,7 +23,6 @@ import {
   stateRoot,
 } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
-import { NativeStackDelivery } from "./delivery/native-stack.js";
 import {
   ControllerCommandIncompleteError,
   requestControl,
@@ -43,7 +36,6 @@ import {
   runDiagnosticsScorecardCommand,
 } from "./diagnostics-cli.js";
 import { compose, composeIntake, composePlanning } from "./index.js";
-import { RealGitHubGateway } from "./github.js";
 import {
   ColdPublicationHeld,
   type IntakeAuthorization,
@@ -140,7 +132,7 @@ function help(): void {
       "  persistence reconcile --objective N",
       "      Inspect local and verified Git durability, or synchronize to the explicitly configured archive",
       "  run --objective N [--deadline ISO_TIMESTAMP] [--provider NAME]",
-      "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness and fixes its provider (--provider, else the calling host, else defaultProvider)",
+      "      Plan if needed and run the Objective until it is done or needs you; the first run checks readiness and fixes its provider (--provider, else defaultProvider)",
       "  queue add N [N ...] | list | sync | remove N | pause | resume | drain",
       "      The Objectives the background service runs, in order",
       "  supervisor start | check | stop [--disable] | upgrade --cli ABSOLUTE_INSTALLED_CLI | uninstall",
@@ -163,7 +155,7 @@ function help(): void {
       "      One screen: each Work Item's step, worker liveness and effort, files changed so far and recent tool calls",
       "  diagnostics --objective N [--follow | --summary | --analyze | --logs ITEM [--follow] | --captures [--content RECORD_ID]]",
       "  diagnostics --scorecard FILE [--json] [--output ABSOLUTE_NEW_FILE]",
-      "      The one observation command: agent timeline by default. --summary prints the efficiency report (time per stage, operator waits, attempts, tokens per role; --json for tools). --analyze takes [--group-by FIELD ...] [--filter FIELD=VALUE ...] [--native-tool-content] [--json|--gantt] [--output ABSOLUTE_NEW_FILE]",
+      "      The one observation command: agent timeline by default. --summary prints the efficiency report (time per stage, operator waits, attempts, tokens per role; --json for tools). --analyze takes [--group-by FIELD ...] [--filter FIELD=VALUE ...] [--json|--gantt] [--output ABSOLUTE_NEW_FILE]",
       "  export-captures --objective N --endpoint HTTPS_OTLP_BASE_URL --content metadata|retained [--run ID ...] [--invocation ID ...] [--send --authorize PREVIEW_DIGEST]",
       "      Preview, then send, retained captures off this host",
       "  select --objective N --item ITEM --output ABSOLUTE_NEW_DIRECTORY",
@@ -173,12 +165,6 @@ function help(): void {
       "  pause|drain|resume --objective N",
       "  cancel --objective N [--provider NAME]",
       "      Cancel the Objective; --provider names the provider it ran with when its frozen configuration matches none",
-      "  handoff --objective N --failed-reservation-evidence ABSOLUTE_PRIVATE_FILE",
-      "      Permanently stop an authenticated failed pre-snapshot reservation and preserve its unaccepted evidence",
-      "  handoff --objective N --retired-withdrawal-evidence ABSOLUTE_PRIVATE_FILE",
-      "      Permanently exclude an authenticated stopped uncertain withdrawal; preserve its unknown result",
-      "  handoff --objective N --retired-admission-evidence ABSOLUTE_PRIVATE_FILE",
-      "      Permanently exclude an authenticated stopped uncertain admission; preserve all originals and allocated order",
     ].join("\n"),
   );
 }
@@ -320,15 +306,6 @@ async function persistenceCommand(args: string[], path: string): Promise<void> {
 async function supervisorCommand(args: string[], path: string): Promise<void> {
   // The action comes first, before any option; `--config PATH` may precede it.
   const [action] = args[0] === "--config" ? args.slice(2) : args;
-  const moved: Record<string, string> = {
-    install: "factory setup --background",
-    status: "factory status",
-    disable: "factory supervisor stop --disable",
-  };
-  if (action && moved[action])
-    throw new Error(
-      `factory supervisor ${action} was removed; use ${moved[action]}`,
-    );
   if (action === "serve") {
     const config = readConfig(path);
     // A service reads only the credentials systemd loaded for it.
@@ -372,7 +349,7 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
   const queue = (await composeIntake(config).intakeControl(
     "status",
   )) as ServiceStatus["queue"] &
-    Pick<IntakeAuthorization, "remoteObservation" | "retiredAdmissions"> & {
+    Pick<IntakeAuthorization, "remoteObservation"> & {
       localMode?: string;
     };
   const objective = queue.activeObjective ?? queue.observation?.needsDecision;
@@ -423,10 +400,6 @@ async function serviceStatus(path: string, json: boolean): Promise<void> {
         queue.remoteObservation.availability === "last-observed"
           ? `Project observation: last observed at ${queue.remoteObservation.observedAt ? displayDateTime(queue.remoteObservation.observedAt) : "an unknown time"}.`
           : "Project observation: unavailable; status grants no new admission.",
-      );
-    for (const entry of queue.retiredAdmissions ?? [])
-      console.log(
-        `Objective #${entry.objective}: ${entry.state}; remote submission ${entry.remoteSubmission}; permanently ineligible. Admission ${entry.admissionId}, card ${entry.itemId}, retirement operation ${entry.operationId}.`,
       );
     console.log(`Durability: ${JSON.stringify(document.durability)}`);
     console.log(
@@ -606,7 +579,6 @@ async function dispatchMain(
       "export-captures",
       "select",
       "cancel",
-      "handoff",
       "propose-amendment",
       "decline-discovery",
       "collect",
@@ -628,61 +600,6 @@ async function dispatchMain(
   let application: ReturnType<typeof compose> | undefined;
   const requireApplication = (): ReturnType<typeof compose> =>
     (application ??= compose(config));
-  if (command === "handoff") {
-    const evidenceOptions = [
-      ["failed-reservation-evidence", "failedReservationEvidence"],
-      ["retired-withdrawal-evidence", "retiredWithdrawalEvidence"],
-      ["retired-admission-evidence", "retiredAdmissionEvidence"],
-    ] as const;
-    const selected = evidenceOptions
-      .map(([flag, key]) => ({ key, path: option(args, flag) }))
-      .filter((value) => value.path !== undefined);
-    if (selected.length !== 1)
-      throw new Error(
-        "handoff requires exactly one private evidence file: --failed-reservation-evidence, --retired-withdrawal-evidence or --retired-admission-evidence",
-      );
-    const evidencePath = selected[0]!.path!;
-    if (!isAbsolute(evidencePath))
-      throw new Error(
-        "Handoff evidence requires an absolute private file path",
-      );
-    const file = openSync(
-      evidencePath,
-      constants.O_RDONLY | constants.O_NOFOLLOW,
-    );
-    let evidence: unknown;
-    try {
-      const observed = fstatSync(file);
-      if (
-        !observed.isFile() ||
-        observed.uid !== process.getuid?.() ||
-        (observed.mode & 0o077) !== 0
-      )
-        throw new Error(
-          "Handoff evidence must be an owned private regular file",
-        );
-      evidence = JSON.parse(readFileSync(file, "utf8"));
-    } finally {
-      closeSync(file);
-    }
-    const result = await controlObjective(
-      config,
-      {
-        objective,
-        action: "handoff",
-        input: {
-          [selected[0]!.key]: evidence,
-          actor: operatorName(),
-        },
-      },
-      new RealGitHubGateway(
-        config.repository,
-        new NativeStackDelivery(config.repository),
-      ),
-    );
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
   if (command === "decide") return decideCommand(config, objective, args);
   if (command === "collect") {
     const item = option(args, "item"),
@@ -1144,7 +1061,6 @@ async function main(): Promise<void> {
     "propose",
     "dream",
     "run",
-    "queue",
     "decide",
     "retry",
     "repair",
@@ -1174,16 +1090,6 @@ async function main(): Promise<void> {
         }),
     },
     () => dispatchMain(),
-    {
-      // These paths only print the application result after its full terminal
-      // barrier. Other commands/custom operations retain their own full sync.
-      queueControlVerification:
-        command === "queue" &&
-        ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),
-      forwardCompletedBarrier:
-        command === "queue" &&
-        ["pause", "resume", "drain"].includes(queueWords(args)[0] ?? ""),
-    },
   );
 }
 

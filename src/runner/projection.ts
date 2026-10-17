@@ -26,6 +26,7 @@ import {
   verifyExecutionProfiles,
 } from "../execution-profiles.js";
 import { preflightLocalExecutables } from "../local-preflight.js";
+import { prerequisitesDigest } from "../native-prerequisite-evidence.js";
 import { retainAcceptedPlanningDecision } from "../planning-decision-context.js";
 import type { FactoryState, PreparationState } from "../state.js";
 import { saveState } from "../state-store.js";
@@ -246,7 +247,6 @@ export function activateProjectedObjective(args: {
     approvedPlaybookAdmission,
     installationConfigDigest,
     plan.graphDigest,
-    preparation.approvedPlaybookPin !== undefined,
   );
   const workflowRecipeAdmission: WorkflowRecipeAdmission | undefined =
     plan.workflowRecipe
@@ -329,10 +329,8 @@ export function activateProjectedObjective(args: {
       ? { githubLiveStatus: preparation.githubLiveStatus }
       : {}),
     publicationContract: "exact-request-v1",
-    ...(approvedPlaybookAdmission ? { approvedPlaybookAdmission } : {}),
-    ...(preparation.approvedPlaybookPin !== undefined
-      ? { approvedPlaybookPin: preparation.approvedPlaybookPin }
-      : {}),
+    approvedPlaybookAdmission,
+    approvedPlaybookPin: preparation.approvedPlaybookPin,
     ...(preparation.planningRecovery
       ? { planningRecovery: preparation.planningRecovery }
       : {}),
@@ -342,9 +340,7 @@ export function activateProjectedObjective(args: {
     planGraphDigest: plan.graphDigest,
     ...(plan.prerequisites
       ? {
-          prerequisitesDigest: createHash("sha256")
-            .update(JSON.stringify(plan.prerequisites))
-            .digest("hex"),
+          prerequisitesDigest: prerequisitesDigest(plan.prerequisites),
           prerequisites: plan.prerequisites,
         }
       : {}),

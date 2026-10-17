@@ -1,5 +1,5 @@
 /** The options each CLI command reads; shared by the CLI and guided setup. */
-export const installFlags = [
+const installFlags = [
   "provider",
   "repository",
   "checkout",
@@ -69,7 +69,6 @@ const commandFlags: Record<string, string[]> = {
     "filter",
     "json",
     "gantt",
-    "native-tool-content",
     "output",
   ],
   select: ["objective", "item", "set", "output", "bind"],
@@ -79,17 +78,11 @@ const commandFlags: Record<string, string[]> = {
   drain: ["objective"],
   resume: ["objective"],
   cancel: ["objective", "provider"],
-  handoff: [
-    "objective",
-    "failed-reservation-evidence",
-    "retired-withdrawal-evidence",
-    "retired-admission-evidence",
-  ],
   repair: ["objective", "proposal"],
   retry: ["objective", "item", "rereview", "review-artifacts", "fresh"],
 };
 /** Flags that take no value; everything else reads the next argument. */
-export const booleanFlags = new Set([
+const booleanFlags = new Set([
   "background",
   "config-only",
   "capture-content",
@@ -99,7 +92,6 @@ export const booleanFlags = new Set([
   "analyze",
   "captures",
   "gantt",
-  "native-tool-content",
   "disable",
   "rereview",
   "fresh",
@@ -107,34 +99,6 @@ export const booleanFlags = new Set([
   "record",
   "preview",
 ]);
-const removedFlags = ["source", "authority", "admission", "abandon"];
-/** Flags dropped when running a command became its own consent. */
-const consentFlags = ["service-consent", "actor", "retain-package"];
-/** Flags whose value now comes from the Objective's state or the configuration. */
-const derivedFlags: Record<string, string> = {
-  plan: "the plan digest is read from the Objective's state",
-  tree: "the tree is read from the Objective's state",
-  "poll-seconds": "set queue.pollSeconds in the configuration",
-  "priority-label": "queue order comes from the bound Project scheduling field",
-  watch: "factory setup --background starts the service that watches the queue",
-  intake: "factory setup --background installs the service",
-};
-/** Commands folded into another; each names where it went. */
-export const removedCommands: Record<string, string> = {
-  install: "factory setup --config-only",
-  readiness:
-    "factory setup --background or factory run --objective N, which run the same checks",
-  intake: "factory queue add|list|remove|pause|resume|drain",
-  "decide-result":
-    "factory decide --objective N [--item X] [--criterion TEXT] --outcome accept|refuse --reason TEXT",
-  rereview: "factory retry --objective N --item X --rereview",
-  plan: "factory run --objective N, which plans and saves the plan for factory status",
-  analyze: "factory diagnostics --objective N --analyze",
-  logs: "factory diagnostics --objective N --logs ITEM",
-  captures: "factory diagnostics --objective N --captures",
-  review: "factory select --objective N --item X --output DIR",
-};
-
 /** The value after `--name`, if any. */
 export function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(`--${name}`);
@@ -163,36 +127,11 @@ function setupCommand(name: string): string {
 
 /** Refuse an option the command does not read, so a typo or removed flag never runs silently. */
 export function assertKnownFlags(command: string, args: string[]): void {
-  const moved = removedCommands[command];
-  if (moved) throw new Error(`factory ${command} was removed; use ${moved}`);
   for (const arg of args) {
     if (!arg.startsWith("--")) continue;
     const name = arg.slice(2);
-    if (
-      removedFlags.includes(name) &&
-      !(command === "propose" && name === "source")
-    )
-      throw new Error(
-        `${arg} was removed; Objectives declare their own sources and running is the consent (see factory help)`,
-      );
-    if (
-      consentFlags.includes(name) ||
-      (name === "reason" && command !== "decide")
-    )
-      throw new Error(
-        `${arg} was removed; running the command is the consent (see factory help)`,
-      );
-    if (derivedFlags[name])
-      throw new Error(`${arg} was removed; ${derivedFlags[name]}`);
     // `--objective=5` is the same mistake as `--objective 5`.
     const [flag, inline] = name.split("=", 2) as [string, string | undefined];
-    if (
-      flag === "objective" &&
-      (command === "setup" || command === "supervisor")
-    )
-      throw new Error(
-        `${arg} was removed from factory ${command}; queue Objectives with factory queue add N`,
-      );
     if (flag === "objective" && command === "queue") {
       // The number to name: the inline value, else the next word if it is one, else a placeholder.
       const value = inline ?? args[args.indexOf(arg) + 1];

@@ -11,7 +11,7 @@ import { PlannerDecision } from "./fault.js";
 import type { FactoryState } from "./state.js";
 
 /** The accepted graph determines whether this run qualifies existing bytes or delivers changes. */
-export function baselineQaGraph(graph: WorkGraph): boolean {
+function baselineQaGraph(graph: WorkGraph): boolean {
   return (
     graph.items.length > 0 &&
     graph.items.every((item) => item.kind === "qa" || item.kind === "discovery")
@@ -501,8 +501,6 @@ function assertSourceObligationShape(entry: {
     entry.source.path === "OBJECTIVE" ||
     typeof entry.statement !== "string" ||
     !entry.statement.trim() ||
-    (entry.source.text !== undefined &&
-      (typeof entry.source.text !== "string" || !entry.source.text.trim())) ||
     !/^[a-f0-9]{64}$/.test(entry.source.digest)
   )
     throw new Error(
@@ -519,7 +517,7 @@ export function normalizedCommand(command: string): string {
  * command, or a plain line, that has command authority of its own. Any other
  * bullet is a semantic obligation for review to judge.
  */
-export function commandObligation(
+function commandObligation(
   text: string,
   isCommand: (command: string, backticked: boolean) => boolean,
 ): string | undefined {
@@ -534,24 +532,16 @@ export function assertCoverageSources(
   graph: WorkGraph,
   sources: { path: string; content: string }[],
   obligations: CoverageObligation[],
-  finalCommands: string[] = [],
-  isCommand?: (command: string, backticked: boolean) => boolean,
+  finalCommands: string[],
+  isCommand: (command: string, backticked: boolean) => boolean,
 ): void {
   assertCoverageShape(graph);
   const checks = (graph.requiredPreIntegrationChecks ?? []).map(
     (gate) => gate.checkName,
   );
   const finals = finalCommands.map(normalizedCommand);
-  const planned = new Set([
-    ...graph.items.flatMap((item) =>
-      item.validation.map((check) => normalizedCommand(check.command)),
-    ),
-    ...finals,
-  ]);
-  const authority =
-    isCommand ?? ((command: string) => planned.has(normalizedCommand(command)));
   // A located exit item is re-sliced from its pinned source; an Objective
-  // criterion (or a retained graph's span) carries its text.
+  // criterion carries its text.
   const spanText = (source: CoverageObligation["source"]) => {
     if (!source.lines) return source.text;
     const pinned = sources.find(
@@ -567,7 +557,7 @@ export function assertCoverageSources(
     const text = spanText(source);
     // An unlocatable span is refused below with its source identity.
     if (text === undefined) continue;
-    const command = commandObligation(text, authority);
+    const command = commandObligation(text, isCommand);
     if (
       command === undefined ||
       finals.includes(command) ||
@@ -598,13 +588,13 @@ export function assertCoverageSources(
   const objective = sources.find((source) => source.path === "OBJECTIVE");
   const spans: CoverageObligation["source"][] = [];
   const located = (entry: { source: CoverageObligation["source"] }) => {
-    const { path, digest, text, lines } = entry.source;
+    const { path, digest, lines } = entry.source;
     const source = sources.find(
       (source) =>
         source.path === path && sourceDigest(source.content) === digest,
     );
     const actual = lines && source && sourceLines(source.content, lines);
-    if (!lines || !actual?.trim() || (text !== undefined && actual !== text))
+    if (!lines || !actual?.trim())
       throw new Error(
         "Source obligation line range differs from its pinned source",
       );
@@ -645,11 +635,7 @@ export function assertCoverageSources(
         source.path === entry.source.path &&
         sourceDigest(source.content) === entry.source.digest,
     );
-    if (
-      !source ||
-      (entry.source.path !== "OBJECTIVE" &&
-        !source.content.includes(entry.source.text!))
-    )
+    if (!source || entry.source.path !== "OBJECTIVE")
       throw new Error("Coverage source differs from pinned content");
     if (
       entry.source.path === "OBJECTIVE" &&
@@ -790,8 +776,8 @@ export function reusableEnvironmentValidationIndices(
     const command = normalizedCommand(item.validation[index]!.command);
     return !coverage.some((entry) => {
       // State checks this without the pinned sources, so a located exit item
-      // is matched by its statement; a retained graph keeps its span text.
-      const explicitCommand = (entry.source.text ?? coverageCriterion(entry))
+      // is matched by its statement.
+      const explicitCommand = coverageCriterion(entry)
         .trim()
         .replace(/^`([^`]+)`$/, "$1");
       return (

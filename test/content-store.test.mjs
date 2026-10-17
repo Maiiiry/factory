@@ -32,7 +32,6 @@ import {
   authenticateAdaptiveContextPacket,
   buildAdaptiveContext,
 } from "../dist/adaptive-context.js";
-import { analyzeInteractions } from "../dist/analysis.js";
 import {
   CaptureWriter,
   readInteractionContent,
@@ -122,7 +121,6 @@ import {
 } from "../dist/recovery-checkpoint.js";
 import {
   buildRecoveryCheckpointClosure,
-  describeContinuationReferences,
   describeMemoryBodyReferences,
   uniqueRecoveryCheckpointFiles,
 } from "../dist/recovery-checkpoint-closure.js";
@@ -397,8 +395,8 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const missing = memory.retain({
     ...record,
     kind: "episode",
-    bodies: [{ role: "legacy-source", availability: "missing-legacy" }],
-    sources: [{ identity: "legacy-native-session", complete: false }],
+    bodies: [{ role: "unretained-source", availability: "unavailable" }],
+    sources: [{ identity: "unretained-native-session", complete: false }],
   });
   assert.equal(
     memory.read({ access, id: missing.id, applicability }).disposition,
@@ -533,6 +531,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     repository,
     objective: 1,
     runId: "cancelled-orchard-documentation",
+    approvedPlaybookPin: null,
     configDigest: factoryConfigDigest(config),
     baseSha: git("rev-parse", "HEAD"),
     objectiveBodyDigest: learningDigest("Observe orchard API documentation"),
@@ -727,7 +726,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       .boundary.elapsedMs,
     durationMs,
   );
-  const interactionBefore = analyzeInteractions(metadataBefore, [], {});
   // Capture a declaration over the same actual source read, then retain the
   // resulting observation as historical memory before its staging is removed.
   const declared = [
@@ -797,14 +795,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     ),
     true,
   );
-  const legacyAssets = structuredClone(capturedAssets);
-  delete legacyAssets[0].manifestRef;
-  const legacyDescription = describeMemoryBodyReferences(
-    "attempt-observation",
-    Buffer.from(JSON.stringify({ assets: legacyAssets })),
-  );
-  assert.equal(legacyDescription.gaps[0].availability, "missing-legacy");
-  assert.equal(legacyDescription.gaps[0].required, false);
   const mismatchedAssets = structuredClone(capturedAssets);
   mismatchedAssets[0].manifestRef = sourceRef;
   assert.throws(
@@ -1590,6 +1580,7 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     objective: 2,
     bodyDigest: cancelled.objectiveBodyDigest,
     ownerTokenDigest: learningDigest("original-owner"),
+    ownerProcess: { pid: 1, startTime: "1", namespace: "pid:[1]" },
     at: new Date().toISOString(),
     deadlineAt: new Date(Date.now() + 60_000).toISOString(),
   };
@@ -1602,8 +1593,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     buildClosure,
   });
   const claimInitial = {
-    // The same real archive supplies a positive pre-snapshot witness before
-    // the workflow records its actual canonical continuation below.
     ...structuredClone(cancelled),
     objective: 2,
     runId: randomUUID(),
@@ -1615,41 +1604,12 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
     },
   };
   delete claimInitial.cancelledAt;
-  const reserved = await readVerifiedRecoveryCheckpoint(config, undefined, {
-    kind: "pre-snapshot",
-    objective: claim.objective,
-    claimId: claim.id,
-  });
-  const reservation = reserved.queueReservationLineage;
-  assert(reservation);
-  assert.equal(reserved.queueOwnerLineage, undefined);
-  assert.equal(reservation.checkpoints.current.commitSha, reserved.commitSha);
-  assert.deepEqual(
-    reservation.generations.at(-1),
-    reservation.checkpoints.current,
-  );
-  assert.deepEqual(
-    Buffer.from(
-      reservation.bodies.find(
-        ({ ref }) => ref.digest === reservation.originalClaim.digest,
-      ).bytes,
-    ),
-    readFileSync(claimPath),
-  );
   saveState(statePath(repository, 2), claimInitial);
   const initialBytes = readFileSync(statePath(repository, 2));
   await synchronizeRecoveryCheckpoint(config, {
     reason: "explicit",
     buildClosure,
   });
-  await assert.rejects(
-    readVerifiedRecoveryCheckpoint(config, undefined, {
-      kind: "pre-snapshot",
-      objective: 2,
-      claimId: claim.id,
-    }),
-    /continuation/,
-  );
   const claimTerminal = {
     // A started continuation can never be reshaped into an orphan reservation.
     ...structuredClone(claimInitial),
@@ -4305,6 +4265,7 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     repository: preparationRepository,
     objective: producer.objective,
     runId: "recipe-pre-provider-inputs",
+    approvedPlaybookPin: null,
     configDigest: createHash("sha256")
       .update(JSON.stringify(recipeAdmission))
       .digest("hex"),
@@ -4401,7 +4362,6 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     manifest,
     body,
     runId: producer.runId,
-    iteration: 1,
   });
   const children = materialized.childIds.map((id) =>
     materialized.graph.items.find((item) => item.id === id),
@@ -4956,7 +4916,6 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     manifest: retainedPacket.manifest,
     body: retainedPacket.body,
     runId: retainedPacket.runId,
-    iteration: retainedPacket.iteration,
   });
   assert.deepEqual(reloaded, materialized);
   assert.throws(
@@ -4967,7 +4926,6 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
         manifest,
         body,
         runId: producer.runId,
-        iteration: 1,
         immutableItemIds: ["integration"],
       }),
     /started or completed integration barrier/,
@@ -5010,7 +4968,6 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     manifest: empty,
     body: emptyBody,
     runId: producer.runId,
-    iteration: 1,
   });
   assert.deepEqual(emptyExpansion.childIds, []);
   assertExpansionCoverage(emptyGraph, emptyExpansion.graph);
@@ -5417,6 +5374,18 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     baseSha,
     graph: routeGraph,
     planGraphDigest: graphDigest(routeGraph),
+    publicationContract: "exact-request-v1",
+    objectiveCommands: [],
+    objectiveBodyDigest: "b".repeat(64),
+    approvedPlaybookPin: null,
+    approvedPlaybookAdmission: {
+      approvedPlaybookPin: null,
+      configDigest: "a".repeat(64),
+      graphDigest: graphDigest(routeGraph),
+      packetDigest: "c".repeat(64),
+      reviewDigest: "d".repeat(64),
+      sourcePacketDigest: "e".repeat(64),
+    },
     capacity: { concurrency: 1 },
     autonomy: resolveAutonomy(),
     coordinator: {
@@ -5545,6 +5514,7 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
     (item) => item.id === "integration",
   ).dependencies = [inventory.id, "has-files"];
   emptyRoute.planGraphDigest = graphDigest(emptyRoute.graph);
+  emptyRoute.approvedPlaybookAdmission.graphDigest = emptyRoute.planGraphDigest;
   delete emptyRoute.issueByItemId["no-files"];
   delete emptyRoute.work["no-files"];
   emptyRoute.work["has-files"] = { status: "pending" };
@@ -5696,7 +5666,6 @@ test("selector-bound discovery retains exact bytes, distinguishes incomplete out
         manifest: truncated,
         body,
         runId: producer.runId,
-        iteration: 1,
       }),
     /complete exact producer-bound/,
   );
@@ -6179,6 +6148,18 @@ test("checkpoint retains authenticated worker returns from a configured private 
     baseSha,
     graph,
     planGraphDigest: graphDigest(graph),
+    publicationContract: "exact-request-v1",
+    objectiveCommands: [],
+    objectiveBodyDigest: "b".repeat(64),
+    approvedPlaybookPin: null,
+    approvedPlaybookAdmission: {
+      approvedPlaybookPin: null,
+      configDigest: factoryConfigDigest(config),
+      graphDigest: graphDigest(graph),
+      packetDigest: "c".repeat(64),
+      reviewDigest: "d".repeat(64),
+      sourcePacketDigest: "e".repeat(64),
+    },
     capacity: { concurrency: 1 },
     autonomy: resolveAutonomy(),
     issueByItemId: { history: 2 },
@@ -6274,6 +6255,12 @@ test("checkpoint retains authenticated worker returns from a configured private 
     binding,
     sequence: 0,
     createdAt: new Date().toISOString(),
+    authority: {
+      schemaVersion: 1,
+      authorityDigest: factoryAuthorityDigest(config),
+      configDigest: factoryConfigDigest(config),
+      hostLayout: { checkout, stateRoot: privateRoot },
+    },
   };
   const bounds = { maxBytes: 64 * 1024 * 1024, maxFiles: 4096 };
   assertRecoveryCheckpointManifest(manifest, binding, bounds);
@@ -6453,6 +6440,18 @@ test("stopped collection freezes a completed owned local return before restart a
     baseSha,
     graph,
     planGraphDigest: graphDigest(graph),
+    publicationContract: "exact-request-v1",
+    objectiveCommands: [],
+    objectiveBodyDigest: "b".repeat(64),
+    approvedPlaybookPin: null,
+    approvedPlaybookAdmission: {
+      approvedPlaybookPin: null,
+      configDigest: factoryConfigDigest(config),
+      graphDigest: graphDigest(graph),
+      packetDigest: "c".repeat(64),
+      reviewDigest: "d".repeat(64),
+      sourcePacketDigest: "e".repeat(64),
+    },
     capacity: { concurrency: 1 },
     autonomy: resolveAutonomy(),
     issueByItemId: { local: 2 },
@@ -6569,6 +6568,7 @@ test("stopped collection freezes a completed owned local return before restart a
   writeFileSync(worker.resultPath, originalBytes, { mode: 0o600 });
   const foreign = structuredClone(state);
   foreign.configDigest = "f".repeat(64);
+  foreign.approvedPlaybookAdmission.configDigest = foreign.configDigest;
   for (const ref of Object.values(foreign.agentSessions))
     ref.scope.configDigest = foreign.configDigest;
   saveState(path, foreign);
@@ -6828,7 +6828,6 @@ async function failedWorkerCollection(t, returned) {
     "../dist/process.js"
   );
   const { executionContext } = await import("../dist/execution/checkpoint.js");
-  const { attachedFault } = await import("../dist/fault.js");
   const temporary = mkdtempSync(join(tmpdir(), "factory-failed-worker-"));
   const repository = `fixture/failed-worker-${randomUUID()}`;
   const privateRoot = stateRoot(repository),

@@ -120,8 +120,7 @@ export interface CoverageObligation {
   /**
    * An Objective criterion carries its text. A source exit item is a
    * reference: path, content digest and line range, re-sliced from the
-   * pinned source when needed. Graphs retained from before this reference
-   * form also carry the line text, which is never written now.
+   * pinned source when needed.
    */
   source: {
     path: string;
@@ -134,11 +133,10 @@ export interface CoverageObligation {
 
 /** A located source exit item the plan leaves out, justified by Objective lines. */
 export interface SourceExclusion {
-  /** A reference to the excluded lines; retained graphs may also carry their text. */
+  /** A reference to the excluded lines. */
   source: {
     path: string;
     digest: string;
-    text?: string;
     lines: [number, number];
   };
   statement: string;
@@ -174,10 +172,9 @@ export interface RequiredPreIntegrationCheck {
   checkName: string;
   /**
    * The pinned source authorizing this gate, by reference: its path, heading
-   * and content digest at the graph base. Graphs retained from before this
-   * reference form also carry the source text, which is never written now.
+   * and content digest at the graph base.
    */
-  source: { path: string; heading?: string; digest: string; text?: string };
+  source: { path: string; heading?: string; digest: string };
 }
 
 /** Reviewed authority for one deterministic inventory-driven graph addition. */
@@ -448,21 +445,12 @@ export function assertApprovedPlaybookAdmission(
   admission: unknown,
   configDigest: unknown,
   originalGraphDigest: unknown,
-  pinPresent: boolean,
-): void {
-  if (admission === undefined) {
-    if (pinPresent)
-      throw new Error(
-        "Approved playbook pin lacks its original admission binding",
-      );
-    return; // Historical absence remains no learned input.
-  }
-  if (
-    !pinPresent ||
-    !admission ||
-    typeof admission !== "object" ||
-    Array.isArray(admission)
-  )
+): asserts admission is ApprovedPlaybookAdmission {
+  if (admission === undefined)
+    throw new Error(
+      "Approved playbook pin lacks its original admission binding",
+    );
+  if (!admission || typeof admission !== "object" || Array.isArray(admission))
     throw new Error("Approved playbook admission differs from the active pin");
   const receipt = admission as Record<string, unknown>;
   if (
@@ -703,7 +691,7 @@ export type AgentSessionScope = AgentObjectiveScope &
 export interface AgentSessionTurn {
   invocationId: string;
   requestDigest: string;
-  /** Admitted elapsed ceiling, immutable for this turn; absent on older receipts. */
+  /** Admitted elapsed ceiling, immutable for this turn; absent when there is no deadline. */
   deadlineAt?: string;
   graphDigest?: string;
   candidateDigest?: string;
@@ -916,12 +904,12 @@ export interface ExecutionResult {
   assets?: CapturedAssetSet[];
   evidence?: unknown;
 }
-/** Persist before each external mutation; callbacks are controller-owned, never serialized. */
 /** A provider resource a lost response may have created that Factory cannot find to delete. */
 export interface ExecutionOrphan {
   resource: string;
   detail: string;
 }
+/** Persist before each external mutation; callbacks are controller-owned, never serialized. */
 export interface ExecutionContext {
   /** Await durable admission after exact local checkpoint and before effects or result disposal. */
   checkpointedEffects?: true;
@@ -1163,7 +1151,7 @@ export interface DeliveryRequest {
   /** Required by ordinary publication; created by the exclusive snapshot owner. */
   publication?: PublicationControl;
   /** Controller-rendered publication text from public intent and exact candidate facts. */
-  body?: string;
+  body: string;
   lfs?: boolean;
   /** Commits earlier attempts of this Work Item produced for this branch. */
   earlierHeads?: string[];
@@ -1284,11 +1272,9 @@ export interface CapturedAssetSet {
   /**
    * Controller-generated from the imported source identities after every
    * declared member has been verified as a regular file beneath the private
-   * media staging root and imported into the content store. Older snapshots
-   * may not contain this receipt and therefore cannot use it as automatic
-   * review evidence.
+   * media staging root and imported into the content store.
    */
-  capture?: AssetCaptureReceipt;
+  capture: AssetCaptureReceipt;
 }
 
 export interface AssetCaptureReceipt {
@@ -1518,7 +1504,6 @@ export interface ProjectQueueExpectedTarget {
 }
 export type ProjectQueueAction =
   | { action: "ensure-card"; issueNodeId: string }
-  | { action: "set-order"; itemId: string; order: number }
   | { action: "set-metadata"; itemId: string; metadata: string }
   | {
       action: "set-admission-fields";
@@ -1541,12 +1526,6 @@ export type ProjectQueueItemSelector =
   | { resultOf: string };
 export type ProjectQueuePlannedAction =
   | { action: "ensure-card"; issueNodeId: string }
-  | {
-      action: "set-order";
-      target: ProjectQueueItemSelector;
-      fieldId: string;
-      order: number;
-    }
   | {
       action: "set-metadata";
       target: ProjectQueueItemSelector;

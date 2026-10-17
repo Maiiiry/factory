@@ -11,7 +11,7 @@ import type { Wait } from "./fault.js";
 import type { PrerequisiteGuidance } from "./prerequisite-guidance.js";
 
 /** A step in a run of transient faults (src/step.ts `outageOf`). */
-export interface OutageView {
+interface OutageView {
   step: string;
   since: string;
   tries: number;
@@ -24,13 +24,13 @@ export interface OutageView {
 }
 
 /** A structured wait and, for outages, the failing step. */
-export interface WaitView {
+interface WaitView {
   wait?: Wait | null;
   outage?: OutageView | null;
   prerequisiteGuidance?: PrerequisiteGuidance;
 }
 
-export type StatusPhase =
+type StatusPhase =
   | "not-started"
   | "planning"
   | "needs-plan-decision"
@@ -41,7 +41,7 @@ export type StatusPhase =
   | "cancelled"
   | "complete";
 
-export interface StatusNextAction {
+interface StatusNextAction {
   command: string;
   reason: string;
 }
@@ -61,14 +61,14 @@ export interface PendingDecisionView {
   more?: PendingDecisionView[];
 }
 
-export interface CoordinatorView {
+interface CoordinatorView {
   mode: "running" | "paused" | "draining";
   phase: string;
   waitReason?: string;
   cancelError?: string;
 }
 
-export interface StatusItemView extends WaitView {
+interface StatusItemView extends WaitView {
   id: string;
   status: string;
   step: string | null;
@@ -97,7 +97,7 @@ export interface StatusItemView extends WaitView {
  * No state file yet. Steps that ran before it exists leave their wait or
  * outage beside it (`PreState`).
  */
-export interface NotStartedStatusView extends WaitView {
+interface NotStartedStatusView extends WaitView {
   objective: number;
   state: "not-started";
   runActive?: boolean | null;
@@ -118,7 +118,7 @@ export interface NotStartedStatusView extends WaitView {
   } | null;
 }
 
-export interface PreparingStatusView extends WaitView {
+interface PreparingStatusView extends WaitView {
   githubProjectTracking?: NotStartedStatusView["githubProjectTracking"];
   githubProgress?: NotStartedStatusView["githubProgress"];
   objective: number;
@@ -156,7 +156,7 @@ export interface PreparingStatusView extends WaitView {
   error?: string | null;
 }
 
-export interface SplitStatusView {
+interface SplitStatusView {
   enqueuedAt: string | null;
   closedAt: string | null;
   children: {
@@ -197,7 +197,7 @@ export function planningActivity(
   return step?.revision ? `${doing} (revision ${step.revision})` : doing;
 }
 
-export interface CapacityView {
+interface CapacityView {
   concurrency: number;
   concurrencySource: "host" | "config";
   schedulingSource: "host" | "config" | null;
@@ -213,7 +213,7 @@ export interface CapacityView {
 }
 
 /** One line naming the worker ceiling, the phase ceilings and who chose them. */
-export function capacityLine(capacity: CapacityView): string {
+function capacityLine(capacity: CapacityView): string {
   const { scheduling: plan } = capacity;
   const parts = [
     `${capacity.concurrency} coding worker${capacity.concurrency === 1 ? "" : "s"} (${capacity.concurrencySource === "host" ? "sized from host" : "configured"})`,
@@ -227,7 +227,7 @@ export function capacityLine(capacity: CapacityView): string {
   return `Capacity: ${parts.join(", ")}${capacity.schedulingSource === "host" ? "; phase reservations sized from host" : ""}`;
 }
 
-export interface ExecutionStatusView extends WaitView {
+interface ExecutionStatusView extends WaitView {
   githubProjectTracking?: NotStartedStatusView["githubProjectTracking"];
   githubProgress?: NotStartedStatusView["githubProgress"];
   /** Work Item comments and cards; failures name the item and the stream. */
@@ -397,7 +397,7 @@ function structuredWait(view: WaitView): ShownWait | undefined {
 }
 
 /** Why an unfinished item is not progressing, or undefined when it is. */
-export function itemWait(item: StatusItemView): ShownWait | undefined {
+function itemWait(item: StatusItemView): ShownWait | undefined {
   const structured = structuredWait(item);
   if (structured) return structured;
   if (item.authentication)
@@ -539,8 +539,7 @@ function proposedDiscovery(
   view: ExecutionStatusView,
 ): StatusSummary | undefined {
   const pending = view.pendingAmendment;
-  if (!pending?.worker || ["rejected", "backlog"].includes(pending.phase))
-    return undefined;
+  if (!pending?.worker || pending.phase === "rejected") return undefined;
   return {
     phase: "waiting",
     summary: `amendment for ${pending.worker}'s discovery is ${pending.phase}`,
@@ -834,7 +833,7 @@ function blamedItem(
           },
     };
   }
-  if (pending && pending.phase !== "backlog")
+  if (pending)
     return {
       phase: "failed",
       summary: `${summary}; an amendment to fix ${file} is pending`,
@@ -1593,7 +1592,7 @@ export function renderStatusText(
 }
 
 /** Render the exact same private derived packet for foreground, service and conversation consumers. */
-export function renderPrerequisiteGuidance(
+function renderPrerequisiteGuidance(
   guidance?: PrerequisiteGuidance,
   configuration?: string,
 ): string[] {
@@ -1645,7 +1644,7 @@ export function renderPrerequisiteGuidance(
 }
 
 /** What `factory status` without `--objective` reports: the background service and its queue. */
-export interface ServiceStatusDocument {
+interface ServiceStatusDocument {
   currentObjective?: StatusView & StatusSummary;
   currentObjectiveError?: string;
   service: {

@@ -18,6 +18,7 @@ import {
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { canonical } from "./canonical-json.js";
 import { stateRoot } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
 import type { ContentRef } from "./contracts.js";
@@ -69,7 +70,7 @@ export interface RepositoryMemoryRecord {
   bodies: {
     role: string;
     ref?: ContentRef;
-    availability: "retained" | "missing-legacy" | "unavailable";
+    availability: "retained" | "unavailable";
   }[];
   sources: {
     identity: string;
@@ -308,9 +309,7 @@ export function assertRepositoryMemoryRecord(
     const body = keys(value, ["role", "ref", "availability"]);
     text(body.role);
     if (
-      !["retained", "missing-legacy", "unavailable"].includes(
-        String(body.availability),
-      ) ||
+      !["retained", "unavailable"].includes(String(body.availability)) ||
       (body.availability === "retained" && body.ref === undefined)
     )
       throw new Error("Memory body availability is invalid");
@@ -435,16 +434,6 @@ export function assertRepositoryMemoryBindings(
   }
 }
 
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value && typeof value === "object")
-    return `{${Object.entries(value)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
-      .join(",")}}`;
-  return JSON.stringify(value);
-}
 function meaningfulRecord(record: RepositoryMemoryRecord): string {
   const immutableReference =
     record.kind === "reference" &&
@@ -979,9 +968,7 @@ export class LocalRepositoryMemory {
     const content: MemoryResult["content"] = [];
     for (const body of record.bodies) {
       if (body.availability !== "retained" || !body.ref) {
-        gaps.push(
-          `${body.role}: ${body.availability === "missing-legacy" ? "missing legacy body" : "referenced bytes unavailable"}`,
-        );
+        gaps.push(`${body.role}: referenced bytes unavailable`);
         disposition = "unavailable";
         continue;
       }

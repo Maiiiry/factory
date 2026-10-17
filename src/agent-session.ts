@@ -57,9 +57,8 @@ export function planningSessionInputDigest(inputs: {
   baseSha: string;
   objectiveBodyDigest?: string;
   sourcePacketDigest?: string;
-  approvedPlaybookPin?: ApprovedPlaybookPin;
+  approvedPlaybookPin: ApprovedPlaybookPin;
   workflowRecipePin?: WorkflowRecipePin;
-  contextLookup?: PlanningContextPacket;
   planningRecovery?: { contextLookup?: { packet: PlanningContextPacket } };
 }): string {
   if (!/^[a-f0-9]{40}$/.test(inputs.baseSha))
@@ -70,23 +69,19 @@ export function planningSessionInputDigest(inputs: {
       !/^[a-f0-9]{64}$/.test(inputs[name]!)
     )
       throw new Error(`Planner immutable ${name} is unavailable`);
-  if (inputs.approvedPlaybookPin !== undefined)
-    assertApprovedPlaybookPin(inputs.approvedPlaybookPin);
+  assertApprovedPlaybookPin(inputs.approvedPlaybookPin);
   const frozen: unknown[] = [
     inputs.baseSha,
     inputs.objectiveBodyDigest,
     inputs.sourcePacketDigest,
-    inputs.approvedPlaybookPin === undefined
-      ? "absent"
-      : inputs.approvedPlaybookPin === null
-        ? null
-        : {
-            version: inputs.approvedPlaybookPin.version,
-            digest: inputs.approvedPlaybookPin.digest,
-          },
+    inputs.approvedPlaybookPin === null
+      ? null
+      : {
+          version: inputs.approvedPlaybookPin.version,
+          digest: inputs.approvedPlaybookPin.digest,
+        },
   ];
-  const context =
-    inputs.planningRecovery?.contextLookup?.packet ?? inputs.contextLookup;
+  const context = inputs.planningRecovery?.contextLookup?.packet;
   if (context) {
     if (context.schemaVersion !== 1 || !/^[a-f0-9]{64}$/.test(context.binding))
       throw new Error("Planner immutable context binding is invalid");

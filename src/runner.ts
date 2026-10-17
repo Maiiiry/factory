@@ -73,13 +73,10 @@ import {
   withProcessCancellation,
 } from "./process.js";
 import {
-  abandonFailedProjectQueueReservation,
   assertProjectQueueRunLive,
   bindProjectQueueRun,
   claimProjectQueueRun,
   type QueueOwnerClaim,
-  retireUnknownProjectAdmission,
-  retireUnknownProjectWithdrawal,
   settleCancelledProjectQueueRun,
   settleFailedProjectQueueReservation,
   settleProjectQueueRun,
@@ -94,7 +91,6 @@ import {
   isCheckpointCollectionPending,
   privateCheckpointBounds,
   trackCollection,
-  withQueueControlVerification,
   withRecoveryCheckpointControllerVerification,
   withRecoveryCheckpointScope,
 } from "./recovery-checkpoint.js";
@@ -167,11 +163,7 @@ import {
   endProviderLimitWaits,
   waitOf,
 } from "./step.js";
-import {
-  applyWorkCorrection,
-  recordSavedResultRefusal,
-  recordWorkFailure,
-} from "./work-repair.js";
+import { applyWorkCorrection, recordWorkFailure } from "./work-repair.js";
 
 export type { ApplicationServices } from "./runner/ownership.js";
 export { CoordinatorHandoff } from "./runner/ownership.js";
@@ -434,73 +426,9 @@ function assertRejectionAllows(
   );
 }
 
-/** A stopped disposition owns verification and settlement until lease release. */
-async function stoppedOperatorHandoff(
-  config: FactoryConfig,
-  request: ControlRequest,
-  github?: GitHubGateway,
-): Promise<unknown> {
-  const input = request.input;
-  if (!input || !github || typeof input.actor !== "string" || !input.actor)
-    throw new Error(
-      "Stopped operator disposition requires its explicit local operator and genuine Project gateway",
-    );
-  if (
-    [
-      input.failedReservationEvidence,
-      input.retiredWithdrawalEvidence,
-      input.retiredAdmissionEvidence,
-    ].filter((value) => value !== undefined).length !== 1
-  )
-    throw new Error("Choose one exact stopped operator disposition");
-  const actor = input.actor;
-  const lockPath = installationLockPath(config.repository),
-    lock = acquireInstallationLock(config.repository, request.objective);
-  try {
-    return await withQueueControlVerification(
-      {
-        config,
-        buildClosure: () => buildRecoveryCheckpointClosure({ config }),
-      },
-      () =>
-        checkpointController(config, async () => {
-          if (input.retiredAdmissionEvidence !== undefined)
-            return await retireUnknownProjectAdmission(
-              config,
-              github,
-              request.objective,
-              input.retiredAdmissionEvidence,
-              actor,
-              lock,
-            );
-          if (input.retiredWithdrawalEvidence !== undefined)
-            return await retireUnknownProjectWithdrawal(
-              config,
-              github,
-              request.objective,
-              input.retiredWithdrawalEvidence,
-              actor,
-              lock,
-            );
-          return await abandonFailedProjectQueueReservation(
-            config,
-            github,
-            request.objective,
-            input.failedReservationEvidence,
-            actor,
-            lock,
-          );
-        }),
-    );
-  } finally {
-    releaseControllerLock(lockPath, lock);
-  }
-}
-
 async function controlObjectiveUnscoped(
   config: FactoryConfig,
   request: ControlRequest,
-  _github?: GitHubGateway,
 ): Promise<unknown> {
   const retained = readContinuation(config.repository, request.objective);
   if (retained && request.action !== "status")
@@ -1974,11 +1902,6 @@ export function repairWorkItem(
       throw new Error(
         "Operator corrections must declare their own provenance, not controller-checked readiness",
       );
-    if (recordSavedResultRefusal(state, input.item, config.checkout)) {
-      // This is a new authenticated observation of a retained refusal, not
-      // a historical command failure. Persist it even if the correction is refused.
-      saveState(statePath(config.repository, objective), state);
-    }
     applyWorkCorrection(state, input.item, input.correction);
     // The repair answers the stop the item's failure caused, as retry does.
     delete state.error;
@@ -2942,14 +2865,7 @@ export function decideStoppedObjective(
 export function controlObjective(
   ...args: Parameters<typeof controlObjectiveUnscoped>
 ): ReturnType<typeof controlObjectiveUnscoped> {
-  const [config, request, github] = args;
-  if (
-    request.action === "handoff" &&
-    (request.input?.failedReservationEvidence !== undefined ||
-      request.input?.retiredWithdrawalEvidence !== undefined ||
-      request.input?.retiredAdmissionEvidence !== undefined)
-  )
-    return stoppedOperatorHandoff(config, request, github);
+  const [config] = args;
   return checkpointController(
     config,
     () => controlObjectiveUnscoped(...args),

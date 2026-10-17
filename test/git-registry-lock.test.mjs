@@ -77,7 +77,6 @@ import {
   verifyQueueObservation,
   verifyQueueInspection,
   retainedQueueEntry,
-  retireUnknownProjectAdmission,
   settleFailedProjectQueueReservation,
 } from "../dist/project-queue-state.js";
 import {
@@ -100,7 +99,7 @@ import {
   ITEMS,
   INSPECT,
 } from "../dist/github-project-queue-wire.js";
-import { controlObjective, runObjective } from "../dist/runner.js";
+import { runObjective } from "../dist/runner.js";
 import {
   acquireInstallationLock,
   acquireObjectiveLock,
@@ -114,30 +113,6 @@ import {
   statePath,
   saveState,
 } from "../dist/state-store.js";
-
-/** The configuration file for a flat test config: one provider in planning's place. */
-function toConfigFile(config) {
-  return Object.fromEntries(
-    Object.entries(config).flatMap(([key, value]) =>
-      key === "planning"
-        ? [
-            [
-              "providers",
-              {
-                test: {
-                  planning: config.planning,
-                  execution: config.execution,
-                },
-              },
-            ],
-            ["defaultProvider", "test"],
-          ]
-        : key === "execution"
-          ? []
-          : [[key, value]],
-    ),
-  );
-}
 
 const processUrl = new URL("../dist/process.js", import.meta.url).href;
 
@@ -690,6 +665,17 @@ async function watcherWorkflow(
       baseSha,
       graph,
       planGraphDigest: graphDigest(graph),
+      publicationContract: "exact-request-v1",
+      objectiveCommands: [],
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: factoryConfigDigest(config),
+        graphDigest: graphDigest(graph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       capacity: { concurrency: 1 },
       autonomy: resolveAutonomy(),
       issueByItemId: { local: 2 },
@@ -1283,6 +1269,16 @@ bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmissio
     objectiveCommands: ["git diff --exit-code"],
     graph,
     planGraphDigest: graphDigest(graph),
+    publicationContract: "exact-request-v1",
+    approvedPlaybookPin: null,
+    approvedPlaybookAdmission: {
+      approvedPlaybookPin: null,
+      configDigest: factoryConfigDigest(config),
+      graphDigest: graphDigest(graph),
+      packetDigest: "c".repeat(64),
+      reviewDigest: "d".repeat(64),
+      sourcePacketDigest: "e".repeat(64),
+    },
     issueByItemId: { qa: 2 },
     work: {
       qa: {
@@ -1587,12 +1583,12 @@ async function holder(key, mode, publication = false) {
     [
       "--input-type=module",
       "-e",
-      `import { withRegistryFiles, withCheckpointPublication, takeGuard, releaseGuard } from ${JSON.stringify(processUrl)};
+      `import { withRegistryFiles, withCheckpointPublication } from ${JSON.stringify(processUrl)};
        const body = async () => {
          process.stdout.write("held\\n");
          await new Promise((resolve) => process.stdin.once("data", resolve));
        };
-       ${publication === "legacy" ? `takeGuard(${JSON.stringify(key)}); try { await body(); } finally { releaseGuard(${JSON.stringify(key)}); }` : `await ${publication ? `withCheckpointPublication(${JSON.stringify(key)}, body)` : `withRegistryFiles(${JSON.stringify(key)}, ${JSON.stringify(mode)}, undefined, body)`};`}
+       await ${publication ? `withCheckpointPublication(${JSON.stringify(key)}, body)` : `withRegistryFiles(${JSON.stringify(key)}, ${JSON.stringify(mode)}, undefined, body)`};
        process.exit(0);`,
     ],
     { stdio: ["pipe", "pipe", "inherit"] },
@@ -1813,7 +1809,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
           config,
           inspection,
           await readQueueHistory(config),
-          false,
           { allowUninitializedControl: true },
         ).uninitializedControl,
         true,
@@ -1825,7 +1820,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
             config,
             inspection,
             [parseQueueRecord(originalControl, repository, operation.id)],
-            false,
             { allowUninitializedControl: true },
           ),
         /partial or unknown/,
@@ -1862,30 +1856,12 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       original = Buffer.from(`${JSON.stringify(claim)}\n`);
     await writeFile(path, original, { mode: 0o600 });
     const error = new Error("original before-effect failure");
-    const maintenanceBuildOwners = [];
-    let observingMaintenance = false;
-    const buildClosure = () => {
-      if (observingMaintenance)
-        maintenanceBuildOwners.push(
-          readControllerOwner(installationLockPath(repository)),
-        );
-      return buildRecoveryCheckpointClosure({
+    const buildClosure = () =>
+      buildRecoveryCheckpointClosure({
         config,
         scope: "private-history",
       });
-    };
     await withRecoveryCheckpointScope({ config, buildClosure }, async () => {
-      const historical = structuredClone(claim);
-      delete historical.ownerProcess;
-      await assert.rejects(
-        settleFailedProjectQueueReservation(
-          config,
-          historical,
-          lock.token,
-          error,
-        ),
-        /historical or started work/,
-      );
       await assert.rejects(
         settleFailedProjectQueueReservation(
           config,
@@ -2131,7 +2107,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       state: "withdrawn",
     });
     const binding = config.queue.project;
-    const unknown = {
+    const header = {
       schemaVersion: 1,
       kind: "project-queue-operation",
       id: operationId,
@@ -2148,6 +2124,20 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       bodyDigest: claim.bodyDigest,
       order: 1,
       metadata,
+    };
+    const planned = createProjectQueuePlannedEffect(binding, {
+      operationId,
+      requestId,
+      actorId: 1,
+      action: "set-metadata",
+      target: { itemId: "PVTI_storage" },
+      fieldId: binding.metadataFieldId,
+      metadata,
+      prior: { target: { itemId: "PVTI_storage", metadata: null } },
+      control: { metadata: null },
+    });
+    const unknown = {
+      ...header,
       effects: [
         {
           intent: {
@@ -2174,6 +2164,15 @@ test("the actual creating lease settles only a fresh failed reservation and arch
           },
         },
       ],
+      commandId: operationId,
+      commandRecipe: {
+        schemaVersion: 1,
+        id: operationId,
+        configDigest: "1".repeat(64),
+        deadlineAt: null,
+        operations: [header],
+        effects: [planned],
+      },
     };
     const unknownBytes = Buffer.from(`${JSON.stringify(unknown)}\n`);
     await withRecoveryCheckpointScope({ config, buildClosure }, async () => {
@@ -2216,10 +2215,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
     );
     assert.equal(
       restoredHistory.find((row) => row.id === operationId).beforeEffectFailure,
-      undefined,
-    );
-    assert.equal(
-      restoredHistory.find((row) => row.id === operationId).retiredWithdrawal,
       undefined,
     );
 
@@ -2504,34 +2499,27 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         issueNodeId: admission.issueNodeId,
         prior: { target: null },
       });
-      const ordered = createProjectQueuePlannedEffect(binding, {
+      const fields = createProjectQueuePlannedEffect(binding, {
         ...common,
         requestId: randomUUID(),
-        action: "set-order",
+        action: "set-admission-fields",
         target: { resultOf: ensured.requestId },
-        fieldId: binding.orderFieldId,
+        orderFieldId: binding.orderFieldId,
+        metadataFieldId: binding.metadataFieldId,
         order: 9,
-        prior: { resultOf: ensured.requestId },
-      });
-      const final = createProjectQueuePlannedEffect(binding, {
-        ...common,
-        requestId: randomUUID(),
-        action: "set-metadata",
-        target: { resultOf: ensured.requestId },
-        fieldId: binding.metadataFieldId,
         metadata: admission.metadata,
-        prior: { resultOf: ordered.requestId },
+        prior: { resultOf: ensured.requestId },
       });
       const admissionPlan = {
         operations: [admission],
-        effects: [ensured, ordered, final],
+        effects: [ensured, fields],
         deadlineAt: null,
       };
       assert.throws(
         () =>
           createQueueCommand(config, {
             ...admissionPlan,
-            effects: [ordered, ensured, final],
+            effects: [fields, ensured],
           }),
         /dependency must precede/,
       );
@@ -2539,7 +2527,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         () =>
           createQueueCommand(config, {
             ...admissionPlan,
-            effects: [ensured, final],
+            effects: [fields],
           }),
         /dependency must precede/,
       );
@@ -2557,12 +2545,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         () => createQueueCommand(config, wrongBody),
         /exact approved Issue body/,
       );
-      const wrongPrior = structuredClone(admissionPlan);
-      wrongPrior.effects[2].prior.resultOf = ensured.requestId;
-      assert.throws(
-        () => createQueueCommand(config, wrongPrior),
-        /immediately preceding/,
-      );
       await withRecoveryCheckpointScope({ config, buildClosure }, async () => {
         const planned = createQueueCommand(config, admissionPlan);
         assert.equal(nextProjectQueueOrder([admission]), 10);
@@ -2572,8 +2554,8 @@ test("the actual creating lease settles only a fresh failed reservation and arch
           /every declared fulfilled original/,
         );
       });
-      // Preserve the three-action legacy declaration above, and archive the new
-      // compound declaration as real local intent only: no remote result exists.
+      // Archive a second compound declaration as real local intent only: no
+      // remote result exists.
       const compoundAdmission = createQueueOperation(config, {
         action: "admit",
         scope: "I_compound",
@@ -2853,7 +2835,7 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       );
       assert.throws(
         () => assertQueueCommandHistory([stripped], readOriginal),
-        /declared command membership/,
+        /exact original recipe owner/,
       );
       assert.throws(
         () => retainedQueueEntry(config, [stripped], 6),
@@ -3014,18 +2996,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         () => assertQueueCommandHistory([partial], readOriginal),
         /every declared original response/,
       );
-      // The old operator disposition accepts only its original three-action
-      // legacy shape; a partial compound record cannot acquire that authority.
-      const refusedRetirement = structuredClone(partial);
-      delete refusedRetirement.completed;
-      refusedRetirement.retiredAdmission = {
-        originalOperation: originalRef(refusedRetirement),
-      };
-      assert.throws(
-        () =>
-          assertQueueOperationReferenceBodies(refusedRetirement, readOriginal),
-        /two genuine ordered responses/,
-      );
       assert.equal(
         originals.get(partial.effects[1].rejectedOriginal.digest).toString(),
         JSON.stringify({
@@ -3044,7 +3014,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
         await readFile(join(history, `${compoundAdmission.id}.json`)),
       );
       assert.equal(compoundAdmission.completed, undefined);
-      assert.equal(compoundAdmission.retiredAdmission, undefined);
       assert.deepEqual(compoundAdmission.effects, []);
       const controlOperation = createQueueOperation(config, {
         action: "control",
@@ -3114,12 +3083,6 @@ test("the actual creating lease settles only a fresh failed reservation and arch
       );
       const groupedHistory = await readQueueHistory(config);
       assert.equal(nextProjectQueueOrder(groupedHistory), 18);
-      assert.equal(
-        groupedHistory.find((row) => row.id === admission.id).retiredAdmission,
-        undefined,
-      );
-      // Unknown legacy effects and grouped recipes cannot be silently reclassified
-      // as the narrowly authorized, two-response legacy admission disposition.
       assert.throws(
         () => acquireInstallationLock(repository, 4),
         /already owns Objective #1/,
@@ -3142,179 +3105,12 @@ test("the actual creating lease settles only a fresh failed reservation and arch
           () => acquireObjectiveLock(repository, 5),
           /already owns this installation/,
         );
-        await assert.rejects(
-          retireUnknownProjectAdmission(
-            config,
-            {},
-            4,
-            {},
-            "Fixture",
-            maintenanceLock,
-          ),
-          /Explicit unknown.*evidence/,
-        );
-        await assert.rejects(
-          retireUnknownProjectAdmission(
-            { ...config, planning: { kind: "unsupported" } },
-            {},
-            4,
-            {},
-            "Fixture",
-            maintenanceLock,
-          ),
-          /unknown provider resource protocols/,
-        );
-        await assert.rejects(
-          retireUnknownProjectAdmission(config, {}, 4, {}, "Fixture", {
-            ...maintenanceLock,
-            token: "foreign",
-          }),
-          /exclusive stopped installation lease/,
-        );
       } finally {
         releaseControllerLock(
           installationLockPath(repository),
           maintenanceLock,
         );
       }
-      // Exercise the real stopped-controller entry and its error settlement.
-      // These deliberately incomplete descriptors claim no operator observation,
-      // provider response or permission to retire any of the preserved intents.
-      const configPath = join(directory, "maintenance-config.json"),
-        configBytes = Buffer.from(JSON.stringify(toConfigFile(config))),
-        refusedProofPath = join(directory, "not-an-operator-proof.json"),
-        refusedProofBytes = Buffer.from("{}\n");
-      await writeFile(configPath, configBytes, { mode: 0o600 });
-      await writeFile(refusedProofPath, refusedProofBytes, { mode: 0o600 });
-      const refusedOriginal = {
-        path: refusedProofPath,
-        sha256: hash(refusedProofBytes),
-        bytes: refusedProofBytes.length,
-      };
-      const refusedEvidence = {
-        schemaVersion: 1,
-        kind: "operator-retired-admission-unknown",
-        operationId: randomUUID(),
-        originalInstallation: {
-          cli: process.execPath,
-          configPath,
-          configSha256: hash(configBytes),
-          ownFileInventory: refusedOriginal,
-        },
-        originals: Object.fromEntries(
-          [
-            "ownerObservation",
-            "installedPlan",
-            "callerFailure",
-            "sourceProtocolReview",
-            "physicalClosure",
-          ].map((name) => [name, refusedOriginal]),
-        ),
-      };
-      const maintenanceOffset = (await readFile(diagnosticPath(repository, 0)))
-        .length;
-      // An actual rewritten retained original makes error settlement durable;
-      // the old unknown intent itself remains byte-for-byte unchanged.
-      await writeFile(join(history, `${operationId}.json`), unknownBytes);
-      markCheckpointDirty(repository, {
-        path: `project-queue-history/${operationId}.json`,
-        kind: "historical",
-      });
-      observingMaintenance = true;
-      try {
-        await assert.rejects(
-          controlObjective(
-            config,
-            {
-              objective: 4,
-              action: "handoff",
-              input: {
-                actor: "Fixture",
-                retiredAdmissionEvidence: refusedEvidence,
-              },
-            },
-            {},
-          ),
-          /Other partial effects or active owners remain held/,
-        );
-      } finally {
-        observingMaintenance = false;
-      }
-      assert(maintenanceBuildOwners.length > 0);
-      assert(
-        maintenanceBuildOwners.every(
-          (owner) => owner?.pid === process.pid && owner.objective === 4,
-        ),
-        "terminal error settlement retains the exclusive installation lease",
-      );
-      const maintenanceEvents = (await readFile(diagnosticPath(repository, 0)))
-        .subarray(maintenanceOffset)
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      const maintenanceReads = maintenanceEvents.filter(
-        (event) =>
-          event.operation === "recovery-checkpoint-verify" &&
-          event.outcome === "started",
-      );
-      assert(maintenanceReads.length >= 2);
-      assert(maintenanceReads.every((event) => event.metadata.owned === true));
-      assert.equal(maintenanceReads[0].metadata.objectsRetained, false);
-      assert(
-        maintenanceReads
-          .slice(1)
-          .every((event) => event.metadata.objectsRetained),
-        "terminal error settlement reuses the same authenticated verifier",
-      );
-      assert.equal(existsSync(installationLockPath(repository)), false);
-      // The normal compiled CLI delegates this complete guarded controller;
-      // rejection must not trigger an unowned, duplicate cold synchronization.
-      const evidencePath = join(directory, "refused-maintenance-evidence.json");
-      await writeFile(evidencePath, JSON.stringify(refusedEvidence), {
-        mode: 0o600,
-      });
-      const cliOffset = (await readFile(diagnosticPath(repository, 0))).length;
-      assert.throws(
-        () =>
-          execFileSync(
-            process.execPath,
-            [
-              new URL("../dist/cli.js", import.meta.url).pathname,
-              "handoff",
-              "--objective",
-              "4",
-              "--retired-admission-evidence",
-              evidencePath,
-              "--config",
-              configPath,
-            ],
-            { env: process.env, encoding: "utf8", timeout: 30_000 },
-          ),
-        (error) =>
-          error.status === 1 &&
-          /Other partial effects or active owners remain held/.test(
-            error.stderr,
-          ),
-      );
-      const cliReads = (await readFile(diagnosticPath(repository, 0)))
-        .subarray(cliOffset)
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line))
-        .filter(
-          (event) =>
-            event.operation === "recovery-checkpoint-verify" &&
-            event.outcome === "started",
-        );
-      assert(cliReads.length > 0);
-      assert(
-        cliReads.every((event) => event.metadata.owned === true),
-        "CLI error propagation never reopens an unowned verifier",
-      );
-      assert.equal(existsSync(installationLockPath(repository)), false);
-
       assert.deepEqual(
         await readFile(join(history, `${operationId}.json`)),
         unknownBytes,
@@ -3575,17 +3371,6 @@ test("archive publication waits for a real publisher beyond one second and prese
 
     other = await holder(guard, "exclusive", true);
     await other.kill();
-    other = undefined;
-    await withCheckpointPublication(guard, async () => undefined);
-
-    other = await holder(guard, "exclusive", "legacy");
-    await assert.rejects(
-      withCheckpointPublication(guard, async () =>
-        assert.fail("live legacy publisher ignored"),
-      ),
-      /lock guard .* held by process/,
-    );
-    await other.release();
     other = undefined;
     await withCheckpointPublication(guard, async () => undefined);
   } finally {

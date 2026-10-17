@@ -634,10 +634,6 @@ export function validateScheduling(
   }
 }
 
-/** The sandbox (Daytona) backend was removed in #720; the tag keeps its last source. */
-const SANDBOX_REMOVED =
-  'execution.kind "sandbox" is no longer supported: use "local" (Codex, Claude or GitHub Copilot on this host) or "managed-agent" (provider "claude-managed-agents" or "openai-agents")';
-
 export function validateConfig(value: unknown): FactoryConfig {
   assertObject(value, "configuration");
   if (value.schemaVersion !== 1)
@@ -781,9 +777,7 @@ export function validateConfig(value: unknown): FactoryConfig {
     value.execution.kind !== "managed-agent"
   ) {
     throw new Error(
-      value.execution.kind === "sandbox"
-        ? SANDBOX_REMOVED
-        : `Execution mode ${String(value.execution.kind)} is not implemented; select local`,
+      `Execution mode ${String(value.execution.kind)} is not implemented; select local`,
     );
   }
   if (
@@ -1039,16 +1033,13 @@ export interface Capacity {
 }
 
 /** The declared capacity, or this host's defaults when `execution.concurrency` is omitted. */
-export function resolveCapacity(
-  config: FactoryConfig,
-  hostFacts?: HostFacts,
-): Capacity {
+export function resolveCapacity(config: FactoryConfig): Capacity {
   if (config.execution.concurrency !== undefined)
     return {
       concurrency: config.execution.concurrency,
       ...(config.scheduling ? { scheduling: config.scheduling } : {}),
     };
-  const host = currentHostDefaults(hostFacts);
+  const host = currentHostDefaults();
   return {
     concurrency: host.concurrency,
     scheduling: config.scheduling ?? host.scheduling,
@@ -1058,29 +1049,27 @@ export function resolveCapacity(
   };
 }
 
-/** The host facts sizing reads; tests inject them, a run reads the live host. */
+/** The host facts sizing reads. */
 export interface HostFacts {
   cpus: number;
   memoryBytes: number;
 }
 
-function currentHostDefaults(hostFacts?: HostFacts) {
-  return hostSchedulingDefaults(
-    hostFacts ?? { cpus: availableParallelism(), memoryBytes: totalmem() },
-  );
+function currentHostDefaults() {
+  return hostSchedulingDefaults({
+    cpus: availableParallelism(),
+    memoryBytes: totalmem(),
+  });
 }
 
 /**
  * The capacity to schedule with now. Stored values bind plan bounds; a host-sized value never
  * exceeds what the current host offers, so a smaller host is not oversubscribed.
  */
-export function liveCapacity(
-  capacity: Capacity,
-  hostFacts?: HostFacts,
-): Capacity {
+export function liveCapacity(capacity: Capacity): Capacity {
   const sized = capacity.hostSized;
   if (!sized) return capacity;
-  const host = currentHostDefaults(hostFacts);
+  const host = currentHostDefaults();
   const least = (stored: number | undefined, live: number | undefined) =>
     stored === undefined || live === undefined
       ? stored
@@ -1386,8 +1375,7 @@ const providerName = /^[a-z][a-z0-9-]{0,31}$/;
 
 /**
  * The FactoryConfig for one provider. Its planning and execution take the place of
- * `providers` in the file's key order, so a file converted from the flat layout keeps
- * the configuration digest its Objectives froze.
+ * `providers` in the file's key order, which keeps configuration digests stable.
  */
 export function resolveProvider(
   file: FactoryConfigFile,

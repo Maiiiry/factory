@@ -41,7 +41,7 @@ import {
   sha256,
 } from "./openai-managed-files.js";
 
-export interface OpenAIManagedConfig {
+interface OpenAIManagedConfig {
   model: string;
   reasoningEffort: "low" | "medium" | "high";
   containerSize: "small" | "medium" | "large";
@@ -79,20 +79,10 @@ export function validateOpenAIManagedConfig(
   return v as unknown as OpenAIManagedConfig;
 }
 
-export interface OpenAIManagedTransport {
-  json(
-    method: "GET" | "POST" | "DELETE",
-    path: string,
-    body?: unknown,
-    timeoutMs?: number,
-  ): Promise<unknown>;
-  content(path: string, timeoutMs?: number): Promise<Response>;
-}
 /** Fixed official API origin; no mutation retries, credentials remain controller-only. */
-export class OpenAIAgentsClient implements OpenAIManagedTransport {
+class OpenAIAgentsClient {
   constructor(
     private keyName: string,
-    private fetcher: typeof fetch = fetch,
     private timeoutMs?: number,
     private apiKey?: string,
   ) {}
@@ -109,7 +99,7 @@ export class OpenAIAgentsClient implements OpenAIManagedTransport {
       throw missingCredential(
         `OpenAI Agents API requires controller credential ${this.keyName}`,
       );
-    return this.fetcher(`https://api.openai.com/v1${path}`, {
+    return fetch(`https://api.openai.com/v1${path}`, {
       method,
       ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
       headers: {
@@ -148,7 +138,7 @@ export class OpenAIAgentsClient implements OpenAIManagedTransport {
   }
 }
 /** An Agents API response that was not successful; `status` lets callers tell transient failures apart. */
-export class AgentsApiError extends Error {
+class AgentsApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
@@ -186,8 +176,7 @@ interface Active {
     | "running"
     | "cancel-submitted"
     | "delete-submitted"
-    | "delete-acknowledged"
-    | "disposed";
+    | "delete-acknowledged";
   sessionId?: string;
   environmentId?: string;
   turnId?: string;
@@ -203,26 +192,22 @@ interface Active {
 export class OpenAIManagedExecutionDriver implements ExecutionDriver {
   readonly childAgents = "disabled" as const;
   readonly effectAdmission = "controller-checkpoint-v1" as const;
-  private client: OpenAIManagedTransport;
+  private client: OpenAIAgentsClient;
   constructor(
     private args: {
       checkout: string;
       workRoot: string;
       contentStore: ContentStore;
       config: OpenAIManagedConfig;
-      transport?: OpenAIManagedTransport;
       apiKey?: string;
     },
   ) {
     validateOpenAIManagedConfig(args.config);
-    this.client =
-      args.transport ??
-      new OpenAIAgentsClient(
-        args.config.apiKeyEnv,
-        fetch,
-        args.config.timeoutSeconds * 1000,
-        args.apiKey,
-      );
+    this.client = new OpenAIAgentsClient(
+      args.config.apiKeyEnv,
+      args.config.timeoutSeconds * 1000,
+      args.apiKey,
+    );
   }
   @classifyFaults(executionFault)
   async availableSlots(): Promise<"unknown"> {
@@ -586,7 +571,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<ExecutionObservation> {
     const data = this.active(handle);
-    if (data.phase === "disposed" || data.phase === "delete-acknowledged")
+    if (data.phase === "delete-acknowledged")
       this.physicalCessationUnconfirmed(handle);
     // This API surface cannot list sessions by attempt tag, so a lost create
     // response cannot be resolved; any session it made never received input.
@@ -704,9 +689,8 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<void> {
     const data = this.active(handle);
-    // Legacy `disposed` checkpoints used API disappearance as their proof.
-    // Neither those checkpoints nor a DELETE acknowledgment prove cessation.
-    if (data.phase === "disposed" || data.phase === "delete-acknowledged")
+    // A DELETE acknowledgment does not prove cessation.
+    if (data.phase === "delete-acknowledged")
       this.physicalCessationUnconfirmed(handle);
     data.cleanupStartedAt ??= Date.now();
     if (data.sessionId) {
@@ -753,7 +737,7 @@ export class OpenAIManagedExecutionDriver implements ExecutionDriver {
     context?: ExecutionContext,
   ): Promise<void> {
     const data = this.active(handle);
-    if (data.phase === "disposed" || data.phase === "delete-acknowledged")
+    if (data.phase === "delete-acknowledged")
       this.physicalCessationUnconfirmed(handle);
     // Each cleanup gets a fresh window, so cleanup resumed after an outage
     // longer than the window still runs.

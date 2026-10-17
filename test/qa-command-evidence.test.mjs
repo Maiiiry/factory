@@ -15,7 +15,6 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { assertKnownFlags } from "../dist/cli-flags.js";
-import { planningSources } from "../dist/compiler/sources.js";
 import { factoryConfigDigest, stateRoot } from "../dist/config.js";
 import { LocalContentStore } from "../dist/content/local.js";
 import {
@@ -442,6 +441,17 @@ test("an exact operator decline preserves a real result and permits ordinary com
       baseSha: base,
       graph,
       planGraphDigest: graphDigest(graph),
+      objectiveCommands: [],
+      objectiveBodyDigest: "b".repeat(64),
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: factoryConfigDigest(config),
+        graphDigest: graphDigest(graph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       capacity: { concurrency: 1 },
       issueByItemId: { implementation: 2 },
       configDigest: factoryConfigDigest(config),
@@ -916,6 +926,17 @@ else { if(process.env.TMPDIR!==process.env.TMP || process.env.TMP!==process.env.
       baseSha: base,
       graph,
       planGraphDigest: graphDigest(graph),
+      objectiveCommands: [],
+      objectiveBodyDigest: "b".repeat(64),
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: factoryConfigDigest(config),
+        graphDigest: graphDigest(graph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       capacity: { concurrency: 1 },
       issueByItemId: { implementation: 3, qa: 2 },
       configDigest: factoryConfigDigest(config),

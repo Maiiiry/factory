@@ -27,6 +27,7 @@ import {
   validateTarget,
 } from "../config.js";
 import type {
+  ApprovedPlaybookPin,
   ExecutionDriver,
   GitHubGateway,
   PlanningModel,
@@ -185,7 +186,7 @@ function preparationSourceDigest(
   sources: { path: string; heading?: string; content: string }[],
   prerequisites: PlanCandidate["prerequisites"],
   localExecutables: PlanCandidate["localExecutables"],
-  approvedPlaybookPin?: PlanCandidate["approvedPlaybookPin"],
+  approvedPlaybookPin: ApprovedPlaybookPin,
   workflowRecipePin?: WorkflowRecipePin,
 ): string {
   const original = createHash("sha256")
@@ -203,12 +204,9 @@ function preparationSourceDigest(
       ),
     )
     .digest("hex");
-  const advisory =
-    approvedPlaybookPin === undefined
-      ? original
-      : createHash("sha256")
-          .update(JSON.stringify([original, approvedPlaybookPin]))
-          .digest("hex");
+  const advisory = createHash("sha256")
+    .update(JSON.stringify([original, approvedPlaybookPin]))
+    .digest("hex");
   return workflowRecipePin === undefined
     ? advisory
     : createHash("sha256")

@@ -365,11 +365,9 @@ process.stdout.write(JSON.stringify(emitted));`,
       durableCapture.content.originalDigest,
       durableCapture.content.retainedDigest,
     );
-    // A real private process capture is not a native model tool call. Even the
-    // explicit legacy-tool read must neither expose its text nor invent counts.
-    const analysis = analyzeInteractions([metadata], [], {
-      includeNativeToolContent: true,
-    });
+    // A real private process capture is not a native model tool call:
+    // analysis must neither expose its text nor invent counts.
+    const analysis = analyzeInteractions([metadata]);
     assert.equal(
       analysis.requestBytes.renderedPromptBytes.total,
       Buffer.byteLength("real child process capture π"),
@@ -437,7 +435,6 @@ process.stdout.write(JSON.stringify(emitted));`,
     );
     assert.equal(analysis.nativeFamilyResponseUsage.paidOwnedChildSessions, 0);
     assert.equal(analysis.nativeToolActivity.uniqueCalls, null);
-    assert.equal(analysis.invocations[0].nativeToolActivity.contentReads, 0);
     assert.equal(
       JSON.stringify(analysis).includes("real child process capture"),
       false,
@@ -1274,6 +1271,18 @@ test("cancellation stops an owned shell and its process group", async () => {
       configDigest: factoryConfigDigest(config),
       baseSha,
       planGraphDigest: graphDigest(graph),
+      publicationContract: "exact-request-v1",
+      objectiveCommands: [],
+      objectiveBodyDigest: "b".repeat(64),
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: factoryConfigDigest(config),
+        graphDigest: graphDigest(graph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       graph,
       issueByItemId: { local: 2 },
       work: { local: { status: "failed" } },
@@ -1353,6 +1362,8 @@ test("cancellation stops an owned shell and its process group", async () => {
       undefined,
       { sessionRoot: join(root, "planning-sessions") },
     );
+    // Scoped as each Objective's model is: no approved advice selected.
+    planningModel.approvedPlaybookPin = null;
     const preparationServices = { ...services, planningModel };
     await withGitHubTransportObserver(
       (observation) => observations.push(observation),
@@ -1366,6 +1377,7 @@ test("cancellation stops an owned shell and its process group", async () => {
           const preparation = {
             schemaVersion: 8,
             kind: "preparing",
+            approvedPlaybookPin: null,
             repository: config.repository,
             objective: 1,
             runId: randomUUID(),
@@ -1395,6 +1407,11 @@ test("cancellation stops an owned shell and its process group", async () => {
             preparation.schemaVersion = 7;
             preparation.graph = structuredClone(snapshot.graph);
             preparation.planGraphDigest = snapshot.planGraphDigest;
+            preparation.approvedPlaybookAdmission = structuredClone(
+              snapshot.approvedPlaybookAdmission,
+            );
+            preparation.publicationContract = snapshot.publicationContract;
+            preparation.objectiveCommands = snapshot.objectiveCommands;
             preparation.issueByItemId = snapshot.issueByItemId;
             preparation.work = {
               local: {
@@ -2291,6 +2308,17 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       objective: 1,
       runId: "actual-local-validation",
       planGraphDigest: graphDigest(graph),
+      objectiveCommands: [],
+      objectiveBodyDigest: "b".repeat(64),
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: factoryConfigDigest(config),
+        graphDigest: graphDigest(graph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       capacity: { concurrency: 1 },
       issueByItemId: { local: 1 },
       configDigest: factoryConfigDigest(config),
@@ -2900,6 +2928,8 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       (item) => item.id === "local",
     ).validation = [{ command: imageCommand, provenance: "source-declared" }];
     retainedImageState.planGraphDigest = graphDigest(retainedImageState.graph);
+    retainedImageState.approvedPlaybookAdmission.graphDigest =
+      retainedImageState.planGraphDigest;
     retainedImageState.work.local = {
       status: "running",
       step: "validate",
@@ -3068,6 +3098,10 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       runId: "actual-local-semantic-refusal",
       graph: semanticGraph,
       planGraphDigest: graphDigest(semanticGraph),
+      approvedPlaybookAdmission: {
+        ...state.approvedPlaybookAdmission,
+        graphDigest: graphDigest(semanticGraph),
+      },
       autonomy: resolveAutonomy({ allowances: { implementationRepairs: 1 } }),
       charges: {},
       work: {
@@ -3415,35 +3449,6 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       ),
     });
     assert.ok(laterPacket.evidence.some((entry) => entry.heading));
-    // A passing review saved before #1254 cited the whole entry, heading
-    // included; that state still loads, and a differing heading does not.
-    const legacyCriteria = (bodies) => [
-      {
-        criterion: later.graph.items[0].acceptance[0],
-        verdict: "pass",
-        evidence: bodies.map(
-          ({ content: _content, reusableBody: _reusable, ...rest }) => rest,
-        ),
-        detail: "The documented section is satisfied.",
-      },
-    ];
-    const legacyBodies = laterPacket.evidence.map((entry) =>
-      structuredClone(entry),
-    );
-    assertRetainedReviewEvidence({
-      criteria: legacyCriteria(legacyBodies),
-      reviewEvidence: legacyBodies,
-    });
-    assert.throws(
-      () =>
-        assertRetainedReviewEvidence({
-          criteria: legacyCriteria(legacyBodies),
-          reviewEvidence: legacyBodies.map((entry) =>
-            entry.heading ? { ...entry, heading: `${entry.heading}!` } : entry,
-          ),
-        }),
-      /Retained review body differs from its complete citation/,
-    );
     const retryConfig = { ...config, delivery: { kind: "regular" } };
     assert.equal(retryWorkItem(retryConfig, 3, "local"), "attempt");
     const retried = readState(config.repository, 3).work.local;
@@ -3482,6 +3487,17 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       objective: 2,
       runId: "actual-local-publication",
       planGraphDigest: graphDigest(publicationGraph),
+      objectiveCommands: [],
+      objectiveBodyDigest: "b".repeat(64),
+      approvedPlaybookPin: null,
+      approvedPlaybookAdmission: {
+        approvedPlaybookPin: null,
+        configDigest: state.configDigest,
+        graphDigest: graphDigest(publicationGraph),
+        packetDigest: "c".repeat(64),
+        reviewDigest: "d".repeat(64),
+        sourcePacketDigest: "e".repeat(64),
+      },
       capacity: state.capacity,
       issueByItemId: { local: 2 },
       configDigest: state.configDigest,
@@ -4270,6 +4286,17 @@ test("source readiness prepares each real fresh checkout before its phase checks
         objective: 1,
         runId: "recorded-readiness-checkout",
         planGraphDigest: originalDigest,
+        objectiveCommands: [],
+        objectiveBodyDigest: "b".repeat(64),
+        approvedPlaybookPin: null,
+        approvedPlaybookAdmission: {
+          approvedPlaybookPin: null,
+          configDigest: factoryConfigDigest({ repository, checkout }),
+          graphDigest: originalDigest,
+          packetDigest: "c".repeat(64),
+          reviewDigest: "d".repeat(64),
+          sourcePacketDigest: "e".repeat(64),
+        },
         configDigest: factoryConfigDigest({ repository, checkout }),
         baseSha,
         capacity: { concurrency: 1 },
@@ -4379,6 +4406,8 @@ test("source readiness prepares each real fresh checkout before its phase checks
         };
       const historicalDigest = graphDigest(historicalGraph);
       historical.planGraphDigest = historicalDigest;
+      historical.approvedPlaybookAdmission.graphDigest =
+        historical.planGraphDigest;
       historical.graphRevisions[0] = {
         graph: historicalGraph,
         digest: historicalDigest,

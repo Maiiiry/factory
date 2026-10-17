@@ -114,7 +114,7 @@ const ENVIRONMENT = [
 ];
 
 /** What a Codex shell may do in its working directory and on the network. */
-export interface CodexSandbox {
+interface CodexSandbox {
   /** The thread's working directory. */
   directory: string;
   workspace: "read" | "write";
@@ -131,6 +131,16 @@ export function codexRuntimeDirectory(): string {
     dirname(cli.resolve(`@openai/codex-linux-${arch}/package.json`)),
     "vendor",
   );
+}
+
+/** The installed Codex binary and the PATH directory of its bundled helpers. */
+export function codexRuntime(): { file: string; path: string } {
+  const target =
+    process.arch === "arm64"
+      ? "aarch64-unknown-linux-musl"
+      : "x86_64-unknown-linux-musl";
+  const root = join(codexRuntimeDirectory(), target);
+  return { file: join(root, "bin", "codex"), path: join(root, "codex-path") };
 }
 
 const real = (path: string) =>
@@ -359,7 +369,7 @@ enabled = ${sandbox.network}
 `;
 }
 
-export interface CodexHome {
+interface CodexHome {
   root: string;
   /** Authenticate settled native history before resuming; unavailable throws. */
   nativeCaptureBoundary(threadId: string): NativeCaptureBoundary;
@@ -646,7 +656,7 @@ function authenticateHome(root: string, owner: string) {
   return identity;
 }
 
-/** Remove only an authenticated, settled retained adapter home. */
+/** Fail unless a retained adapter home still belongs to `owner` with its recorded directory identities. */
 export function assertOwnedCodexHome(root: string, owner: string): void {
   authenticateHome(root, owner);
 }

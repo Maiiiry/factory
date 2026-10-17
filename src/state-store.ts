@@ -109,7 +109,7 @@ export interface PreState {
   wait?: Wait;
 }
 
-export function preStatePath(repository: string, objective: number): string {
+function preStatePath(repository: string, objective: number): string {
   return join(dirname(statePath(repository, objective)), "pre-state.json");
 }
 
@@ -232,23 +232,8 @@ export function saveState(
 }
 
 const currentVersion = (value: unknown): boolean => {
-  const version = (value as { schemaVersion?: unknown } | null)?.schemaVersion;
-  return (
-    version === 7 ||
-    version === 8 ||
-    version === 9 ||
-    version === 10 ||
-    version === 11 ||
-    version === 12 ||
-    version === 13 ||
-    version === 14 ||
-    version === 15 ||
-    version === 16 ||
-    version === 17 ||
-    version === 18 ||
-    version === 19 ||
-    version === 20
-  );
+  const state = value as ContinuationState | null;
+  return isPreparationState(state) || isExecutionState(state);
 };
 
 /** Every Objective (or preparation) directory whose snapshot an earlier version wrote. */
@@ -470,8 +455,7 @@ function parsePreparation(
     throw new Error(
       "Invalid preparation snapshot; operator direction required",
     );
-  if (Object.hasOwn(value, "approvedPlaybookPin"))
-    assertApprovedPlaybookPin(value.approvedPlaybookPin);
+  assertApprovedPlaybookPin(value.approvedPlaybookPin);
   if (
     value.plan &&
     JSON.stringify(value.plan.approvedPlaybookPin) !==
@@ -571,7 +555,7 @@ export interface ControllerLock {
   token: string;
 }
 
-export interface ControllerOwner {
+interface ControllerOwner {
   intake?: boolean;
   pid: number;
   startTime: string;
@@ -810,7 +794,6 @@ export function continuationConfigurationMatches(
   try {
     assertContinuationRestoration(state);
     return (
-      !!receipt.source &&
       receipt.original.configDigest === receipt.source.configDigest &&
       receipt.source.authorityDigest === factoryAuthorityDigest(config) &&
       receipt.installation.authorityDigest === factoryAuthorityDigest(config) &&
@@ -1270,10 +1253,6 @@ export async function restoreRecoveryCheckpoint(args: {
             return data;
           },
         );
-        if (description.gaps.some((gap) => gap.required !== false))
-          throw new Error(
-            "Proposal original has an unresolved required reference",
-          );
         gitObjects.set(`commit:${description.baseSha}`, {
           sha: description.baseSha,
           kind: "commit",
@@ -1321,6 +1300,10 @@ export async function restoreRecoveryCheckpoint(args: {
           throw new Error("Recovery source Git object has the wrong type");
       pinnedGit(config.checkout, "rev-parse", "--git-dir");
     }
+    if (originals.length && !source)
+      throw new Error(
+        "Recovery checkpoint has no publisher authority; its continuations cannot be restored",
+      );
     // Refuse mutable path conflicts before canonical replicas or operational snapshots are installed.
     for (const file of replicaFiles) {
       assertRecoveryReplicaPath(
@@ -1408,6 +1391,8 @@ export async function restoreRecoveryCheckpoint(args: {
       reason: string;
     }[] = [];
     for (const { state, ref, retired } of originals) {
+      // Refused above when the manifest carries no publisher authority.
+      const authority = source!;
       const previous = readContinuation(
         config.repository,
         state.objective,
@@ -1424,30 +1409,26 @@ export async function restoreRecoveryCheckpoint(args: {
           configDigest: state.configDigest,
           schemaVersion: state.schemaVersion,
         },
-        ...(source
-          ? {
-              source:
-                state.restoration &&
-                state.restoration.installation.configDigest ===
-                  source.configDigest &&
-                state.restoration.installation.checkout ===
-                  source.hostLayout.checkout &&
-                state.restoration.installation.authorityDigest ===
-                  source.authorityDigest &&
-                state.restoration.source?.authorityDigest ===
-                  source.authorityDigest &&
-                factoryConfigDigest({
-                  ...config,
-                  checkout: source.hostLayout.checkout,
-                }) === source.configDigest
-                  ? structuredClone(state.restoration.source)
-                  : {
-                      authorityDigest: source.authorityDigest,
-                      configDigest: source.configDigest,
-                      ...source.hostLayout,
-                    },
-            }
-          : {}),
+        source:
+          state.restoration &&
+          state.restoration.installation.configDigest ===
+            authority.configDigest &&
+          state.restoration.installation.checkout ===
+            authority.hostLayout.checkout &&
+          state.restoration.installation.authorityDigest ===
+            authority.authorityDigest &&
+          state.restoration.source.authorityDigest ===
+            authority.authorityDigest &&
+          factoryConfigDigest({
+            ...config,
+            checkout: authority.hostLayout.checkout,
+          }) === authority.configDigest
+            ? structuredClone(state.restoration.source)
+            : {
+                authorityDigest: authority.authorityDigest,
+                configDigest: authority.configDigest,
+                ...authority.hostLayout,
+              },
         installation: {
           identity: previous?.installation.identity ?? randomUUID(),
           configDigest: factoryConfigDigest(config),

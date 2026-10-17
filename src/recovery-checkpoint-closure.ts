@@ -84,7 +84,7 @@ export interface RecoveryGitObject {
 }
 export interface RecoveryClosureGap {
   path: string;
-  availability: "missing-legacy" | "unavailable" | "transient" | "archived";
+  availability: "unavailable" | "transient" | "archived";
   reason: string;
   required?: boolean;
   /** For an `archived` gap: the commit that holds the complete evidence. */
@@ -139,12 +139,11 @@ function object(value: unknown): Record<string, unknown> {
 function assetReferences(
   sets: CapturedAssetSet[] | undefined,
   add: (ref: ContentRef | undefined) => void,
-  gaps: RecoveryClosureGap[],
   excludedManifestDigests?: ReadonlySet<string>,
 ): void {
   for (const set of sets ?? []) {
     if (
-      set.capture?.declarationDigest !== undefined &&
+      set.capture.declarationDigest !== undefined &&
       !/^[a-f0-9]{64}$/.test(set.capture.declarationDigest)
     )
       throw new Error("Asset declaration digest is invalid");
@@ -152,24 +151,16 @@ function assetReferences(
       assertRef(set.manifestRef);
       if (
         set.manifestRef.mediaType !== "application/json" ||
-        (set.capture?.declarationDigest !== undefined &&
+        (set.capture.declarationDigest !== undefined &&
           set.manifestRef.digest !== set.capture.declarationDigest)
       )
         throw new Error("Asset manifest differs from its original declaration");
       if (!excludedManifestDigests?.has(set.manifestRef.digest))
         add(set.manifestRef);
-    } else if (set.capture?.declarationDigest) {
-      gaps.push({
-        path: `media/manifests/${set.capture.declarationDigest}.json`,
-        availability: "missing-legacy",
-        required: false,
-        reason:
-          "Historical asset receipt retained a declaration digest without its original bytes",
-      });
     }
     for (const input of set.inputs ?? []) add(input.ref);
     for (const member of set.members) add(member.ref);
-    for (const input of set.capture?.inputs ?? []) add(input.ref);
+    for (const input of set.capture.inputs ?? []) add(input.ref);
   }
 }
 
@@ -284,7 +275,7 @@ function continuationReferences(value: unknown): ContinuationReferences & {
     git(manifest.source.treeSha, "tree", "discovery-source-tree");
   };
   const assets = (sets: CapturedAssetSet[] | undefined) => {
-    assetReferences(sets, add, gaps);
+    assetReferences(sets, add);
   };
   const rejectedCollection = (
     value: unknown,
@@ -322,12 +313,7 @@ function continuationReferences(value: unknown): ContinuationReferences & {
           "Authenticated rejected source candidate failed its collector safety admission",
       });
     if (value.media.availability === "available")
-      assetReferences(
-        value.media.sets,
-        add,
-        gaps,
-        rejectedManifestDigests(value),
-      );
+      assetReferences(value.media.sets, add, rejectedManifestDigests(value));
     else
       gaps.push({
         path: `${path}/media`,
@@ -461,7 +447,6 @@ function continuationReferences(value: unknown): ContinuationReferences & {
         assetReferences(
           active.collectedAssets as CapturedAssetSet[] | undefined,
           add,
-          gaps,
           excludedManifestDigests,
         );
         if (active.assetManifest !== undefined) {
@@ -606,7 +591,7 @@ function continuationReferences(value: unknown): ContinuationReferences & {
   };
 }
 
-/** Schema-checked portable references, also used by original learning snapshots. */
+/** Schema-checked portable references of a continuation, without its roots; tests inspect them. */
 export function describeContinuationReferences(
   value: unknown,
 ): ContinuationReferences {
@@ -615,7 +600,7 @@ export function describeContinuationReferences(
 }
 
 /** A verified archive cache can supply bytes before any installation writes. */
-export interface RecoveryReferenceReader {
+interface RecoveryReferenceReader {
   readBytes(ref: ContentRef): Uint8Array | Promise<Uint8Array>;
 }
 async function readReference(
@@ -713,7 +698,7 @@ function memoryReferences(
         git(failed[key], "commit", "memory-failed-base");
       validation(failed.evidence);
     }
-    assetReferences(value.assets as CapturedAssetSet[] | undefined, add, gaps);
+    assetReferences(value.assets as CapturedAssetSet[] | undefined, add);
   } else if (role === "objective-observation") {
     if (value.planningRecovery !== undefined) {
       const recovery = object(value.planningRecovery);

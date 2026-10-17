@@ -18,15 +18,9 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { option } from "./cli-flags.js";
 import { DEFAULT_CONTEXT_LOOKUP_BOUNDS } from "./compiler/context.js";
-import { failedWithoutProviderEvidence } from "./compiler/observation.js";
 import { objectiveComplete } from "./completion.js";
 import type { FactoryConfig } from "./config.js";
-import {
-  configPath,
-  factoryConfigDigest,
-  stateRoot,
-  validateTarget,
-} from "./config.js";
+import { factoryConfigDigest, stateRoot, validateTarget } from "./config.js";
 import { LocalContentStore } from "./content/local.js";
 import type {
   ApprovedPlaybook,
@@ -63,12 +57,12 @@ export const DEFAULT_PLAYBOOK_BUDGET_BYTES = 16_384;
 export const learningDigest = (value: string | Buffer): string =>
   createHash("sha256").update(value).digest("hex");
 
-export interface EpisodeSource {
+interface EpisodeSource {
   episodeId: string;
   digest: string;
 }
 
-export interface Retrospective {
+interface Retrospective {
   schemaVersion: 1;
   repository: string;
   objective: number;
@@ -82,14 +76,14 @@ export interface Retrospective {
   experiences: unknown;
 }
 
-export interface PlaybookLesson {
+interface PlaybookLesson {
   text: string;
   sources: EpisodeSource[];
   /** Indices in the parent revision's lessons, retained even after consolidation. */
   previousLessons: number[];
 }
 
-export interface PlaybookDraft {
+interface PlaybookDraft {
   lessons: PlaybookLesson[];
   summaries: {
     text: string;
@@ -101,7 +95,7 @@ export interface PlaybookDraft {
   retired: { previousLesson: number; reason: string }[];
 }
 
-export interface PlaybookProposal {
+interface PlaybookProposal {
   schemaVersion: 1;
   repository: string;
   configDigest: string;
@@ -230,26 +224,21 @@ function append(path: string, text: string, repository?: string): void {
 
 /**
  * The terminal state a snapshot record names, read from the content store
- * (which verifies its exact bytes). A legacy snapshot is the state itself.
+ * (which verifies its exact bytes).
  */
 function snapshotState(
   store: LocalContentStore,
   raw: string,
-): { stateRef?: ContentRef; state: Record<string, unknown> } {
-  const value = record(JSON.parse(raw));
-  const stateRef = snapshotStateRef(value);
-  if (!stateRef) return { state: value };
+): { stateRef: ContentRef; state: Record<string, unknown> } {
+  const stateRef = snapshotStateRef(record(JSON.parse(raw)));
   return {
     stateRef,
     state: record(JSON.parse(store.readBytes(stateRef).toString("utf8"))),
   };
 }
 
-/** A decoded snapshot original's state reference; undefined for a legacy inline state. */
-export function snapshotStateRef(
-  value: Record<string, unknown>,
-): ContentRef | undefined {
-  if (value.stateRef === undefined) return undefined;
+/** A decoded snapshot original's state reference. */
+export function snapshotStateRef(value: Record<string, unknown>): ContentRef {
   const ref = record(value.stateRef);
   if (
     Object.keys(ref).sort().join() !== "bytes,digest,mediaType" ||
@@ -289,7 +278,7 @@ function proposalIdentity(value: unknown): asserts value is string {
     throw new Error("Invalid dream proposal identity");
 }
 
-export function readRetrospectives(
+function readRetrospectives(
   repository: string,
 ): { source: EpisodeSource; episode: Retrospective }[] {
   return readdirSync(directory(repository, "episodes"))
@@ -299,7 +288,7 @@ export function readRetrospectives(
 }
 
 /** Authenticate one original source; a bounded selection need not open all snapshots. */
-export function readRetrospectiveSource(
+function readRetrospectiveSource(
   repository: string,
   episodeId: string,
 ): { source: EpisodeSource; episode: Retrospective } {
@@ -336,8 +325,7 @@ export function readRetrospectiveSource(
 }
 
 /** Retain original learning bytes/provenance for retrieval, without promoting guidance.
- * Missing historical snapshot bodies stay explicit; Dream's stricter source validation
- * is unchanged. Catalog rebuild/intake can call this bridge for preexisting records.
+ * Retrospective recording, Dream input and planning context call it.
  */
 export function retainLearningMemory(
   repository: string,
@@ -376,27 +364,17 @@ export function retainLearningMemory(
     const bodies: RepositoryMemoryRecord["bodies"] = [
       { role: "episode", ref: episodeRef, availability: "retained" },
     ];
-    let snapshotRef: import("./contracts.js").ContentRef | undefined;
-    const snapshotPath = join(directory(repository, "snapshots"), `${id}.json`);
-    if (existsSync(snapshotPath)) {
-      const snapshot = privateRead(snapshotPath);
-      if (learningDigest(snapshot) !== episode.snapshotDigest)
-        throw new Error("Retrospective memory snapshot changed");
-      snapshotRef =
-        snapshotState(store, snapshot).stateRef ??
-        store.putBytes(Buffer.from(snapshot), {
-          mediaType: "application/json",
-        });
-      bodies.push({
-        role: "original-snapshot",
-        ref: snapshotRef,
-        availability: "retained",
-      });
-    } else
-      bodies.push({
-        role: "original-snapshot",
-        availability: "missing-legacy",
-      });
+    const snapshot = privateRead(
+      join(directory(repository, "snapshots"), `${id}.json`),
+    );
+    if (learningDigest(snapshot) !== episode.snapshotDigest)
+      throw new Error("Retrospective memory snapshot changed");
+    const snapshotRef = snapshotState(store, snapshot).stateRef;
+    bodies.push({
+      role: "original-snapshot",
+      ref: snapshotRef,
+      availability: "retained",
+    });
     bindings.push(
       memory.retain({
         schemaVersion: 1,
@@ -420,8 +398,8 @@ export function retainLearningMemory(
           },
           {
             identity: `learning:snapshots/${id}`,
-            ...(snapshotRef ? { ref: snapshotRef } : {}),
-            complete: !!snapshotRef,
+            ref: snapshotRef,
+            complete: true,
           },
         ],
         bindings: {},
@@ -636,7 +614,7 @@ export function observeRetrospective(
   }
 }
 
-export function validatePlaybookDraft(
+function validatePlaybookDraft(
   repository: string,
   draft: PlaybookDraft,
   parent: PlaybookRevision | null,
@@ -762,7 +740,7 @@ export function validatePlaybookDraft(
     );
 }
 
-export function readPlaybookRevision(
+function readPlaybookRevision(
   repository: string,
   throughVersion?: number,
 ): PlaybookRevision | null {
@@ -1066,7 +1044,8 @@ function outsideTarget(config: FactoryConfig, path: string): boolean {
   const local = relative(realpathSync(config.checkout), realpathSync(path));
   return local === ".." || local.startsWith("../") || isAbsolute(local);
 }
-function secrets(config: FactoryConfig): string[] {
+/** Values no learning or proposal diagnostic may show. */
+export function secrets(config: FactoryConfig): string[] {
   return [
     ...config.policy.allowedSecretNames.flatMap((name) =>
       process.env[name] ? [process.env[name]!] : [],
@@ -1087,7 +1066,7 @@ export const LEARNING_ORIGINAL_KINDS = [
   "submissions",
   "returns",
 ] as const;
-export type LearningOriginalKind = (typeof LEARNING_ORIGINAL_KINDS)[number];
+type LearningOriginalKind = (typeof LEARNING_ORIGINAL_KINDS)[number];
 export interface LearningOriginal {
   path: string;
   bytes: Uint8Array;
@@ -1117,7 +1096,7 @@ export function decodeLearningOriginal(
   const value = record(JSON.parse(raw));
   if (raw !== encoded(value))
     throw new Error("Immutable learning bytes changed");
-  if (kind !== "calls" && value.schemaVersion !== 1 && kind !== "snapshots")
+  if (kind !== "calls" && value.schemaVersion !== 1)
     throw new Error("Unsupported learning original schema");
   if (
     kind !== "calls" &&
@@ -1395,8 +1374,8 @@ export function validateLearningOriginals(
     }));
   for (const episode of episodes) {
     const path = `learning/snapshots/${episode.source.episodeId}.json`;
-    // Absence remains legacy unavailability; a present original may never change.
-    if (bodies.has(path) && digest(path) !== episode.episode.snapshotDigest)
+    original(path);
+    if (digest(path) !== episode.episode.snapshotDigest)
       throw new Error("Retrospective original snapshot changed");
   }
   const checkProposal = (
@@ -1598,18 +1577,7 @@ export function learningPersistenceClosure(repository: string): {
     }
     for (const child of Object.values(body)) inspect(child);
   };
-  for (const kind of [
-    "episodes",
-    "snapshots",
-    "proposals",
-    "reviews",
-    "decisions",
-    "versions",
-    "calls",
-    "checkpoints",
-    "submissions",
-    "returns",
-  ])
+  for (const kind of LEARNING_ORIGINAL_KINDS)
     for (const name of readdirSync(directory(repository, kind))
       .filter((name) => name.endsWith(".json") && !name.endsWith(".draft.json"))
       .sort()) {
@@ -1796,7 +1764,6 @@ export function dreamSubmissionHolds(repository: string): {
         parent: DreamInputCheckpoint["parent"];
         providerAttempt: number;
         providerMaxAttempts: number;
-        dispatchAdmitted?: true;
       };
       const checkpoint = readDreamCheckpoint(repository, {
         checkpointId: submitted.id,
@@ -1848,17 +1815,6 @@ export function dreamSubmissionHolds(repository: string): {
           )
         )
           return [];
-        // A submission recorded before any dispatch checkpoint whose only
-        // evidence is a start and a failure never left the host.
-        if (
-          !submitted.dispatchAdmitted &&
-          failedWithoutProviderEvidence(
-            observations,
-            submitted.invocationId,
-            submitted.providerAttempt,
-          )
-        )
-          return [];
       }
       return [
         {
@@ -1886,8 +1842,6 @@ export async function prepareDreamInput(
   input: {
     budgetBytes: number;
     inputBudgetBytes?: number;
-    id?: string;
-    invocationId?: string;
   },
 ): Promise<{
   checkpoint: DreamInputCheckpoint;
@@ -1912,10 +1866,8 @@ export async function prepareDreamInput(
     throw new Error(
       "Dream input and playbook bounds must be positive safe integers",
     );
-  const id = input.id ?? randomUUID(),
-    invocationId = input.invocationId ?? randomUUID();
-  proposalIdentity(id);
-  proposalIdentity(invocationId);
+  const id = randomUUID(),
+    invocationId = randomUUID();
   const started = Date.now(),
     parent = readPlaybookRevision(config.repository);
   const parentIdentity = parent
@@ -2170,7 +2122,7 @@ export async function prepareDreamInput(
 }
 
 /** Dream choices name only episodes and parent lessons supplied to this call. */
-export function dreamSchema(sourceCount: number, previousCount: number) {
+function dreamSchema(sourceCount: number, previousCount: number) {
   const nonblank = {
     type: "string",
     minLength: 1,
@@ -2539,7 +2491,7 @@ async function dream(
 export async function runDreamCommand(
   config: FactoryConfig,
   args: string[],
-  configuration = configPath(),
+  configuration: string,
 ): Promise<void> {
   if (!config.gitPersistence)
     return runDreamCommandUnscoped(config, args, configuration);
@@ -2562,7 +2514,7 @@ export async function runDreamCommand(
 async function runDreamCommandUnscoped(
   config: FactoryConfig,
   args: string[],
-  configuration = configPath(),
+  configuration: string,
 ): Promise<void> {
   validateTarget(config.repository, config.checkout);
   const preview = args.includes("--preview");

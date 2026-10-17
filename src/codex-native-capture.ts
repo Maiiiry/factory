@@ -120,7 +120,7 @@ export function ownedRolloutBoundary(
 }
 
 /** Only explicit transport fields: never inspect shell text or nested output. */
-export function nativeToolObservation(
+function nativeToolObservation(
   value: unknown,
   rowTimestamp?: unknown,
   turnId: string | null = null,
@@ -195,7 +195,7 @@ export interface OwnedRolloutBudget {
 }
 
 /** Only explicit image blocks in tool output; text, shell arguments and URLs are never exported. */
-export function nativeImageOutputObservation(
+function nativeImageOutputObservation(
   payload: Record<string, unknown>,
   rowTimestamp?: unknown,
 ): CaptureEvent["nativeImageOutput"] {

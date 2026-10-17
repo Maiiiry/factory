@@ -95,6 +95,7 @@ import {
   assertValidationExecutionControl,
 } from "./validation-evidence.js";
 import { assertRepairReadiness } from "./work-repair.js";
+import { record } from "./unknown-fields.js";
 
 export type WorkStatus =
   | "pending"
@@ -251,8 +252,8 @@ export interface PreparationState {
   githubProgress?: import("./github-progress-state.js").GitHubProgressProjection;
   /** The Objective's live status comment while it plans; execution keeps the same record. */
   githubLiveStatus?: import("./github-progress-state.js").LiveStatusRecord;
-  /** Immutable advisory selection; absence is legacy no-input, null is explicit no-input. */
-  approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
+  /** Immutable advisory selection; null is explicit no-input. */
+  approvedPlaybookPin: import("./contracts.js").ApprovedPlaybookPin;
   sourcePacketDigest?: string;
   planningRecovery?: import("./compiler.js").PlanningRecoveryRecord;
   /** Limits snapshotted from configuration when the Objective started. */
@@ -429,8 +430,7 @@ export interface FactoryState {
    * card's Project Status. The issue is recorded, so a later graph revision cannot rebind it.
    */
   workItemTracking?: Record<string, WorkItemTracking>;
-  /** New-run admission only. Absence does not prove historical non-submission. */
-  publicationContract?: "exact-request-v1";
+  publicationContract: "exact-request-v1";
   /** Retained across WorkState replacement; never reconstructed from diagnostics. */
   publicationIntents?: Record<
     string,
@@ -463,15 +463,15 @@ export interface FactoryState {
   /** Immutable authenticated admission facts, bound to prerequisitesDigest. */
   prerequisites?: import("./contracts.js").PlanningPrerequisites;
   schemaVersion: 7 | 9 | 11 | 13 | 15 | 17 | 19;
-  approvedPlaybookAdmission?: import("./contracts.js").ApprovedPlaybookAdmission;
-  approvedPlaybookPin?: import("./contracts.js").ApprovedPlaybookPin;
+  approvedPlaybookAdmission: import("./contracts.js").ApprovedPlaybookAdmission;
+  approvedPlaybookPin: import("./contracts.js").ApprovedPlaybookPin;
   repository: string;
   objective: number;
   runId: string;
   configDigest: string;
   baseSha: string;
   graph: WorkGraph;
-  objectiveCommands?: string[];
+  objectiveCommands: string[];
   issueByItemId: Record<string, number>;
   /** The login that authored Factory's issues: its GitHub identity. */
   issueAuthor?: string;
@@ -502,7 +502,7 @@ export interface FactoryState {
   finalValidation?: ValidationEvidence & { passed: boolean; detail?: string };
   finalAcceptancePending?: AcceptancePending;
   finalAcceptanceDecisions?: AcceptanceDecision[];
-  objectiveBodyDigest?: string;
+  objectiveBodyDigest: string;
   objectiveClosure?: "pending" | "complete";
   cancelRequested?: boolean;
   cancelledAt?: string;
@@ -739,12 +739,6 @@ export function assertCoordinator(value: unknown): void {
       ))
   )
     throw new Error("Invalid coordinator process identities");
-}
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error(`${label} must be an object`);
-  return value as Record<string, unknown>;
 }
 
 function string(value: unknown, label: string): string {
@@ -1012,8 +1006,7 @@ export function parseFactoryState(
   sha(state.configDigest, "configDigest", 64);
   if (state.sourcePacketDigest !== undefined)
     sha(state.sourcePacketDigest, "sourcePacketDigest", 64);
-  if (Object.hasOwn(state, "approvedPlaybookPin"))
-    assertApprovedPlaybookPin(state.approvedPlaybookPin);
+  assertApprovedPlaybookPin(state.approvedPlaybookPin);
   sha(state.planGraphDigest, "planGraphDigest", 64);
   assertStateWorkflowRecipe(state as unknown as FactoryState);
   assertAcceptedPlanningDecision(
@@ -1025,7 +1018,6 @@ export function parseFactoryState(
     state.approvedPlaybookAdmission,
     state.configDigest,
     state.planGraphDigest,
-    Object.hasOwn(state, "approvedPlaybookPin"),
   );
   validateCapacity(state.capacity as Capacity);
   if (state.prerequisitesDigest !== undefined)
@@ -1302,10 +1294,11 @@ export function parseFactoryState(
         planned.validation.map((check) => check.command),
       );
     }
-    for (const legacy of ["pendingEffect", "interruptions", "waitingReason"])
-      if (item[legacy] !== undefined)
+    // Records Factory no longer keeps; an in-flight effect must not be dropped.
+    for (const field of ["pendingEffect", "interruptions", "waitingReason"])
+      if (item[field] !== undefined)
         throw new Error(
-          `Work Item ${id} records ${legacy} from an earlier Factory version; start the Objective fresh`,
+          `Work Item ${id} records ${field}, which Factory no longer keeps; start the Objective fresh`,
         );
     if (!statuses.has(item.status as WorkStatus))
       throw new Error(`Work Item ${id} has an invalid status`);
@@ -1739,8 +1732,7 @@ export function parseFactoryState(
           )
             throw new Error("AssetSet relationships are invalid");
         }
-        if (set.capture !== undefined || set.manifestRef !== undefined)
-          assertAssetCaptureReceipt(set as unknown as CapturedAssetSet);
+        assertAssetCaptureReceipt(set as unknown as CapturedAssetSet);
       }
     }
     if (item.selectedAssetSet !== undefined) {
@@ -1847,13 +1839,7 @@ export function parseFactoryState(
             throw new Error("Invalid managed checkpoint admission disposition");
         }
       }
-      const interruptedStart =
-        execution.provider === "local" &&
-        JSON.stringify(
-          Object.keys(record(execution.data, `${id}.data`)).sort(),
-        ) === '["stopped","worktree"]' &&
-        typeof (execution.data as { stopped?: unknown }).stopped === "string";
-      if (execution.provider === "local" && !interruptedStart) {
+      if (execution.provider === "local") {
         const active = record(execution.data, `work.${id}.execution.data`);
         const request = record(active.request, `work.${id}.execution.request`);
         const attemptedItem = record(request.item, `work.${id}.execution.item`);
@@ -2187,9 +2173,8 @@ export function parseFactoryState(
     const final = record(state.finalValidation, "finalValidation");
     const receiptCommands = validationEvidence(final, "finalValidation");
     if (
-      !Array.isArray(state.objectiveCommands) ||
       JSON.stringify(receiptCommands) !==
-        JSON.stringify(state.objectiveCommands)
+      JSON.stringify(state.objectiveCommands)
     )
       throw new Error(
         "Final validation receipts differ from declared Objective commands",
@@ -2243,10 +2228,8 @@ export function parseFactoryState(
       state.finalAcceptanceDecisions,
       "finalAcceptanceDecisions",
     );
-  if (state.objectiveCommands !== undefined)
-    strings(state.objectiveCommands, "objectiveCommands");
-  if (state.objectiveBodyDigest !== undefined)
-    sha(state.objectiveBodyDigest, "objectiveBodyDigest", 64);
+  strings(state.objectiveCommands, "objectiveCommands");
+  sha(state.objectiveBodyDigest, "objectiveBodyDigest", 64);
   if (
     state.objectiveClosure !== undefined &&
     (state.finalValidation === undefined ||
@@ -2308,7 +2291,7 @@ export interface ContinuationRestoration {
     configDigest: string;
     schemaVersion: number;
   };
-  source?: {
+  source: {
     authorityDigest: string;
     configDigest: string;
     checkout: string;
@@ -2410,7 +2393,7 @@ export function assertContinuationRestoration(state: ContinuationState): void {
           "Restoration layout must retain exact absolute host paths",
         );
   };
-  if (value.source) layout(value.source, true);
+  layout(value.source, true);
   layout(value.installation, false);
   if (
     value.schemaVersion !== 1 ||
@@ -2418,8 +2401,4 @@ export function assertContinuationRestoration(state: ContinuationState): void {
     !value.reason?.trim()
   )
     throw new Error("Invalid restoration disposition");
-  if (value.status === "reconciled" && !value.source)
-    throw new Error(
-      "A legacy checkpoint without original authority cannot be rebound",
-    );
 }

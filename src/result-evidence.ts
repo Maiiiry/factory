@@ -107,7 +107,7 @@ export function selectedLfsReviewEvidence(
   return { sources, textBytes: limit - remaining };
 }
 
-export type ReviewDeliveryObservation =
+type ReviewDeliveryObservation =
   | { kind: "regular" }
   | { kind: "read-only-proof" }
   | {
@@ -198,51 +198,48 @@ export function workItemReviewObservations(
   selectedAsset?: CapturedAssetSet,
 ): string {
   const current = state.work[item.id]!;
-  const captureReceipt = (asset: CapturedAssetSet) =>
-    asset.capture
-      ? {
-          authority: "factory-controller" as const,
-          ...(asset.capture.declarationPath &&
-            asset.capture.declarationDigest &&
-            asset.capture.declarationProvenance && {
-              declarationPath: asset.capture.declarationPath,
-              declarationDigest: asset.capture.declarationDigest,
-              declarationProvenance: {
-                source: asset.capture.declarationProvenance.source,
-                rights: asset.capture.declarationProvenance.rights,
-                visibility: asset.capture.declarationProvenance.visibility,
-                lineage: [...asset.capture.declarationProvenance.lineage],
-              },
-            }),
-          mediaRoot: ".factory-media" as const,
-          complete: true as const,
-          setId: asset.id,
-          ...(asset.capture.inputs && {
-            inputs: asset.capture.inputs.map((input) => ({
-              binding: {
-                kind: input.binding.kind,
-                path: input.binding.path,
-                role: input.binding.role,
-                mediaType: input.binding.mediaType,
-                visibility: input.binding.visibility,
-              },
-              ref: {
-                digest: input.ref.digest,
-                bytes: input.ref.bytes,
-                mediaType: input.ref.mediaType,
-              },
-            })),
-          }),
-          members: asset.capture.members.map((member) => ({
-            role: member.role,
-            stagingPath: member.stagingPath,
-            destination: member.destination,
-            digest: member.digest,
-            bytes: member.bytes,
-            mediaType: member.mediaType,
-          })),
-        }
-      : null;
+  const captureReceipt = (asset: CapturedAssetSet) => ({
+    authority: "factory-controller" as const,
+    ...(asset.capture.declarationPath &&
+      asset.capture.declarationDigest &&
+      asset.capture.declarationProvenance && {
+        declarationPath: asset.capture.declarationPath,
+        declarationDigest: asset.capture.declarationDigest,
+        declarationProvenance: {
+          source: asset.capture.declarationProvenance.source,
+          rights: asset.capture.declarationProvenance.rights,
+          visibility: asset.capture.declarationProvenance.visibility,
+          lineage: [...asset.capture.declarationProvenance.lineage],
+        },
+      }),
+    mediaRoot: ".factory-media" as const,
+    complete: true as const,
+    setId: asset.id,
+    ...(asset.capture.inputs && {
+      inputs: asset.capture.inputs.map((input) => ({
+        binding: {
+          kind: input.binding.kind,
+          path: input.binding.path,
+          role: input.binding.role,
+          mediaType: input.binding.mediaType,
+          visibility: input.binding.visibility,
+        },
+        ref: {
+          digest: input.ref.digest,
+          bytes: input.ref.bytes,
+          mediaType: input.ref.mediaType,
+        },
+      })),
+    }),
+    members: asset.capture.members.map((member) => ({
+      role: member.role,
+      stagingPath: member.stagingPath,
+      destination: member.destination,
+      digest: member.digest,
+      bytes: member.bytes,
+      mediaType: member.mediaType,
+    })),
+  });
   const contentRef = (ref: CapturedAssetSet["members"][number]["ref"]) => ({
     digest: ref.digest,
     bytes: ref.bytes,
@@ -303,7 +300,7 @@ export function workItemReviewObservations(
       harnessIdentity: asset.evidence.harnessIdentity,
       resultDigest: asset.evidence.resultDigest,
     },
-    ...(asset.capture && { capture: captureReceipt(asset) }),
+    capture: captureReceipt(asset),
   });
   const criterionText = item.acceptance.join("\n");
   const namedByCriterion = (id: string): boolean => {
@@ -411,7 +408,7 @@ export function workItemReviewObservations(
  * materialization commit retains the worker result as its sole parent, so a
  * restart does not require a second receipt or diagnostic history.
  */
-export function workItemMaterializationEvidence(args: {
+function workItemMaterializationEvidence(args: {
   state: FactoryState;
   item: WorkItem;
   checkout: string;
@@ -1606,12 +1603,6 @@ function literalGitPatches(packet: ResultChangePacket): string {
     .join("\n");
 }
 
-/** Same transient current-result text for the prompt and exact citation source. */
-export function gitChangeEvidence(change: string): string {
-  const packet = parseResultChangePacket(change);
-  return `${JSON.stringify(gitChangeMetadata(packet))}\n${literalGitPatches(packet)}`;
-}
-
 /** Exact descriptors and independently bounded file deltas; metadata never proves file contents. */
 export function gitChangeEvidenceSources(
   change: string,
@@ -2535,11 +2526,6 @@ export function workItemReviewEvidence(args: {
     });
   return evidence;
 }
-/**
- * Build final-review authority from supervisor state and exact Git objects.
- * Accepted findings are historical context with their original literal evidence;
- * they never replace independent judgment of the integrated original criteria.
- */
 /** Accepted Work Item review bodies retained by reference, by digest. */
 export async function retainedReviewLiterals(
   state: FactoryState,
@@ -2565,6 +2551,11 @@ export async function retainedReviewLiterals(
   return literals;
 }
 
+/**
+ * Build final-review authority from supervisor state and exact Git objects.
+ * Accepted findings are historical context with their original literal evidence;
+ * they never replace independent judgment of the integrated original criteria.
+ */
 export function objectiveReviewEvidence(args: {
   state: FactoryState;
   checkout: string;
