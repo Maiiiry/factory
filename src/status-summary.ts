@@ -144,6 +144,10 @@ interface PreparingStatusView extends WaitView {
   planningStopped: boolean;
   /** It stopped at the planner's own question: an answer revises its draft. */
   planningQuestion?: boolean;
+  /** The plan review's operator questions one answer settles; the answer revises the plan, which is reviewed again. */
+  planReviewQuestions?: number;
+  /** The review asked the operator, but the plan's draft is not retained: only a refusal applies. */
+  planReviewDraftMissing?: true;
   /** It stopped at its revision allowance with only fix findings left: accepting grants this many more revisions. */
   planningRevisionGrant?: number | null;
   /** The planner call now or last made, and projection's issue count. */
@@ -1255,10 +1259,20 @@ function summarizePreparation(view: PreparingStatusView): StatusSummary {
     return {
       phase: "needs-plan-decision",
       summary: "plan review needs a human decision",
-      nextAction: {
-        command: `factory decide --objective ${objective} --outcome accept|refuse --answer ${ANSWER} --reason ${REASON}`,
-        reason: `Answer the question below; then ${run(objective)}`,
-      },
+      nextAction: view.planReviewDraftMissing
+        ? {
+            command: `factory decide --objective ${objective} --outcome refuse --reason ${REASON}`,
+            reason: `This plan's draft is not retained, so an answer cannot revise it; refuse it, state the decision in the Objective, then ${run(objective)} plans again`,
+          }
+        : view.planReviewQuestions
+          ? {
+              command: `factory decide --objective ${objective} --outcome accept --answer ${ANSWER} --reason ${REASON}`,
+              reason: `${view.planReviewQuestions > 1 ? "Answer every question below in one --answer" : "Answer the plan review's question below"}; then ${run(objective)} revises the plan with your answer and reviews it again (refuse discards the plan instead)`,
+            }
+          : {
+              command: `factory decide --objective ${objective} --outcome accept|refuse --answer ${ANSWER} --reason ${REASON}`,
+              reason: `Answer the question below; then ${run(objective)}`,
+            },
     };
   if (view.planningStopped && view.planningRevisionGrant) {
     const rounds = planningRoundsText(view.planningStep?.rounds);

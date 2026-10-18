@@ -379,6 +379,49 @@ export function openPlanningQuestion(
   return record?.phase === "stopped" && open && !open.answer ? open : undefined;
 }
 
+/**
+ * The questions of a plan whose independent review asked the operator
+ * (operator-decision findings). An answer revises the plan's retained draft
+ * and the revised plan is reviewed again; it never accepts this plan.
+ */
+export function openReviewDecision(
+  state: ContinuationState,
+): { question: string; count: number } | undefined {
+  if (!isPreparationState(state) || !state.plan) return undefined;
+  const review = state.plan.review;
+  if (review.status !== "needs-human" || review.acceptable === false)
+    return undefined;
+  const questions = [
+    ...new Set(
+      review.findings.flatMap((finding) =>
+        "kind" in finding && finding.kind === "operator-decision"
+          ? [finding.question]
+          : [],
+      ),
+    ),
+  ];
+  return questions.length
+    ? { question: questions.join("\n"), count: questions.length }
+    : undefined;
+}
+
+/**
+ * The review's questions when an answer can revise the plan: its draft is
+ * retained. Without one (older state) decide refuses the answer, so guidance
+ * offers only a refusal.
+ */
+export function reviewDecisionAnswerable(
+  state: ContinuationState,
+): { question: string; count: number } | undefined {
+  const asked = openReviewDecision(state);
+  return asked &&
+    isPreparationState(state) &&
+    state.planningRecovery?.phase === "stopped" &&
+    state.planningRecovery.answer
+    ? asked
+    : undefined;
+}
+
 /** Planning stopped at its revision allowance with only fix findings left: accepting grants more revisions. */
 export function planningRevisionGrantable(state: ContinuationState): boolean {
   return (
