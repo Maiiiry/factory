@@ -32,6 +32,7 @@ import {
   sourceObligationId,
 } from "./qa.js";
 import { assertWorkItemFields, validValidationCommand } from "./scheduler.js";
+import { WORK_ITEM_ENTRY_SIGNAL } from "./compiler/work-item-rubric.js";
 
 type Schema = {
   [key: string]: unknown;
@@ -98,6 +99,38 @@ const strict = (properties: Record<string, Schema>): Schema => ({
 });
 const text: Schema = { type: "string" };
 
+/**
+ * A line-number reference next to a file name in an acceptance entry
+ * (`store.ts:88`, `store.ts#L88`, `store.ts line 88`, `store.ts (lines
+ * 40-210)`). Structural only: a file name with an extension directly followed
+ * by a line marker. Only source-file extensions count, so host:port and data
+ * files ("data.csv line 1") do not match, nor do URLs or "line 1" of output.
+ */
+const LINE_REFERENCE =
+  /(?<![:/\w.-])[\w.-]+(?:\/[\w.-]+)*\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|rb|php|cs|c|cc|cpp|h|hpp|swift|sh|sql|css|scss|vue|svelte|md|ya?ml|toml|json|html)`?(?::\d+\b|#L\d+\b|\s*,?\s*\(?\s*(?:around\s+|near\s+|at\s+)?lines?\s+\d+)/i;
+
+/**
+ * The plan standard's deterministic lint, run before paid review on the
+ * items the planner defined in this answer: an item above the entry signal
+ * states why it is one outcome, and no acceptance entry cites a line. An
+ * amendment carries pending items over and has no correction channel for
+ * these, so it is not linted; graph review checks 3 and 8 judge it there.
+ */
+function planStandardLint(item: ObjectValue, reason: string | null): string[] {
+  if (!Array.isArray(item.acceptance)) return [];
+  const findings: string[] = [];
+  if (item.acceptance.length > WORK_ITEM_ENTRY_SIGNAL && reason === null)
+    findings.push(
+      `Work Item ${String(item.id)} has ${item.acceptance.length} acceptance entries, above the signal of ${WORK_ITEM_ENTRY_SIGNAL}, and no oneOutcomeReason: split it into one item per outcome, or state in oneOutcomeReason why it is one outcome`,
+    );
+  for (const [at, entry] of item.acceptance.entries())
+    if (typeof entry === "string" && LINE_REFERENCE.test(entry))
+      findings.push(
+        `Work Item ${String(item.id)} acceptance ${at} cites a line number: state the behaviour instead; the worker finds the lines in the code`,
+      );
+  return findings;
+}
+
 /** The environment a null planner choice stands for: no setup, no probe. */
 const DEFAULT_ENVIRONMENT = {
   kind: "local",
@@ -110,6 +143,41 @@ const DEFAULT_ENVIRONMENT = {
 /** Shared compilation/diagnosis meaning; no probe result or extra authority. */
 export const COMPILER_READINESS_GUIDANCE =
   "Same-owner source-authorized setup followed by the unchanged real readiness probe uses available with empty preparedBy and ordered prerequisiteValidationIndices before probeValidationIndex. available describes that sequence for checking in the actual fresh checkout before implementation; it never claims the probe already passed or grants authority. prepare is exclusively preparation supplied by an actual declared dependency named in preparedBy, not a synonym for the owner's setup commands. Unknown runtime readiness alone does not require an operator decision when this authorized sequence can establish it. Correct a generated mismatch as planning-output only within permitted repair classes and recorded attempt limits; do not invent a dependency, waive the probe or claim readiness. Ask the operator for an actual missing source fact, permission, capability or human-owned choice through decisionRequired.";
+
+/**
+ * A retained answer from an earlier release, in this wire's terms: a semantic
+ * proof drops its acceptance entry (owner-level proof judges the obligation
+ * itself) and a defined item gains a null oneOutcomeReason. Only the revision
+ * base changes; the full decode still judges every resulting choice.
+ */
+function currentAnswer(answer: unknown): unknown {
+  if (!answer || typeof answer !== "object" || Array.isArray(answer))
+    return answer;
+  const plan = structuredClone(answer) as ObjectValue;
+  const proofOf = (entry: unknown) => {
+    const proof = (entry as { proof?: ObjectValue } | null)?.proof;
+    if (
+      proof &&
+      typeof proof === "object" &&
+      (proof.kind === "result-semantic" || proof.kind === "integrated-semantic")
+    )
+      delete proof.acceptanceIndex;
+  };
+  if (Array.isArray(plan.coverage)) plan.coverage.forEach(proofOf);
+  if (Array.isArray(plan.sourceObligations))
+    for (const entry of plan.sourceObligations)
+      proofOf((entry as { disposition?: unknown } | null)?.disposition);
+  if (Array.isArray(plan.items))
+    for (const item of plan.items as (ObjectValue | null)[])
+      if (
+        item &&
+        typeof item === "object" &&
+        item.kind !== "retained" &&
+        !Object.hasOwn(item, "oneOutcomeReason")
+      )
+        item.oneOutcomeReason = null;
+  return plan;
+}
 
 /** A transient model language: choices in, canonical controller facts out. */
 export function compilerWire(
@@ -249,6 +317,10 @@ export function compilerWire(
       },
     },
     brief: { ...text, minLength: 1 },
+    oneOutcomeReason: {
+      description: `null unless acceptance has more than ${WORK_ITEM_ENTRY_SIGNAL} entries; then why this item is one outcome that separate items cannot verify. Factory adds it to the brief.`,
+      anyOf: [{ type: "null" }, { ...text, minLength: 1 }],
+    },
     sourceAssets: {
       type: "array",
       items: strict({
@@ -384,9 +456,9 @@ export function compilerWire(
   const checkIndex = integer(checkNames.length);
   const proofForms: Record<string, Record<string, Schema>> = {
     "result-command": { validationIndex: integer() },
-    "result-semantic": { acceptanceIndex: integer() },
+    "result-semantic": {},
     "integrated-command": { validationIndex: integer() },
-    "integrated-semantic": { acceptanceIndex: integer() },
+    "integrated-semantic": {},
     "final-review": {},
     "final-controller": { guaranteeIndex: integer(guarantees.length) },
     "integrated-ci": { checkIndex },
@@ -751,7 +823,10 @@ export function compilerWire(
   // A revision answers with only its changes to the current plan. Factory
   // applies them by id and index alone; the full decode below still judges
   // every resulting choice.
-  const revision = context.revision;
+  const revision = context.revision && {
+    ...context.revision,
+    answer: currentAnswer(context.revision.answer),
+  };
   const nullable = (entry: Schema): Schema =>
     Array.isArray(entry.anyOf) &&
     (entry.anyOf as Schema[]).some((branch) => branch.type === "null")
@@ -1059,6 +1134,8 @@ export function compilerWire(
         requiredPreIntegrationChecks,
       };
       const referenced = new Set<string>();
+      const lint: string[] = [];
+      const linted = new Set<string>();
       for (const raw of wire.items) {
         let item = structuredClone(object(raw, "item"));
         let newPackages: string[] = [];
@@ -1103,6 +1180,17 @@ export function compilerWire(
           );
           if (item.kind === "discovery") expected.push("discovery");
           keys(item, expected, "item");
+          const reason = item.oneOutcomeReason;
+          delete item.oneOutcomeReason;
+          if (reason !== null && (typeof reason !== "string" || !reason.trim()))
+            throw new Error("Planner oneOutcomeReason must be null or text");
+          const findings = context.previousGraph
+            ? []
+            : planStandardLint(item, reason);
+          if (findings.length) linted.add(String(item.id));
+          lint.push(...findings);
+          if (reason !== null && typeof item.brief === "string")
+            item.brief = `${item.brief}\n\nOne outcome: ${reason.trim()}`;
           if (item.condition === null) delete item.condition;
           if (item.kind === "discovery") {
             assertDiscoverySpecification(item.discovery);
@@ -1267,6 +1355,7 @@ export function compilerWire(
       const proved = (
         entry: ObjectValue,
         label: string,
+        criterionId: string,
       ): Omit<
         NonNullable<WorkGraph["coverage"]>[number],
         keyof CoverageObligation
@@ -1301,17 +1390,31 @@ export function compilerWire(
               ),
             };
             break;
+          // The owner's review judges the obligation itself; its acceptance
+          // as a whole is the proof, so no entry is named.
           case "result-semantic":
-          case "integrated-semantic":
-            canonicalProof = {
-              kind: proof.kind,
-              acceptanceIndex: index(
-                proof.acceptanceIndex,
-                owner.acceptance.length,
-                "acceptanceIndex",
-              ),
-            };
+          case "integrated-semantic": {
+            canonicalProof = { kind: proof.kind };
+            // A started item's review is settled: it judged only the
+            // obligations it owned then. It keeps proving those, with the
+            // exact earlier proof; it cannot judge a newly assigned one.
+            if (retainedItems.has(owner.id) && owner.id !== reattempt) {
+              const previous = context.previousGraph?.coverage?.find(
+                (old) =>
+                  old.criterionId === criterionId &&
+                  old.itemId === owner.id &&
+                  (old.proof.kind === "result-semantic" ||
+                    old.proof.kind === "integrated-semantic"),
+              );
+              if (!previous)
+                throw new PlannerChoiceError(
+                  `Work Item ${owner.id} is already reviewed and cannot judge a newly assigned obligation; use final-review or new work`,
+                  [owner.id],
+                );
+              canonicalProof = structuredClone(previous.proof);
+            }
             break;
+          }
           case "final-review":
             canonicalProof = { kind: "final-review" };
             break;
@@ -1467,7 +1570,11 @@ export function compilerWire(
         }
         graph.coverage!.push({
           ...structuredClone(obligations[obligationIndex]!),
-          ...proved(entry, `coverage ${obligationIndex}`),
+          ...proved(
+            entry,
+            `coverage ${obligationIndex}`,
+            obligations[obligationIndex]!.criterionId,
+          ),
         });
       }
       const objectiveSource = request.sources.find(
@@ -1523,11 +1630,16 @@ export function compilerWire(
             stubSourceKeys.push({ key: stub, path: source.path });
             continue;
           }
+          const criterionId = sourceObligationId(source);
           graph.coverage!.push({
-            criterionId: sourceObligationId(source),
+            criterionId,
             source,
             statement,
-            ...proved(disposition, `source obligation ${position}`),
+            ...proved(
+              disposition,
+              `source obligation ${position}`,
+              criterionId,
+            ),
           });
           continue;
         }
@@ -1610,6 +1722,12 @@ export function compilerWire(
         }
         assertDeclaredConditions(graph);
       }
+      // Last, so a plan that passes every other check gets these as one
+      // batched correction instead of a paid review finding.
+      if (lint.length)
+        throw new PlannerChoiceError(`Plan standard: ${lint.join("; ")}`, [
+          ...linted,
+        ]);
       if (splittable && wire.split !== null)
         return splitGraph(graph, wire.split, stubObligations, stubSourceKeys);
       return graph;
