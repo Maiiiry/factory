@@ -344,6 +344,17 @@ async function main(): Promise<void> {
           ...(input.request.validationLfs && {
             lfs: input.request.validationLfs,
           }),
+          ...(input.request.commandSandbox && {
+            sandbox: input.request.commandSandbox,
+          }),
+          packageAuthority: {
+            sourceDeclared: input.request.item.validation
+              .filter((check) => check.provenance === "source-declared")
+              .map((check) => check.command),
+            ...(input.request.packageManagerUpdate !== undefined && {
+              packageManagerUpdate: input.request.packageManagerUpdate,
+            }),
+          },
           handoff: {
             peers: input.request.handoffPeers ?? [],
             acceptance: input.request.item.acceptance,

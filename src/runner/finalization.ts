@@ -1,3 +1,4 @@
+import { commandSandboxPolicy } from "../execution/sandbox.js";
 import { workSettled } from "../scheduler.js";
 import { authenticateWorkRouting } from "./routing.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -309,6 +310,13 @@ export async function finalizeObjective(args: {
               ),
           },
           config.reviewArtifacts,
+          undefined,
+          // assertPinnedNpmScripts checked these commands' inputs above.
+          {
+            ...commandSandboxPolicy(config),
+            packageInputsVerified: true,
+            packageInputsBase: state.baseSha,
+          },
         );
         // This ordering is controller-observed, not inferred from cleanliness
         // or an identical tree. Baseline/read-only QA makes no integration claim.

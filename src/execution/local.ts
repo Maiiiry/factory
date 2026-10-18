@@ -1,3 +1,7 @@
+import {
+  type CommandSandboxPolicy,
+  STRICT_COMMAND_SANDBOX,
+} from "./sandbox.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
@@ -109,6 +113,7 @@ import {
   workerSourceDelivery,
 } from "./harness-support.js";
 import {
+  assertNoNestedGit,
   checkStagedCandidate,
   scanCollectionObservation,
   scanPrivateStaging,
@@ -1168,6 +1173,8 @@ export async function freezeRejectedCollection(args: {
     reason: "collector-safety-rejected",
   };
   try {
+    // Before host-side Git reads anything: no nested repository it would enter.
+    assertNoNestedGit(args.worktree);
     if (pinnedGit(args.worktree, "rev-parse", "HEAD") !== args.request.baseSha)
       throw workFault("Rejected worker changed its admitted HEAD");
     const prospective = [
@@ -1420,6 +1427,8 @@ export async function collectWorktreeResult(
   // database. Bound inputs and the manifest stay on disk until the commit
   // lands: a transient fault before then repeats collection from the top and
   // verifies the same bytes again.
+  // Before host-side Git stages anything: no nested repository it would enter.
+  assertNoNestedGit(worktree);
   try {
     await pinnedGitMagicAsync(
       worktree,
@@ -1807,6 +1816,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
       policy?: import("../capture.js").CapturePolicy;
       configDigest: string;
     },
+    private commandSandbox: CommandSandboxPolicy = STRICT_COMMAND_SANDBOX,
   ) {
     if (profiles)
       this.profiles = new Map(
@@ -2138,6 +2148,14 @@ export class LocalExecutionDriver implements ExecutionDriver {
           this.contentStore,
           readiness.acceptedBaseSha,
           false,
+          undefined,
+          undefined,
+          // assertPinnedNpmScripts checked these commands' inputs above.
+          {
+            ...this.commandSandbox,
+            packageInputsVerified: true,
+            packageInputsBase: request.baseSha,
+          },
         );
         if (context?.cancelled())
           throw cancelledFault(
@@ -2333,6 +2351,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
             store: lfsStore,
           },
         }),
+        commandSandbox: structuredClone(this.commandSandbox),
       };
       const preparedHandle: ExecutionHandle = {
         provider: "local",

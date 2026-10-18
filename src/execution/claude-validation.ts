@@ -1,4 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
@@ -8,13 +10,22 @@ import {
   hasUnresolvedSubprocesses,
   pinnedGit,
   pinnedGitAsync,
-  pinnedGitMagicAsync,
+  pinnedGitIndexAsync,
 } from "../process.js";
 import { workHandoffSchema } from "../objective-knowledge.js";
-import { validateTree } from "../validation.js";
+import {
+  assertPinnedNpmScripts,
+  type PackageScriptAuthority,
+  validateTree,
+} from "../validation.js";
 import { CandidateValidationFailure } from "../work-repair.js";
 import type { HarnessRequest, WorkHandoffNote } from "../contracts.js";
 import { readWorkHandoff } from "./harness-support.js";
+import { assertNoNestedGit, indexHasGitlinks } from "./staged-candidate.js";
+import {
+  type CommandSandboxPolicy,
+  STRICT_COMMAND_SANDBOX,
+} from "./sandbox.js";
 import {
   FACTORY_EMAIL,
   privateStagingExclusions,
@@ -41,6 +52,10 @@ interface ValidationEnvironmentInput {
   config: { tools: readonly string[]; allowedTools: readonly string[] };
   handoff: HandoffContext;
   lfs?: HarnessRequest["validationLfs"];
+  /** The controller's OS sandbox policy; absent is strict. */
+  sandbox?: CommandSandboxPolicy;
+  /** The controller's package authority for these commands (source-declared ones, a pinned update). */
+  packageAuthority?: PackageScriptAuthority;
   /** Each completed run's structured facts, for the worker's progress stream. */
   onRun?: (facts: ValidationRunFacts) => void;
 }
@@ -76,12 +91,17 @@ function validationAuthorized(input: {
   );
 }
 
-/** The declared commands a configured worker may run, or none. */
+/**
+ * The declared commands a configured worker may run, or none. None in a
+ * checkout with submodule gitlinks: Factory validates no such tree, and
+ * host-side Git would enter repositories the commands could write.
+ */
 export function workerValidationCommands(input: {
   config: { tools: readonly string[]; allowedTools: readonly string[] };
-  request: { item: { validation: { command: string }[] } };
+  request: { worktree: string; item: { validation: { command: string }[] } };
 }): string[] {
-  return validationAuthorized(input)
+  return validationAuthorized(input) &&
+    !indexHasGitlinks(input.request.worktree)
     ? input.request.item.validation.map((entry) => entry.command)
     : [];
 }
@@ -139,19 +159,39 @@ function bounded(text: string): string {
 
 /** The tree of the worker's current files without private staging, as collection stages them. */
 export async function workerFilesTree(worktree: string): Promise<string> {
-  await pinnedGitMagicAsync(
-    worktree,
-    "add",
-    "-A",
-    "--",
-    ".",
-    ...privateStagingExclusions(worktree),
-  );
+  // Host-side Git must not enter a repository the worker wrote.
+  assertNoNestedGit(worktree);
+  // A separate index from HEAD: the worker's own index never holds what this
+  // stages, so a nested repository made meanwhile never becomes a gitlink
+  // there for another Git call to enter.
+  const scratch = mkdtempSync(join(tmpdir(), "factory-snapshot-"));
+  const index = join(scratch, "index");
   try {
-    return pinnedGit(worktree, "write-tree");
+    await pinnedGitIndexAsync(worktree, index, "read-tree", "HEAD");
+    await pinnedGitIndexAsync(
+      worktree,
+      index,
+      "add",
+      "-A",
+      "--",
+      ".",
+      ...privateStagingExclusions(worktree),
+    );
+    const staged = await pinnedGitIndexAsync(
+      worktree,
+      index,
+      "ls-files",
+      "--stage",
+      "-z",
+    );
+    // No snapshot with a gitlink is committed, let alone validated.
+    if (staged.split("\0").some((entry) => entry.startsWith("160000 ")))
+      throw new Error(
+        "Your files include a submodule gitlink; Factory refuses nested repositories and submodules",
+      );
+    return (await pinnedGitIndexAsync(worktree, index, "write-tree")).trim();
   } finally {
-    // Leave the worker's index as it was; collection stages its own result.
-    await pinnedGitAsync(worktree, "reset", "--quiet");
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 
@@ -172,6 +212,8 @@ export async function runDeclaredValidation(
   run: number,
   lfs?: HarnessRequest["validationLfs"],
   outputs?: ValidationOutputs,
+  sandbox: CommandSandboxPolicy = STRICT_COMMAND_SANDBOX,
+  packageAuthority: PackageScriptAuthority = {},
 ): Promise<{
   passed: boolean;
   text: string;
@@ -197,6 +239,28 @@ export async function runDeclaredValidation(
       "Factory worker validation snapshot",
     )
   ).trim();
+  // The controller's package-input check, against the attempt's base: only
+  // when it passes may an install write the shared store or use the network
+  // the operator allowed. Otherwise the run continues without either.
+  let packageInputsVerified = false;
+  try {
+    assertPinnedNpmScripts(
+      worktree,
+      pinnedGit(worktree, "rev-parse", "HEAD"),
+      commit,
+      [...commands],
+      packageAuthority,
+    );
+    packageInputsVerified = true;
+  } catch {
+    // Unverified package inputs: the install gets neither.
+  }
+  const {
+    packageInputsVerified: _claimed,
+    packageInputsBase: _base,
+    ...policy
+  } = sandbox;
+  const base = pinnedGit(worktree, "rev-parse", "HEAD");
   const root = join(workerValidationRoot(worktree), `${run}`);
   let produced = "";
   const inspectSettled =
@@ -225,6 +289,9 @@ export async function runDeclaredValidation(
       undefined,
       undefined,
       inspectSettled,
+      packageInputsVerified
+        ? { ...policy, packageInputsVerified: true, packageInputsBase: base }
+        : policy,
     );
     return {
       passed: true,
@@ -360,6 +427,8 @@ export async function createFactoryValidationMcp(
               run,
               input.lfs,
               outputs,
+              input.sandbox,
+              input.packageAuthority,
             );
             return { declared, handoff };
           });

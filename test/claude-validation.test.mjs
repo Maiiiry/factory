@@ -6,12 +6,14 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -21,7 +23,10 @@ import {
   checkWorkHandoff,
   runDeclaredValidation,
   workerFilesTree,
+  workerValidationCommands,
 } from "../dist/execution/claude-validation.js";
+import { commandSandboxAvailability } from "../dist/execution/sandbox.js";
+import { validateTree } from "../dist/validation.js";
 
 const status = (worktree) =>
   execFileSync("git", ["-C", worktree, "status", "--porcelain"], {
@@ -268,4 +273,407 @@ test("declared validation runs on a snapshot and leaves the worktree unchanged",
   assert.equal(readFileSync(join(worktree, "new.txt"), "utf8"), "edited\n");
   assert.equal(readFileSync(join(worktree, "a.txt"), "utf8"), "changed\n");
   rmSync(dirname(worktree), { recursive: true, force: true });
+});
+
+test("declared commands run in an OS sandbox that hides the host and keeps loopback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-command-sandbox-"));
+  const worktree = join(root, "worktree");
+  execFileSync("git", ["init", "-q", worktree]);
+  writeFileSync(join(worktree, "a.txt"), "base\n");
+  // A dependency-free npm project, so the exact install runs offline.
+  const manifest = { name: "sandboxed", version: "1.0.0" };
+  writeFileSync(join(worktree, "package.json"), JSON.stringify(manifest));
+  writeFileSync(
+    join(worktree, "package-lock.json"),
+    JSON.stringify({
+      ...manifest,
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": manifest },
+    }),
+  );
+  execFileSync("git", [
+    "-C",
+    worktree,
+    "add",
+    "a.txt",
+    "package.json",
+    "package-lock.json",
+  ]);
+  execFileSync("git", [
+    "-C",
+    worktree,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.com",
+    "commit",
+    "-qm",
+    "base",
+  ]);
+  // Host secrets a hostile test script would look for, and a host directory
+  // outside the checkout it would try to write.
+  const home = process.env.HOME;
+  const secrets = [
+    join(home, ".claude", ".credentials.json"),
+    join(home, ".ssh", "id_ed25519"),
+    join(home, ".config", "gh", "hosts.yml"),
+    join(process.env.XDG_STATE_HOME, "clockgrove-factory", "state.json"),
+  ];
+  for (const path of secrets) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "secret\n");
+  }
+  const outside = join(root, "outside");
+  mkdirSync(outside);
+  const store = join(root, "package-store");
+  const quote = (path) => `'${path}'`;
+  const policy = {
+    required: true,
+    network: "package-install",
+    packageStore: store,
+    readOnlyPaths: [],
+  };
+  const result = await runDeclaredValidation(
+    worktree,
+    [
+      // The verified install, run first, may write the shared store.
+      "npm ci --ignore-scripts",
+      // Each escape must fail inside the sandbox, so each command passes.
+      ...secrets.map((path) => `! cat ${quote(path)}`),
+      `! ls ${quote(home)}`,
+      `! ls ${quote(join(process.env.XDG_STATE_HOME, "clockgrove-factory"))}`,
+      `! touch ${quote(join(outside, "escape"))}`,
+      // The checkout's .git cannot be repointed.
+      "! sh -c 'echo gitdir: /tmp >> .git'",
+      // No host process is visible or signalable.
+      `! kill -0 ${process.pid}`,
+      // Only loopback: no route off the host, even for a command the
+      // package-install policy does not name.
+      `test "$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ')" = lo`,
+      // A private, writable HOME; the shared package store is read-only to
+      // every command but the install.
+      `test "$HOME" != ${quote(home)} && touch "$HOME/ok"`,
+      'test -d "$npm_config_cache" && ! touch "$npm_config_cache/marker"',
+      // Normal work: read the checkout, write ignored files, serve loopback.
+      "grep -qx base a.txt && git status --porcelain >/dev/null",
+      `node -e 'const s=require("net").createServer(c=>c.end("ok")).listen(0,"127.0.0.1",()=>require("net").connect(s.address().port,"127.0.0.1").on("data",d=>{s.close();process.exit(String(d)==="ok"?0:1)}))'`,
+    ],
+    1,
+    undefined,
+    undefined,
+    policy,
+    { sourceDeclared: ["npm ci --ignore-scripts"] },
+  );
+  assert.equal(result.passed, true, result.text);
+  assert.equal(existsSync(join(outside, "escape")), false);
+  assert.equal(existsSync(join(store, "npm", "marker")), false);
+  const logs = () => readdirSync(join(store, "npm", "_logs")).length;
+  const written = logs();
+  assert.ok(written > 0);
+  // A candidate that changes package-manager configuration loses that: its
+  // install neither writes the store nor reaches the network.
+  writeFileSync(join(worktree, ".npmrc"), "registry=http://127.0.0.1:9/\n");
+  await runDeclaredValidation(
+    worktree,
+    ["npm ci --ignore-scripts"],
+    3,
+    undefined,
+    undefined,
+    policy,
+    { sourceDeclared: ["npm ci --ignore-scripts"] },
+  );
+  assert.equal(logs(), written);
+  for (const path of secrets)
+    assert.equal(readFileSync(path, "utf8"), "secret\n");
+  // A command that does reach a host secret fails the run.
+  const leaked = await runDeclaredValidation(
+    worktree,
+    [`cat ${quote(secrets[0])}`],
+    2,
+  );
+  assert.equal(leaked.passed, false);
+  assert.doesNotMatch(leaked.text, /secret/);
+});
+
+test("host-side Git never enters a nested repository sandboxed code could write", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-nested-git-"));
+  const marker = join(root, "ran-outside-the-sandbox");
+  const git = (cwd, ...args) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        cwd,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        ...args,
+      ],
+      { encoding: "utf8" },
+    );
+  // A nested repository whose clean filter runs a program: host-side Git
+  // runs it once a gitlink in the index makes it recurse.
+  const plant = (directory) =>
+    [
+      `mkdir -p '${directory}'`,
+      `cd '${directory}'`,
+      "git init -q",
+      "echo '* filter=evil' > .gitattributes && echo data > f",
+      "git add . && git -c user.name=t -c user.email=t@e commit -qm n",
+      `git config filter.evil.clean "sh -c 'touch ${marker}; cat'"`,
+      "touch -d '2000-01-01' f",
+    ].join(" && ");
+  const repository = (name) => {
+    const path = join(root, name);
+    execFileSync("git", ["init", "-q", path]);
+    writeFileSync(join(path, "a.txt"), "base\n");
+    git(path, "add", "a.txt");
+    git(path, "commit", "-qm", "base");
+    return path;
+  };
+  // Route 1: a worker's embedded repository would become a gitlink in the
+  // Validate snapshot; the snapshot is refused before Git stages it.
+  const first = repository("embedded");
+  execFileSync("sh", ["-c", plant(join(first, "x"))]);
+  const embedded = await runDeclaredValidation(first, ["true"], 1).catch(
+    (error) => error,
+  );
+  assert.match(String(embedded.message ?? embedded.text), /nested Git entry/);
+  assert.equal(existsSync(marker), false);
+  rmSync(join(first, "x"), { recursive: true, force: true });
+  // A validation command that plants one in its checkout leaves no gitlink:
+  // host-side status after it never enters the repository.
+  const planted = await runDeclaredValidation(
+    first,
+    [plant("y"), "git status --porcelain >/dev/null"],
+    2,
+  );
+  assert.equal(planted.passed, false);
+  assert.match(planted.text, /modified the result tree/);
+  assert.equal(existsSync(marker), false);
+  // Route 2: a base with a submodule gitlink gets no Validate, a worker's
+  // repository behind it is refused before Git stages, and no tree with a
+  // gitlink is validated.
+  const second = repository("submodule");
+  git(
+    second,
+    "update-index",
+    "--add",
+    "--cacheinfo",
+    `160000,${git(second, "rev-parse", "HEAD").trim()},sub`,
+  );
+  git(second, "commit", "-qm", "submodule");
+  assert.deepEqual(
+    workerValidationCommands({
+      config: { tools: ["Validate"], allowedTools: ["Validate"] },
+      request: {
+        worktree: second,
+        item: { validation: [{ command: "true" }] },
+      },
+    }),
+    [],
+  );
+  execFileSync("sh", ["-c", plant(join(second, "sub"))]);
+  const behindGitlink = await runDeclaredValidation(second, ["true"], 3).catch(
+    (error) => error,
+  );
+  assert.match(
+    String(behindGitlink.message ?? behindGitlink.text),
+    /nested Git entry/,
+  );
+  assert.equal(existsSync(marker), false);
+  rmSync(join(second, "sub"), { recursive: true, force: true });
+  await assert.rejects(
+    validateTree(
+      second,
+      join(root, "validation"),
+      git(second, "rev-parse", "HEAD").trim(),
+      git(second, "rev-parse", "HEAD^{tree}").trim(),
+      ["true"],
+    ),
+    /submodule gitlinks/,
+  );
+  assert.equal(existsSync(marker), false);
+});
+
+test("a verified install reaches only its configured registry, and commands are resource-limited", async () => {
+  const root = mkdtempSync(join(tmpdir(), "factory-install-network-"));
+  // Real dependency tarballs served on host loopback, standing in for the
+  // configured registry: only an install in the host's network reaches it.
+  const tarballs = {};
+  for (const name of ["dep", "added", "foreign", "merged"]) {
+    const pack = join(root, "pack", name);
+    mkdirSync(join(pack, "package"), { recursive: true });
+    writeFileSync(
+      join(pack, "package", "package.json"),
+      JSON.stringify({ name, version: "1.0.0" }),
+    );
+    execFileSync("tar", ["-czf", join(pack, "p.tgz"), "-C", pack, "package"]);
+    tarballs[name] = readFileSync(join(pack, "p.tgz"));
+  }
+  const requests = [];
+  // npm also asks the registry for audits and its own version.
+  const fetched = () => requests.filter((url) => url.includes(".tgz"));
+  const server = createServer((request, response) => {
+    requests.push(request.url);
+    const name = request.url.split("/")[1];
+    response.end(tarballs[name] ?? "");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const registry = `http://127.0.0.1:${server.address().port}/`;
+    const integrity = (bytes) =>
+      `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+    const write = (worktree, dependencies) => {
+      const manifest = {
+        name: "installing",
+        version: "1.0.0",
+        dependencies: Object.fromEntries(
+          Object.keys(dependencies).map((name) => [name, "1.0.0"]),
+        ),
+      };
+      writeFileSync(join(worktree, "package.json"), JSON.stringify(manifest));
+      writeFileSync(
+        join(worktree, "package-lock.json"),
+        JSON.stringify({
+          name: "installing",
+          version: "1.0.0",
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            "": manifest,
+            ...Object.fromEntries(
+              Object.entries(dependencies).map(([name, resolved]) => [
+                `node_modules/${name}`,
+                {
+                  version: "1.0.0",
+                  resolved,
+                  integrity: integrity(tarballs[name]),
+                },
+              ]),
+            ),
+          },
+        }),
+      );
+    };
+    const worktree = join(root, "worktree");
+    execFileSync("git", ["init", "-q", worktree]);
+    const commit = (message) => {
+      execFileSync("git", ["-C", worktree, "add", "."]);
+      execFileSync("git", [
+        "-C",
+        worktree,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        message,
+      ]);
+      const read = (revision) =>
+        execFileSync("git", ["-C", worktree, "rev-parse", revision], {
+          encoding: "utf8",
+        }).trim();
+      return { commit: read("HEAD"), tree: read("HEAD^{tree}") };
+    };
+    // The base configures the registry; its lockfile resolves there.
+    // No fetch retries, so an offline install fails at once.
+    writeFileSync(
+      join(worktree, ".npmrc"),
+      `registry=${registry}\nfetch-retries=0\n`,
+    );
+    writeFileSync(join(worktree, ".gitignore"), "node_modules/\n");
+    write(worktree, { dep: `${registry}dep/-/dep-1.0.0.tgz` });
+    const base = commit("base");
+    const install = "npm ci --ignore-scripts";
+    // The caller that verified these package inputs passes the base, as
+    // validateWorkItem, final validation and readiness do.
+    const validate = (target, number, commands = [install]) =>
+      validateTree(
+        worktree,
+        join(root, `validation-${number}`),
+        target.commit,
+        target.tree,
+        commands,
+        undefined,
+        undefined,
+        [],
+        undefined,
+        base.commit,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        {
+          required: true,
+          network: "package-install",
+          packageStore: join(root, "store"),
+          readOnlyPaths: [],
+          limits: { tmpMiB: 64, processes: 512 },
+          packageInputsVerified: true,
+          packageInputsBase: base.commit,
+        },
+      );
+    const limited = [
+      `test "$(awk '/Max processes/{print $3}' /proc/self/limits)" = 512`,
+      ...(commandSandboxAvailability().tmpfsSize
+        ? [`test "$(df -k /tmp | awk 'NR==2{print $2}')" = 65536`]
+        : []),
+    ];
+    // The base lockfile: the install fetches from the registry.
+    await validate(base, 1, [install, ...limited]);
+    assert.deepEqual(fetched(), ["/dep/-/dep-1.0.0.tgz"]);
+    // A candidate adding a dependency from the configured registry still
+    // reaches it.
+    write(worktree, {
+      dep: `${registry}dep/-/dep-1.0.0.tgz`,
+      added: `${registry}added/-/added-1.0.0.tgz`,
+    });
+    await validate(commit("add a registry dependency"), 2);
+    assert.deepEqual(fetched(), [
+      "/dep/-/dep-1.0.0.tgz",
+      "/added/-/added-1.0.0.tgz",
+    ]);
+    // One naming a tarball on another host installs offline: no request
+    // leaves, and the install fails where it connects (npm retries).
+    write(worktree, {
+      dep: `${registry}dep/-/dep-1.0.0.tgz`,
+      foreign: `http://localhost:${server.address().port}/foreign/x.tgz?repository-contents`,
+    });
+    const before = requests.length;
+    await assert.rejects(
+      validate(commit("add a foreign tarball"), 3),
+      /ECONNREFUSED/,
+    );
+    assert.equal(requests.length, before);
+    // A pnpm lockfile hiding a foreign tarball behind a YAML merge key (which
+    // pnpm's reader applies and YAML 1.2 does not) keeps the install offline,
+    // although the npm lockfile alone would be allowed.
+    write(worktree, {
+      dep: `${registry}dep/-/dep-1.0.0.tgz`,
+      merged: `${registry}merged/-/merged-1.0.0.tgz`,
+    });
+    writeFileSync(
+      join(worktree, "pnpm-lock.yaml"),
+      [
+        "lockfileVersion: '9.0'",
+        "packages:",
+        "  merged@1.0.0:",
+        "    resolution:",
+        `      integrity: ${integrity(tarballs.merged)}`,
+        `      <<: {tarball: 'http://localhost:${server.address().port}/merged/x.tgz'}`,
+        "",
+      ].join("\n"),
+    );
+    await assert.rejects(
+      validate(commit("hide a tarball behind a merge key"), 4),
+      /ECONNREFUSED/,
+    );
+    assert.equal(requests.length, before);
+  } finally {
+    server.close();
+  }
 });

@@ -23,7 +23,14 @@ import type {
   WorkItem,
 } from "./contracts.js";
 import type { FailedValidationEvidence } from "./failed-validation.js";
+import {
+  type CommandSandboxPolicy,
+  STRICT_COMMAND_SANDBOX,
+  sandboxedCommand,
+} from "./execution/sandbox.js";
 import { StepFault, transient } from "./fault.js";
+import { installMayUseNetwork } from "./execution/package-network.js";
+import { indexHasGitlinks } from "./execution/staged-candidate.js";
 import { lfsFiltered } from "./media.js";
 import { ownsPath } from "./ownership.js";
 import {
@@ -36,7 +43,6 @@ import {
   currentProcessSignal,
   hasUnresolvedSubprocesses,
   localValidationEnvironment,
-  localValidationShellArguments,
   pinnedGit,
   pinnedGitRaw,
   removeWorktree,
@@ -323,6 +329,21 @@ function dependencyInputsChanged(
   );
 }
 
+function treeHasGitlinks(checkout: string, commit: string): boolean {
+  return pinnedGitRaw(checkout, "ls-tree", "-r", "-z", "--full-tree", commit)
+    .toString("utf8")
+    .split("\0")
+    .some((entry) => entry.startsWith("160000 "));
+}
+
+const gitlinkRefusal = () =>
+  new StepFault({
+    kind: "config",
+    detail:
+      "Factory does not validate trees that contain submodule gitlinks: host-side Git would enter repositories sandboxed commands can write",
+    fix: "Use Factory on a repository without submodules",
+  });
+
 interface ValidationPreparation {
   commands: string[];
   observe?: (entry: ValidationObservation) => void;
@@ -345,6 +366,7 @@ export async function validateTree(
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
   /** Reads the settled checkout, passed or failed, before it is removed; must not throw. */
   inspectSettled?: (worktree: string) => void,
+  sandbox: CommandSandboxPolicy = STRICT_COMMAND_SANDBOX,
 ): Promise<ValidationEvidence> {
   const worktree = join(root, "worktree");
   try {
@@ -354,6 +376,7 @@ export async function validateTree(
       `Validation environment unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  if (treeHasGitlinks(checkout, commit)) throw gitlinkRefusal();
   await removeValidationWorktree(checkout, worktree);
   await addWorktree(checkout, worktree, commit);
   try {
@@ -371,6 +394,7 @@ export async function validateTree(
       retainFailedValidation,
       preparation,
       reviewArtifacts,
+      sandbox,
     );
     evidence.worktreeObservation!.checkoutPreparation = {
       kind: "fresh-detached-worktree",
@@ -402,6 +426,8 @@ export async function validateCheckout(
   retainFailedValidation = true,
   preparation: ValidationPreparation = { commands: [] },
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
+  /** The OS sandbox every command runs in; strict unless configuration relaxes it. */
+  sandbox: CommandSandboxPolicy = STRICT_COMMAND_SANDBOX,
 ): Promise<ValidationEvidence> {
   assertReviewArtifactSelectors(reviewArtifacts);
   if (reviewArtifacts.length && !contentStore)
@@ -428,6 +454,10 @@ export async function validateCheckout(
     );
   if (pinnedGitRaw(worktree, "status", "--porcelain").length)
     throw new Error("Validation worktree is not initially clean");
+  // Sandboxed commands can write any directory of the checkout. Behind a
+  // gitlink, host-side Git would enter a repository they wrote, with its
+  // configuration; so no checkout with one is validated.
+  if (indexHasGitlinks(worktree)) throw gitlinkRefusal();
   const selectedLfs = await hydrateSelectedLfsBytes(
     worktree,
     lfsMembers,
@@ -477,10 +507,22 @@ export async function validateCheckout(
   // Every run gets its own empty TMPDIR, which a locator's files stay inside:
   // no other run's temporary files reach the commands. Under tmpdir(), not
   // the state root, so socket paths inside it stay short.
+  // The sandbox's private HOME lasts the whole sequence, so what setup puts
+  // there (caches, downloaded browsers) reaches the commands after it.
   let temporaryRoot: string;
+  let homeRoot: string;
+  const installHomes: string[] = [];
   try {
     temporaryRoot = mkdtempSync(join(tmpdir(), "factory-validation-"));
   } catch (error) {
+    throw new CandidateEnvironmentFailure(
+      `Validation environment unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    homeRoot = mkdtempSync(join(tmpdir(), "factory-home-"));
+  } catch (error) {
+    rmSync(temporaryRoot, { recursive: true, force: true });
     throw new CandidateEnvironmentFailure(
       `Validation environment unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -547,18 +589,46 @@ export async function validateCheckout(
         stdout: new StringDecoder("utf8"),
         stderr: new StringDecoder("utf8"),
       };
-      const result = await subprocessAsync(
-        "sh",
-        localValidationShellArguments(check),
-        {
-          cwd: worktree,
-          env: {
-            ...localValidationEnvironment(emptyCredentials),
-            TMPDIR: temporaryRoot,
-            TMP: temporaryRoot,
-            TEMP: temporaryRoot,
-          },
+      // Only Factory's exact script-disabled install, run first (before any
+      // command could change the checkout) after its package inputs were
+      // verified, writes the shared store; and only it, when the operator
+      // allowed it, reaches the network. It gets an empty HOME of its own,
+      // so nothing an earlier command left there configures it.
+      const install =
+        sequenceIndex === 0 &&
+        sandbox.packageInputsVerified === true &&
+        packageBootstrap(check) !== undefined;
+      // Network only from the configured registries: unchanged package
+      // configuration and a lockfile that resolves only there.
+      const online =
+        install &&
+        sandbox.network === "package-install" &&
+        sandbox.packageInputsBase !== undefined &&
+        installMayUseNetwork(worktree, sandbox.packageInputsBase, commit);
+      let home = homeRoot;
+      if (install) {
+        home = mkdtempSync(join(tmpdir(), "factory-install-home-"));
+        installHomes.push(home);
+      }
+      const launch = sandboxedCommand({
+        command: check,
+        checkout: worktree,
+        temporary: temporaryRoot,
+        home,
+        env: {
+          ...localValidationEnvironment(emptyCredentials),
+          TMPDIR: temporaryRoot,
+          TMP: temporaryRoot,
+          TEMP: temporaryRoot,
         },
+        network: online,
+        packageInstall: install,
+        policy: sandbox,
+      });
+      const result = await subprocessAsync(
+        launch.file,
+        launch.args,
+        { cwd: worktree, env: launch.env },
         undefined,
         (stream, chunk) => {
           const original = originalStreams[stream];
@@ -706,7 +776,8 @@ export async function validateCheckout(
     return evidence;
   } finally {
     if (!hasUnresolvedSubprocesses())
-      rmSync(temporaryRoot, { recursive: true, force: true });
+      for (const path of [temporaryRoot, homeRoot, ...installHomes])
+        rmSync(path, { recursive: true, force: true });
   }
 }
 
@@ -802,7 +873,7 @@ export function packageBootstrap(command: string): "npm" | "pnpm" | undefined {
   return undefined;
 }
 
-interface PackageScriptAuthority {
+export interface PackageScriptAuthority {
   /** Exact stable same-manager pin declared by the pinned Objective. */
   packageManagerUpdate?: string;
   /** Final acceptance must include the declared update. */
@@ -1191,6 +1262,7 @@ export async function validateWorkItem(
   packageManagerUpdate?: string,
   retainFailedValidation = true,
   reviewArtifacts: readonly ReviewArtifactSelector[] = [],
+  sandbox: CommandSandboxPolicy = STRICT_COMMAND_SANDBOX,
 ): Promise<ValidationEvidence> {
   // Validate every declaration before selection, including unowned producers.
   assertReviewArtifactSelectors(reviewArtifacts);
@@ -1228,6 +1300,13 @@ export async function validateWorkItem(
     retainFailedValidation,
     { commands: [] },
     selectedArtifacts,
+    undefined,
+    // The package inputs were just checked for exactly these commands.
+    {
+      ...sandbox,
+      packageInputsVerified: true,
+      packageInputsBase: predecessorSha ?? acceptedBaseSha,
+    },
   );
   // Keep the installation selector identity when only this item's producers
   // were selected. QA and final validation still use the complete selection.
