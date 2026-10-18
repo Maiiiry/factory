@@ -772,6 +772,8 @@ interface QueueVerificationContext {
   retiredSnapshotBytes?: number;
   /** Set once a full publication completes; see checkpointBasis. */
   incremental?: { since: number; publications: number };
+  /** The current reference summary key of each producer slot. */
+  referenceSlots?: Map<string, string>;
 }
 const scopes = new AsyncLocalStorage<{
   config: FactoryConfig;
@@ -801,9 +803,13 @@ const scopes = new AsyncLocalStorage<{
     key: string;
     options: GitPersistenceConfig;
     bodies: Map<string, { ref: ContentRef; bytes?: Buffer }>;
+    /** Sequential producer steps recording every original they touch. */
+    recorders: Map<string, ContentRef>[];
     /** Bodies the verified acknowledged base already holds; see checkpointBasis. */
     covered?: ReadonlySet<string>;
     pendingReferences: Map<string, string>;
+    /** Producer slots this build staged; committed after its final boundary. */
+    slots: Map<string, string>;
     pendingReferenceBytes: number;
     sourceOriginals: Map<string, string>;
     sourceInventories: Map<
@@ -1637,6 +1643,7 @@ export function withQueueControlVerification<T>(
     } finally {
       verification.summaries.clear();
       verification.content.clear();
+      delete verification.referenceSlots;
       verification.lineages.clear();
       delete verification.queueValidation;
       delete verification.queueValidationBytes;
@@ -1748,7 +1755,9 @@ async function withFiniteCheckpointReads<T>(
     key: verificationKey(config, options),
     options: { ...options },
     bodies: new Map<string, { ref: ContentRef; bytes?: Buffer }>(),
+    recorders: [] as Map<string, ContentRef>[],
     pendingReferences: new Map<string, string>(),
+    slots: new Map<string, string>(),
     pendingReferenceBytes: 0,
     sourceOriginals: new Map<string, string>(),
     sourceInventories: new Map<
@@ -1837,7 +1846,7 @@ async function withFiniteCheckpointReads<T>(
         throw new Error(
           "Checkpoint closure configuration changed during verification",
         );
-      if (phase.verification)
+      if (phase.verification) {
         for (const [key, value] of [...phase.pendingReferences]) {
           if (!phase.pendingReferences.has(key)) continue;
           phase.pendingReferences.delete(key);
@@ -1851,6 +1860,24 @@ async function withFiniteCheckpointReads<T>(
             value,
           );
         }
+        // Only a build that passed its final boundary supersedes a slot's
+        // previous summary; a failed build keeps it.
+        const context = phase.verification;
+        for (const [named, key] of phase.slots) {
+          const previous = context.referenceSlots?.get(named);
+          const retained =
+            previous === undefined || previous === key
+              ? undefined
+              : context.content.get(previous);
+          if (retained !== undefined) {
+            context.content.delete(previous!);
+            context.contentBytes -=
+              Buffer.byteLength(previous!) + Buffer.byteLength(retained);
+          }
+          context.referenceSlots ??= new Map();
+          context.referenceSlots.set(named, key);
+        }
+      }
       return closure;
     } finally {
       phase.closed = true;
@@ -1860,6 +1887,7 @@ async function withFiniteCheckpointReads<T>(
         phase.verification.pendingReferenceBytes -= phase.pendingReferenceBytes;
       }
       phase.pendingReferences.clear();
+      phase.slots.clear();
       phase.sourceOriginals.clear();
       phase.sourceInventories.clear();
       phase.pendingReferenceBytes = 0;
@@ -1901,6 +1929,16 @@ function closureReadPhase(root: string) {
     : undefined;
 }
 
+/** Every active recorder sees each original this build touches. */
+function recordClosureOriginal(
+  phase: NonNullable<ReturnType<typeof closureReadPhase>>,
+  key: string,
+  ref: ContentRef,
+): void {
+  for (const recorder of phase.recorders)
+    if (!recorder.has(key)) recorder.set(key, { ...ref });
+}
+
 export function checkpointClosureBytes(
   root: string,
   ref: ContentRef,
@@ -1908,7 +1946,9 @@ export function checkpointClosureBytes(
   const phase = closureReadPhase(root);
   if (!phase) return undefined;
   assertRef(ref);
-  const body = phase.bodies.get(canonical([resolve(root), ref]));
+  const key = canonical([resolve(root), ref]);
+  const body = phase.bodies.get(key);
+  if (body?.bytes) recordClosureOriginal(phase, key, ref);
   return body?.bytes && Buffer.from(body.bytes);
 }
 
@@ -1921,6 +1961,7 @@ export function deferCheckpointClosureVerification(
   if (!phase) return false;
   assertRef(ref);
   const key = canonical([resolve(root), ref]);
+  recordClosureOriginal(phase, key, ref);
   if (phase.bodies.has(key)) return true;
   if (
     phase.bodies.size >= phase.options.maxFiles ||
@@ -1932,17 +1973,28 @@ export function deferCheckpointClosureVerification(
   return true;
 }
 
+/**
+ * The concrete store passes the identity of the file it just read: when this
+ * controller holds a hash of that exact identity, the bytes are not hashed a
+ * second time. Any other bytes are hashed before they are shared.
+ */
 export function retainCheckpointClosureBytes(
   root: string,
   ref: ContentRef,
   bytes: Buffer,
+  identity: string,
 ): void {
   const phase = closureReadPhase(root);
   if (!phase) return;
   assertRef(ref);
-  if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
+  if (
+    bytes.length !== ref.bytes ||
+    (!checkpointContentVerified(root, ref, identity) &&
+      hash(bytes) !== ref.digest)
+  )
     throw new Error("Checkpoint closure body failed exact digest verification");
   const key = canonical([resolve(root), ref]);
+  recordClosureOriginal(phase, key, ref);
   const prior = phase.bodies.get(key);
   if (prior) {
     prior.bytes ??= Buffer.from(bytes);
@@ -1990,7 +2042,7 @@ function originalNames(
 }
 
 function originalFingerprint(path: string): string {
-  if (realpathSync(dirname(path)) !== resolve(dirname(path)))
+  if (realpathSync.native(dirname(path)) !== resolve(dirname(path)))
     throw new Error(
       "Checkpoint producer original parent resolves through a link",
     );
@@ -2073,6 +2125,29 @@ export function checkpointClosureOriginals(): ContentRef[] | undefined {
   return [...active.phase.bodies.values()].map(({ ref }) => ({ ...ref }));
 }
 
+/**
+ * Every original this build touches while one sequential producer step runs,
+ * including those an earlier step already touched, so the step's own summary
+ * can verify all of them again when it is reused. Undefined outside an owned
+ * closure build.
+ */
+export async function checkpointClosureOriginalsDuring<T>(
+  task: () => Promise<T>,
+): Promise<{ value: T; originals?: ContentRef[] }> {
+  const active = activeClosureBinding();
+  if (!active?.scope.verification || active.phase.closed)
+    return { value: await task() };
+  const { phase } = active;
+  const touched = new Map<string, ContentRef>();
+  phase.recorders.push(touched);
+  try {
+    const value = await task();
+    return { value, originals: [...touched.values()] };
+  } finally {
+    phase.recorders.splice(phase.recorders.indexOf(touched), 1);
+  }
+}
+
 export function cachedRecoveryCheckpointReferences(
   root: string,
   description: string,
@@ -2099,6 +2174,12 @@ export function retainRecoveryCheckpointReferences(
   root: string,
   description: string,
   summary: RecoveryCheckpointReferenceSummary,
+  /**
+   * A producer whose summary covers a growing set names one slot: its new
+   * summary replaces the previous one, which no later build can match, instead
+   * of stale summaries filling the pool until every fact is evicted.
+   */
+  slot?: string,
 ): void {
   const active = activeClosureBinding();
   const context = active?.scope.verification;
@@ -2117,6 +2198,8 @@ export function retainRecoveryCheckpointReferences(
   ]);
   const value = JSON.stringify(summary);
   const charge = Buffer.byteLength(key) + Buffer.byteLength(value);
+  if (slot !== undefined)
+    phase.slots.set(canonical(["reference-slot", resolve(root), slot]), key);
   if (phase.pendingReferences.has(key) || context.content.has(key)) return;
   if (!reserveVerificationMetadata(context, phase.options, charge)) return;
   phase.pendingReferences.set(key, value);
@@ -2192,6 +2275,7 @@ function clearRebuildableVerificationMetadata(
   context.summaries.clear();
   context.summaryBytes = 0;
   context.content.clear();
+  delete context.referenceSlots;
   context.contentBytes = 0;
   delete context.publisherObjects;
   delete context.publisherObjectBytes;
@@ -5120,6 +5204,7 @@ function checkpointBasis(
   // verifier already established (for example at controller startup).
   if (basis || final) {
     context.content.clear();
+    delete context.referenceSlots;
     context.contentBytes = 0;
     context.summaries.clear();
     context.summaryBytes = 0;
@@ -6026,6 +6111,7 @@ async function freshArchiveOwnedStrict(
       context.summaries.clear();
       context.summaryBytes = 0;
       context.content.clear();
+      delete context.referenceSlots;
       context.contentBytes = 0;
       rmSync(directory, { recursive: true, force: true });
       delete context.directory;
@@ -6045,6 +6131,7 @@ async function freshArchiveOwnedStrict(
         context.lineageBytes = 0;
         context.summaryBytes = 0;
         context.content.clear();
+        delete context.referenceSlots;
         context.contentBytes = 0;
         delete context.objects;
         delete context.negotiationTip;
@@ -6056,6 +6143,7 @@ async function freshArchiveOwnedStrict(
       context.summaries.clear();
       context.summaryBytes = 0;
       context.content.clear();
+      delete context.referenceSlots;
       context.contentBytes = 0;
       context.lineages.clear();
       context.lineageBytes = 0;

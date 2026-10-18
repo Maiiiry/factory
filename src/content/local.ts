@@ -106,7 +106,9 @@ export class LocalContentStore implements ContentStore {
 
   private openObject(ref: ContentRef): number {
     const path = this.path(ref);
-    if (realpathSync(dirname(path)) !== resolve(dirname(path)))
+    // One native resolution, not a JavaScript walk with an lstat per path
+    // component: this runs for every original of every closure.
+    if (realpathSync.native(dirname(path)) !== resolve(dirname(path)))
       throw new Error("Content object parent resolves through a symlink");
     if (!lstatSync(path).isFile())
       throw new Error("Content object must be a regular file");
@@ -155,7 +157,10 @@ export class LocalContentStore implements ContentStore {
     );
   }
 
-  private readDescriptor(fd: number, ref: ContentRef): Buffer {
+  private readDescriptor(
+    fd: number,
+    ref: ContentRef,
+  ): { bytes: Buffer; identity: string } {
     const identity = this.descriptorIdentity(fd, ref);
     const verified = checkpointContentVerified(this.root, ref, identity);
     const bytes = readFileSync(fd);
@@ -171,7 +176,7 @@ export class LocalContentStore implements ContentStore {
       throw new Error("Content object changed during exact byte verification");
     if (!verified)
       retainCheckpointContentVerification(this.root, ref, identity);
-    return bytes;
+    return { bytes, identity };
   }
 
   private retainExisting(ref: ContentRef): boolean {
@@ -250,8 +255,9 @@ export class LocalContentStore implements ContentStore {
     if (cached) return cached;
     const fd = this.openObject(ref);
     try {
-      const bytes = this.readDescriptor(fd, ref);
-      if (concrete) retainCheckpointClosureBytes(this.root, ref, bytes);
+      const { bytes, identity } = this.readDescriptor(fd, ref);
+      if (concrete)
+        retainCheckpointClosureBytes(this.root, ref, bytes, identity);
       return bytes;
     } finally {
       closeSync(fd);
@@ -270,12 +276,13 @@ export class LocalContentStore implements ContentStore {
   retainCheckpointReferences(
     description: string,
     summary: RecoveryCheckpointReferenceSummary,
+    slot?: string,
   ): void {
     if (
       Object.getPrototypeOf(this) === LocalContentStore.prototype &&
       this.readBytes === LocalContentStore.prototype.readBytes
     )
-      retainRecoveryCheckpointReferences(this.root, description, summary);
+      retainRecoveryCheckpointReferences(this.root, description, summary, slot);
   }
 
   async put(
