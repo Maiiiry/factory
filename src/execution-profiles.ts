@@ -1,3 +1,5 @@
+import { factoryShellAuthorized } from "./execution/claude-shell.js";
+import { indexHasGitlinks } from "./execution/staged-candidate.js";
 import { createHash } from "node:crypto";
 import {
   harnessAdapterIdentity,
@@ -108,19 +110,25 @@ export function executionProfileChoices(
 
 /**
  * What a worker can execute, decided by its harness kind. Codex workers have
- * a sandboxed shell. Claude and Copilot workers have no shell: only checkout
- * file tools and the item's authorized validation. Registered and managed
- * adapters declare neither, so planning treats them as shell-less.
+ * a sandboxed shell. Claude workers have one (run_command) when Write and
+ * Validate are granted and the command sandbox runs on this host; otherwise,
+ * like Copilot workers, only checkout file tools and the item's authorized
+ * validation. Registered and managed adapters declare neither, so planning
+ * treats them as shell-less.
  */
 export type WorkerCommandAccess = "shell" | "validation-only" | "undeclared";
 
 function harnessCommandAccess(
   harness: LocalHarnessConfig,
+  gitlinks: boolean,
 ): WorkerCommandAccess {
   switch (harness.kind) {
     case "codex-sdk":
       return "shell";
     case "claude-agent-sdk":
+      return factoryShellAuthorized({ config: harness }) && !gitlinks
+        ? "shell"
+        : "validation-only";
     case "github-copilot-sdk":
       return "validation-only";
     case "registered":
@@ -134,14 +142,21 @@ export function workerCommandAccess(
 ): Record<string, WorkerCommandAccess> {
   const execution = config.execution;
   if (execution.kind !== "local") return { "": "undeclared" };
+  // Claude workers get no shell in a checkout with submodule gitlinks.
+  let gitlinks = false;
+  try {
+    gitlinks = indexHasGitlinks(config.checkout);
+  } catch {
+    gitlinks = true;
+  }
   if (execution.profiles)
     return Object.fromEntries(
       Object.entries(execution.profiles).map(([id, profile]) => [
         id,
-        harnessCommandAccess(profile.harness),
+        harnessCommandAccess(profile.harness, gitlinks),
       ]),
     );
-  return { "": harnessCommandAccess(execution.harness!) };
+  return { "": harnessCommandAccess(execution.harness!, gitlinks) };
 }
 
 export function normalizeExecutionProfiles(
