@@ -65,6 +65,7 @@ import type {
   WorkState,
 } from "./state.js";
 import {
+  answeredQuestionDigest,
   isPreparationState,
   observedStackNumber,
   openAmendmentQuestion,
@@ -2377,6 +2378,7 @@ export function statusDocument(
             const open = openAmendmentQuestion(state);
             return open ? redactDiagnosticDetail(open.question, secrets) : null;
           })(),
+          questionDigest: answeredQuestionDigest(state),
           // Why `factory propose-amendment` would refuse a replacement of a
           // rejected amendment (the checks submitAmendment applies); null when
           // it fits. Status names it only then; otherwise `factory cancel`.
@@ -2652,6 +2654,7 @@ function preparationStatusDocument(
       !preparation.plan && preparation.planningRecovery?.phase === "stopped",
     planningQuestion: Boolean(openPlanningQuestion(preparation)),
     planReviewQuestions: reviewDecisionAnswerable(preparation)?.count ?? 0,
+    questionDigest: answeredQuestionDigest(preparation),
     // An older plan without its retained draft: an answer cannot revise it.
     ...(openReviewDecision(preparation) &&
     !reviewDecisionAnswerable(preparation)

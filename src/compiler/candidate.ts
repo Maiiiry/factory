@@ -18,7 +18,6 @@ import type {
   OperatorPlanningDecision,
   WorkGraph,
   PlanCommandAuthorization,
-  PlanReviewRequest,
 } from "../contracts.js";
 import {
   planningSources,
@@ -36,6 +35,8 @@ import {
 import type { ResolvedGraphFinding } from "../review-evidence.js";
 import type { checkedPlanReview } from "./planning.js";
 import {
+  assertAnsweredQuestion,
+  type PlanningReviewRequest,
   planReviewDigest,
   digest,
   reviewResultDigest,
@@ -115,7 +116,7 @@ export function buildPlanCandidate(
   executionProfiles: ExecutionProfileChoices | undefined,
   sources: ReturnType<typeof planningSources>,
   graph: WorkGraph,
-  packet: PlanReviewRequest,
+  packet: PlanningReviewRequest,
   review: Awaited<ReturnType<typeof checkedPlanReview>>,
   revisions: number,
 ): PlanCandidate {
@@ -388,6 +389,7 @@ export async function resolvePlan(
     outcome: "accept" | "refuse";
     answer: string;
     reason: string;
+    question?: string;
   },
   configDigest: string,
 ): Promise<PlanCandidate> {
@@ -413,10 +415,12 @@ export async function resolvePlan(
     throw new Error(
       "A human decision needs actor, reason, and a specific answer when accepted",
     );
+  const question =
+    candidate.review.failure?.question ??
+    candidate.review.findings[0]!.question;
+  assertAnsweredQuestion(question, input.question);
   const decision = {
-    question:
-      candidate.review.failure?.question ??
-      candidate.review.findings[0]!.question,
+    question,
     answer: input.answer,
     actor: input.actor,
     at: new Date().toISOString(),

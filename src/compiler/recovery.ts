@@ -83,7 +83,13 @@ import {
   MalformedPlannerOutput,
   PlanValidationError,
 } from "./faults.js";
-import { digest, planningReviewEvidence, planReviewPacket } from "./packets.js";
+import {
+  assertAnsweredQuestion,
+  digest,
+  type PlanningReviewRequest,
+  planningReviewEvidence,
+  planReviewPacket,
+} from "./packets.js";
 import {
   checkedPlanReview,
   compileObjective,
@@ -223,7 +229,7 @@ export function operatorPlanningDecisions(
  */
 export function answerPlanningDecision(
   state: { plan?: PlanCandidate; planningRecovery?: PlanningRecoveryRecord },
-  input: { actor: string; answer: string; reason: string },
+  input: { actor: string; answer: string; reason: string; question?: string },
 ): void {
   const record = state.planningRecovery;
   const open = record?.decisions?.at(-1);
@@ -231,6 +237,7 @@ export function answerPlanningDecision(
     throw new Error("Planning has no open planner question");
   if (!input.actor.trim() || !input.answer.trim() || !input.reason.trim())
     throw new Error("Answering the planner needs actor, answer and reason");
+  assertAnsweredQuestion(open.question, input.question);
   open.answer = {
     actor: input.actor,
     answer: input.answer,
@@ -255,7 +262,7 @@ export function answerPlanningDecision(
 export function answerReviewDecision(
   state: { plan?: PlanCandidate; planningRecovery?: PlanningRecoveryRecord },
   questions: string,
-  input: { actor: string; answer: string; reason: string },
+  input: { actor: string; answer: string; reason: string; question?: string },
   current: {
     objective: number;
     body: string;
@@ -270,6 +277,7 @@ export function answerReviewDecision(
     throw new Error("This plan has no open review question");
   if (!input.actor.trim() || !input.answer.trim() || !input.reason.trim())
     throw new Error("Answering the plan review needs actor, answer and reason");
+  assertAnsweredQuestion(questions, input.question);
   verifyPlanCandidate(
     plan,
     current.objective,
@@ -319,7 +327,7 @@ export function answerReviewDecision(
  */
 export function grantPlanningRevisions(
   state: { plan?: PlanCandidate; planningRecovery?: PlanningRecoveryRecord },
-  input: { actor: string; reason: string; answer?: string },
+  input: { actor: string; reason: string; answer?: string; question?: string },
 ): void {
   const record = state.planningRecovery;
   if (
@@ -328,9 +336,9 @@ export function grantPlanningRevisions(
     record.stoppedFor !== "revision-allowance"
   )
     throw new Error("Planning did not stop at its revision allowance");
-  if (input.answer?.trim())
+  if (input.answer?.trim() || input.question !== undefined)
     throw new Error(
-      "Granting planning revisions answers no question; omit --answer",
+      "Granting planning revisions answers no question; omit --answer and --question",
     );
   if (!input.actor.trim() || !input.reason.trim())
     throw new Error("Granting planning revisions needs actor and reason");
@@ -980,7 +988,7 @@ async function compilePlanAdmitted(
   };
   while (true) {
     let graph: WorkGraph | undefined;
-    let packet: PlanReviewRequest | undefined;
+    let packet: PlanningReviewRequest | undefined;
     let review: Awaited<ReturnType<typeof checkedPlanReview>> | undefined;
     let reviewing = false;
     let failure: string;
@@ -988,6 +996,16 @@ async function compilePlanAdmitted(
     let stated: "check" | "review" | undefined;
     // The graph items a check refusal names, so the revision cites them.
     let refusedItems: string[] = [];
+    // The first round after an answer revises the exact draft it is bound to.
+    const bound = record.decisions?.at(-1);
+    if (
+      bound?.answer &&
+      bound.round === record.history.length &&
+      record.revision?.digest !== bound.draft.digest
+    )
+      throw new PlanningReviewBindingError(
+        "The revision does not revise the draft the operator's answer is bound to; preserve the planning record and use supported cancellation before a corrected successor",
+      );
     try {
       const revised =
         corrections.length && record.revision && contentStore

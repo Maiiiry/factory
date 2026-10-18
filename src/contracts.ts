@@ -599,9 +599,18 @@ export interface OperatorPlanningDecision {
   draftDigest: string;
 }
 
+/**
+ * An operator answer a review checks the graph follows. An answer to a
+ * pending amendment's question reaches the amendment's next compilation, not
+ * a retained draft, and records neither a time nor a draft.
+ */
+export type ReviewedOperatorDecision =
+  | OperatorPlanningDecision
+  | Omit<OperatorPlanningDecision, "at" | "draftDigest">;
+
 export interface PlanReviewRequest {
-  /** Operator answers to the planner's and plan reviews' questions, in the order asked. */
-  operatorDecisions?: OperatorPlanningDecision[];
+  /** Operator answers to the planner's, plan reviews' and an amendment's questions, in the order asked. */
+  operatorDecisions?: ReviewedOperatorDecision[];
   /** Exact pinned structural recipe independently reviewed with this graph. */
   workflowRecipe?: import("./workflow-recipes.js").WorkflowRecipeInput;
   /** Authenticated role input; preserves source, command and effect authority. */
