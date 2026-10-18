@@ -105,6 +105,12 @@ import {
 } from "../dist/github-project-queue-wire.js";
 import { runObjective } from "../dist/runner.js";
 import {
+  admitExecution,
+  plannedExecutionConflict,
+  sharedCapacity,
+} from "../dist/concurrent-objectives.js";
+import { phaseAdmission } from "../dist/phase-admission.js";
+import {
   acquireInstallationLock,
   acquireObjectiveLock,
   asInstallationOwner,
@@ -1374,6 +1380,139 @@ bindProjectQueueRun(config,claim,lock.token,state);await awaitCheckpointAdmissio
       await owner;
       releaseControllerLock(objectiveLockPath(repository, 1), foregroundLock);
     }
+  }
+  if (!collectedExecution) {
+    // Opting in to concurrent Objectives changes neither digest, so started
+    // Objectives and queue receipts stay valid.
+    const concurrent = {
+      ...config,
+      queue: { ...config.queue, maxActiveObjectives: 2 },
+    };
+    validateConfig(concurrent);
+    assert.equal(factoryConfigDigest(concurrent), factoryConfigDigest(config));
+    assert.equal(
+      factoryAuthorityDigest(concurrent),
+      factoryAuthorityDigest(config),
+    );
+    // Concurrent Objectives see each other through real retained snapshots
+    // and live controller locks of another installation identity.
+    const shared = `fixture/concurrent-${randomUUID()}`;
+    t.after(() => rm(stateRoot(shared), { recursive: true, force: true }));
+    const sharedConfig = {
+      ...config,
+      repository: shared,
+      queue: { pollSeconds: 1, maxActiveObjectives: 2 },
+    };
+    delete sharedConfig.gitPersistence;
+    const planned = (objective, ownedPaths) => {
+      const next = structuredClone(state);
+      Object.assign(next, {
+        repository: shared,
+        objective,
+        runId: randomUUID(),
+      });
+      for (const key of [
+        "finalAcceptance",
+        "finalValidation",
+        "objectiveClosure",
+      ])
+        delete next[key];
+      next.graph = {
+        ...next.graph,
+        objective,
+        items: [
+          {
+            ...next.graph.items[0],
+            id: "code",
+            kind: "work",
+            title: "Change owned files",
+            ownedPaths,
+          },
+          { ...next.graph.items[0], dependencies: ["code"] },
+        ],
+      };
+      next.planGraphDigest = graphDigest(next.graph);
+      next.approvedPlaybookAdmission.graphDigest = next.planGraphDigest;
+      next.work = { qa: { status: "pending" }, code: { status: "pending" } };
+      next.issueByItemId = { code: 3, qa: 2 };
+      next.capacity = {
+        concurrency: 1,
+        scheduling: { validationConcurrency: 1 },
+      };
+      saveState(statePath(shared, objective), next);
+      return next;
+    };
+    const first = planned(2, ["src/"]),
+      overlapping = planned(3, ["src/a.ts", "README.md"]),
+      disjoint = planned(4, ["docs/"]);
+    assert.equal(admitExecution(sharedConfig, first), undefined);
+    assert.deepEqual(admitExecution(sharedConfig, overlapping), {
+      objective: 2,
+      paths: ["src/a.ts"],
+    });
+    assert.deepEqual(plannedExecutionConflict(sharedConfig, overlapping), {
+      objective: 2,
+      paths: ["src/a.ts"],
+    });
+    assert.equal(admitExecution(sharedConfig, disjoint), undefined);
+    // The earlier admission keeps running when re-admitted at its next pass.
+    assert.equal(admitExecution(sharedConfig, first), undefined);
+    // A path an amendment adds yields to a later admission that owns it.
+    const amended = structuredClone(first);
+    amended.graph.items[0].ownedPaths = ["src/", "docs/guide.md"];
+    assert.deepEqual(admitExecution(sharedConfig, amended), {
+      objective: 4,
+      paths: ["docs/guide.md"],
+    });
+    // Two amendments onto each other's paths: the later one, now waiting
+    // itself, no longer holds the earlier one, which goes first.
+    const crossed = structuredClone(disjoint);
+    crossed.graph.items[0].ownedPaths = ["docs/", "src/x.ts"];
+    assert.deepEqual(admitExecution(sharedConfig, crossed), {
+      objective: 2,
+      paths: ["src/x.ts"],
+    });
+    assert.equal(admitExecution(sharedConfig, amended), undefined);
+    assert.deepEqual(admitExecution(sharedConfig, crossed)?.objective, 2);
+    // Host capacity: another live controller's reservation fills the ceiling.
+    const firstLock = acquireObjectiveLock(shared, 2),
+      secondLock = acquireObjectiveLock(shared, 4);
+    try {
+      const firstCapacity = sharedCapacity(sharedConfig, 2, firstLock.token);
+      firstCapacity.publish(["validation"], []);
+      const capacity = sharedCapacity(sharedConfig, 4, secondLock.token);
+      assert.deepEqual(capacity.others(), {
+        reserved: ["validation"],
+        pending: [],
+      });
+      const phases = phaseAdmission(
+        disjoint,
+        () => undefined,
+        () => false,
+        capacity,
+      );
+      assert.equal(phases.blocker("code", "validation")?.kind, "concurrency");
+      assert.equal(phases.blocker("code", "coding"), undefined);
+      // An older request of the other controller goes first.
+      firstCapacity.publish(
+        [],
+        [{ phase: "validation", requestedAt: Date.now() - 1000 }],
+      );
+      assert.equal(phases.blocker("code", "validation")?.kind, "concurrency");
+      assert.equal(phases.blocker("code", "review"), undefined);
+      releaseControllerLock(objectiveLockPath(shared, 2), firstLock);
+      assert.deepEqual(capacity.others(), { reserved: [], pending: [] });
+      assert.equal(phases.blocker("code", "validation"), undefined);
+    } finally {
+      releaseControllerLock(objectiveLockPath(shared, 4), secondLock);
+      if (readControllerOwner(objectiveLockPath(shared, 2)))
+        releaseControllerLock(objectiveLockPath(shared, 2), firstLock);
+    }
+    // A finished Objective releases its paths.
+    first.cancelRequested = true;
+    first.cancelledAt = new Date().toISOString();
+    saveState(statePath(shared, 2), first);
+    assert.equal(admitExecution(sharedConfig, overlapping), undefined);
   }
   // Exercise the actual intake eligibility seam against real Git. An empty
   // native dependency set has no base-dependent eligibility, while the
