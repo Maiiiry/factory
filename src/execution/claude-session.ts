@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSessionRef, AgentSessionRequest } from "../contracts.js";
@@ -234,43 +234,48 @@ export function claudeSessionEnvironment(
   privateDirectory(session.data.root);
   const config = join(session.data.root, "config");
   privateDirectory(config);
-  // Carry only the existing Linux login credential file, never ambient settings or plugins.
-  const loginRoot = environment.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-  const credentials = join(loginRoot, ".credentials.json");
+  // Settings, plugins and transcripts stay in the private config directory,
+  // but the login stays where the operator's Claude clients keep it. The CLI
+  // reads and refreshes its credentials in CLAUDE_SECURESTORAGE_CONFIG_DIR
+  // under that directory's refresh lock, so a session refreshes the shared
+  // login in place. A private copy would fork it: a refresh revokes the
+  // tokens every other holder has. The empty value is the CLI's default
+  // login directory (~/.claude) and keychain entry.
+  const login =
+    environment.CLAUDE_SECURESTORAGE_CONFIG_DIR ??
+    environment.CLAUDE_CONFIG_DIR ??
+    "";
+  // The CLI resolves a relative directory against its own working
+  // directory, which for a worker is the checkout it may write.
+  if (login && !isAbsolute(login))
+    throw new Error(
+      "CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR must be absolute paths",
+    );
+  const credentials = join(
+    login || join(homedir(), ".claude"),
+    ".credentials.json",
+  );
   const stat = lstatSync(credentials, { throwIfNoEntry: false });
-  if (stat) {
-    if (
-      !stat.isFile() ||
-      stat.isSymbolicLink() ||
-      stat.uid !== process.getuid?.()
-    )
-      throw new Error(
-        "Claude login credential source is not an owned regular file",
-      );
-    const destination = join(config, ".credentials.json");
-    const previous = lstatSync(destination, { throwIfNoEntry: false });
-    if (
-      previous &&
-      (!previous.isFile() ||
-        previous.isSymbolicLink() ||
-        previous.uid !== process.getuid?.() ||
-        previous.mode & 0o077)
-    )
-      throw new Error("Claude private credential destination changed");
-    const staging = join(config, `.credentials.${randomUUID()}.tmp`);
-    writeFileSync(staging, readFileSync(credentials), {
-      flag: "wx",
-      mode: 0o600,
-    });
-    try {
-      renameSync(staging, destination);
-    } finally {
+  if (
+    stat &&
+    (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
+  )
+    throw new Error(
+      "Claude login credential source is not an owned regular file",
+    );
+  // A copy or staging file left by an earlier version must not be kept.
+  rmSync(join(config, ".credentials.json"), { force: true });
+  for (const name of readdirSync(config)) {
+    if (!/^\.credentials\..*\.tmp$/.test(name)) continue;
+    const staging = join(config, name);
+    const entry = lstatSync(staging);
+    if (entry.isFile() && entry.uid === process.getuid?.())
       rmSync(staging, { force: true });
-    }
   }
   return {
     ...environment,
     CLAUDE_CONFIG_DIR: config,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: login,
     CLAUDE_CODE_PROJECT_DIR_NAME: session.ref.identity,
   };
 }
