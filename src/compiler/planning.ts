@@ -38,6 +38,7 @@ import {
   type PlanningPrerequisites,
   type PlanningRequest,
   type PlanReviewRequest,
+  type PlanRevisionScope,
   type ResultReviewEvidenceSource,
   type WorkGraph,
 } from "../contracts.js";
@@ -768,6 +769,8 @@ export async function checkedPlanReview(
   packet: PlanReviewRequest,
   invocation?: ModelInvocationContext,
   evidencePacket = reviewPacket([], planningReviewEvidence(packet)),
+  /** A revision round's scope; it reaches the reviewer, never the packet. */
+  revisionScope?: PlanRevisionScope,
 ): Promise<{
   findings: ResolvedGraphFinding[];
   failure?: { detail: string; question: string };
@@ -777,6 +780,7 @@ export async function checkedPlanReview(
     const response = await model.reviewGraph({
       ...packet,
       reviewPacket: evidencePacket,
+      ...(revisionScope && { revisionScope }),
       invocation,
     });
     responseReceived = true;

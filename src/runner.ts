@@ -14,6 +14,7 @@ import {
 import {
   answerPlanningDecision,
   bindPlanningPlaybook,
+  grantPlanningRevisions,
   resolvePlan,
 } from "./compiler.js";
 import { objectiveComplete } from "./completion.js";
@@ -142,6 +143,7 @@ import {
   openAmendmentQuestion,
   openPlanningQuestion,
   pendingQuestions,
+  planningRevisionGrantable,
   rejectionHoldsPause,
   setCoordinatorMode,
 } from "./state.js";
@@ -267,6 +269,7 @@ async function decideObjectiveUnscoped(
 ): Promise<
   | "plan-accepted"
   | "plan-answered"
+  | "plan-revisions-granted"
   | "plan-refused"
   | "amendment-accepted"
   | "amendment-refused"
@@ -284,8 +287,15 @@ async function decideObjectiveUnscoped(
       throw new Error(
         "--item names a Work Item's result; a plan decision takes none",
       );
-    if (input.outcome === "accept" && !input.answer)
+    // Granting more revisions answers no question, so it takes no --answer.
+    const granting =
+      input.outcome === "accept" && planningRevisionGrantable(state);
+    if (input.outcome === "accept" && !input.answer && !granting)
       throw new Error("Accepting a plan requires --answer to its question");
+    if (granting && input.answer?.trim())
+      throw new Error(
+        "Granting planning revisions answers no question; omit --answer",
+      );
     // A live service owns the installation: it applies the decision (#1290).
     if (forward) {
       const reply = await requestControl(config.repository, {
@@ -297,6 +307,7 @@ async function decideObjectiveUnscoped(
         if (
           reply.result !== "plan-accepted" &&
           reply.result !== "plan-answered" &&
+          reply.result !== "plan-revisions-granted" &&
           reply.result !== "plan-refused"
         )
           throw new Error("The live owner returned no plan decision");
@@ -313,7 +324,9 @@ async function decideObjectiveUnscoped(
       ? "plan-refused"
       : decided.plan
         ? "plan-accepted"
-        : "plan-answered";
+        : granting
+          ? "plan-revisions-granted"
+          : "plan-answered";
   }
   // The planner's open question about the pending amendment (#1296).
   const asked = openAmendmentQuestion(state);
@@ -982,6 +995,14 @@ async function runObjectiveOwned(
             throw new Error(
               "Refusing a plan needs its owner stopped: hand off the owner, then decide",
             );
+          // Planning stopped at its revision allowance: accepting grants more.
+          if (planningRevisionGrantable(current)) {
+            grantPlanningRevisions(current, decision);
+            resumePlanning(current);
+            persist();
+            wake();
+            return "plan-revisions-granted";
+          }
           if (!decision.answer)
             throw new Error(
               "Accepting a plan requires --answer to its question",

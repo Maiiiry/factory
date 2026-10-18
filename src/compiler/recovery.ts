@@ -23,6 +23,7 @@ import type {
   PlanningModel,
   PlanningPrerequisites,
   PlanReviewRequest,
+  PlanRevisionScope,
   WorkGraph,
 } from "../contracts.js";
 import {
@@ -44,6 +45,7 @@ import {
   failureDigest,
   objectiveEvent,
   PAID_ATTEMPTS,
+  PLANNING_REVISION_GRANT,
   type RepairClass,
   type RepairLedger,
 } from "../repair-policy.js";
@@ -128,6 +130,28 @@ export interface PlanningDecisionRecord {
   answer?: { actor: string; answer: string; reason: string; at: string };
 }
 
+/**
+ * Operator authority for more planning revisions, given when the allowance
+ * ran out and the last review had only fix findings. It raises this
+ * Objective's planningRevisions limit by `rounds`.
+ */
+export interface PlanningRevisionGrant {
+  actor: string;
+  reason: string;
+  at: string;
+  rounds: number;
+  /** Accepted corrections when it was granted. */
+  round: number;
+}
+
+export { PLANNING_REVISION_GRANT };
+
+/** A reviewed graph's per-item and plan-level digests: what the next review compares. */
+interface ReviewedGraphDigests {
+  items: Record<string, string>;
+  fields: Record<string, string>;
+}
+
 export interface PlanningRecoveryRecord {
   /** Resource coverage only; never a native response or non-submission verdict. */
   cancelledResources?: {
@@ -150,6 +174,13 @@ export interface PlanningRecoveryRecord {
   review?: PlanningReviewRecord;
   /** The planner's questions, oldest first; the last, while unanswered, holds planning. */
   decisions?: PlanningDecisionRecord[];
+  /**
+   * Planning stopped because the revision allowance ran out while the last
+   * review had only fix findings: the operator may grant more revisions.
+   */
+  stoppedFor?: "revision-allowance";
+  /** The operator's revision grants, oldest first. */
+  grants?: PlanningRevisionGrant[];
   history: {
     failure: string;
     detail: string;
@@ -160,6 +191,8 @@ export interface PlanningRecoveryRecord {
     /** The exact corrections a check or review supplied without a diagnosis. */
     corrections?: PlanCorrection[];
     review?: PlanningReviewRecord;
+    /** The reviewed graph's digests, so the next review sees what changed. */
+    reviewedGraph?: ReviewedGraphDigests;
   }[];
 }
 
@@ -205,6 +238,111 @@ export function answerPlanningDecision(
   };
   record.revision = open.draft;
   record.phase = "ready";
+}
+
+/**
+ * `factory decide --outcome accept` when planning stopped at its revision
+ * allowance with only fix findings left: record the operator's grant of
+ * PLANNING_REVISION_GRANT more revisions. The next run continues from the
+ * retained draft and its last review, so no call is repeated. The caller
+ * holds the mutation lock and saves.
+ */
+export function grantPlanningRevisions(
+  state: { plan?: PlanCandidate; planningRecovery?: PlanningRecoveryRecord },
+  input: { actor: string; reason: string; answer?: string },
+): void {
+  const record = state.planningRecovery;
+  if (
+    state.plan ||
+    record?.phase !== "stopped" ||
+    record.stoppedFor !== "revision-allowance"
+  )
+    throw new Error("Planning did not stop at its revision allowance");
+  if (input.answer?.trim())
+    throw new Error(
+      "Granting planning revisions answers no question; omit --answer",
+    );
+  if (!input.actor.trim() || !input.reason.trim())
+    throw new Error("Granting planning revisions needs actor and reason");
+  record.grants = [
+    ...(record.grants ?? []),
+    {
+      actor: input.actor,
+      reason: input.reason,
+      at: new Date().toISOString(),
+      rounds: PLANNING_REVISION_GRANT,
+      round: record.history.length,
+    },
+  ];
+  delete record.stoppedFor;
+  record.phase = "ready";
+}
+
+function reviewedGraphDigests(
+  graph: WorkGraph,
+  record: PlanningRecoveryRecord,
+): ReviewedGraphDigests {
+  const { items: _items, ...graphFields } = graph;
+  // The operator's answers are reviewed with the graph, so a new answer
+  // counts as a change the next review checks.
+  const fields = {
+    ...graphFields,
+    operatorDecisions: operatorPlanningDecisions(record) ?? [],
+  };
+  return {
+    items: Object.fromEntries(
+      graphItems(graph).map((item) => [item.id, digest(JSON.stringify(item))]),
+    ),
+    fields: Object.fromEntries(
+      Object.entries(fields).map(([key, value]) => [
+        key,
+        digest(JSON.stringify(value)),
+      ]),
+    ),
+  };
+}
+
+/**
+ * A revision round's review scope: the last review's findings and what
+ * changed since the graph it reviewed. Undefined before any review.
+ */
+function revisionScope(
+  record: PlanningRecoveryRecord,
+  graph: WorkGraph,
+): PlanRevisionScope | undefined {
+  const reviewed = record.history.filter((entry) => entry.review);
+  const last = reviewed.at(-1);
+  const before = last?.reviewedGraph;
+  if (!last || !before) return undefined;
+  const now = reviewedGraphDigests(graph, record);
+  const findings = (last.review?.response as { findings?: unknown } | undefined)
+    ?.findings;
+  const keys = new Set([
+    ...Object.keys(before.fields),
+    ...Object.keys(now.fields),
+  ]);
+  return {
+    round: reviewed.length + 1,
+    previousFindings: (Array.isArray(findings) ? findings : []).map(
+      (finding: { kind?: unknown; itemIds?: unknown; detail?: unknown }) => ({
+        kind: String(finding.kind),
+        itemIds: Array.isArray(finding.itemIds)
+          ? finding.itemIds.map(String)
+          : [],
+        detail: String(finding.detail),
+      }),
+    ),
+    changedItemIds: Object.keys(now.items).filter(
+      (id) => id in before.items && before.items[id] !== now.items[id],
+    ),
+    addedItemIds: Object.keys(now.items).filter((id) => !(id in before.items)),
+    removedItemIds: Object.keys(before.items).filter(
+      (id) => !(id in now.items),
+    ),
+    changedFields: [...keys].filter(
+      (key) => before.fields[key] !== now.fields[key],
+    ),
+  };
 }
 
 /** Retain the current owned native original and complete its existing admission. */
@@ -836,6 +974,7 @@ async function compilePlanAdmitted(
         packet,
         invocation("graph-review"),
         retained.packet,
+        revisionScope(record, graph),
       );
       if (!review.findings.length && !review.failure) {
         const candidate = buildPlanCandidate(
@@ -1033,7 +1172,6 @@ async function compilePlanAdmitted(
         save();
         return candidate;
       }
-      save();
       const reason = unchanged
         ? "Unchanged planning failure"
         : diagnosed >= PAID_ATTEMPTS
@@ -1041,9 +1179,27 @@ async function compilePlanAdmitted(
           : !permitted.length
             ? "Planning correction is disabled"
             : "Planning revision allowance is exhausted";
+      const findings = `${fixes.length} plan review fix finding${fixes.length === 1 ? "" : "s"}`;
+      // Only the allowance stopped a review whose findings are all fixes:
+      // the operator may grant more revisions to continue this draft.
+      if (
+        !unchanged &&
+        !unanswered &&
+        reason === "Planning revision allowance is exhausted" &&
+        stated === "review" &&
+        fixes.length &&
+        fixes.length === review?.findings.length
+      ) {
+        record.stoppedFor = "revision-allowance";
+        save();
+        throw new PlanningNeedsDecision(
+          `${reason} with ${findings} left; accepting grants ${PLANNING_REVISION_GRANT} more revisions`,
+        );
+      }
+      save();
       throw new PlanningNeedsDecision(
         fixes.length
-          ? `${reason}; the planner did not apply ${fixes.length} plan review fix finding${fixes.length === 1 ? "" : "s"}`
+          ? `${reason}; the planner did not apply ${findings}`
           : `${reason}; operator decision required`,
       );
     }
@@ -1116,6 +1272,9 @@ async function compilePlanAdmitted(
         correction: stating.map((entry) => entry.detail).join("\n"),
         corrections: structuredClone(stating),
         ...(record.review ? { review: reviewByReference(record.review) } : {}),
+        ...(record.review && graph
+          ? { reviewedGraph: reviewedGraphDigests(graph, record) }
+          : {}),
       });
       record.invocations = [];
       corrections = withAnswers(stating);
@@ -1207,6 +1366,9 @@ async function compilePlanAdmitted(
       diagnosis: diagnosis.diagnosis,
       correction: diagnosis.correction,
       ...(record.review ? { review: reviewByReference(record.review) } : {}),
+      ...(record.review && graph
+        ? { reviewedGraph: reviewedGraphDigests(graph, record) }
+        : {}),
     });
     record.invocations = [];
     corrections = withAnswers([

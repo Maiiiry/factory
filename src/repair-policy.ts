@@ -146,7 +146,17 @@ export interface RepairLedger {
    * an event (restart, interruption, lost response) never charges twice.
    */
   charges?: Record<string, Charge>;
+  /** Operator grants of more planning revisions (see grantPlanningRevisions). */
+  planningRecovery?: {
+    grants?: readonly { rounds: number }[];
+    history?: { readonly length: number };
+  };
+  /** Set on a preparation: planning is still revising while it has no plan. */
+  kind?: string;
+  plan?: unknown;
 }
+/** Revisions one operator grant adds after planning used up its allowance. */
+export const PLANNING_REVISION_GRANT = 2;
 /** Paid calls (planning diagnoses) asked per failure event before the operator decides. */
 export const PAID_ATTEMPTS = 3;
 /**
@@ -288,11 +298,33 @@ export function consumption(
       for (const allowance of charge.allowances) total[allowance]++;
   return total;
 }
+/** The Objective's limit for `key`: its snapshot plus the operator's planning revision grants. */
+export function allowanceLimit(state: RepairLedger, key: Allowance): number {
+  const base = state.autonomy.allowances[key];
+  if (key !== "planningRevisions") return base;
+  const granted = (state.planningRecovery?.grants ?? []).reduce(
+    (total, grant) => total + grant.rounds,
+    0,
+  );
+  // A grant is for initial planning: once a plan exists, only the granted
+  // rounds planning used still count, so none becomes amendment budget.
+  if (state.kind === "preparing" && state.plan === undefined)
+    return base + granted;
+  const used = Math.max(
+    0,
+    (state.planningRecovery?.history?.length ?? 0) - base,
+  );
+  return base + Math.min(granted, used);
+}
 /** Per-path limits cap Work Item scopes; planning is one Objective-wide scope under its allowance. */
-function scopeLimit(autonomy: Autonomy, scope: string, key: Allowance): number {
+function scopeLimit(
+  state: RepairLedger,
+  scope: string,
+  key: Allowance,
+): number {
   return scope === "$planning"
-    ? autonomy.allowances[key]
-    : autonomy.repairPolicy.perPath[key];
+    ? allowanceLimit(state, key)
+    : state.autonomy.repairPolicy.perPath[key];
 }
 /** What is left of each allowance, Objective-wide and for each scope. */
 export function remaining(
@@ -308,8 +340,8 @@ export function remaining(
     for (const key of allowanceKeys)
       result[key] =
         (scope === undefined
-          ? state.autonomy.allowances[key]
-          : scopeLimit(state.autonomy, scope, key)) - used[key];
+          ? allowanceLimit(state, key)
+          : scopeLimit(state, scope, key)) - used[key];
     return result;
   };
   return {
@@ -325,12 +357,10 @@ function exhausted(
   key: Allowance,
   scopes: string[],
 ): string | undefined {
-  if (consumption(state)[key] >= state.autonomy.allowances[key])
+  if (consumption(state)[key] >= allowanceLimit(state, key))
     return `Objective ${key} allowance exhausted`;
   for (const scope of scopes)
-    if (
-      consumption(state, scope)[key] >= scopeLimit(state.autonomy, scope, key)
-    )
+    if (consumption(state, scope)[key] >= scopeLimit(state, scope, key))
       return `Repair path ${scope} ${key} allowance exhausted`;
   return undefined;
 }
@@ -652,6 +682,49 @@ export function validateCorrection(
     throw new Error("Unchanged failed correction cannot be repeated");
 }
 
+/** Each grant is a recorded operator decision: who, why, when, how many and at which round. */
+function assertPlanningGrants(state: RepairLedger): void {
+  const recovery: unknown = state.planningRecovery;
+  if (recovery === undefined) return;
+  const value = recovery as {
+    grants?: unknown;
+    history?: unknown[];
+    phase?: unknown;
+    stoppedFor?: unknown;
+  };
+  if (
+    value?.stoppedFor !== undefined &&
+    (value.stoppedFor !== "revision-allowance" ||
+      value.phase !== "stopped" ||
+      state.plan !== undefined)
+  )
+    throw new Error("Invalid planning stop reason");
+  if (value?.grants === undefined) return;
+  // Each grant follows the allowance it extends: it is given exactly when
+  // planning has used the snapshot plus every earlier grant.
+  let expectedRound = state.autonomy.allowances.planningRevisions;
+  if (
+    !Array.isArray(value.grants) ||
+    value.grants.some((grant) => {
+      const entry = grant as Record<string, unknown>;
+      const round = expectedRound;
+      expectedRound += PLANNING_REVISION_GRANT;
+      return (
+        !entry ||
+        typeof entry !== "object" ||
+        Object.keys(entry).sort().join() !== "actor,at,reason,round,rounds" ||
+        ![entry.actor, entry.reason, entry.at].every(
+          (text) => typeof text === "string" && text.trim(),
+        ) ||
+        !Number.isFinite(Date.parse(entry.at as string)) ||
+        entry.rounds !== PLANNING_REVISION_GRANT ||
+        entry.round !== round ||
+        round > (value.history?.length ?? 0)
+      );
+    })
+  )
+    throw new Error("Invalid planning revision grant");
+}
 /** Persisted allowance and continuation data is validated before it can authorize effects. */
 export function assertRepairLedger(
   state: RepairLedger & {
@@ -659,7 +732,8 @@ export function assertRepairLedger(
     work?: Record<string, WorkState>;
   },
 ): void {
-  const autonomy = validateAutonomy(state.autonomy);
+  validateAutonomy(state.autonomy);
+  assertPlanningGrants(state);
   // Charges replaced these counters; refuse rather than silently reset them.
   for (const counter of ["allowanceConsumption", "repairConsumption"])
     if (Object.hasOwn(state, counter))
@@ -693,10 +767,10 @@ export function assertRepairLedger(
     }
     const total = consumption(state);
     for (const key of allowanceKeys) {
-      if (total[key] > autonomy.allowances[key])
+      if (total[key] > allowanceLimit(state, key))
         throw new Error("Repair charges exceed the bound allowance");
       for (const scope of scopes)
-        if (consumption(state, scope)[key] > scopeLimit(autonomy, scope, key))
+        if (consumption(state, scope)[key] > scopeLimit(state, scope, key))
           throw new Error("Repair path charges exceed the bound allowance");
     }
   }
