@@ -36,13 +36,24 @@ import {
   commandSandboxAvailability,
   commandSandboxStatus,
   STRICT_COMMAND_SANDBOX,
+  sandboxedCommand,
 } from "../dist/execution/sandbox.js";
+import { faultOf } from "../dist/fault.js";
+import { subprocessAsync } from "../dist/process.js";
 import { validateTree, validateWorkItem } from "../dist/validation.js";
 
 const status = (worktree) =>
   execFileSync("git", ["-C", worktree, "status", "--porcelain"], {
     encoding: "utf8",
   });
+
+// A host directory outside every temporary directory: the repository's
+// ignored `.factory`.
+const outsideTemporary = () => {
+  const parent = new URL("../.factory/", import.meta.url).pathname;
+  mkdirSync(parent, { recursive: true });
+  return mkdtempSync(join(parent, "sandbox-"));
+};
 
 test("declared validation runs on a snapshot and leaves the worktree unchanged", async () => {
   const worktree = join(
@@ -286,7 +297,7 @@ test("declared validation runs on a snapshot and leaves the worktree unchanged",
   rmSync(dirname(worktree), { recursive: true, force: true });
 });
 
-test("declared commands run in an OS sandbox that hides the host and keeps loopback", async () => {
+test("declared commands run in an OS sandbox that hides the host and keeps loopback", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-command-sandbox-"));
   const worktree = join(root, "worktree");
   execFileSync("git", ["init", "-q", worktree]);
@@ -337,7 +348,10 @@ test("declared commands run in an OS sandbox that hides the host and keeps loopb
   }
   const outside = join(root, "outside");
   mkdirSync(outside);
-  const store = join(root, "package-store");
+  // A package store lies outside the shared temporary directories.
+  const stores = outsideTemporary();
+  t.after(() => rmSync(stores, { recursive: true, force: true }));
+  const store = join(stores, "package-store");
   const quote = (path) => `'${path}'`;
   const policy = {
     required: true,
@@ -548,8 +562,10 @@ test("host-side Git never enters a nested repository sandboxed code could write"
   }
 });
 
-test("a verified install reaches only its configured registry, and commands are resource-limited", async () => {
+test("a verified install reaches only its configured registry, and commands are resource-limited", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "factory-install-network-"));
+  const stores = outsideTemporary();
+  t.after(() => rmSync(stores, { recursive: true, force: true }));
   // Real dependency tarballs served on host loopback, standing in for the
   // configured registry: only an install in the host's network reaches it.
   const tarballs = {};
@@ -642,7 +658,7 @@ test("a verified install reaches only its configured registry, and commands are 
     const sandbox = {
       required: true,
       network: "package-install",
-      packageStore: join(root, "store"),
+      packageStore: join(stores, "store"),
       readOnlyPaths: [],
       limits: { tmpMiB: 64, processes: 512 },
     };
@@ -763,7 +779,7 @@ test("a verified install reaches only its configured registry, and commands are 
         undefined,
         false,
         [],
-        { ...sandbox, packageStore: join(root, "empty-store") },
+        { ...sandbox, packageStore: join(stores, "empty-store") },
       ),
       /ECONNREFUSED/,
     );
@@ -851,13 +867,56 @@ test("a worker's shell runs in its checkout inside the same sandbox, bounded", a
   assert.match(long.output, /last\n$/);
 });
 
-// A host directory outside every temporary directory: the repository's
-// ignored `.factory`.
-const outsideTemporary = () => {
-  const parent = new URL("../.factory/", import.meta.url).pathname;
-  mkdirSync(parent, { recursive: true });
-  return mkdtempSync(join(parent, "sandbox-"));
+// One command as validation launches it, and its run.
+const launchIn = (root, command, readOnlyPaths) =>
+  sandboxedCommand({
+    command,
+    checkout: join(root, "worktree"),
+    temporary: join(root, "tmp"),
+    home: join(root, "home"),
+    env: { PATH: process.env.PATH },
+    network: false,
+    packageInstall: false,
+    policy: { ...STRICT_COMMAND_SANDBOX, readOnlyPaths },
+  });
+const runIn = (root, launch) =>
+  subprocessAsync(launch.file, launch.args, {
+    cwd: join(root, "worktree"),
+    env: launch.env,
+    bubblewrap: launch.bubblewrap,
+  });
+const sandboxRoot = (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-sandbox-setup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const name of ["tmp", "home"]) mkdirSync(join(root, name));
+  execFileSync("git", ["init", "-q", join(root, "worktree")]);
+  return root;
 };
+
+test("a sandbox that cannot be set up is a configuration fault, not the command's failure", {
+  skip: new URL("..", import.meta.url).pathname.startsWith(`${tmpdir()}/`),
+}, async (t) => {
+  const root = sandboxRoot(t);
+  const tools = outsideTemporary();
+  t.after(() => rmSync(tools, { recursive: true, force: true }));
+  // A command that runs and fails is the command's failure.
+  const failed = await runIn(
+    root,
+    launchIn(root, `test -d '${tools}' && exit 1`, [tools]),
+  );
+  assert.equal(failed.status, 1);
+  // A mount source that vanishes after the arguments were built: bubblewrap
+  // exits 1 before the command runs, which is the host's fault (#1573).
+  const launch = launchIn(root, "exit 0", [tools]);
+  rmSync(tools, { recursive: true });
+  const error = await runIn(root, launch).then(
+    () => assert.fail("a sandbox that could not be set up ran"),
+    (error) => error,
+  );
+  assert.equal(faultOf(error).kind, "config");
+  assert.match(error.message, /could not be set up \(bubblewrap exit 1\)/);
+  assert.match(error.message, /Can't find source path/);
+});
 
 test("no toolchain or read-only path mounts the host's /tmp or its sockets", {
   skip:
@@ -907,6 +966,43 @@ test("no toolchain or read-only path mounts the host's /tmp or its sockets", {
   await assert.rejects(
     run("true", { ...STRICT_COMMAND_SANDBOX, readOnlyPaths: [sockets] }),
     /sandbox\.readOnlyPaths entry .* shared temporary/,
+  );
+  // And a package store there, which another user could create first; it
+  // is refused before it is created. One that others can write is refused.
+  const store = join(root, "store");
+  await assert.rejects(
+    run("true", { ...STRICT_COMMAND_SANDBOX, packageStore: store }),
+    /sandbox\.packageStore .* shared temporary/,
+  );
+  assert.equal(existsSync(store), false);
+  // So is one reached through a link into /tmp, or under a directory others
+  // can write, before anything is created there.
+  symlinkSync(root, join(tools, "into-tmp"));
+  await assert.rejects(
+    run("true", {
+      ...STRICT_COMMAND_SANDBOX,
+      packageStore: join(tools, "into-tmp", "linked", "store"),
+    }),
+    /sandbox\.packageStore .* shared temporary/,
+  );
+  assert.equal(existsSync(join(root, "linked")), false);
+  const open = join(tools, "open");
+  mkdirSync(open);
+  chmodSync(open, 0o777);
+  await assert.rejects(
+    run("true", {
+      ...STRICT_COMMAND_SANDBOX,
+      packageStore: join(open, "nested", "store"),
+    }),
+    /sandbox\.packageStore .* which others can write/,
+  );
+  assert.equal(existsSync(join(open, "nested")), false);
+  const writable = join(tools, "store");
+  mkdirSync(writable);
+  chmodSync(writable, 0o777);
+  await assert.rejects(
+    run("true", { ...STRICT_COMMAND_SANDBOX, packageStore: writable }),
+    /sandbox\.packageStore .* group- or world-writable/,
   );
 });
 

@@ -1,5 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type SpawnOptions, spawn, spawnSync } from "node:child_process";
+import {
+  type ChildProcess,
+  type SpawnOptions,
+  spawn,
+  spawnSync,
+} from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -17,8 +22,9 @@ import {
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { type Fault, transient, withFault } from "./fault.js";
+import { type Fault, StepFault, transient, withFault } from "./fault.js";
 import {
   assertOrigin,
   boundRepository,
@@ -1893,6 +1899,69 @@ async function groupEnds(
   return true;
 }
 
+/** A bubblewrap launch that writes `--json-status-fd` documents to stdio 3. */
+export interface BubblewrapLaunch {
+  statusFd: 3;
+}
+
+/**
+ * What bubblewrap reported. Its `child-pid` document comes right after the
+ * clone, before any mount; `exit-code` comes only after setup finished and
+ * the command was executed. A missing `exit-code` from a bubblewrap that
+ * exited by itself is a setup failure, never the command's (#1573).
+ */
+interface BubblewrapStatus {
+  executed: boolean;
+  /** Bubblewrap's own error output, bounded. */
+  stderr: string;
+  /** Every writer closed the status pipe. */
+  ended: Promise<void>;
+}
+
+const BUBBLEWRAP_STATUS_LIMIT = 65_536;
+
+function watchBubblewrap(child: ChildProcess): BubblewrapStatus {
+  const stream = child.stdio[3] as Readable | null | undefined;
+  const status: BubblewrapStatus = {
+    executed: false,
+    stderr: "",
+    ended: Promise.resolve(),
+  };
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (status.stderr.length < 4_096)
+      status.stderr += chunk.toString("utf8").slice(0, 4_096);
+  });
+  if (!stream) return status;
+  status.ended = new Promise<void>((resolve) => {
+    stream.once("close", resolve);
+    stream.once("end", resolve);
+    stream.once("error", resolve);
+  });
+  let text = "";
+  let read = 0;
+  stream.on("data", (chunk: Buffer) => {
+    read += chunk.length;
+    // Only bubblewrap holds the pipe: it is closed in the sandbox.
+    if (read > BUBBLEWRAP_STATUS_LIMIT) {
+      stream.destroy();
+      return;
+    }
+    text += chunk.toString("utf8");
+    // Flat documents, one or more per read, possibly split across reads.
+    for (let end = text.indexOf("}"); end >= 0; end = text.indexOf("}")) {
+      const document = text.slice(0, end + 1);
+      text = text.slice(end + 1);
+      try {
+        const value = JSON.parse(document) as Record<string, unknown>;
+        if (Number.isSafeInteger(value["exit-code"])) status.executed = true;
+      } catch {
+        // Not a status document; it reports nothing.
+      }
+    }
+  });
+  return status;
+}
+
 /** A bidirectional input channel inside the same owned subprocess lifecycle. */
 export interface SubprocessInputChannel {
   signal?: AbortSignal;
@@ -1915,6 +1984,8 @@ export async function subprocessAsync(
   options: SpawnOptions & {
     /** Records the child's identity before any input; a throw stops it. */
     spawned?: (owner: NativeProcessOwner) => void;
+    /** The command is sandboxedCommand's bubblewrap launch. */
+    bubblewrap?: BubblewrapLaunch;
   } = {},
   input?: string | InteractiveSubprocessInput,
   observe?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
@@ -1945,7 +2016,9 @@ export async function subprocessAsync(
   const scope = processCancellation.getStore();
   let stoppedLeftovers = 0;
   // `options.signal` (such as a deadline) also stops the whole process group.
-  const { signal: extra, spawned, ...spawnOptions } = options;
+  const { signal: extra, spawned, bubblewrap, ...spawnOptions } = options;
+  if (bubblewrap && spawnOptions.stdio)
+    throw new Error("A sandboxed command's stdio is bubblewrap's");
   const signal =
     scope?.signal && extra
       ? AbortSignal.any([scope.signal, extra])
@@ -1963,7 +2036,12 @@ export async function subprocessAsync(
     );
   assertProcessActive();
   signal?.throwIfAborted();
-  const child = spawn(file, args, { ...spawnOptions, detached: true });
+  const child = spawn(file, args, {
+    ...spawnOptions,
+    ...(bubblewrap && { stdio: ["pipe", "pipe", "pipe", "pipe"] }),
+    detached: true,
+  });
+  const sandbox = bubblewrap && watchBubblewrap(child);
   let error: Error | undefined;
   let inputError: unknown;
   let inputFailed = false;
@@ -2150,6 +2228,25 @@ export async function subprocessAsync(
     throw new Error("Owned subprocess cancelled after verified cessation");
   if (error) throw error;
   if (inputFailed) throw inputError;
+  if (sandbox && child.signalCode === null) {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      sandbox.ended,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 1_000);
+      }),
+    ]);
+    clearTimeout(timer);
+    // bubblewrap exited by itself and never executed the command: its
+    // setup (a mount or namespace) failed. The host's fault, not the
+    // command's, whatever its exit status.
+    if (!sandbox.executed)
+      throw new StepFault({
+        kind: "config",
+        detail: `The command sandbox could not be set up (bubblewrap exit ${status}), so the command did not run: ${sandbox.stderr.trim().slice(0, 1_000) || "no detail"}`,
+        fix: "Keep every sandbox mount source (the PATH's toolchains, sandbox.readOnlyPaths, sandbox.packageStore, the checkout) in place while Factory runs, and let bubblewrap create namespaces on this host",
+      });
+  }
   return {
     status,
     stdout: Buffer.concat(output.stdout).toString("utf8"),

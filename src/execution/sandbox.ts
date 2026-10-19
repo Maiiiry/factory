@@ -29,11 +29,12 @@ import {
   dirname,
   isAbsolute,
   join,
+  relative,
   resolve,
   sep,
 } from "node:path";
 import { StepFault } from "../fault.js";
-import { workerToolchainPath } from "../process.js";
+import { type BubblewrapLaunch, workerToolchainPath } from "../process.js";
 import { record, refuseUnknownFields } from "../unknown-fields.js";
 
 export const real = (path: string) =>
@@ -181,10 +182,9 @@ function privatePaths(
  * which such a mount still lets a process connect to (a user bus, a
  * container daemon, a terminal multiplexer, an SSH agent): it is, holds or
  * lies in a runtime directory, or it is or holds a shared temporary
- * directory or, unless `temporaryChildren` is false, lies in one, where any
- * host process keeps them.
+ * directory or lies in one, where any host process keeps them.
  */
-function showsHostSockets(path: string, temporaryChildren = true): boolean {
+function showsHostSockets(path: string): boolean {
   const runtime = [
     "/run",
     "/var/run",
@@ -196,9 +196,7 @@ function showsHostSockets(path: string, temporaryChildren = true): boolean {
   const temporary = ["/tmp", "/var/tmp", tmpdir()].map(real);
   return (
     runtime.some((root) => within(path, root) || within(root, path)) ||
-    temporary.some(
-      (root) => within(root, path) || (temporaryChildren && within(path, root)),
-    )
+    temporary.some((root) => within(root, path) || within(path, root))
   );
 }
 
@@ -637,19 +635,22 @@ const HOST_DIRECTORY_VARIABLES = [
 /**
  * The process to spawn for `command`: `sh -c` inside bubblewrap, or plain
  * `sh -c` only when the operator set `sandbox.required` false and bubblewrap
- * is not installed. Spawn it detached (as subprocessAsync does): that makes
- * bubblewrap the leader of its own session and process group, without a
- * controlling terminal, and the caller stops that group and proves it gone.
- * A process that leaves the group inside the sandbox still ends with it:
- * when the command exits, the PID namespace's init exits and the kernel
- * kills the rest first. Throws a configuration fault when the sandbox cannot
- * run, or when Factory runs as root and sandbox.required is not false.
+ * is not installed. Run it with subprocessAsync, passing `bubblewrap`: that
+ * reads bubblewrap's status, so a setup failure is a configuration fault,
+ * never the command's failure, and makes bubblewrap the leader of its own
+ * session and process group, without a controlling terminal, which it stops
+ * and proves gone. A process that leaves the group inside the sandbox
+ * still ends with it: when the command exits, the PID namespace's init exits
+ * and the kernel kills the rest first. Throws a configuration fault when the
+ * sandbox cannot run, or when Factory runs as root and sandbox.required is
+ * not false.
  */
 export function sandboxedCommand(input: SandboxedCommandInput): {
   file: string;
   args: string[];
   env: Record<string, string>;
   sandbox: "bubblewrap" | "none";
+  bubblewrap?: BubblewrapLaunch;
 } {
   const found = commandSandboxAvailability();
   if (!found.available) {
@@ -677,9 +678,8 @@ export function sandboxedCommand(input: SandboxedCommandInput): {
   const home = realpathSync(input.home);
   // Exposure is judged against the operator's real HOME and Factory's paths.
   const { exposes } = privatePaths(process.env, checkout);
-  // The package store may lie in a temporary directory; nothing read-only may.
-  const unsafe = (path: string, field: string, temporaryChildren = true) => {
-    if (exposes(path) || showsHostSockets(path, temporaryChildren))
+  const unsafe = (path: string, field: string) => {
+    if (exposes(path) || showsHostSockets(path))
       throw configFault(
         `${field} ${path} would show sandboxed commands your HOME, a login, Factory's own files, runtime sockets or the shared temporary directory`,
         `Point ${field} at a directory of its own, outside /tmp and the runtime directories`,
@@ -717,9 +717,35 @@ export function sandboxedCommand(input: SandboxedCommandInput): {
   const writable = [checkout, temporary, home];
   let readOnlyStore: string | undefined;
   if (input.policy.packageStore) {
+    // Not in a shared temporary directory, nor in any directory others can
+    // write, where another user could create or replace it first (installs
+    // write it): checked through its nearest existing ancestor's real path
+    // before it is created.
+    let existing = input.policy.packageStore;
+    while (!existsSync(existing)) existing = dirname(existing);
+    const planned = join(
+      realpathSync(existing),
+      relative(existing, input.policy.packageStore),
+    );
+    unsafe(planned, "sandbox.packageStore");
+    for (let parent = dirname(planned); ; parent = dirname(parent)) {
+      const entry = statSync(parent, { throwIfNoEntry: false });
+      if (entry && (entry.mode & 0o022) !== 0 && (entry.mode & 0o1000) === 0)
+        throw configFault(
+          `sandbox.packageStore ${planned} lies in ${parent}, which others can write`,
+          "Point sandbox.packageStore at a directory whose parents only you (or root) can write",
+        );
+      if (parent === dirname(parent)) break;
+    }
     mkdirSync(input.policy.packageStore, { recursive: true, mode: 0o700 });
     const store = realpathSync(input.policy.packageStore);
-    unsafe(store, "sandbox.packageStore", false);
+    unsafe(store, "sandbox.packageStore");
+    const owner = statSync(store);
+    if (owner.uid !== process.getuid?.() || (owner.mode & 0o022) !== 0)
+      throw configFault(
+        `sandbox.packageStore ${store} is not owned by Factory's user or is group- or world-writable`,
+        "Point sandbox.packageStore at a directory you own that only you can write (chmod go-w)",
+      );
     if (
       [checkout, temporary, home].some(
         (path) => within(store, path) || within(path, store),
@@ -805,6 +831,10 @@ export function sandboxedCommand(input: SandboxedCommandInput): {
   return {
     file: found.executable,
     args: [
+      // The init's pid once cloned, and the exit code only once setup
+      // finished and the command was executed.
+      "--json-status-fd",
+      "3",
       ...ISOLATION,
       ...network,
       ...systemMounts(),
@@ -841,5 +871,6 @@ export function sandboxedCommand(input: SandboxedCommandInput): {
     ],
     env,
     sandbox: "bubblewrap",
+    bubblewrap: { statusFd: 3 },
   };
 }
