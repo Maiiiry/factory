@@ -22,7 +22,7 @@ import {
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { type Fault, StepFault, transient, withFault } from "./fault.js";
 import {
@@ -1835,12 +1835,14 @@ export function nativeProcessDisposition(
  * its boot while the spawn may be in flight, then bubblewrap's identity, then
  * also its PID namespace init's. The sandbox is detached in bubblewrap's own
  * group; the init stays in that group, and every other sandbox process is in
- * its namespace, which ends with the init.
+ * its namespace, which ends with the init. A networked sandbox also records
+ * its pasta: empty while that spawn may be in flight, then its identity.
  */
 interface SandboxRecord {
   boot?: string;
   owner?: NativeProcessOwner;
   init?: { pid: number; startTime: string };
+  pasta?: { pid?: number; startTime?: string };
 }
 let sandboxRecords: string | undefined;
 
@@ -1875,7 +1877,10 @@ const SANDBOX_CESSATION_MS = 2_000;
  * running `bubblewrap()`, the executable sandboxed commands use, is
  * signalled, so a reused pid or group is never. A sandbox is gone once
  * bubblewrap's group is empty: that holds its init, whose exit ends the
- * namespace's other processes. A record of an earlier boot is gone. In this
+ * namespace's other processes. A recorded pasta is stopped too, known by
+ * its identity as the leader of its own group: it re-executes itself and is
+ * not dumpable, so what it runs cannot be read. A record of an earlier boot
+ * is gone. In this
  * boot, a record without an identity (a spawn the worker may have been
  * killed during), from another namespace or user, of another executable, or
  * whose group is still present after the stop, leaves the outcome unknown.
@@ -1918,6 +1923,7 @@ export async function stopRecordedSandboxes(
     }
     const owner = record?.owner;
     const init = record?.init;
+    const recordedPasta = record?.pasta;
     const boot = record?.boot ?? owner?.boot;
     // A later boot ended every process of this one.
     if (typeof boot === "string" && boot !== currentBoot()) {
@@ -1930,11 +1936,18 @@ export async function stopRecordedSandboxes(
       (init !== undefined &&
         (!Number.isSafeInteger(init.pid) ||
           init.pid <= 0 ||
-          typeof init.startTime !== "string"))
+          typeof init.startTime !== "string")) ||
+      (recordedPasta !== undefined &&
+        (!Number.isSafeInteger(recordedPasta.pid) ||
+          recordedPasta.pid! <= 0 ||
+          typeof recordedPasta.startTime !== "string"))
     ) {
       unproved++;
       continue;
     }
+    const pasta = recordedPasta as
+      | { pid: number; startTime: string }
+      | undefined;
     if (
       owner.boot !== boot ||
       owner.uid !== process.getuid?.() ||
@@ -1949,7 +1962,10 @@ export async function stopRecordedSandboxes(
     };
     const initRuns = () =>
       init !== undefined && !!live(init.pid, init.startTime);
-    const present = () => processGroupExists(owner.group) || initRuns();
+    const pastaRuns = () =>
+      pasta !== undefined && !!live(pasta.pid, pasta.startTime);
+    const present = () =>
+      processGroupExists(owner.group) || initRuns() || pastaRuns();
     // What a recorded identity runs now. One that exited between the checks
     // is gone, not foreign; one whose executable is unreadable stays unknown.
     const executable = (pid: number, startTime: string) => {
@@ -1967,12 +1983,15 @@ export async function stopRecordedSandboxes(
     const leaderRuns = leader && executable(owner.pid, owner.startTime);
     const initRunsNow =
       init && initRuns() ? executable(init.pid, init.startTime) : undefined;
-    // A recorded identity running anything but bubblewrap is never signalled.
+    const pastaNow = pasta && live(pasta.pid, pasta.startTime);
+    // A recorded identity running anything but bubblewrap is never
+    // signalled, nor a pasta that left its own group.
     if (
       leaderRuns === "other" ||
       leaderRuns === "unreadable" ||
       initRunsNow === "other" ||
-      initRunsNow === "unreadable"
+      initRunsNow === "unreadable" ||
+      (pastaNow && pastaNow.group !== pasta.pid)
     ) {
       unproved++;
       continue;
@@ -1980,6 +1999,7 @@ export async function stopRecordedSandboxes(
     if (leaderRuns === "bubblewrap" && leader?.group === owner.group)
       kill(-owner.group);
     if (init && initRunsNow === "bubblewrap") kill(init.pid);
+    if (pastaNow) kill(pasta.pid);
     const deadline = Date.now() + SANDBOX_CESSATION_MS;
     while (present() && Date.now() < deadline)
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -2071,6 +2091,14 @@ async function groupEnds(
 /** A bubblewrap launch that writes `--json-status-fd` documents to stdio 3. */
 export interface BubblewrapLaunch {
   statusFd: 3;
+  /**
+   * User-mode networking for the sandbox's own network namespace. The
+   * command waits in the sandbox for `go` on stdio 4, written once pasta,
+   * run with these arguments against the sandbox's process, has configured
+   * it; end of file runs nothing. Stdio 5 carries `resolver` for
+   * `--ro-bind-data 5`.
+   */
+  network?: { pasta: string; args: string[]; resolver?: string };
 }
 
 /**
@@ -2085,6 +2113,8 @@ interface BubblewrapStatus {
   stderr: string;
   /** Every writer closed the status pipe. */
   ended: Promise<void>;
+  /** The sandbox's first process, or undefined when none was reported. */
+  childPid: Promise<number | undefined>;
 }
 
 const BUBBLEWRAP_STATUS_LIMIT = 65_536;
@@ -2094,21 +2124,29 @@ function watchBubblewrap(
   onChildPid: (pid: number) => void,
 ): BubblewrapStatus {
   const stream = child.stdio[3] as Readable | null | undefined;
+  let reported: (pid: number | undefined) => void = () => undefined;
   const status: BubblewrapStatus = {
     executed: false,
     stderr: "",
     ended: Promise.resolve(),
+    childPid: new Promise((resolve) => {
+      reported = resolve;
+    }),
   };
   child.stderr?.on("data", (chunk: Buffer) => {
     if (status.stderr.length < 4_096)
       status.stderr += chunk.toString("utf8").slice(0, 4_096);
   });
-  if (!stream) return status;
+  if (!stream) {
+    reported(undefined);
+    return status;
+  }
   status.ended = new Promise<void>((resolve) => {
     stream.once("close", resolve);
     stream.once("end", resolve);
     stream.once("error", resolve);
   });
+  void status.ended.then(() => reported(undefined));
   let text = "";
   let read = 0;
   stream.on("data", (chunk: Buffer) => {
@@ -2126,14 +2164,161 @@ function watchBubblewrap(
       try {
         const value = JSON.parse(document) as Record<string, unknown>;
         if (Number.isSafeInteger(value["exit-code"])) status.executed = true;
-        if (Number.isSafeInteger(value["child-pid"]))
+        if (Number.isSafeInteger(value["child-pid"])) {
           onChildPid(value["child-pid"] as number);
+          reported(value["child-pid"] as number);
+        }
       } catch {
         // Not a status document; it reports nothing.
       }
     }
   });
   return status;
+}
+
+/** pasta, run for one sandbox, as recorded when it was spawned. */
+interface PastaProcess {
+  pid: number;
+  owner?: NativeProcessOwner;
+  exited: () => boolean;
+  exit: Promise<void>;
+  /** Holds pasta's pid file. */
+  directory: string;
+}
+
+/** How long pasta may take to configure a sandbox's network namespace. */
+const PASTA_SETUP_MS = 10_000;
+
+const networkFault = (detail: string) =>
+  new StepFault({
+    kind: "config",
+    detail: `The command sandbox's network could not be set up, so the command did not run: ${detail}`,
+    fix: "Let pasta (passt) configure the sandbox's network namespace on this host (/dev/net/tun usable by Factory's user), or set sandbox.network to \"off\"",
+  });
+
+/**
+ * Configures the network namespace of a sandbox whose command waits for
+ * its release on stdio 4: runs pasta against the sandbox's first process, a member of
+ * bubblewrap's group, and waits until pasta's pid file says it configured
+ * the namespace. `starting` runs before pasta is spawned, and `started`
+ * receives it as soon as it runs, so the caller records and settles it
+ * whatever happens. Resolves true when the command may be
+ * released, false when bubblewrap ended first (its own setup failure, which
+ * its status reports); throws a configuration fault when pasta could not
+ * configure the namespace, so the command must never be released.
+ */
+async function connectSandbox(
+  bwrap: ChildProcess,
+  status: BubblewrapStatus,
+  network: NonNullable<BubblewrapLaunch["network"]>,
+  starting: () => void,
+  started: (pasta: PastaProcess) => void,
+): Promise<boolean> {
+  const ended = () => bwrap.exitCode !== null || bwrap.signalCode !== null;
+  const target = await status.childPid;
+  if (target === undefined || ended()) return false;
+  const held = linuxProcessIdentity(target);
+  if (!held || held.group !== bwrap.pid)
+    throw networkFault(`process ${target} is not bubblewrap's sandbox`);
+  starting();
+  const directory = mkdtempSync(join(tmpdir(), "factory-pasta-"));
+  const pidFile = join(directory, "pid");
+  const child = spawn(
+    network.pasta,
+    [...network.args, "--pid", pidFile, String(target)],
+    { detached: true, stdio: ["ignore", "ignore", "pipe"], env: {} },
+  );
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (stderr.length < 4_096) stderr += chunk.toString("utf8");
+  });
+  let failure: Error | undefined;
+  let exited = false;
+  const exit = new Promise<void>((resolve) => {
+    child.once("exit", () => {
+      exited = true;
+      resolve();
+    });
+    child.once("error", (error) => {
+      failure = error;
+      // A process that never started never exits.
+      if (!child.pid) {
+        exited = true;
+        resolve();
+      }
+    });
+  });
+  const pasta: PastaProcess = {
+    pid: child.pid ?? 0,
+    owner: child.pid ? nativeProcessOwner(child.pid) : undefined,
+    exited: () => exited,
+    exit,
+    directory,
+  };
+  started(pasta);
+  const detail = () =>
+    `${network.pasta} ${failure ? failure.message : `exited ${child.exitCode ?? child.signalCode}`}: ${stderr.trim().slice(0, 1_000) || "no detail"}`;
+  if (!child.pid) {
+    await exit;
+    throw networkFault(detail());
+  }
+  if (!pasta.owner)
+    throw networkFault(`${network.pasta} could not be identified`);
+  const deadline = Date.now() + PASTA_SETUP_MS;
+  for (;;) {
+    if (exited) throw networkFault(detail());
+    if (ended()) return false;
+    let written = "";
+    try {
+      written = readFileSync(pidFile, "utf8");
+    } catch {
+      // Not written yet.
+    }
+    // pasta writes its pid file once the namespace is configured.
+    if (written.endsWith("\n")) {
+      if (Number(written.trim()) !== child.pid)
+        throw networkFault(`${pidFile} names another process`);
+      break;
+    }
+    if (Date.now() >= deadline)
+      throw networkFault(
+        `${network.pasta} did not configure the namespace within ${PASTA_SETUP_MS / 1_000} seconds`,
+      );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // The process pasta joined is the one held: alive, and the same, throughout.
+  if (linuxProcessIdentity(target)?.startTime !== held.startTime)
+    throw networkFault(`the sandbox's process ${target} ended`);
+  return true;
+}
+
+/**
+ * Stops pasta once its sandbox is gone and proves it gone: its own exit,
+ * observed as its parent, and no process left in its group, in the PID
+ * namespace it was recorded in. False means it may still run.
+ */
+async function pastaEnds(pasta: PastaProcess): Promise<boolean> {
+  const within = (milliseconds: number) => {
+    let timer: NodeJS.Timeout | undefined;
+    return Promise.race([
+      pasta.exit.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(resolve, milliseconds, false);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+  if (!pasta.pid) return pasta.exited();
+  if (!pasta.exited()) {
+    // Unreaped, so its pid still names it.
+    try {
+      process.kill(-pasta.pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+    }
+    if (!(await within(1_000))) return false;
+  }
+  if (!(await groupEnds(pasta.pid, 1_000))) return false;
+  return !pasta.owner || nativeProcessDisposition(pasta.owner) === "settled";
 }
 
 /** A bidirectional input channel inside the same owned subprocess lifecycle. */
@@ -2210,6 +2395,7 @@ export async function subprocessAsync(
     );
   assertProcessActive();
   signal?.throwIfAborted();
+  const network = bubblewrap?.network;
   // A worker's sandbox is recorded before it can start, for its controller
   // (#1575); a record still without an identity is a spawn in flight.
   const record =
@@ -2221,7 +2407,17 @@ export async function subprocessAsync(
   try {
     child = spawn(file, args, {
       ...spawnOptions,
-      ...(bubblewrap && { stdio: ["pipe", "pipe", "pipe", "pipe"] }),
+      ...(bubblewrap && {
+        stdio: [
+          "pipe",
+          "pipe",
+          "pipe",
+          "pipe",
+          // The release, and the resolver's data.
+          ...(network ? (["pipe"] as const) : []),
+          ...(network?.resolver !== undefined ? (["pipe"] as const) : []),
+        ],
+      }),
       detached: true,
     });
   } catch (error) {
@@ -2253,6 +2449,15 @@ export async function subprocessAsync(
         // bubblewrap's identity stays recorded; its group holds the init.
       }
     });
+  // `go` on it releases the held command, only once pasta configured its
+  // network; closing it runs nothing, and is left until bubblewrap's group
+  // is proven gone.
+  const stdio = child.stdio as unknown as (Writable | null | undefined)[];
+  const block = network ? stdio[4] : undefined;
+  block?.on("error", () => undefined);
+  const data = network?.resolver !== undefined ? stdio[5] : undefined;
+  data?.on("error", () => undefined);
+  data?.end(network?.resolver);
   let error: Error | undefined;
   let inputError: unknown;
   let inputFailed = false;
@@ -2378,6 +2583,50 @@ export async function subprocessAsync(
     kill();
     child.stdin?.end();
   }
+  let pasta: PastaProcess | undefined;
+  let networkTask: Promise<void> | undefined;
+  let released = false;
+  if (network && sandbox && !inputFailed) {
+    if (!owned) {
+      inputFailed = true;
+      inputError = networkFault("bubblewrap could not be identified");
+      kill();
+    } else
+      networkTask = connectSandbox(
+        child,
+        sandbox,
+        network,
+        // A worker records its pasta beside its sandbox, for its controller.
+        () => {
+          if (!record || !recorded?.owner) return;
+          recorded = { ...recorded, pasta: {} };
+          writeSandboxRecord(record, recorded);
+        },
+        (started) => {
+          pasta = started;
+          if (!started.owner) return;
+          const identity = {
+            pid: started.owner.pid,
+            startTime: started.owner.startTime,
+          };
+          scope?.observe?.(identity, false);
+          if (!record || !recorded?.owner) return;
+          recorded = { ...recorded, pasta: identity };
+          writeSandboxRecord(record, recorded);
+        },
+      )
+        .then((connected) => {
+          if (!connected) return;
+          released = true;
+          block?.end("go\n");
+        })
+        .catch((cause) => {
+          // Killed with its group, never released: it never runs offline.
+          inputFailed = true;
+          inputError = cause;
+          kill();
+        });
+  }
   // `close` may await descendant-held pipes; settlement starts at parent exit.
   const status = await exited;
   signal?.removeEventListener("abort", cancel);
@@ -2415,6 +2664,31 @@ export async function subprocessAsync(
         "Owned subprocess group remains active; outcome unknown",
         { cause: stopError },
       );
+    }
+  }
+  if (network) {
+    // bubblewrap's group is gone, with any command it held: closing its
+    // release now runs nothing. pasta goes with the namespace it served.
+    await networkTask;
+    if (aborted ? child.pid : owned) {
+      block?.destroy();
+      data?.destroy();
+    }
+    const served = pasta as PastaProcess | undefined;
+    if (served) {
+      if (!(await pastaEnds(served))) {
+        if (scope) scope.unresolved = true;
+        observed({ event: "cessation", status: "unavailable" });
+        throw new UnsettledSubprocessError(
+          `The sandbox's pasta (pid ${served.pid}) may still run; outcome unknown`,
+        );
+      }
+      if (served.owner)
+        scope?.observe?.(
+          { pid: served.owner.pid, startTime: served.owner.startTime },
+          true,
+        );
+      rmSync(served.directory, { recursive: true, force: true });
     }
   }
   // bubblewrap's group, and with it the sandbox, is gone; without a child,
@@ -2469,6 +2743,10 @@ export async function subprocessAsync(
         fix: "Keep every sandbox mount source (the PATH's toolchains, sandbox.readOnlyPaths, sandbox.packageStore, the checkout) in place while Factory runs, and let bubblewrap create namespaces on this host",
       });
   }
+  // A networked command never released ran nothing (its gate exits 125):
+  // the host's fault, never the command's.
+  if (network && !released)
+    throw networkFault(`it was never released (bubblewrap exit ${status})`);
   return {
     status,
     stdout: Buffer.concat(output.stdout).toString("utf8"),
