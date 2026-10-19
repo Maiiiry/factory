@@ -1,7 +1,9 @@
 import {
   type CommandSandboxPolicy,
   STRICT_COMMAND_SANDBOX,
+  sandboxCandidateBounds,
 } from "./sandbox.js";
+import { diskBytes } from "./disk-use.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
@@ -727,13 +729,22 @@ export function privateStagingExclusions(
  * Bound what `add -A` would stage, before host-side Git reads any of it: the
  * changed and untracked paths outside private staging, counted, and sized by
  * lstat. Git hashes a sparse file's whole apparent size, so that counts.
+ * A preallocated file counts at its allocated blocks (diskBytes). Not
+ * counted: `excluded` paths (asset destinations, which collection unstages).
+ * `inspect` still sees every path; `exceeded` makes the error for a
+ * candidate over a bound.
  */
 export function assertCandidateBounds(
   worktree: string,
   bounds: { maxBytes: number; maxFiles: number },
   label: string,
-  inspect?: (path: string) => void,
+  options: {
+    inspect?: (path: string) => void;
+    exceeded?: (detail: string) => Error;
+    excluded?: readonly string[];
+  } = {},
 ): void {
+  const exceeded = options.exceeded ?? ((detail: string) => new Error(detail));
   // Git prints names as raw bytes. A name that is not UTF-8 would decode to
   // another path, which lstat misses and Git still hashes.
   const names = (output: Buffer) => {
@@ -745,13 +756,16 @@ export function assertCandidateBounds(
       throw workFault(`${label} has an unsafe path`);
     }
   };
+  // Neither listing reads file contents: diff-index (without --cached)
+  // names every path whose stat differs from the index, where diff would
+  // hash it, through any clean filter (Git LFS's stores what it cleans).
   const prospective = [
     ...new Set(
       [
         ...names(
           pinnedGitRaw(
             worktree,
-            "diff",
+            "diff-index",
             "--name-only",
             "--no-renames",
             "-z",
@@ -770,19 +784,26 @@ export function assertCandidateBounds(
       ].filter(Boolean),
     ),
   ].filter((path) => !privateStagingPath(path));
-  if (prospective.length > bounds.maxFiles)
-    throw new Error(`${label} exceeds the admitted file bound`);
+  const uncounted = new Set(options.excluded);
+  const counted = prospective.filter((path) => !uncounted.has(path));
+  if (counted.length > bounds.maxFiles)
+    throw exceeded(
+      `${label} exceeds the admitted file bound: ${counted.length} files, at most ${bounds.maxFiles}`,
+    );
   let bytes = 0;
   for (const path of prospective) {
-    inspect?.(path);
+    options.inspect?.(path);
     const file = resolve(worktree, path);
     if (!file.startsWith(`${resolve(worktree)}${sep}`))
       throw workFault(`${label} has an unsafe path`);
+    if (uncounted.has(path)) continue;
     const info = lstatSync(file, { throwIfNoEntry: false });
-    bytes += info?.isFile() ? info.size : 0;
+    bytes += info?.isFile() ? diskBytes(info) : 0;
   }
   if (bytes > bounds.maxBytes)
-    throw new Error(`${label} exceeds the admitted byte bound`);
+    throw exceeded(
+      `${label} exceeds the admitted byte bound: ${bytes} bytes, at most ${bounds.maxBytes}`,
+    );
 }
 /** The first path under the worktree Factory cannot read, if any. */
 function firstUnreadable(directory: string, relative = ""): string | undefined {
@@ -1255,9 +1276,11 @@ export async function freezeRejectedCollection(args: {
         maxFiles: bounds.maxFiles - usedFiles,
       },
       "Rejected candidate",
-      (path) => {
-        if (!ownsPath(path, args.request.item.ownedPaths))
-          throw workFault("Rejected candidate exceeds ownership");
+      {
+        inspect: (path) => {
+          if (!ownsPath(path, args.request.item.ownedPaths))
+            throw workFault("Rejected candidate exceeds ownership");
+        },
       },
     );
     await pinnedGitMagicAsync(
@@ -1358,6 +1381,8 @@ export async function collectWorktreeResult(
     ref: ContentRef;
   }) => Promise<void>,
   checkpointAssets?: (assets: CapturedAssetSet[]) => Promise<void>,
+  /** Without checkpoint bounds, the most `add -A` may stage (sandbox.limits). */
+  candidateBounds = sandboxCandidateBounds(STRICT_COMMAND_SANDBOX),
 ): Promise<ExecutionResult> {
   const handoffPath = join(worktree, ".factory-handoff.json");
   const handoffNotes = judgedAsWork(() =>
@@ -1468,6 +1493,12 @@ export async function collectWorktreeResult(
   // verifies the same bytes again.
   // Before host-side Git stages anything: no nested repository it would enter.
   assertNoNestedGit(worktree);
+  // Nor, unless checkpoint bounds admit it, more than sandbox.limits allow.
+  if (!privateCheckpointBounds())
+    assertCandidateBounds(worktree, candidateBounds, "Worker candidate", {
+      exceeded: workFault,
+      excluded: assetDestinations,
+    });
   try {
     await pinnedGitMagicAsync(
       worktree,
@@ -2812,6 +2843,7 @@ export class LocalExecutionDriver implements ExecutionDriver {
             active.collectedAssets = structuredClone(assets);
             context?.checkpoint({ ...handle, data: active });
           },
+          sandboxCandidateBounds(this.commandSandbox),
         );
       if (result.session) collected.session = structuredClone(result.session);
     } catch (error) {

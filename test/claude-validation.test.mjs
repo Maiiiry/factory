@@ -33,6 +33,7 @@ import {
   workerValidationCommands,
 } from "../dist/execution/claude-validation.js";
 import {
+  assertCommandSandboxConfig,
   commandSandboxAvailability,
   commandSandboxStatus,
   STRICT_COMMAND_SANDBOX,
@@ -561,7 +562,54 @@ test("host-side Git never enters a nested repository sandboxed code could write"
     /Worker snapshot has an unsafe path/,
   );
   rmSync(raw);
+  // Without admitted checkpoint bounds the default ones apply: 2 GiB.
+  truncateSync(join(bounded, "a.txt"), 2 * 1024 ** 3 + 1);
+  await assert.rejects(
+    workerFilesTree(bounded),
+    /Worker snapshot exceeds the admitted byte bound: 2147483649 bytes, at most 2147483648/,
+  );
+  git(bounded, "checkout", "--", "a.txt");
+  // sandbox.limits sets them without checkpoint bounds.
+  truncateSync(join(bounded, "a.txt"), 17 * 1024 ** 2);
+  await assert.rejects(
+    runDeclaredValidation(bounded, ["true"], 9, undefined, undefined, {
+      ...STRICT_COMMAND_SANDBOX,
+      limits: { ...STRICT_COMMAND_SANDBOX.limits, candidateMiB: 16 },
+    }),
+    /Worker snapshot exceeds the admitted byte bound: 17825792 bytes, at most 16777216/,
+  );
+  git(bounded, "checkout", "--", "a.txt");
   assert.equal(objects(), stored);
+  // The candidate's own attributes decide nothing: a file Git LFS's
+  // filter would take still lands on disk, so it counts.
+  writeFileSync(
+    join(bounded, ".gitattributes"),
+    "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+  );
+  git(bounded, "config", "filter.lfs.clean", "git-lfs clean -- %f");
+  git(bounded, "config", "filter.lfs.process", "git-lfs filter-process");
+  writeFileSync(join(bounded, "media.bin"), Buffer.alloc(2 * 1024 ** 2, 1));
+  await assert.rejects(
+    workerFilesTree(bounded, bounds),
+    /Worker snapshot exceeds the admitted byte bound: \d+ bytes/,
+  );
+  rmSync(join(bounded, "media.bin"));
+  rmSync(join(bounded, ".gitattributes"));
+  // Preallocated blocks beyond a file's size count.
+  if (existsSync("/usr/bin/fallocate")) {
+    writeFileSync(join(bounded, "reserved"), "");
+    execFileSync("fallocate", [
+      "--keep-size",
+      "-l",
+      "2M",
+      join(bounded, "reserved"),
+    ]);
+    await assert.rejects(
+      workerFilesTree(bounded, bounds),
+      /Worker snapshot exceeds the admitted byte bound: 2097152 bytes/,
+    );
+    rmSync(join(bounded, "reserved"));
+  }
   // A directory the worker made unreadable is its fault, found before
   // host-side Git reads the checkout. Root reads it anyway.
   if (process.getuid() !== 0) {
@@ -800,6 +848,285 @@ test("a verified install reaches only its configured registry, and commands are 
   } finally {
     server.close();
   }
+});
+
+test("a run's HOME, TMPDIR and checkout growth stay within the sandbox's disk budget", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "factory-disk-budget-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const worktree = join(root, "worktree");
+  execFileSync("git", ["init", "-q", worktree]);
+  writeFileSync(join(worktree, ".gitignore"), "out/\n");
+  // A dependency-free npm project, so the exact install runs offline.
+  const manifest = { name: "budgeted", version: "1.0.0" };
+  writeFileSync(join(worktree, "package.json"), JSON.stringify(manifest));
+  writeFileSync(
+    join(worktree, "package-lock.json"),
+    JSON.stringify({
+      ...manifest,
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": manifest },
+    }),
+  );
+  // The repository's own files are not growth: 24 MiB, over every limit.
+  writeFileSync(join(worktree, "data.bin"), Buffer.alloc(24 * 1024 ** 2));
+  execFileSync("git", ["-C", worktree, "add", "."]);
+  execFileSync("git", [
+    "-C",
+    worktree,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.com",
+    "commit",
+    "-qm",
+    "base",
+  ]);
+  const read = (revision) =>
+    execFileSync("git", ["-C", worktree, "rev-parse", revision], {
+      encoding: "utf8",
+    }).trim();
+  const sandbox = {
+    ...STRICT_COMMAND_SANDBOX,
+    limits: {
+      ...STRICT_COMMAND_SANDBOX.limits,
+      tmpMiB: 16,
+      homeMiB: 16,
+      checkoutMiB: 16,
+      files: 1024,
+    },
+  };
+  let runs = 0;
+  const validate = (commands, policy = sandbox) =>
+    validateTree(
+      worktree,
+      join(root, `validation-${++runs}`),
+      read("HEAD"),
+      read("HEAD^{tree}"),
+      commands,
+      undefined,
+      undefined,
+      [],
+      undefined,
+      read("HEAD"),
+      false,
+      undefined,
+      undefined,
+      undefined,
+      policy,
+    );
+  const write = (path, mebibytes) =>
+    `head -c ${mebibytes * 1024 * 1024} /dev/zero > ${path}`;
+  // Within the budget: HOME, TMPDIR and the checkout's ignored output.
+  const passed = await validate([
+    write('"$HOME/cache"', 12),
+    write('"$TMPDIR/scratch"', 12),
+    `mkdir out && ${write("out/build", 12)}`,
+    "test -s data.bin",
+  ]);
+  assert.equal(passed.commands.length, 4);
+  // Past it the command failed, a candidate's work fault naming the limit.
+  // HOME, TMPDIR and the checkout last the run, so commands add up.
+  for (const [commands, over] of [
+    [
+      [write('"$HOME/a"', 9), write('"$HOME/b"', 9)],
+      /HOME holds 18\.0 MiB, more than sandbox\.limits\.homeMiB \(16 MiB\)/,
+    ],
+    [
+      [write('"$TMPDIR/a"', 17)],
+      /TMPDIR holds 17\.0 MiB, more than sandbox\.limits\.tmpMiB \(16 MiB\)/,
+    ],
+    [
+      ["mkdir out", write("out/a", 9), write("out/b", 9)],
+      /the checkout grew by 18\.0 MiB, more than sandbox\.limits\.checkoutMiB \(16 MiB\)/,
+    ],
+    [
+      ["mkdir out && cd out && seq 1 1100 | xargs touch"],
+      /checkout growth, HOME and TMPDIR hold more than sandbox\.limits\.files \(1024\) files/,
+    ],
+    // Preallocated blocks beyond a file's size count too.
+    ...(existsSync("/usr/bin/fallocate")
+      ? [
+          [
+            ["mkdir out && : > out/a && fallocate --keep-size -l 17M out/a"],
+            /the checkout grew by 17\.0 MiB/,
+          ],
+        ]
+      : []),
+  ]) {
+    const failure = await validate(commands).catch((error) => error);
+    assert.match(
+      String(failure.message),
+      /^Validation command failed \(disk budget\): .*: the sandbox disk budget is exceeded: /,
+    );
+    assert.match(String(failure.message), over);
+    assert.equal(faultOf(failure)?.kind, "work");
+  }
+  // The verified install on the accepted base's package inputs, run first
+  // with an empty HOME, is the environment's, as when it fails (#839): it
+  // repeats, charging no repair. (A policy that lets HOME hold nothing.)
+  const empty = {
+    ...sandbox,
+    limits: { ...sandbox.limits, homeMiB: 0 },
+  };
+  const install = await validate(["npm ci --ignore-scripts"], {
+    ...empty,
+    packageInputsVerified: true,
+  }).catch((error) => error);
+  assert.match(
+    String(install.message),
+    /^Validation command failed \(disk budget\): npm ci --ignore-scripts: the sandbox disk budget is exceeded: HOME holds/,
+  );
+  assert.equal(faultOf(install)?.kind, "transient");
+  // The same install after other commands, or unverified, is the candidate's.
+  const later = await validate(["true", "npm ci --ignore-scripts"], {
+    ...empty,
+    packageInputsVerified: true,
+  }).catch((error) => error);
+  assert.match(String(later.message), /disk budget.*HOME holds/);
+  assert.equal(faultOf(later)?.kind, "work");
+  // The private /tmp is a sized tmpfs where bubblewrap can size one: there
+  // the write itself fails.
+  if (commandSandboxAvailability().tmpfsSize)
+    await assert.rejects(
+      validate([write("/tmp/a", 17)]),
+      /Validation command failed \(1\).*No space left on device/s,
+    );
+  // A worker's shell keeps its HOME and checkout between calls: the call
+  // that leaves them over the budget reports it, and the next can clean up.
+  execFileSync("git", ["-C", worktree, "worktree", "add", "-q", "../shell"]);
+  const shell = (command) =>
+    runSandboxedCommand({
+      worktree: join(root, "shell"),
+      root: join(root, "shell.root"),
+      command,
+      timeoutMs: 60_000,
+      policy: sandbox,
+    });
+  assert.equal((await shell(write('"$HOME/a"', 9))).exitCode, 0);
+  await assert.rejects(
+    shell(write('"$HOME/b"', 9)),
+    /^Error: the command ran, but the sandbox disk budget is exceeded: HOME holds 18\.0 MiB/,
+  );
+  assert.equal((await shell('rm "$HOME/b"')).exitCode, 0);
+  await assert.rejects(
+    shell(`mkdir out && ${write("out/a", 17)}`),
+    /the checkout grew by 17\.0 MiB/,
+  );
+  assert.equal((await shell("rm -r out")).exitCode, 0);
+  // A command stopped at its deadline is measured too.
+  await assert.rejects(
+    runSandboxedCommand({
+      worktree: join(root, "shell"),
+      root: join(root, "shell.root"),
+      command: `${write('"$TMPDIR/a"', 17)} && sleep 30`,
+      timeoutMs: 2_000,
+      policy: sandbox,
+    }),
+    /the command ran, but the sandbox disk budget is exceeded: TMPDIR holds 17\.0 MiB/,
+  );
+  assert.equal((await shell('rm "$TMPDIR/a"')).exitCode, 0);
+  // Worker Validate counts an over-budget command that exited 0 as failed.
+  const declared = await runDeclaredValidation(
+    join(root, "shell"),
+    [write('"$HOME/a"', 17)],
+    1,
+    undefined,
+    undefined,
+    sandbox,
+  );
+  assert.equal(declared.passed, false);
+  assert.equal(declared.failed, 1);
+  assert.match(declared.text, /HOME holds 17\.0 MiB/);
+  // The limits are validated strictly.
+  for (const limits of [
+    { homeMiB: 8 },
+    { checkoutMiB: 1.5 },
+    { candidateMiB: 8 },
+    { disk: 1 },
+  ])
+    assert.throws(
+      () => assertCommandSandboxConfig({ limits }),
+      /sandbox\.limits/,
+    );
+  assertCommandSandboxConfig({
+    limits: {
+      homeMiB: 16,
+      checkoutMiB: 16,
+      files: 1024,
+      candidateMiB: 16,
+      candidateFiles: 1024,
+    },
+  });
+  // Once Git LFS is installed for the repository, Git cleans what it hashes
+  // into the shared LFS store. Neither the candidate bound nor a command
+  // over the budget lets host-side Git hash the bytes a candidate put under
+  // its own LFS attributes.
+  const media = join(root, "media");
+  const inMedia = (...args) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        media,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        ...args,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+  execFileSync("git", ["init", "-q", media]);
+  for (const [key, value] of [
+    ["filter.lfs.clean", "git-lfs clean -- %f"],
+    ["filter.lfs.smudge", "git-lfs smudge -- %f"],
+    ["filter.lfs.process", "git-lfs filter-process"],
+    ["filter.lfs.required", "true"],
+  ])
+    inMedia("config", key, value);
+  writeFileSync(join(media, "empty.bin"), "");
+  inMedia("add", "empty.bin");
+  inMedia("commit", "-qm", "base");
+  const stored = () =>
+    existsSync(join(media, ".git", "lfs", "objects"))
+      ? readdirSync(join(media, ".git", "lfs", "objects"), {
+          recursive: true,
+        }).length
+      : 0;
+  writeFileSync(
+    join(media, ".gitattributes"),
+    "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+  );
+  writeFileSync(join(media, "empty.bin"), Buffer.alloc(48 * 1024 ** 2, 1));
+  await assert.rejects(
+    workerFilesTree(media, { maxBytes: 16 * 1024 ** 2, maxFiles: 64 }),
+    /Worker snapshot exceeds the admitted byte bound/,
+  );
+  assert.equal(stored(), 0);
+  writeFileSync(join(media, "empty.bin"), "");
+  inMedia("add", ".gitattributes", "empty.bin");
+  inMedia("commit", "-qm", "media under LFS");
+  assert.equal(stored(), 0);
+  const overBudget = await validateTree(
+    media,
+    join(root, "media-validation"),
+    inMedia("rev-parse", "HEAD"),
+    inMedia("rev-parse", "HEAD^{tree}"),
+    [write("empty.bin", 48)],
+    undefined,
+    undefined,
+    [],
+    undefined,
+    undefined,
+    false,
+    undefined,
+    undefined,
+    undefined,
+    sandbox,
+  ).catch((error) => error);
+  assert.match(String(overBudget.message), /the checkout grew by 48\.0 MiB/);
+  assert.equal(stored(), 0);
 });
 
 test("a worker's shell runs in its checkout inside the same sandbox, bounded", async () => {

@@ -26,6 +26,8 @@ import type { FailedValidationEvidence } from "./failed-validation.js";
 import {
   type CommandSandboxPolicy,
   STRICT_COMMAND_SANDBOX,
+  recordSandboxBaseline,
+  sandboxDiskOverflow,
   sandboxedCommand,
 } from "./execution/sandbox.js";
 import { StepFault, transient } from "./fault.js";
@@ -625,6 +627,10 @@ export async function validateCheckout(
         home = mkdtempSync(join(tmpdir(), "factory-install-home-"));
         installHomes.push(home);
       }
+      await recordSandboxBaseline({
+        checkout: worktree,
+        temporary: temporaryRoot,
+      });
       const launch = sandboxedCommand({
         command: check,
         checkout: worktree,
@@ -673,49 +679,67 @@ export async function validateCheckout(
         outputObserver?.({ index, stream, output: trailing, final: true });
       }
       const output = `${stdout}${stderr}`;
+      const durationMs = Date.now() - started;
+      const overflow = await sandboxDiskOverflow({
+        checkout: worktree,
+        home,
+        temporary: temporaryRoot,
+        policy: sandbox,
+      });
       commandObserver?.({
         index,
-        passed: result.status === 0,
+        passed: result.status === 0 && !overflow,
         exitCode: result.status ?? -1,
-        durationMs: Date.now() - started,
+        durationMs,
         output,
       });
       if (hasUnresolvedSubprocesses())
         throw new Error(
           "Validation subprocess ownership unresolved; checkout retained",
         );
-      partial.postCommandStatus = candidateStatus();
-      if (!preparing)
-        partial.commands.push({
-          index,
-          command: check,
-          passed: result.status === 0,
-          exitCode: result.status,
-          treeSha,
-          worktreeStatusBefore,
-          worktreeStatusAfter: partial.postCommandStatus,
-          ...(result.stoppedLeftovers && {
-            stoppedLeftovers: result.stoppedLeftovers,
-          }),
-        });
-      if (result.status !== 0) {
-        const failed = `Validation command failed (${result.status}): ${check}: `;
+      // Over the budget no host-side Git reads the checkout: `git status`
+      // would hash what the command wrote, through any clean filter.
+      if (!overflow) {
+        partial.postCommandStatus = candidateStatus();
+        if (!preparing)
+          partial.commands.push({
+            index,
+            command: check,
+            passed: result.status === 0,
+            exitCode: result.status,
+            treeSha,
+            worktreeStatusBefore,
+            worktreeStatusAfter: partial.postCommandStatus,
+            ...(result.stoppedLeftovers && {
+              stoppedLeftovers: result.stoppedLeftovers,
+            }),
+          });
+      }
+      // Past the sandbox's disk budget the command failed, whatever it exited.
+      if (result.status !== 0 || overflow) {
+        const failed = `Validation command failed (${overflow ? "disk budget" : result.status}): ${check}: `;
         // People read the bounded form; diagnosis reads the complete output.
-        const detail = `${failed}${failedOutput(output)}`;
+        const detail = `${failed}${overflow ?? failedOutput(output)}`;
         // The dependency install is the controller's own bootstrap step. When
         // the candidate left every manifest and lockfile as at the accepted
         // base, the same install worked there, so its failure is the
         // environment's: it repeats and charges no repair (#839). A changed
         // manifest or lockfile may be what broke it: the candidate's fault.
+        // Over the disk budget, only the verified install, run first with an
+        // empty HOME, is: earlier commands could have filled the budget.
         if (
           packageBootstrap(check) !== undefined &&
+          (!overflow || install) &&
           !dependencyInputsChanged(worktree, acceptedBaseSha, commit)
         )
           throw new StepFault(transient(detail, false));
         throw new CandidateValidationFailure(
           detail,
-          retainFailedValidation && !preparing ? partial : undefined,
-          `${failed}${output}`,
+          // Its receipt records the exit, which an overflow passed.
+          retainFailedValidation && !preparing && !overflow
+            ? partial
+            : undefined,
+          `${failed}${overflow ? `${overflow}\n` : ""}${output}`,
         );
       }
       if (!preparing && contentStore && reviewArtifacts.length) {
