@@ -820,11 +820,38 @@ function validateAmendment(
     )
       throw new Error("An amendment cannot change a settled branch binding");
     const work = state.work[old.id]!;
-    // Only ownership widens, and only for the attempt that is run again.
+    // Only the attempt that is run again changes: its ownership widens, and
+    // its acceptance, brief and non-goals state the behaviour it now owns.
     const widened =
       old.id === reattemptedItem(state, pending.proposal) &&
-      sameItem({ ...next, ownedPaths: old.ownedPaths }, old) &&
+      sameItem(
+        {
+          ...next,
+          ownedPaths: old.ownedPaths,
+          acceptance: old.acceptance,
+          brief: old.brief,
+          nonGoals: old.nonGoals,
+        },
+        old,
+      ) &&
       old.ownedPaths.every((path) => next.ownedPaths.includes(path));
+    // Review judges a result only against these fields, so an operator
+    // answer that widens the reattempted item without them leaves the
+    // approved change unreviewable (#1610).
+    if (
+      widened &&
+      pending.decisions?.some((entry) => entry.answer) &&
+      !isDeepStrictEqual(
+        [...next.ownedPaths].sort(),
+        [...old.ownedPaths].sort(),
+      ) &&
+      isDeepStrictEqual(next.acceptance, old.acceptance) &&
+      next.brief === old.brief &&
+      isDeepStrictEqual(next.nonGoals, old.nonGoals)
+    )
+      throw new Error(
+        `Work Item ${old.id} changes its owned paths after an operator answer but not its acceptance, brief or non-goals; state the behaviour the answer approved`,
+      );
     if (
       changed &&
       !widened &&
