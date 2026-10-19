@@ -2246,6 +2246,15 @@ export class RealGitHubGateway implements GitHubGateway {
     settled(key);
   }
 
+  /** When `sha` was committed, as GitHub reports it; undefined if it does not. */
+  private async commitTime(sha: string): Promise<string | undefined> {
+    const commit = await this.api<{
+      committer?: { date?: unknown } | null;
+    }>("GET", `git/commits/${sha}`);
+    const date = commit.committer?.date;
+    return typeof date === "string" ? date : undefined;
+  }
+
   /**
    * The check names the repository requires on `branch`: its rulesets and
    * its classic branch protection (from the protection route, else from the
@@ -2327,6 +2336,7 @@ export class RealGitHubGateway implements GitHubGateway {
       status: string;
       conclusion: string | null;
       html_url: string;
+      started_at?: string | null;
       app?: { id?: number } | null;
     }[] = [];
     for (let page = 1; ; page++) {
@@ -2339,7 +2349,12 @@ export class RealGitHubGateway implements GitHubGateway {
       runs.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
     }
-    type Status = { context?: unknown; state?: unknown; target_url?: unknown };
+    type Status = {
+      context?: unknown;
+      state?: unknown;
+      target_url?: unknown;
+      updated_at?: unknown;
+    };
     const contexts: Status[] = [];
     let combined: { state: string; total_count: number; statuses?: unknown };
     for (let page = 1; ; page++) {
@@ -2355,14 +2370,23 @@ export class RealGitHubGateway implements GitHubGateway {
     }
     const statuses = combined;
     // Every check on the head that ended without success, required or not
-    // (#1637). A cancelled (or stale) run whose name has another run on the
-    // head that succeeded or is still running was superseded, not failed.
+    // (#1637). A cancelled (or stale) run with another run of the same check
+    // (name and app, #1640) on the head that succeeded or is still running
+    // was superseded, not failed.
+    const sameCheck = (a: (typeof runs)[number], b: (typeof runs)[number]) =>
+      a.name === b.name &&
+      typeof a.app?.id === "number" &&
+      a.app.id === b.app?.id;
     const failedChecks: FailedCheck[] = [];
     for (const run of runs) {
       const conclusion = run.conclusion ?? "";
       if (
         run.head_sha !== identity.headSha ||
-        failedChecks.some((check) => check.name === run.name) ||
+        // One entry per name and conclusion: a cancelled run of a name
+        // never hides another run of that name that failed (#1640).
+        failedChecks.some(
+          (check) => check.name === run.name && check.conclusion === conclusion,
+        ) ||
         !(
           [
             "failure",
@@ -2373,7 +2397,7 @@ export class RealGitHubGateway implements GitHubGateway {
           (["cancelled", "stale"].includes(conclusion) &&
             !runs.some(
               (other) =>
-                other.name === run.name &&
+                sameCheck(other, run) &&
                 other.head_sha === identity.headSha &&
                 (other.status !== "completed" ||
                   other.conclusion === "success"),
@@ -2392,7 +2416,11 @@ export class RealGitHubGateway implements GitHubGateway {
       if (
         typeof status.context === "string" &&
         ["error", "failure"].includes(String(status.state)) &&
-        !failedChecks.some((check) => check.name === status.context)
+        !failedChecks.some(
+          (check) =>
+            check.name === status.context &&
+            check.conclusion === String(status.state),
+        )
       )
         failedChecks.push({
           name: status.context,
@@ -2522,6 +2550,23 @@ export class RealGitHubGateway implements GitHubGateway {
       ),
     ];
     if (unreported && mergeReadiness === "ready") mergeReadiness = "waiting";
+    const open = !detail.merged && detail.state !== "closed";
+    // When the pending set last changed, from GitHub's times; any unknown
+    // time leaves it unknown, so the wait stays unbounded.
+    let pendingSince: string | undefined;
+    if (open && pendingChecks.length) {
+      const times = [
+        ...runs
+          .filter((run) => run.status !== "completed")
+          .map((run) => run.started_at),
+        ...contexts
+          .filter((status) => status.state === "pending")
+          .map((status) => status.updated_at),
+        ...(unreported ? [await this.commitTime(identity.headSha)] : []),
+      ].map((time) => (typeof time === "string" ? Date.parse(time) : NaN));
+      if (times.length && times.every(Number.isFinite))
+        pendingSince = new Date(Math.max(...times)).toISOString();
+    }
     // Every name with any run (whatever its state or conclusion) or status
     // on the exact head; both reads above are of that commit.
     const reportedChecks = [
@@ -2539,6 +2584,7 @@ export class RealGitHubGateway implements GitHubGateway {
       ...(reportedChecks.length ? { reportedChecks } : {}),
       ...(failedChecks.length ? { failedChecks } : {}),
       ...(pendingChecks.length ? { pendingChecks } : {}),
+      ...(pendingSince ? { pendingSince } : {}),
       ...(mergeReadiness ? { mergeReadiness } : {}),
       ...(!detail.merged && detail.state === "closed" && detail.closed_at
         ? { closedAt: detail.closed_at }
