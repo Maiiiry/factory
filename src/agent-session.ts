@@ -30,6 +30,7 @@ import {
 } from "./recovery-checkpoint.js";
 import { settleInterruptedPaidCall } from "./step.js";
 import type { ContinuationState } from "./state.js";
+import type { WorkRecovery } from "./repair-policy.js";
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -716,6 +717,61 @@ export async function settleAbandonedReviewTurns(
 }
 
 /**
+ * A submitted diagnosis settled without a native outcome: its id is recorded
+ * as abandoned (never answered) and the next diagnosis is a fresh invocation.
+ */
+function abandonedDiagnosis(
+  invocation: NonNullable<WorkRecovery["diagnosisInvocation"]>,
+): NonNullable<WorkRecovery["diagnosisInvocation"]> {
+  return {
+    id: randomUUID(),
+    submitted: false,
+    ...(invocation.rejected && {
+      rejected: structuredClone(invocation.rejected),
+    }),
+    abandoned: [...(invocation.abandoned ?? []), invocation.id],
+  };
+}
+
+/**
+ * The operator's retry of a Work Item settles each of its submitted
+ * diagnoses that has no response (current or archived) as abandoned: the
+ * retry decision ends them, their outcome stays unknown, and a late response
+ * no longer matches its invocation (#1661). One that holds native returns
+ * awaiting validation stays as it is. A diagnosis whose planning turn is
+ * still live or holds a completed result is not the retry's to end: the
+ * retry is refused until a run settles that turn through its owner.
+ */
+export function abandonRetriedDiagnoses(
+  state: ContinuationState,
+  recovery: WorkRecovery,
+): void {
+  const unanswered = [recovery, ...(recovery.history ?? [])].filter(
+    (holder) =>
+      holder.diagnosisInvocation?.submitted &&
+      holder.diagnosisInvocation.response === undefined &&
+      !holder.diagnosisInvocation.nativeReturns?.length,
+  );
+  const held = (id: string) =>
+    Object.values(state.agentSessions ?? {}).some(
+      (ref) =>
+        ref.scope.role === "planning" &&
+        ref.currentTurn?.invocationId === id &&
+        (ref.status === "in-flight" ||
+          ref.currentTurn.resources !== "settled" ||
+          (ref.status === "ready" && ref.currentTurn.terminal === "completed")),
+    );
+  if (unanswered.some((holder) => held(holder.diagnosisInvocation!.id)))
+    throw new Error(
+      "A diagnosis of this Work Item is still held by its planning session; run the Objective to settle it, then retry",
+    );
+  for (const holder of unanswered)
+    holder.diagnosisInvocation = abandonedDiagnosis(
+      holder.diagnosisInvocation!,
+    );
+}
+
+/**
  * A planning call that ended without a usable outcome leaves its invocation
  * submitted. Settle it as abandoned so the next call is a fresh invocation and
  * retry, refuse and cancel proceed:
@@ -812,14 +868,7 @@ export async function settleAbandonedPlanningTurn(
         { item: itemId! },
         "diagnose",
       );
-      recovery.diagnosisInvocation = {
-        id: randomUUID(),
-        submitted: false,
-        ...(invocation.rejected && {
-          rejected: structuredClone(invocation.rejected),
-        }),
-        abandoned: [...(invocation.abandoned ?? []), invocation.id],
-      };
+      recovery.diagnosisInvocation = abandonedDiagnosis(invocation);
     };
     restore = () => {
       undoMarker?.();
