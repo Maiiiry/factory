@@ -21,6 +21,7 @@ import type {
 import { notYet, settled } from "./delivery/lag.js";
 import type { NativeStackDelivery } from "./delivery/native-stack.js";
 import { deliveryReadiness } from "./delivery/readiness.js";
+import { redactDiagnosticDetail } from "./diagnostics.js";
 import { attachedFault, attachFault, decision, transient } from "./fault.js";
 import {
   classifiedGitHubCall,
@@ -54,6 +55,7 @@ import {
 } from "./github-project-queue.js";
 import { availableIssueType } from "./issue-type.js";
 import { childMarker } from "./objective-split.js";
+import { currentProcessSignal } from "./process.js";
 import {
   CheckpointProducerInventoryChanged,
   isCheckpointAdmissionFailure,
@@ -176,6 +178,13 @@ const latest = (...times: (number | undefined)[]): number | undefined => {
 
 /** Empty issue numbers in a row past the newest listed issue that end a probe. */
 const PROBE_GAP = 3;
+/** Failed checks whose annotations and log tail go into repair evidence. */
+const EXCERPTED_CHECKS = 3;
+const LOG_TAIL_LINES = 40;
+const LOG_TAIL_CHARS = 3000;
+/** Bytes of job log asked for, and the most read if the range is ignored. */
+const LOG_TAIL_BYTES = 64 * 1024;
+const LOG_READ_CAP_BYTES = 1024 * 1024;
 
 /**
  * A list that has not caught up yet, where the caller bounds the repeat
@@ -2342,6 +2351,73 @@ export class RealGitHubGateway implements GitHubGateway {
     ];
   }
 
+  /**
+   * A failed check run's failure annotations and, for an Actions job, the
+   * tail of its log, bounded. Undefined when GitHub shows neither (no
+   * access, logs expired): the evidence then names the check only.
+   */
+  private async failureExcerpt(
+    checkRun: number,
+    actions: boolean,
+  ): Promise<string | undefined> {
+    const parts: string[] = [];
+    // Evidence is best effort: only cancellation stops the observation.
+    const tolerated = (error: unknown) => {
+      if (
+        currentProcessSignal()?.aborted ||
+        attachedFault(error)?.kind === "cancelled"
+      )
+        throw error;
+    };
+    try {
+      const annotations = await this.api<
+        {
+          path?: unknown;
+          start_line?: unknown;
+          annotation_level?: unknown;
+          message?: unknown;
+        }[]
+      >("GET", `check-runs/${checkRun}/annotations?per_page=50`);
+      for (const note of (Array.isArray(annotations) ? annotations : [])
+        .filter((note) => note?.annotation_level === "failure")
+        .slice(0, 5))
+        parts.push(
+          `${typeof note.path === "string" ? note.path : ""}${typeof note.start_line === "number" ? `:${note.start_line}` : ""} ${String(note.message ?? "").slice(0, 300)}`.trim(),
+        );
+    } catch (error) {
+      tolerated(error);
+    }
+    if (actions)
+      try {
+        // An Actions check run's id is its job's id.
+        const log = await classifiedGitHubCall(
+          this.client,
+          this.repository,
+          { method: "GET", path: `actions/jobs/${checkRun}/logs` },
+          () =>
+            this.client.jobLogTail(
+              this.repository,
+              checkRun,
+              LOG_TAIL_BYTES,
+              LOG_READ_CAP_BYTES,
+            ),
+        );
+        if (log)
+          parts.push(
+            log
+              .trimEnd()
+              .split("\n")
+              .slice(-LOG_TAIL_LINES)
+              .map((line) => line.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /, ""))
+              .join("\n")
+              .slice(-LOG_TAIL_CHARS),
+          );
+      } catch (error) {
+        tolerated(error);
+      }
+    return parts.length ? redactDiagnosticDetail(parts.join("\n")) : undefined;
+  }
+
   async observe(
     identity: PullRequestIdentity,
   ): Promise<PullRequestObservation> {
@@ -2471,6 +2547,8 @@ export class RealGitHubGateway implements GitHubGateway {
       );
     };
     const failedChecks: FailedCheck[] = [];
+    /** The check run behind each failed check, by its id for evidence. */
+    const failedRuns = new Map<FailedCheck, (typeof runs)[number]>();
     for (const run of runs) {
       const conclusion = run.conclusion ?? "";
       if (
@@ -2491,11 +2569,13 @@ export class RealGitHubGateway implements GitHubGateway {
         )
       )
         continue;
-      failedChecks.push({
+      const failure: FailedCheck = {
         name: run.name,
         conclusion,
         ...(run.html_url ? { url: run.html_url } : {}),
-      });
+      };
+      failedChecks.push(failure);
+      failedRuns.set(failure, run);
     }
     // Commit statuses: the latest state of each context on the head.
     for (const status of contexts)
@@ -2518,6 +2598,20 @@ export class RealGitHubGateway implements GitHubGateway {
     // From the evidence above: a superseded cancelled run drops out, and its
     // replacement, still running, keeps the checks pending.
     const failing = failedChecks.length > 0;
+    // Why the first few real failures failed, so a repair is not blind.
+    for (const check of failedChecks
+      .filter((check) => !["cancelled", "stale"].includes(check.conclusion))
+      .slice(0, EXCERPTED_CHECKS)) {
+      const run = failedRuns.get(check);
+      const excerpt =
+        run &&
+        (await this.failureExcerpt(
+          run.id,
+          (run.app as { slug?: unknown } | null | undefined)?.slug ===
+            "github-actions",
+        ));
+      if (excerpt) check.excerpt = excerpt;
+    }
     const checksByName = new Map<string, typeof runs>();
     for (const run of runs) {
       const group = checksByName.get(run.name);

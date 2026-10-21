@@ -1736,6 +1736,8 @@ export interface FailedCheck {
   /** The check run's conclusion, or the commit status's state. */
   conclusion: string;
   url?: string;
+  /** Its failure annotations and job log tail, bounded; repair evidence. */
+  excerpt?: string;
 }
 
 export interface NamedCheckEvidence {
