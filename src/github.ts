@@ -2478,12 +2478,20 @@ export class RealGitHubGateway implements GitHubGateway {
     // Actions run shares one app, the same workflow (#1640); an unknown
     // identity is never superseded.
     let suites: Map<number, number> | undefined;
+    type WorkflowRun = {
+      check_suite_id?: unknown;
+      workflow_id?: unknown;
+      status?: unknown;
+      conclusion?: unknown;
+    };
+    /** The head's Actions workflow runs; undefined when unreadable. */
+    let workflowRuns: WorkflowRun[] | undefined;
     /** The workflow of each Actions check suite on the head. */
     const workflowSuites = async (): Promise<Map<number, number>> => {
       if (suites) return suites;
       suites = new Map();
-      type WorkflowRun = { check_suite_id?: unknown; workflow_id?: unknown };
       try {
+        const all: WorkflowRun[] = [];
         for (let page = 1; ; page++) {
           const result = await this.api<{ workflow_runs?: WorkflowRun[] }>(
             "GET",
@@ -2492,6 +2500,7 @@ export class RealGitHubGateway implements GitHubGateway {
           const listed = Array.isArray(result.workflow_runs)
             ? result.workflow_runs
             : [];
+          all.push(...listed);
           for (const run of listed)
             if (
               Number.isSafeInteger(run?.check_suite_id) &&
@@ -2503,6 +2512,7 @@ export class RealGitHubGateway implements GitHubGateway {
               );
           if (listed.length < 100) break;
         }
+        workflowRuns = all;
       } catch (error) {
         // No Actions read access: the workflows stay unknown.
         if (
@@ -2764,14 +2774,51 @@ export class RealGitHubGateway implements GitHubGateway {
         ].filter((name): name is string => typeof name === "string" && !!name),
       ),
     ];
-    // Nothing registered on the head yet: Actions may not have created its
-    // check suites, or a path filter or push-only workflow never will.
-    const pushedAt =
-      open && !reportedChecks.length ? await headPushedAt() : undefined;
+    const checks = failing
+      ? "failing"
+      : unreported ||
+          runs.some((run) => run.status !== "completed") ||
+          (statuses.total_count > 0 && statuses.state === "pending")
+        ? "pending"
+        : "passing";
+    // No Actions check on the head yet: Actions may not have created its
+    // check suites, or a path filter or push-only workflow never will. A
+    // check from another app does not settle that (#1687). Read only once
+    // nothing else holds the merge.
+    const actionsChecks = runs.some(
+      (run) =>
+        run.head_sha === identity.headSha && run.app?.slug === "github-actions",
+    );
+    const unheld =
+      open &&
+      !actionsChecks &&
+      checks === "passing" &&
+      (mergeReadiness === "ready" || mergeReadiness === "behind");
+    const pushedAt = unheld ? await headPushedAt() : undefined;
+    let actionsRuns: PullRequestObservation["actionsRuns"];
+    if (unheld && reportedChecks.length) {
+      await workflowSuites();
+      actionsRuns = !workflowRuns
+        ? undefined
+        : workflowRuns.some((run) => run?.status !== "completed")
+          ? "running"
+          : workflowRuns.some(
+                (run) =>
+                  !["success", "neutral", "skipped"].includes(
+                    String(run?.conclusion),
+                  ),
+              )
+            ? "failed"
+            : workflowRuns.length
+              ? "completed"
+              : "none";
+    }
     return {
       namedChecks,
       ...(reportedChecks.length ? { reportedChecks } : {}),
       ...(pushedAt ? { pushedAt } : {}),
+      ...(open ? { actionsChecks } : {}),
+      ...(actionsRuns ? { actionsRuns } : {}),
       ...(failedChecks.length ? { failedChecks } : {}),
       ...(pendingChecks.length ? { pendingChecks } : {}),
       ...(pendingSince ? { pendingSince } : {}),
@@ -2784,13 +2831,7 @@ export class RealGitHubGateway implements GitHubGateway {
         : detail.state === "closed"
           ? "closed"
           : "open",
-      checks: failing
-        ? "failing"
-        : unreported ||
-            runs.some((run) => run.status !== "completed") ||
-            (statuses.total_count > 0 && statuses.state === "pending")
-          ? "pending"
-          : "passing",
+      checks,
     };
   }
 
