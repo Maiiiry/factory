@@ -59,6 +59,7 @@ import {
   DiagnosticEmitter,
   diagnosticPath,
   readDiagnostics,
+  statusDocument,
   summarizeFormalHistory,
   withDiagnosticSession,
 } from "../dist/diagnostics.js";
@@ -3652,6 +3653,70 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
     saveState(statePath(config.repository, 3), unbound);
     assert.equal(retryWorkItem(retryConfig, 3, "local"), "attempt");
     assert.equal(git("rev-parse", "HEAD"), commit);
+    // The operator retires the command that cannot pass in the sandbox
+    // (#1667): only the operator, only a command the item runs, with a reason
+    // that status keeps. Acceptance is unchanged; its review judges it.
+    saveState(statePath(config.repository, 3), unbound);
+    const retire = (retirement) =>
+      retryWorkItem(retryConfig, 3, "local", { retire: retirement });
+    assert.throws(
+      () =>
+        retire({ command: "npm run audit", reason: "CI", actor: "operator" }),
+      /Work Item local has no validation command "npm run audit"/,
+    );
+    assert.throws(
+      () => retire({ command, reason: "CI", actor: "factory-worker" }),
+      /Only the operator can retire a validation command/,
+    );
+    assert.throws(
+      () => retire({ command, reason: "CI", actor: "operator" }),
+      /last validation command; an item keeps at least one/,
+    );
+    // With a second command, the first one retires.
+    const kept = { command: "npm test", provenance: "base-observed" };
+    const twoCommands = structuredClone(unbound);
+    twoCommands.graph.items[0].validation.push(kept);
+    // Its receipts covered one command: here the item was cancelled first.
+    twoCommands.work.local = { status: "cancelled" };
+    saveState(
+      statePath(config.repository, 3),
+      JSON.parse(
+        JSON.stringify(twoCommands).replaceAll(
+          graphDigest(unbound.graph),
+          graphDigest(twoCommands.graph),
+        ),
+      ),
+    );
+    assert.equal(
+      retire({ command, reason: "covered by CI", actor: "operator" }),
+      "attempt",
+    );
+    const retiredState = readState(config.repository, 3);
+    assert.equal(retiredState.work.local.status, "pending");
+    assert.deepEqual(retiredState.graph.items[0].validation, [kept]);
+    assert.deepEqual(
+      retiredState.graph.items[0].acceptance,
+      unbound.graph.items[0].acceptance,
+    );
+    assert.deepEqual(retiredState.graph.coverage[0].proof, {
+      kind: "result-semantic",
+    });
+    const [retiredEntry] = statusDocument(
+      retiredState,
+      config.repository,
+      3,
+      "regular",
+    ).retiredValidation;
+    assert.deepEqual(
+      { ...retiredEntry, at: undefined },
+      {
+        itemId: "local",
+        command,
+        reason: "covered by CI",
+        actor: "operator",
+        at: undefined,
+      },
+    );
     // A real exclusive owner saves intent then exits before dispatch. The next
     // process reclaims ownership and loads the atomic snapshot, not diagnostics.
     const validationHistory = readState(config.repository, 1);
