@@ -96,6 +96,8 @@ import {
 import {
   assertCompletedCoverage,
   environmentValidationIndices,
+  finalReceiptsMatch,
+  finalValidationSequence,
   objectivePreparationCommands,
   reusableEnvironmentValidationIndices,
 } from "../dist/qa.js";
@@ -4207,6 +4209,68 @@ test("source readiness prepares each real fresh checkout before its phase checks
     );
     assert.deepEqual(environmentValidationIndices(graph, item.id), [0, 1]);
     assert.deepEqual(objectivePreparationCommands(graph), [setup]);
+    // Final validation installs first, exactly once: a listed bootstrap
+    // moves to the front, else the graph's declared one leads.
+    const install = "pnpm install --frozen-lockfile --ignore-scripts";
+    const bootstrapped = structuredClone(graph);
+    bootstrapped.items[0].validation.unshift({
+      command: install,
+      provenance: "source-declared",
+      source: "README.md",
+    });
+    const sequence = (commands, target = bootstrapped) =>
+      finalValidationSequence(target, commands);
+    assert.deepEqual(sequence([acceptance]), {
+      preparation: [install, setup],
+      commands: [acceptance],
+    });
+    assert.deepEqual(sequence([setup, acceptance]), {
+      preparation: [install],
+      commands: [setup, acceptance],
+    });
+    assert.deepEqual(sequence([setup, acceptance, install]), {
+      preparation: [],
+      commands: [install, setup, acceptance],
+    });
+    assert.deepEqual(sequence([install, acceptance, install], graph), {
+      preparation: [install, setup],
+      commands: [acceptance],
+    });
+    assert.deepEqual(sequence([acceptance], graph), {
+      preparation: [setup],
+      commands: [acceptance],
+    });
+    assert.deepEqual(sequence([` ${install}`, acceptance, `${install} `]), {
+      preparation: [` ${install}`, setup],
+      commands: [acceptance],
+    });
+    // Only a source-declared exact bootstrap moves or leads.
+    const observed = structuredClone(bootstrapped);
+    observed.items[0].validation[0].provenance = "base-observed";
+    assert.deepEqual(sequence([acceptance], observed), {
+      preparation: [setup],
+      commands: [acceptance],
+    });
+    const nearMiss = "pnpm install --frozen-lockfile";
+    assert.deepEqual(sequence([setup, acceptance, nearMiss], graph), {
+      preparation: [],
+      commands: [setup, acceptance, nearMiss],
+    });
+    // Receipts must match the current sequence, or exactly the previous one.
+    const listed = [setup, acceptance, install];
+    assert.ok(finalReceiptsMatch(bootstrapped, listed, sequence(listed)));
+    assert.ok(
+      finalReceiptsMatch(bootstrapped, listed, {
+        preparation: [],
+        commands: listed,
+      }),
+    );
+    assert.ok(
+      !finalReceiptsMatch(bootstrapped, [acceptance, install], {
+        preparation: [install, setup],
+        commands: [acceptance, install],
+      }),
+    );
     const diagnosticRepository = "integration/fresh-readiness";
     const diagnostics = new DiagnosticEmitter(diagnosticRepository, 1);
     const observerConfigDigest = createHash("sha256")
