@@ -869,20 +869,31 @@ export function selectWorkerAmendment(state: FactoryState): void {
  * result is gone and it is attempted again, so the amendment may widen its
  * ownership: the worker saw paths the plan could not (#819, #827).
  */
-function reattemptedItem(
+/**
+ * The failed items an amendment may widen and run again: the worker's own
+ * failed attempt for its discovery, otherwise every failed, undelivered work
+ * item. The planner decides which of them the amendment serves (#1644).
+ */
+function reattemptedItems(
   state: FactoryState,
   proposal: AmendmentProposal,
-): string | undefined {
-  const id = proposal.worker?.itemId ?? "";
-  const work = state.work[id];
-  const item = state.graph.items.find((entry) => entry.id === id);
-  return work?.status === "failed" &&
-    work.attempt === proposal.worker?.attempt &&
-    work.recovery?.failure?.event &&
-    !work.pullRequest &&
-    (item?.kind ?? "work") === "work"
-    ? id
-    : undefined;
+): string[] {
+  const eligible = (id: string) => {
+    const work = state.work[id];
+    const item = state.graph.items.find((entry) => entry.id === id);
+    return (
+      work?.status === "failed" &&
+      !!work.recovery?.failure?.event &&
+      !work.pullRequest &&
+      (item?.kind ?? "work") === "work"
+    );
+  };
+  if (proposal.worker)
+    return eligible(proposal.worker.itemId) &&
+      state.work[proposal.worker.itemId]!.attempt === proposal.worker.attempt
+      ? [proposal.worker.itemId]
+      : [];
+  return state.graph.items.map((item) => item.id).filter(eligible);
 }
 
 export function amendmentBlocksDispatch(state: FactoryState): boolean {
@@ -893,6 +904,82 @@ export function amendmentBlocksDispatch(state: FactoryState): boolean {
         work.discovery?.scope === "in-scope" && !work.discoveryDisposition,
     )
   );
+}
+
+/**
+ * A reattempted item widens only when its owned paths or dependencies grow,
+ * keeping every earlier one; only then may it restate its acceptance, brief
+ * and non-goals, start again and have its failure charge released (#1644).
+ */
+function widensItem(
+  old: WorkGraph["items"][number],
+  next: WorkGraph["items"][number] | undefined,
+): boolean {
+  if (!next) return false;
+  const grows = (before: string[], after: string[]) =>
+    before.every((entry) => after.includes(entry)) &&
+    after.some((entry) => !before.includes(entry));
+  const keeps = (before: string[], after: string[]) =>
+    before.every((entry) => after.includes(entry));
+  return (
+    sameItem(
+      {
+        ...next,
+        ownedPaths: old.ownedPaths,
+        dependencies: old.dependencies,
+        acceptance: old.acceptance,
+        brief: old.brief,
+        nonGoals: old.nonGoals,
+      },
+      old,
+    ) &&
+    keeps(old.ownedPaths, next.ownedPaths) &&
+    keeps(old.dependencies, next.dependencies) &&
+    (grows(old.ownedPaths, next.ownedPaths) ||
+      grows(old.dependencies, next.dependencies))
+  );
+}
+
+/**
+ * The amendment fence for one existing item: started or completed items stay
+ * as they are unless a reattempted one widens.
+ */
+export function assertAmendedItem(
+  old: WorkGraph["items"][number],
+  next: WorkGraph["items"][number],
+  work: WorkState,
+  reattempted: boolean,
+  answered: boolean,
+): void {
+  const widened = reattempted && widensItem(old, next);
+  // Review judges a result only against these fields, so an operator
+  // answer that widens the reattempted item without them leaves the
+  // approved change unreviewable (#1610).
+  if (
+    widened &&
+    answered &&
+    !isDeepStrictEqual(
+      [...next.ownedPaths].sort(),
+      [...old.ownedPaths].sort(),
+    ) &&
+    isDeepStrictEqual(next.acceptance, old.acceptance) &&
+    next.brief === old.brief &&
+    isDeepStrictEqual(next.nonGoals, old.nonGoals)
+  )
+    throw new Error(
+      `Work Item ${old.id} changes its owned paths after an operator answer but not its acceptance, brief or non-goals; state the behaviour the answer approved`,
+    );
+  if (
+    !sameItem(next, old) &&
+    !widened &&
+    (work.status !== "pending" ||
+      work.attempt ||
+      work.execution ||
+      work.pullRequest)
+  )
+    throw new Error(
+      `Started/completed Work Item ${old.id} is immutable; add explicit successor or revalidation work`,
+    );
 }
 
 function validateAmendment(
@@ -958,56 +1045,18 @@ function validateAmendment(
     const next = graph.items.find((item) => item.id === old.id);
     if (!next)
       throw new Error("Amendments cannot remove stable Work Item identities");
-    const changed = !sameItem(next, old);
     if (
       state.work[old.id]?.routing &&
       !isDeepStrictEqual(next.condition, old.condition)
     )
       throw new Error("An amendment cannot change a settled branch binding");
-    const work = state.work[old.id]!;
-    // Only the attempt that is run again changes: its ownership widens, and
-    // its acceptance, brief and non-goals state the behaviour it now owns.
-    const widened =
-      old.id === reattemptedItem(state, pending.proposal) &&
-      sameItem(
-        {
-          ...next,
-          ownedPaths: old.ownedPaths,
-          acceptance: old.acceptance,
-          brief: old.brief,
-          nonGoals: old.nonGoals,
-        },
-        old,
-      ) &&
-      old.ownedPaths.every((path) => next.ownedPaths.includes(path));
-    // Review judges a result only against these fields, so an operator
-    // answer that widens the reattempted item without them leaves the
-    // approved change unreviewable (#1610).
-    if (
-      widened &&
-      pending.decisions?.some((entry) => entry.answer) &&
-      !isDeepStrictEqual(
-        [...next.ownedPaths].sort(),
-        [...old.ownedPaths].sort(),
-      ) &&
-      isDeepStrictEqual(next.acceptance, old.acceptance) &&
-      next.brief === old.brief &&
-      isDeepStrictEqual(next.nonGoals, old.nonGoals)
-    )
-      throw new Error(
-        `Work Item ${old.id} changes its owned paths after an operator answer but not its acceptance, brief or non-goals; state the behaviour the answer approved`,
-      );
-    if (
-      changed &&
-      !widened &&
-      (work.status !== "pending" ||
-        work.attempt ||
-        work.execution ||
-        work.pullRequest)
-    )
-      throw new Error(
-        `Started/completed Work Item ${old.id} is immutable; add explicit successor or revalidation work`,
-      );
+    assertAmendedItem(
+      old,
+      next,
+      state.work[old.id]!,
+      reattemptedItems(state, pending.proposal).includes(old.id),
+      !!pending.decisions?.some((entry) => entry.answer),
+    );
   }
   for (const entry of state.graph.coverage ?? []) {
     const next = graph.coverage.find(
@@ -1591,7 +1640,21 @@ async function advanceAmendment(args: {
               (id) =>
                 state.work[id]!.status !== "pending" || state.work[id]!.attempt,
             ),
-            reattemptItemId: reattemptedItem(state, pending.proposal),
+            reattemptItems: reattemptedItems(state, pending.proposal).map(
+              (id) => {
+                const discovery = state.work[id]!.discovery;
+                return {
+                  id,
+                  ...(discovery && {
+                    discovery: {
+                      reason: discovery.reason,
+                      ownership: discovery.ownership,
+                      acceptance: discovery.acceptance,
+                    },
+                  }),
+                };
+              },
+            ),
             currentImplementationEvidence: amendmentImplementationEvidence({
               state,
               proposal: pending.proposal,
@@ -1856,13 +1919,12 @@ async function advanceAmendment(args: {
       }),
       acceptedAt: new Date().toISOString(),
     });
-    const reattempt = reattemptedItem(state, pending.proposal);
-    const widened =
-      reattempt !== undefined &&
-      !sameItem(
-        state.graph.items.find((item) => item.id === reattempt),
-        pending.graph!.items.find((item) => item.id === reattempt),
-      );
+    const widened = reattemptedItems(state, pending.proposal).filter((id) =>
+      widensItem(
+        state.graph.items.find((item) => item.id === id)!,
+        pending.graph!.items.find((item) => item.id === id),
+      ),
+    );
     state.graph = pending.graph!;
     if ([17, 19].includes(state.schemaVersion)) {
       /* Keep the checkpoint reader fence. */
@@ -1882,7 +1944,7 @@ async function advanceAmendment(args: {
     if (pending.proposal.worker)
       state.work[pending.proposal.worker.itemId]!.discoveryDisposition =
         "accepted";
-    if (widened) {
+    for (const reattempt of widened) {
       // The plan was wrong, not the implementation: the item starts a new
       // attempt under its wider ownership, and no repair is spent on it.
       const work = state.work[reattempt]!;

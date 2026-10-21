@@ -55,7 +55,7 @@ import {
 import { deliveryDescription } from "../dist/delivery/description.js";
 import { transplantIndependentChange } from "../dist/delivery/transplant.js";
 import { StepFault } from "../dist/fault.js";
-import { graphDigest } from "../dist/graph-amendments.js";
+import { assertAmendedItem, graphDigest } from "../dist/graph-amendments.js";
 import { validPromptSections } from "../dist/prompt-bytes.js";
 import { coverageObligations } from "../dist/qa.js";
 import { resolveAutonomy } from "../dist/repair-policy.js";
@@ -729,7 +729,7 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
       currentGraph,
       discovery: { paths: ["additional.ts"] },
       immutableItemIds: currentGraph.items.map((item) => item.id),
-      reattemptItemId: "part-0",
+      reattemptItems: [{ id: "part-0" }],
     };
     const instructions = renderPlanningInstructions(
       body,
@@ -746,7 +746,7 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
         instructions,
         previousGraph: currentGraph,
         immutableItemIds: amendment.immutableItemIds,
-        reattemptItemId: "part-0",
+        reattemptItemIds: ["part-0"],
       },
       coverageObligations: obligations,
       controllerCapabilities: installedControllerCapabilities(),
@@ -1139,6 +1139,8 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
         ...(index === 0
           ? {
               addedOwnedPaths: ["additional.ts"],
+              // A split-out prerequisite becomes its dependency (#1644).
+              addedDependencies: ["part-1"],
               acceptance: [...item.acceptance, "Additional behaviour."],
               brief: item.brief,
               nonGoals: item.nonGoals,
@@ -1168,8 +1170,30 @@ test("retained graph amendments render exact pinned inputs once and keep canonic
         "Additional behaviour.",
       ],
       ownedPaths: ["part-0.ts", "additional.ts"],
+      dependencies: ["part-1"],
     });
     assert.deepEqual(decoded.items.slice(1), currentGraph.items.slice(1));
+    // Only a failed item whose ownership or dependencies grow may change and
+    // restart; a reworded one stays immutable and keeps its charge (#1644).
+    const failed = { status: "failed", attempt: "first" };
+    assertAmendedItem(
+      currentGraph.items[0],
+      decoded.items[0],
+      failed,
+      true,
+      false,
+    );
+    assert.throws(
+      () =>
+        assertAmendedItem(
+          currentGraph.items[1],
+          { ...currentGraph.items[1], acceptance: ["Reworded behaviour."] },
+          failed,
+          true,
+          false,
+        ),
+      /Work Item part-1 is immutable/,
+    );
     assert.equal(JSON.stringify(currentGraph), before);
     const wrongHeading = structuredClone(currentGraph);
     wrongHeading.items[0].inputSources[0].heading = "Appendix";
