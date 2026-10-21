@@ -5,9 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { assertKnownFlags } from "../dist/cli-flags.js";
+import { assertRequiredFinalCommands, fixedScripts } from "../dist/compiler.js";
 import {
   factoryAuthorityDigest,
   factoryConfigDigest,
+  finalValidationCommands,
+  requiredFinalCommands,
   readConfig,
   resolveProvider,
   validateConfigFile,
@@ -109,6 +112,74 @@ test("a provider resolves to the flat configuration its Objectives froze", () =>
     () => validateConfigFile({ ...file, defaultProvider: "copilot" }),
     /defaultProvider must name a configured provider/,
   );
+});
+
+test("required final-validation commands follow the Objective's and bind authority", () => {
+  const required = {
+    ...file,
+    finalValidation: { requiredCommands: ["npm run qualify", "npm test"] },
+  };
+  const config = resolveProvider(validateConfigFile(required), "codex");
+  assert.deepEqual(
+    finalValidationCommands(
+      ["npm test", "npm run lint"],
+      requiredFinalCommands(config),
+    ),
+    ["npm test", "npm run lint", "npm run qualify"],
+  );
+  assert.deepEqual(
+    finalValidationCommands(["npm test"], requiredFinalCommands(flat)),
+    ["npm test"],
+  );
+  // Planning keeps a required command's script fixed, and projection refuses
+  // a required command the base cannot run as a fixed command.
+  const scripts = checkout("example/scripts");
+  writeFileSync(
+    join(scripts, "package.json"),
+    JSON.stringify({ scripts: { qualify: "node qualify.mjs" } }),
+  );
+  execFileSync("git", ["-C", scripts, "add", "package.json"]);
+  execFileSync("git", [
+    "-C",
+    scripts,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-qm",
+    "scripts",
+  ]);
+  const baseSha = execFileSync("git", ["-C", scripts, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const body = "## Acceptance\n- The suite qualifies.\n";
+  assert.deepEqual(fixedScripts(body, baseSha, scripts, ["npm run qualify"]), [
+    { name: "qualify", body: "node qualify.mjs" },
+  ]);
+  assert.throws(
+    () =>
+      assertRequiredFinalCommands(
+        ["npm run qualify --workspace y"],
+        body,
+        baseSha,
+        scripts,
+      ),
+    /^Error: Required final-validation command has no executable authority at the accepted base: npm run qualify --workspace y\./,
+  );
+  assert.notEqual(factoryConfigDigest(config), factoryConfigDigest(flat));
+  assert.notEqual(factoryAuthorityDigest(config), factoryAuthorityDigest(flat));
+  for (const finalValidation of [
+    { requiredCommands: [] },
+    { requiredCommands: [" npm test"] },
+    { requiredCommands: ["npm test\nrm -rf ."] },
+    { requiredCommands: ["npm test", "npm test"] },
+    { commands: ["npm test"] },
+  ])
+    assert.throws(
+      () => validateConfigFile({ ...file, finalValidation }),
+      /^Error: finalValidation/,
+    );
 });
 
 test("queue authority binds the default provider whichever provider runs", () => {

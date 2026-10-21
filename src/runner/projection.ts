@@ -8,11 +8,16 @@ import { graphProjectionControl } from "../graph-projection-control.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
+  assertRequiredFinalCommands,
   finalObjectiveCommands,
   type PlanCandidate,
   verifyPlanCandidate,
 } from "../compiler.js";
-import type { FactoryConfig } from "../config.js";
+import {
+  finalValidationCommands,
+  requiredFinalCommands,
+  type FactoryConfig,
+} from "../config.js";
 import type {
   ApprovedPlaybookAdmission,
   ContentStore,
@@ -104,6 +109,21 @@ export async function projectPreparedObjective(args: {
   )
     throw new Error(
       "Accepted plan execution profile policy differs from installation",
+    );
+  // Required final-validation commands fail here, before any item starts,
+  // rather than at the end of final validation.
+  assertRequiredFinalCommands(
+    requiredFinalCommands(config),
+    issue.body,
+    baseSha,
+    config.checkout,
+  );
+  if (
+    JSON.stringify(plan.requiredFinalCommands ?? []) !==
+    JSON.stringify(requiredFinalCommands(config))
+  )
+    throw new Error(
+      "Accepted plan was reviewed with other required final-validation commands than the installation's; plan again",
     );
   const graph = plan.graph;
   if (
@@ -355,7 +375,10 @@ export function activateProjectedObjective(args: {
     configDigest: installationConfigDigest,
     baseSha,
     graph,
-    objectiveCommands: finalObjectiveCommands(issue.body),
+    objectiveCommands: finalValidationCommands(
+      finalObjectiveCommands(issue.body),
+      requiredFinalCommands(config),
+    ),
     objectiveBodyDigest: createHash("sha256").update(issue.body).digest("hex"),
     issueByItemId: projected.issueByItemId,
     ...(preparation.issueAuthor

@@ -1,4 +1,5 @@
 import type { ExecutionProfileEnvironment } from "./config.js";
+import type { DesignRisk } from "./compiler/work-item-rubric.js";
 import type { ControllerCapabilitiesManifest } from "./controller-capabilities.js";
 import type {
   GraphReviewFinding,
@@ -637,6 +638,8 @@ export interface PlanReviewRequest {
   graph: WorkGraph;
   commands: PlanCommandAuthorization[];
   finalCommands: string[];
+  /** The installation's required final-validation commands, already in finalCommands. */
+  requiredFinalCommands?: string[];
   /** Check names from the base's workflows. */
   checkNames?: string[];
   /**
@@ -801,7 +804,7 @@ export interface AgentSessionContinuation extends AgentSessionRequest {
 
 /** Private advisory learning; never source, command or acceptance authority. */
 export interface WorkHandoffNote {
-  kind: "interface" | "pitfall" | "hypothesis" | "verification";
+  kind: "interface" | "pitfall" | "hypothesis" | "verification" | "design";
   summary: string;
   paths: string[];
   consumers: string[];
@@ -811,6 +814,12 @@ export interface WorkHandoffNote {
    * It is an index for review, never proof.
    */
   criterionIndex?: number;
+  /**
+   * A design note's checklist question: the implementer's claimed answer, with
+   * the file:line locations it rests on. Like a verification map, it is an
+   * index for review, never proof.
+   */
+  designRisk?: DesignRisk;
 }
 
 /** Authenticated adapter recovery; observational captures never supply this. */
