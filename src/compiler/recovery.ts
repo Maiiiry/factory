@@ -100,6 +100,7 @@ import {
   PlanningNeedsDecision,
   withPlannerAdmission,
 } from "./planning.js";
+import type { ReviewArtifactSelector } from "../review-artifacts.js";
 import { planningSources } from "./sources.js";
 
 /** Compile and independently review a candidate without GitHub or run-state writes. */
@@ -179,6 +180,12 @@ export interface PlanningRecoveryRecord {
   revision?: ContentRef;
   diagnosisResponse?: { kind: string; diagnosis: string; correction: string };
   review?: PlanningReviewRecord;
+  /**
+   * The installation's selectors when a review was first retained; resumes
+   * rebuild the packet from them, so adding or reordering selectors meanwhile
+   * keeps the retained review (#1641).
+   */
+  reviewArtifactSelectors?: ReviewArtifactSelector[];
   /** The planner's and plan reviews' questions, oldest first; the last, while unanswered, holds planning. */
   decisions?: PlanningDecisionRecord[];
   /**
@@ -613,6 +620,8 @@ async function compilePlanAdmitted(
   workflowRecipe?: WorkflowRecipeInput,
   requiredFinalCommands: readonly string[] = [],
   ciOnlyCommands: readonly string[] = [],
+  /** The installation's selectors compile and graph review see. */
+  reviewArtifactSelectors: readonly ReviewArtifactSelector[] = [],
 ): Promise<PlanCandidate> {
   const { state, save } = context;
   if (workflowRecipe) assertWorkflowRecipeInput(workflowRecipe);
@@ -632,6 +641,8 @@ async function compilePlanAdmitted(
     );
   state.planningRecovery ??= { phase: "ready", history: [] };
   const record = state.planningRecovery;
+  const selectors = () =>
+    record.reviewArtifactSelectors ?? reviewArtifactSelectors;
   if (
     context.contextResolver &&
     model.providerAttemptAdmission !== "controller-checkpoint-v1"
@@ -721,6 +732,7 @@ async function compilePlanAdmitted(
       workflowRecipe,
       operatorPlanningDecisions(record),
       requiredFinalCommands,
+      selectors(),
     );
     const retained = retainedPlanningReview(record, packet, configDigest);
     if (
@@ -1058,9 +1070,11 @@ async function compilePlanAdmitted(
         workflowRecipe,
         operatorPlanningDecisions(record),
         requiredFinalCommands,
+        selectors(),
       );
       const retained = retainedPlanningReview(record, packet, configDigest);
       record.review = retained.review;
+      record.reviewArtifactSelectors ??= structuredClone([...selectors()]);
       save();
       reviewing = true;
       review = await checkedPlanReview(
