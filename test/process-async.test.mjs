@@ -77,7 +77,7 @@ import { killGroup } from "../dist/execution/worker-process.js";
 import { faultOf } from "../dist/fault.js";
 import { RealGitHubGateway } from "../dist/github.js";
 import { withGitHubTransportObserver } from "../dist/github-client.js";
-import { graphDigest } from "../dist/graph-amendments.js";
+import { graphDigest, submitAmendment } from "../dist/graph-amendments.js";
 import { validateItem } from "../dist/item-steps.js";
 import {
   addWorktree,
@@ -107,6 +107,7 @@ import {
   charge,
   chargeRepair,
   consumption,
+  failureDigest,
   objectiveEvent,
   repairScopes,
   resolveAutonomy,
@@ -1365,6 +1366,33 @@ test("cancellation stops an owned shell and its process group", async () => {
       "Retained unresolved owned cancellation",
     );
     assert.equal(readState(config.repository, 1).cancelledAt, undefined);
+
+    // A drain during a rejection hold survives the replacement (#1645).
+    const [evidence, error, actor] = [["README.md"], "Refused", "operator"];
+    const [ownership, acceptance, dependencies] = [evidence, evidence, []];
+    const discovery = { scope: "in-scope", reason: "Restore", evidence };
+    Object.assign(discovery, { ownership, acceptance, dependencies, actor });
+    discovery.expectedGraphDigest = graphDigest(graph);
+    const held = structuredClone({ ...snapshot, cancelRequested: false });
+    held.coordinator.mode = "paused";
+    held.autonomy = resolveAutonomy({ allowances: { planningRevisions: 2 } });
+    const id = randomUUID();
+    held.pendingAmendment = { id, proposal: discovery, phase: "rejected" };
+    Object.assign(held.pendingAmendment, { rejectionStage: "compilation" });
+    Object.assign(held.pendingAmendment, {
+      error,
+      issueByItemId: { local: 2 },
+    });
+    setCoordinatorMode(held, "draining");
+    const correction = { kind: "planning-output", actor, diagnosis: "d" };
+    Object.assign(correction, { failureDigest: failureDigest(error) });
+    correction.correction = "c";
+    submitAmendment(held, {
+      ...discovery,
+      replacement: { amendmentId: id, correction },
+    });
+    assert.equal(held.pendingAmendment.phase, "ready");
+    assert.equal(held.coordinator.mode, "draining");
 
     // Actual pre-dispatch Codex receipts and owned homes exercise preparation
     // cancellation without native inference, GitHub calls or invented terminals.
