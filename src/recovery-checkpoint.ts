@@ -5,6 +5,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  copyFileSync,
   existsSync,
   fstatSync,
   fsyncSync,
@@ -662,6 +663,20 @@ export function recoveryCheckpointGitPackObservation(
   );
 }
 class CheckpointConflict extends Error {}
+/** An adopted verifier failed integrity; it and the sealed copy are discarded. */
+/**
+ * Local Git material differs from the ID or digest that names it, is missing
+ * from the read path, or cannot be read. Transport, cancellation and archive
+ * domain errors are never this class.
+ */
+class VerifierIntegrityFailure extends Error {}
+class AdoptedVerifierFailure extends Error {
+  constructor(readonly original: unknown) {
+    super("Adopted checkpoint verifier failed integrity", {
+      cause: original,
+    });
+  }
+}
 class CheckpointRestoreRequired extends Error {}
 /** An exactly fetched remote archive whose history does not contain a commit. */
 class CheckpointCommitAbsent extends Error {
@@ -749,6 +764,10 @@ interface QueueVerificationContext {
   objects?: Map<string, string>;
   objectBytes: number;
   negotiationTip?: string;
+  /** The sealed tip of a verifier adopted from an earlier process; see adoptRetainedVerifier. */
+  adoptedTip?: string;
+  /** This verifier started from the sealed copy; see adoptRetainedVerifier. */
+  adopted?: boolean;
   baseIdentity?: VerifiedBaseIdentity;
   baseIdentityBytes?: number;
   publisherObjects?: Map<string, string>;
@@ -1017,6 +1036,7 @@ function paths(repository: string) {
     root,
     journal: join(root, "checkpoint.json"),
     git: join(root, "git.git"),
+    verifier: join(root, "verifier.git"),
     mutationGuard: join(root, ".checkpoint.guard"),
     publicationGuard: join(root, ".publication.guard"),
   };
@@ -1634,7 +1654,11 @@ export function withQueueControlVerification<T>(
     verification.closed = true;
     try {
       await verification.serial;
-      if (verification.directory && !verification.quarantined)
+      if (
+        verification.directory &&
+        !verification.quarantined &&
+        !(await retainVerifier(input.config, verification))
+      )
         rmSync(verification.directory, { recursive: true, force: true });
     } catch (error) {
       if (!failed) {
@@ -1650,6 +1674,8 @@ export function withQueueControlVerification<T>(
       delete verification.queueValidationBytes;
       delete verification.objects;
       delete verification.negotiationTip;
+      delete verification.adoptedTip;
+      delete verification.adopted;
       delete verification.baseIdentity;
       delete verification.baseIdentityBytes;
       delete verification.publisherObjects;
@@ -3876,7 +3902,7 @@ export function readRecoveryCheckpointBodies(
           .update(bytes)
           .digest("hex") !== oid
       )
-        throw new Error(
+        throw new VerifierIntegrityFailure(
           "Fetched checkpoint body failed exact digest verification",
         );
       cursor++;
@@ -3952,6 +3978,81 @@ export function recoveryCheckpointClosureDigest(
 ): string {
   return hash(closureIdentity(closure));
 }
+/**
+ * Read Git objects and re-hash each one from its content against its ID. Git
+ * does not re-hash objects on ordinary reads, and a verifier may start from a
+ * sealed local copy whose objects this process did not fetch, so every
+ * commit, tree and manifest an archive read resolves paths through is checked
+ * here before use; bodies are checked against their digests when read. A
+ * missing selector returns undefined.
+ */
+function authenticatedObjects(
+  directory: string,
+  options: GitPersistenceConfig,
+  selectors: string[],
+): ({ oid: string; type: string; bytes: Buffer } | undefined)[] {
+  if (!selectors.length) return [];
+  assertProcessActive();
+  let packet: Buffer;
+  try {
+    packet = git(
+      directory,
+      options,
+      ["cat-file", "--batch"],
+      selectors.map((selector) => `${selector}\n`).join(""),
+    );
+  } catch (error) {
+    // Git exited with a status: an unreadable or corrupt local object. A
+    // timeout or signal has no status and stays what it is.
+    if (typeof (error as { status?: unknown } | null)?.status === "number")
+      throw new VerifierIntegrityFailure("Archive Git object is unreadable", {
+        cause: error,
+      });
+    throw error;
+  }
+  let cursor = 0;
+  const objects = selectors.map(() => {
+    const end = packet.indexOf(10, cursor);
+    if (end === -1)
+      throw new VerifierIntegrityFailure(
+        "Archive Git object packet is incomplete",
+      );
+    const header = packet.subarray(cursor, end).toString("utf8");
+    cursor = end + 1;
+    if (header.endsWith(" missing")) return undefined;
+    const [oid, type, rawSize] = header.split(" ");
+    const size = Number(rawSize);
+    if (
+      !oid ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid) ||
+      !type ||
+      !Number.isSafeInteger(size) ||
+      size < 0
+    )
+      throw new VerifierIntegrityFailure(
+        "Archive Git object header is invalid",
+      );
+    const bytes = packet.subarray(cursor, cursor + size);
+    cursor += size;
+    if (
+      bytes.length !== size ||
+      packet[cursor++] !== 10 ||
+      createHash(oid.length === 40 ? "sha1" : "sha256")
+        .update(`${type} ${size}\0`)
+        .update(bytes)
+        .digest("hex") !== oid
+    )
+      throw new VerifierIntegrityFailure(
+        "Archive Git object differs from its ID",
+      );
+    return { oid, type, bytes };
+  });
+  if (cursor !== packet.length)
+    throw new VerifierIntegrityFailure(
+      "Archive Git object packet has extra bytes",
+    );
+  return objects;
+}
 function readArchive(
   directory: string,
   commitSha: string,
@@ -3968,10 +4069,29 @@ function readArchive(
   originalManifestBytes: Buffer;
   payloadDigest: string;
 } {
-  const manifestBytes = git(directory, options, [
-    "show",
-    `${commitSha}:checkpoint.json`,
-  ]);
+  // The commit, both trees and the manifest every path below resolves
+  // through, each checked against its ID.
+  const [commit, tree, blobs, manifestObject] = authenticatedObjects(
+    directory,
+    options,
+    [
+      commitSha,
+      `${commitSha}^{tree}`,
+      `${commitSha}:blobs`,
+      `${commitSha}:checkpoint.json`,
+    ],
+  );
+  if (
+    commit?.type !== "commit" ||
+    commit.oid !== commitSha ||
+    tree?.type !== "tree" ||
+    (blobs && blobs.type !== "tree") ||
+    manifestObject?.type !== "blob"
+  )
+    throw new VerifierIntegrityFailure(
+      "Archive commit objects are missing or of another type",
+    );
+  const manifestBytes = manifestObject.bytes;
   const manifest = JSON.parse(
     new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes),
   );
@@ -4327,6 +4447,22 @@ function observeQueueAncestry(
       "Cached queue witness is absent from exact first-parent ancestry",
     );
   const commits = completeCommits.slice(prefixIndex + 1);
+  // Each manifest below is found through its commit and root tree.
+  const linked = authenticatedObjects(
+    directory,
+    options,
+    commits.flatMap((sha) => [sha, `${sha}^{tree}`]),
+  );
+  if (
+    linked.some(
+      (object, index) =>
+        object?.type !== (index % 2 ? "tree" : "commit") ||
+        (index % 2 === 0 && object.oid !== commits[index / 2]),
+    )
+  )
+    throw new VerifierIntegrityFailure(
+      "Queue lineage commit objects are missing or differ",
+    );
   const inventory = `${commits.map((sha) => `${sha}:checkpoint.json`).join("\n")}\n`;
   const metadata = git(
     directory,
@@ -4391,7 +4527,9 @@ function observeQueueAncestry(
         .update(bytes)
         .digest("hex") !== identities[index]!.oid
     )
-      throw new Error("Queue lineage manifest Git identity differs");
+      throw new VerifierIntegrityFailure(
+        "Queue lineage manifest Git identity differs",
+      );
     entries.push(
       Object.freeze({
         commit,
@@ -4593,7 +4731,9 @@ function observeQueueAncestry(
         `${commit}:blobs/${ref.digest}`,
       ]);
       if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
-        throw new Error("Queue lineage original failed exact verification");
+        throw new VerifierIntegrityFailure(
+          "Queue lineage original failed exact verification",
+        );
       if (retain(bytes.length + Buffer.byteLength(key)))
         originals.set(key, bytes);
       return bytes;
@@ -4832,7 +4972,9 @@ function reuseQueueLineage(
       ? observation.readOriginal(commit, ref)
       : git(directory, options, ["show", `${commit}:blobs/${ref.digest}`]);
     if (bytes.length !== ref.bytes || hash(bytes) !== ref.digest)
-      throw new Error("Queue lineage original failed exact verification");
+      throw new VerifierIntegrityFailure(
+        "Queue lineage original failed exact verification",
+      );
     const existing = originals.get(ref.digest);
     if (existing && canonical(existing) !== canonical(ref))
       throw new Error("Queue lineage reference binding differs");
@@ -5070,7 +5212,9 @@ function assertVerifierUnchanged(
  * touching its file times (loose or packed) without rewriting it, so a file
  * whose type, device, inode, mode and size are unchanged but whose times moved
  * only invalidates the cached body facts: the caller then re-authenticates
- * every byte it uses. Any other change or removal still refuses.
+ * every byte it uses. A removed file or directory does the same: packing the
+ * publisher (see packPublisher) moves loose objects into a pack without
+ * changing any object. Any other change still refuses.
  */
 function publisherMaterialCurrent(
   current: Map<string, string> | undefined,
@@ -5085,6 +5229,10 @@ function publisherMaterialCurrent(
         .slice(0, identity.startsWith("d:") ? 4 : 5)
         .join(":");
     const now = current.get(path);
+    if (now === undefined) {
+      unchanged = false;
+      continue;
+    }
     if (stable(now) !== stable(identity))
       throw new Error(
         "Checkpoint publisher contains altered or missing object material",
@@ -5531,13 +5679,18 @@ function refreshProducedPublisherTrees(
   for (const oid of oids) {
     const path = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
     if (!prior.has(path) || prior.get(path) === material.get(path)) continue;
+    if (!material.has(path)) {
+      // Packed since it was cached: the next parent check re-authenticates.
+      delete context.publisherObjects;
+      delete context.publisherObjectBytes;
+      return;
+    }
     const bytes = git(directory, options, ["cat-file", "tree", oid]);
     if (
       createHash(oid.length === 40 ? "sha1" : "sha256")
         .update(`tree ${bytes.length}\0`)
         .update(bytes)
-        .digest("hex") !== oid ||
-      !material.has(path)
+        .digest("hex") !== oid
     )
       throw new Error("Produced publisher tree failed exact integrity");
     prior.set(path, material.get(path)!);
@@ -5573,7 +5726,7 @@ async function freshArchiveOwned(
     }),
   );
   observed.start("archive-and-final-validation");
-  const read = () =>
+  const strict = () =>
     freshArchiveOwnedStrict(
       config,
       options,
@@ -5584,6 +5737,15 @@ async function freshArchiveOwned(
       context,
       candidateAck,
     );
+  // An adopted verifier that failed integrity has already been discarded
+  // with the sealed copy; the read is repeated once from an empty verifier.
+  const read = () =>
+    strict().catch((error: unknown) => {
+      if (!(error instanceof AdoptedVerifierFailure)) throw error;
+      return strict().catch((again: unknown) => {
+        throw again instanceof AdoptedVerifierFailure ? again.original : again;
+      });
+    });
   const result = await (async () => {
     try {
       const result =
@@ -5656,6 +5818,187 @@ function verifierDirectory(repository: string): string {
     `verify-${process.pid}-${self?.startTime ?? "0"}-${randomUUID()}.git`,
   );
 }
+/**
+ * One installation keeps a sealed copy of the remote-only verifier of its
+ * last closed controller, so a new process fetches only what is new instead
+ * of the whole archive. Processes running as the installation's user are
+ * trusted: they can already rewrite Factory's code, configuration and
+ * credentials. What the copy must survive is accidental change and
+ * corruption. The seal detects change cheaply; every commit, tree and
+ * manifest a read uses is re-hashed against its ID (authenticatedObjects) and
+ * every body against its digest, so the remote's exact tip hash still fixes
+ * what is read. Objects fetched in this process are strictly checked as
+ * before. No process
+ * writes the sealed copy: each controller copies its object files into its
+ * own verifier, so concurrent processes each start from it, and a closing
+ * controller replaces it by atomic renames. A replaced copy takes a
+ * `verify-<uuid>.git` name, which the sweep removes.
+ */
+const VERIFIER_SEAL = "factory-verifier.json";
+/**
+ * At close, consolidate a verifier holding more than this many object files
+ * (loose objects and pack files) into one pack. A cold start compares and
+ * copies every file, and each in-process fetch below Git's unpack limit adds
+ * loose objects, so this keeps a cold start to a few files. Comparing 256
+ * files takes well under a millisecond; the repack reuses existing deltas
+ * and takes under a second for a 65 MB archive.
+ */
+const VERIFIER_CONSOLIDATE_FILES = 256;
+/** Seal a settled verifier as the installation's copy; false removes it. */
+async function retainVerifier(
+  config: FactoryConfig,
+  verification: QueueVerificationContext,
+): Promise<boolean> {
+  const directory = verification.directory;
+  const options = settings(config);
+  const tip = verification.negotiationTip;
+  if (
+    !directory ||
+    !options ||
+    !verification.objects ||
+    !tip ||
+    verification.key !== verificationKey(config, options)
+  )
+    return false;
+  try {
+    // Only the exact material this controller authenticated is sealed.
+    assertRemoteOnlyVerifier(directory, options);
+    let objects = scanVerifierObjects(directory, options);
+    assertVerifierUnchanged(objects, verification.objects);
+    if (
+      [...objects!.values()].filter((identity) => identity.startsWith("f:"))
+        .length > VERIFIER_CONSOLIDATE_FILES
+    ) {
+      // A local rewrite of already authenticated objects. The verifier has no
+      // refs, so --keep-unreachable is what keeps every object.
+      await gitRemote(directory, options, [
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "repack.writeBitmaps=false",
+        "repack",
+        "-a",
+        "-d",
+        "-q",
+        "--keep-unreachable",
+      ]);
+      objects = scanVerifierObjects(directory, options);
+      if (!objects) return false;
+    }
+    writeAtomic(join(directory, VERIFIER_SEAL), {
+      key: hash(verification.key),
+      tip,
+      objects: [...objects!],
+    });
+    const shared = paths(config.repository).verifier;
+    const replaced = join(dirname(shared), `verify-${randomUUID()}.git`);
+    try {
+      renameSync(shared, replaced);
+    } catch {
+      // None sealed yet.
+    }
+    // A copy another process sealed meanwhile is kept instead.
+    renameSync(directory, shared);
+    rmSync(replaced, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+/**
+ * Start this controller's verifier from the installation's sealed copy. It is
+ * copied only when its seal names this exact binding and every object file is
+ * the one sealed (type, device, inode, mode, size and times), before and after
+ * copying; only object files are copied, and the Git metadata is this
+ * verifier's own. Any difference discards the sealed copy, and the read
+ * starts from an empty verifier with a full strict fetch; so does a read of
+ * it that fails integrity, once (see AdoptedVerifierFailure).
+ */
+function adoptRetainedVerifier(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  context: QueueVerificationContext,
+  directory: string,
+): void {
+  const shared = paths(config.repository).verifier;
+  if (!existsSync(shared)) return;
+  try {
+    const seal = JSON.parse(
+      privateFile(join(shared, VERIFIER_SEAL)).toString("utf8"),
+    );
+    const stat = lstatSync(shared);
+    if (
+      !stat.isDirectory() ||
+      stat.uid !== process.getuid?.() ||
+      stat.mode & 0o077 ||
+      seal?.key !== hash(context.key) ||
+      typeof seal.tip !== "string" ||
+      !/^[a-f0-9]{40,64}$/.test(seal.tip) ||
+      !Array.isArray(seal.objects) ||
+      !seal.objects.every(
+        (entry: unknown) =>
+          Array.isArray(entry) &&
+          entry.length === 2 &&
+          entry.every((part) => typeof part === "string"),
+      )
+    )
+      throw new Error("Retained verifier seal differs");
+    const sealed = new Map<string, string>(seal.objects);
+    assertRemoteOnlyVerifier(shared, options);
+    assertVerifierUnchanged(scanVerifierObjects(shared, options), sealed);
+    initializeGit(directory, options);
+    chmodSync(directory, 0o700);
+    for (const [path, identity] of sealed) {
+      assertProcessActive();
+      if (identity.startsWith("d:"))
+        mkdirSync(join(directory, path), { recursive: true, mode: 0o700 });
+      else
+        copyFileSync(
+          join(shared, path),
+          join(directory, path),
+          constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE,
+        );
+    }
+    assertVerifierUnchanged(scanVerifierObjects(shared, options), sealed);
+    assertRemoteOnlyVerifier(directory, options);
+    const objects = scanVerifierObjects(directory, options);
+    if (!objects) throw new Error("Retained verifier exceeds the scan budget");
+    const objectBytes = [...objects].reduce(
+      (sum, [key, value]) =>
+        sum + Buffer.byteLength(key) + Buffer.byteLength(value),
+      0,
+    );
+    if (
+      verificationMetadataBytes(context) + objectBytes >
+      verificationMetadataBudget(options)
+    )
+      throw new Error("Retained verifier exceeds the metadata budget");
+    context.objects = objects;
+    context.objectBytes = objectBytes;
+    retainVerifiedNegotiationTip(context, options, seal.tip);
+    if (context.negotiationTip === seal.tip) context.adoptedTip = seal.tip;
+  } catch {
+    delete context.objects;
+    context.objectBytes = 0;
+    delete context.negotiationTip;
+    delete context.adoptedTip;
+    rmSync(directory, { recursive: true, force: true });
+    discardSharedVerifier(config.repository);
+  }
+}
+/** A changed, corrupt or failing sealed copy is not offered again. */
+function discardSharedVerifier(repository: string): void {
+  const shared = paths(repository).verifier;
+  const discarded = join(dirname(shared), `verify-${randomUUID()}.git`);
+  try {
+    renameSync(shared, discarded);
+    rmSync(discarded, { recursive: true, force: true });
+  } catch {
+    // Already replaced or removed by another process.
+  }
+}
 async function freshArchiveOwnedStrict(
   config: FactoryConfig,
   options: GitPersistenceConfig,
@@ -5667,9 +6010,12 @@ async function freshArchiveOwnedStrict(
   candidateAck = false,
 ) {
   const directory = context?.directory ?? verifierDirectory(config.repository);
+  const adopt = Boolean(context && !context.directory);
   if (context) context.directory = directory;
   let settled = true;
   let hintUsed = false;
+  let verifierAdopted = false;
+  let fetchSkipped = false;
   let observedTip: string | undefined;
   let semanticBodyReads:
     | { refs: number; bytes: number; fallback: boolean }
@@ -5685,6 +6031,8 @@ async function freshArchiveOwnedStrict(
       selectedCommit: expectedCommit ?? observedTip ?? "unobserved",
       remoteTip: observedTip ?? "unobserved",
       negotiationHintArgument: hintUsed,
+      verifierAdopted,
+      fetchSkipped,
       lineageEntries: context?.lineages.size ?? 0,
       referenceEntries: context?.content.size ?? 0,
       metadataBytes: context ? verificationMetadataBytes(context) : 0,
@@ -5703,6 +6051,15 @@ async function freshArchiveOwnedStrict(
   );
   observed.start("prior-material");
   try {
+    if (adopt && context) {
+      adoptRetainedVerifier(config, options, context, directory);
+      // Kept for this verifier's whole life: corruption a later read reaches
+      // in adopted material also discards the sealed copy.
+      context.adopted = Boolean(context.adoptedTip);
+    }
+    const adoptedTip = context?.adoptedTip;
+    verifierAdopted = Boolean(adoptedTip);
+    if (context) delete context.adoptedTip;
     initializeGit(directory, options);
     if (context) chmodSync(directory, 0o700);
     if (context) assertRemoteOnlyVerifier(directory, options);
@@ -5731,29 +6088,92 @@ async function freshArchiveOwnedStrict(
     // round trip. A failed or missing-ref fetch never grants access to an old
     // FETCH_HEAD; every check below uses only this settled successful fetch.
     observed.start("fetch");
-    await gitRemote(directory, options, [
-      "-c",
-      "gc.auto=0",
-      "-c",
-      "maintenance.auto=false",
-      "-c",
-      "fetch.fsckObjects=true",
-      "-c",
-      "transfer.fsckObjects=true",
-      "fetch",
-      "--no-tags",
-      "--no-append",
-      ...(negotiationTip ? [`--negotiation-tip=${negotiationTip}`] : []),
-      "--",
-      options.remote,
-      options.ref,
-    ]);
+    // A cold start on an adopted verifier whose sealed tip is still the
+    // remote's exact ref needs no fetch: the fresh exact ref observation
+    // names that commit ID, which fixes every reachable object by hash, and
+    // every object this read uses is re-hashed against its ID before use
+    // (see authenticatedObjects). The ref observation is then this read's
+    // remote observation boundary. Any other tip, an absent ref or an
+    // absent commit fetches as usual.
+    const holdsCommit = (commit: string) => {
+      try {
+        return (
+          git(directory, options, ["cat-file", "-t", commit])
+            .toString("utf8")
+            .trim() === "commit"
+        );
+      } catch {
+        return false;
+      }
+    };
+    const unchangedTip =
+      adoptedTip &&
+      negotiationTip === adoptedTip &&
+      (await remoteTip(directory, options)) === adoptedTip &&
+      holdsCommit(adoptedTip)
+        ? adoptedTip
+        : undefined;
+    fetchSkipped = Boolean(unchangedTip);
+    if (!unchangedTip)
+      try {
+        await gitRemote(directory, options, [
+          "-c",
+          "gc.auto=0",
+          "-c",
+          "maintenance.auto=false",
+          "-c",
+          "fetch.fsckObjects=true",
+          "-c",
+          "transfer.fsckObjects=true",
+          "fetch",
+          "--no-tags",
+          "--no-append",
+          ...(negotiationTip ? [`--negotiation-tip=${negotiationTip}`] : []),
+          "--",
+          options.remote,
+          options.ref,
+        ]);
+      } catch (error) {
+        // The fetch's connectivity walk reads adopted objects, so a failure
+        // there may be local corruption. Only a failed local connectivity
+        // check of the verified tip (an exit status, not a timeout) makes it
+        // an integrity failure; anything else stays the fetch's own error.
+        if (
+          !context?.adopted ||
+          !negotiationTip ||
+          error instanceof UnsettledSubprocessError
+        )
+          throw error;
+        try {
+          await gitRemote(directory, options, [
+            "fsck",
+            "--connectivity-only",
+            "--no-reflogs",
+            "--no-dangling",
+            negotiationTip,
+          ]);
+        } catch (check) {
+          if (check instanceof UnsettledSubprocessError) throw check;
+          if (
+            check instanceof ArchiveTransportFailure &&
+            check.exitStatus !== null &&
+            !check.timedOut
+          )
+            throw new VerifierIntegrityFailure(
+              "Adopted verifier objects are not connected",
+              { cause: error },
+            );
+        }
+        throw error;
+      }
     if (context && context.key !== verificationKey(config, options))
       throw new Error("Queue verifier admitted binding changed during fetch");
     observed.start("fetched-material");
-    const tip = git(directory, options, ["rev-parse", "--verify", "FETCH_HEAD"])
-      .toString("utf8")
-      .trim();
+    const tip =
+      unchangedTip ??
+      git(directory, options, ["rev-parse", "--verify", "FETCH_HEAD"])
+        .toString("utf8")
+        .trim();
     if (
       !/^[a-f0-9]{40,64}$/.test(tip) ||
       git(directory, options, ["cat-file", "-t", tip])
@@ -6126,6 +6546,11 @@ async function freshArchiveOwnedStrict(
     return result;
   } catch (error) {
     observed.fail(error);
+    // Adopted material that failed integrity is not offered again. Any other
+    // failure (transport, cancellation, archive domain) keeps the sealed copy.
+    const adoptedIntegrity =
+      context?.adopted === true && error instanceof VerifierIntegrityFailure;
+    if (adoptedIntegrity) discardSharedVerifier(config.repository);
     if (error instanceof UnsettledSubprocessError) {
       settled = false;
       if (context) {
@@ -6168,6 +6593,8 @@ async function freshArchiveOwnedStrict(
         // Keep the failed verifier quarantined and preserve the original error.
       }
     }
+    if (adoptedIntegrity && settled && !context.quarantined)
+      throw new AdoptedVerifierFailure(error);
     throw error;
   } finally {
     if (settled && !context)
@@ -6872,11 +7299,109 @@ function coverDisposals(): void {
   const disposals = scopes.getStore()?.disposals;
   if (disposals) disposals.covered = true;
 }
+/**
+ * The publisher writes every body, tree and commit as a loose object and
+ * holds no refs, so Git's own repack and gc would pack nothing; left alone it
+ * grows to many times the packed archive. After an acknowledged publication,
+ * once it holds at least PUBLISHER_LOOSE_THRESHOLD loose objects, one pass
+ * packs a bounded batch of exactly those objects and then removes only loose
+ * copies that a pack now holds (`git prune-packed`). No object, pack or ref
+ * is ever dropped, so material an unacknowledged or in-flight publication
+ * needs stays available. The pass holds the publication lock, so no
+ * publication in any process sees the store change under it, and it runs
+ * after the publication's own critical section, so it never delays that
+ * acknowledgment. Each pass is bounded by PUBLISHER_PACK_OBJECTS and
+ * PUBLISHER_PACK_BYTES (a few seconds) and by the transport timeout, so a
+ * large existing loose store is drained over several publications instead of
+ * stalling one. A failed or interrupted pass leaves every object in place.
+ *
+ * 2048 loose objects is about one hour of a busy installation's publications
+ * and a few hundred MB of loose bodies; Git's own `gc.auto` default is 6700.
+ * The batch packs 4096 objects of a few hundred MB in about two seconds.
+ */
+const PUBLISHER_LOOSE_THRESHOLD = 2048;
+const PUBLISHER_PACK_OBJECTS = 4096;
+const PUBLISHER_PACK_BYTES = 256 * 1024 * 1024;
+async function packPublisher(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+): Promise<void> {
+  const p = paths(config.repository);
+  const loose: string[] = [];
+  const batch: string[] = [];
+  const observed = checkpointObservation(
+    config,
+    "recovery-checkpoint-publisher-pack",
+    () => ({ looseObjects: loose.length, packedObjects: batch.length }),
+  );
+  try {
+    await withCheckpointPublication(p.publicationGuard, async () => {
+      const objects = join(p.git, "objects");
+      for (const prefix of readdirSync(objects).sort()) {
+        if (!/^[a-f0-9]{2}$/.test(prefix)) continue;
+        for (const name of readdirSync(join(objects, prefix)).sort())
+          if (/^(?:[a-f0-9]{38}|[a-f0-9]{62})$/.test(name))
+            loose.push(`${prefix}${name}`);
+      }
+      if (loose.length < PUBLISHER_LOOSE_THRESHOLD) return;
+      observed.start("pack");
+      // A pass stopped by its timeout leaves only its temporary files, a
+      // pack Git renamed into place before its index, or an index companion
+      // without its pack; no reader uses any of them.
+      const packs = readdirSync(join(objects, "pack"));
+      for (const name of packs)
+        if (
+          name.startsWith("tmp_") ||
+          (/^pack-[a-f0-9]+\.pack$/.test(name) &&
+            !packs.includes(name.replace(/\.pack$/, ".idx"))) ||
+          (/^pack-[a-f0-9]+\.(?:rev|keep)$/.test(name) &&
+            !packs.includes(name.replace(/\.(?:rev|keep)$/, ".pack")))
+        )
+          rmSync(join(objects, "pack", name), { force: true });
+      let bytes = 0;
+      for (const oid of loose) {
+        if (
+          batch.length >= PUBLISHER_PACK_OBJECTS ||
+          bytes >= PUBLISHER_PACK_BYTES
+        )
+          break;
+        bytes += lstatSync(join(objects, oid.slice(0, 2), oid.slice(2))).size;
+        batch.push(oid);
+      }
+      const local = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+      await gitRemote(
+        p.git,
+        options,
+        [...local, "pack-objects", "-q", join(objects, "pack", "pack")],
+        batch.map((oid) => `${oid}\n`).join(""),
+      );
+      await gitRemote(p.git, options, [...local, "prune-packed", "-q"]);
+      observed.complete();
+    });
+  } catch (error) {
+    // Packing only saves space; the publication is already acknowledged.
+    observed.fail(error);
+  }
+}
 async function publishCheckpoint(
   config: FactoryConfig,
   input: CheckpointAdmissionInput & {
     buildClosure?: () => Promise<RecoveryCheckpointClosure>;
   },
+): Promise<RecoveryCheckpointStatus> {
+  const packed = { acknowledged: false };
+  const result = await publishCheckpointLocked(config, input, packed);
+  const options = settings(config);
+  if (options && packed.acknowledged) await packPublisher(config, options);
+  return result;
+}
+async function publishCheckpointLocked(
+  config: FactoryConfig,
+  input: CheckpointAdmissionInput & {
+    buildClosure?: () => Promise<RecoveryCheckpointClosure>;
+  },
+  /** Set once this call acknowledged its own publication. */
+  packed: { acknowledged: boolean },
 ): Promise<RecoveryCheckpointStatus> {
   const options = settings(config);
   if (!options) return gitPersistenceStatus(config);
@@ -7406,6 +7931,7 @@ async function publishCheckpoint(
       );
       coverDisposals();
       completeCheckpointBasis(verification, full);
+      packed.acknowledged = true;
       return acknowledged;
     } catch (error) {
       if (error instanceof CheckpointRestart) throw error;
