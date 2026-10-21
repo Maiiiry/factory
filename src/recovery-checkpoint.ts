@@ -104,6 +104,26 @@ export interface RecoveryCheckpointGap {
   required?: boolean;
   /** For an `archived` gap: the commit that holds the complete evidence. */
   evidenceCommit?: string;
+  /** The archive epoch whose ref holds `evidenceCommit`; see ArchiveEpoch. */
+  evidenceEpoch?: number;
+}
+/**
+ * Archive history is split into epochs (#1657). Epoch 0 is the configured ref;
+ * epoch n > 0 is `<ref>-epoch-<n>`, rooted at a parentless commit that holds
+ * only the active checkpoint. `closed[j]` is the final checkpoint of epoch j,
+ * so a reader of epoch n can find any retired evidence on its own epoch's ref.
+ * Manifests of epoch 0 carry no epoch.
+ */
+export interface ArchiveEpoch {
+  number: number;
+  closed: string[];
+  /**
+   * Settled verified first-run cancellation proofs, by claim ID, that the
+   * publisher re-verified against the full history when it cut an epoch:
+   * the digest of each proof (lineageDigest). Reads accept exactly these
+   * instead of walking ancestry that the new root no longer reaches.
+   */
+  lineage?: Record<string, string>;
 }
 export interface RecoveryCheckpointClosure {
   files: RecoveryCheckpointFile[];
@@ -129,6 +149,8 @@ export interface RecoveryCheckpointManifest extends RecoveryCheckpointClosure {
    * individual historical records retain their original bindings.
    */
   authority?: RecoveryCheckpointAuthority;
+  /** Absent in epoch 0. */
+  epoch?: ArchiveEpoch;
 }
 export interface RecoveryCheckpointHostLayout {
   checkout: string;
@@ -774,6 +796,8 @@ interface QueueVerificationContext {
   adoptedTip?: string;
   /** This verifier started from the sealed copy; see adoptRetainedVerifier. */
   adopted?: boolean;
+  /** The archive epoch this verifier read, or -1 after reading across a cut. */
+  epoch?: number;
   baseIdentity?: VerifiedBaseIdentity;
   baseIdentityBytes?: number;
   publisherObjects?: Map<string, string>;
@@ -3594,10 +3618,50 @@ async function verifyDestination(
       "Private source repository knowledge cannot be published to a public archive",
     );
 }
-async function remoteTip(
+/** The epoch a manifest belongs to; manifests of epoch 0 carry none. */
+function manifestEpoch(value: { epoch?: unknown }): ArchiveEpoch {
+  if (value.epoch === undefined) return { number: 0, closed: [] };
+  keys(value.epoch, ["number", "closed"], ["lineage"]);
+  const epoch = value.epoch as unknown as ArchiveEpoch;
+  if (
+    epoch.lineage !== undefined &&
+    (!epoch.lineage ||
+      typeof epoch.lineage !== "object" ||
+      Array.isArray(epoch.lineage) ||
+      Object.entries(epoch.lineage).some(
+        ([claim, digest]) =>
+          !/^[a-f0-9-]{36}$/.test(claim) ||
+          typeof digest !== "string" ||
+          !/^[a-f0-9]{64}$/.test(digest),
+      ))
+  )
+    throw new Error("Checkpoint archive epoch is invalid");
+  if (
+    !Number.isSafeInteger(epoch.number) ||
+    epoch.number < 1 ||
+    !Array.isArray(epoch.closed) ||
+    epoch.closed.length !== epoch.number ||
+    epoch.closed.some(
+      (commit) =>
+        typeof commit !== "string" || !/^[a-f0-9]{40,64}$/.test(commit),
+    )
+  )
+    throw new Error("Checkpoint archive epoch is invalid");
+  return epoch;
+}
+/** Epoch 0 is the configured ref itself, so an existing archive is epoch 0. */
+function epochRef(options: GitPersistenceConfig, epoch: number): string {
+  return epoch ? `${options.ref}-epoch-${epoch}` : options.ref;
+}
+/**
+ * One ref observation of every archive epoch: the current epoch is the highest
+ * one present. A reader binds that choice to the fetched tip (see
+ * assertEpochHead), so a stale or forged epoch ref is refused, not read.
+ */
+async function archiveHead(
   directory: string,
   options: GitPersistenceConfig,
-): Promise<string | undefined> {
+): Promise<{ epoch: number; tip?: string; tips: Map<number, string> }> {
   const lines = (
     await gitRemote(directory, options, [
       "ls-remote",
@@ -3605,18 +3669,128 @@ async function remoteTip(
       "--",
       options.remote,
       options.ref,
+      `${options.ref}-epoch-*`,
     ])
   )
     .trim()
     .split("\n")
     .filter(Boolean);
-  if (!lines.length) return undefined;
-  if (lines.length !== 1)
-    throw new Error("Archive ref observation is ambiguous");
-  const [sha, ref] = lines[0]!.split("\t");
-  if (!sha || !/^[a-f0-9]{40,64}$/.test(sha) || ref !== options.ref)
-    throw new Error("Archive ref observation differs from exact binding");
-  return sha;
+  const tips = new Map<number, string>();
+  const prefix = `${options.ref}-epoch-`;
+  for (const line of lines) {
+    const [sha, ref] = line.split("\t");
+    // Patterns match ref tails; only the exact epoch names are this archive.
+    const epoch =
+      ref === options.ref
+        ? 0
+        : ref?.startsWith(prefix) &&
+            /^[1-9][0-9]{0,8}$/.test(ref.slice(prefix.length))
+          ? Number(ref.slice(prefix.length))
+          : undefined;
+    if (epoch === undefined) continue;
+    if (!sha || !/^[a-f0-9]{40,64}$/.test(sha) || tips.has(epoch))
+      throw new Error("Archive ref observation differs from exact binding");
+    tips.set(epoch, sha);
+  }
+  const epoch = Math.max(0, ...tips.keys());
+  return { epoch, tip: tips.get(epoch), tips };
+}
+async function remoteTip(
+  directory: string,
+  options: GitPersistenceConfig,
+): Promise<string | undefined> {
+  return (await archiveHead(directory, options)).tip;
+}
+/**
+ * The commit that closes an epoch: the next epoch's root commit with the
+ * closed epoch's final checkpoint as its parent. It is a fast-forward of the
+ * old epoch's ref, and its manifest names the next epoch, so a reader that
+ * reaches it through the old ref refuses it as stale. It is a pure function of
+ * the root and that final checkpoint, so a reader can recompute it.
+ */
+function closingCommit(root: Buffer, previous: string): Buffer {
+  const header = root.indexOf(10);
+  const text = root.toString("utf8");
+  if (
+    header < 0 ||
+    !/^tree [a-f0-9]{40,64}$/.test(root.subarray(0, header).toString("utf8")) ||
+    /^parent /m.test(text.slice(0, text.indexOf("\n\n")))
+  )
+    throw new Error("Archive epoch root commit is invalid");
+  return Buffer.concat([
+    root.subarray(0, header + 1),
+    Buffer.from(`parent ${previous}\n`),
+    root.subarray(header + 1),
+  ]);
+}
+function commitId(bytes: Buffer, like: string): string {
+  return createHash(like.length === 40 ? "sha1" : "sha256")
+    .update(`commit ${bytes.length}\0`)
+    .update(bytes)
+    .digest("hex");
+}
+/** A restoration read named a checkpoint outside the current epoch (#1657). */
+export class CheckpointInClosedEpoch extends Error {
+  readonly code = "checkpoint-in-closed-epoch";
+  constructor(readonly commit: string) {
+    super(
+      `Checkpoint ${commit} is not in the current archive epoch; closed epochs are read only for retired snapshots`,
+    );
+  }
+}
+/**
+ * Bind the epoch a read selected to its fetched tip, as the configured ref's
+ * tip is bound: the tip's manifest must name that epoch. An epoch whose tip is
+ * its closing commit has a newer epoch, so a stale ref is never read as
+ * current. The previous epoch's ref must also be exactly this epoch's closing
+ * commit, so a forged newer ref is refused too. Every object read is
+ * re-hashed.
+ */
+function assertEpochHead(
+  directory: string,
+  options: GitPersistenceConfig,
+  tip: string,
+  epoch: number,
+  head: Awaited<ReturnType<typeof archiveHead>>,
+): ArchiveEpoch {
+  const [commit, tree, manifest] = authenticatedObjects(directory, options, [
+    tip,
+    `${tip}^{tree}`,
+    `${tip}:checkpoint.json`,
+  ]);
+  if (
+    commit?.type !== "commit" ||
+    tree?.type !== "tree" ||
+    manifest?.type !== "blob"
+  )
+    throw new VerifierIntegrityFailure(
+      "Archive tip objects are missing or of another type",
+    );
+  const named = manifestEpoch(
+    JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(manifest.bytes),
+    ) as { epoch?: unknown },
+  );
+  if (named.number !== epoch)
+    throw new Error(
+      "Archive epoch ref was closed and its successor epoch is missing",
+    );
+  if (epoch === 0) return named;
+  const roots = git(directory, options, ["rev-list", "--max-parents=0", tip])
+    .toString("utf8")
+    .trim()
+    .split("\n");
+  const [root] = authenticatedObjects(directory, options, roots.slice(0, 1));
+  if (roots.length !== 1 || root?.type !== "commit")
+    throw new Error("Archive epoch has no single root commit");
+  if (
+    head.tips.get(epoch - 1) !==
+    commitId(closingCommit(root.bytes, named.closed[epoch - 1]!), root.oid)
+  )
+    throw new Error(
+      "Archive epoch does not continue its predecessor's closing commit",
+    );
+  return named;
 }
 function initializeGit(directory: string, options: GitPersistenceConfig): void {
   if (existsSync(directory)) {
@@ -3650,7 +3824,7 @@ function assertManifest(
       "contentRefs",
       "gaps",
     ],
-    ["gitObjects", "authority"],
+    ["gitObjects", "authority", "epoch"],
   );
   if (
     value.schemaVersion !== 1 ||
@@ -3667,6 +3841,7 @@ function assertManifest(
     throw new Error(
       "Checkpoint manifest is incomplete or outside its admitted binding",
     );
+  manifestEpoch(value);
   // Archive history is immutable: manifests published before publisher
   // authority existed stay readable; restoring their continuations is refused.
   if (options.scope === "private-history") {
@@ -3681,10 +3856,15 @@ function assertManifest(
     keys(
       gap,
       ["path", "reason", "availability"],
-      ["required", "evidenceCommit"],
+      ["required", "evidenceCommit", "evidenceEpoch"],
     );
     safePath(gap.path);
     if (
+      (gap.evidenceEpoch !== undefined &&
+        (gap.evidenceCommit === undefined ||
+          !Number.isSafeInteger(gap.evidenceEpoch) ||
+          (gap.evidenceEpoch as number) < 0 ||
+          (gap.evidenceEpoch as number) > manifestEpoch(value).number)) ||
       typeof gap.reason !== "string" ||
       !gap.reason ||
       typeof gap.availability !== "string" ||
@@ -4254,15 +4434,16 @@ function readArchive(
  * manifest against this binding, and each body against its digest. A missing
  * snapshot or evidence commit fails loudly.
  */
-function readArchivedSnapshots(
+async function readArchivedSnapshots(
   directory: string,
   commitSha: string,
   config: FactoryConfig,
   options: GitPersistenceConfig,
   manifest: RecoveryCheckpointManifest,
-): { file: RecoveryCheckpointFile; bytes: Uint8Array }[] {
+): Promise<{ file: RecoveryCheckpointFile; bytes: Uint8Array }[]> {
   const present = new Set(manifest.files.map((file) => file.path));
-  const byCommit = new Map<string, string[]>();
+  const current = manifestEpoch(manifest);
+  const byEpoch = new Map<number, Map<string, string[]>>();
   for (const gap of manifest.gaps)
     if (
       gap.availability === ARCHIVED_EVIDENCE &&
@@ -4270,11 +4451,91 @@ function readArchivedSnapshots(
       gap.evidenceCommit &&
       /^objectives\/[1-9][0-9]*\/state\.json$/.test(gap.path) &&
       !present.has(gap.path)
-    )
+    ) {
+      const epoch = gap.evidenceEpoch ?? current.number;
+      const byCommit = byEpoch.get(epoch) ?? new Map<string, string[]>();
+      byEpoch.set(epoch, byCommit);
       byCommit.set(gap.evidenceCommit, [
         ...(byCommit.get(gap.evidenceCommit) ?? []),
         gap.path,
       ]);
+    }
+  const snapshots: { file: RecoveryCheckpointFile; bytes: Uint8Array }[] = [];
+  for (const [epoch, byCommit] of byEpoch)
+    snapshots.push(
+      ...(epoch === current.number
+        ? readSnapshotsAt(directory, commitSha, config, options, byCommit)
+        : await readClosedEpochSnapshots(
+            config,
+            options,
+            epoch,
+            current.closed[epoch]!,
+            byCommit,
+          )),
+    );
+  return snapshots;
+}
+/**
+ * Evidence retired in a closed epoch is on that epoch's ref, which a cold read
+ * never fetches. Restoration fetches only that epoch, strictly, into its own
+ * disposable verifier. The epoch's final checkpoint, named by the verified
+ * manifest, must be on the fetched ref, and the evidence commit in its
+ * history; every object read is re-hashed as below. An integrity failure
+ * discards that verifier and fetches the epoch in full once more.
+ */
+async function readClosedEpochSnapshots(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  epoch: number,
+  final: string,
+  byCommit: Map<string, string[]>,
+): Promise<{ file: RecoveryCheckpointFile; bytes: Uint8Array }[]> {
+  for (let attempt = 0; ; attempt++) {
+    const directory = verifierDirectory(config.repository);
+    try {
+      initializeGit(directory, options);
+      await gitRemote(directory, options, [
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "fetch.fsckObjects=true",
+        "-c",
+        "transfer.fsckObjects=true",
+        "fetch",
+        "--no-tags",
+        "--no-append",
+        "--",
+        options.remote,
+        epochRef(options, epoch),
+      ]);
+      const tip = git(directory, options, [
+        "rev-parse",
+        "--verify",
+        "FETCH_HEAD",
+      ])
+        .toString("utf8")
+        .trim();
+      if (!reachableFrom(directory, options, final, tip))
+        throw new Error(
+          "Closed archive epoch does not hold its final checkpoint",
+        );
+      return readSnapshotsAt(directory, final, config, options, byCommit);
+    } catch (error) {
+      if (attempt || !(error instanceof VerifierIntegrityFailure)) throw error;
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+}
+function readSnapshotsAt(
+  directory: string,
+  commitSha: string,
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  byCommit: Map<string, string[]>,
+): { file: RecoveryCheckpointFile; bytes: Uint8Array }[] {
   const selected: { file: RecoveryCheckpointFile; oid: string }[] = [];
   for (const [evidence, wanted] of byCommit) {
     if (!reachableFrom(directory, options, evidence, commitSha))
@@ -5970,6 +6231,8 @@ async function retainVerifier(
     !options ||
     !verification.objects ||
     !tip ||
+    verification.epoch === undefined ||
+    verification.epoch < 0 ||
     verification.key !== verificationKey(config, options)
   )
     return false;
@@ -6002,6 +6265,7 @@ async function retainVerifier(
     }
     writeAtomic(join(directory, VERIFIER_SEAL), {
       key: hash(verification.key),
+      epoch: verification.epoch,
       tip,
       objects: [...objects!],
     });
@@ -6034,6 +6298,8 @@ function adoptRetainedVerifier(
   options: GitPersistenceConfig,
   context: QueueVerificationContext,
   directory: string,
+  /** A copy sealed in an earlier epoch holds only retired history. */
+  epoch: number,
 ): void {
   const shared = paths(config.repository).verifier;
   if (!existsSync(shared)) return;
@@ -6047,6 +6313,7 @@ function adoptRetainedVerifier(
       stat.uid !== process.getuid?.() ||
       stat.mode & 0o077 ||
       seal?.key !== hash(context.key) ||
+      seal.epoch !== epoch ||
       typeof seal.tip !== "string" ||
       !/^[a-f0-9]{40,64}$/.test(seal.tip) ||
       !Array.isArray(seal.objects) ||
@@ -6165,8 +6432,13 @@ async function freshArchiveOwnedStrict(
   );
   observed.start("prior-material");
   try {
+    // One ref observation selects the current epoch; the fetched tip
+    // confirms it (assertEpochHead).
+    initializeGit(directory, options);
+    const head = await archiveHead(directory, options);
+    const epoch = head.epoch;
     if (adopt && context) {
-      adoptRetainedVerifier(config, options, context, directory);
+      adoptRetainedVerifier(config, options, context, directory, epoch);
       // Kept for this verifier's whole life: corruption a later read reaches
       // in adopted material also discards the sealed copy.
       context.adopted = Boolean(context.adoptedTip);
@@ -6223,7 +6495,7 @@ async function freshArchiveOwnedStrict(
     const unchangedTip =
       adoptedTip &&
       negotiationTip === adoptedTip &&
-      (await remoteTip(directory, options)) === adoptedTip &&
+      head.tip === adoptedTip &&
       holdsCommit(adoptedTip)
         ? adoptedTip
         : undefined;
@@ -6245,7 +6517,7 @@ async function freshArchiveOwnedStrict(
           ...(negotiationTip ? [`--negotiation-tip=${negotiationTip}`] : []),
           "--",
           options.remote,
-          options.ref,
+          epochRef(options, epoch),
         ]);
       } catch (error) {
         // The fetch's connectivity walk reads adopted objects, so a failure
@@ -6296,6 +6568,7 @@ async function freshArchiveOwnedStrict(
     )
       throw new Error("Fetched archive ref has no exact commit identity");
     observedTip = tip;
+    const tipEpoch = assertEpochHead(directory, options, tip, epoch, head);
     if (context) {
       assertRemoteOnlyVerifier(directory, options);
       const objects = scanVerifierObjects(directory, options);
@@ -6354,7 +6627,9 @@ async function freshArchiveOwnedStrict(
       expectedCommit &&
       !reachableFrom(directory, options, expectedCommit, tip)
     )
-      throw new CheckpointCommitAbsent(expectedCommit, tip);
+      throw archivedSnapshots && tipEpoch.number
+        ? new CheckpointInClosedEpoch(expectedCommit)
+        : new CheckpointCommitAbsent(expectedCommit, tip);
     const archive = {
       ...readArchive(directory, commit, config, options),
       commitSha: commit,
@@ -6590,6 +6865,12 @@ async function freshArchiveOwnedStrict(
           ? record.settled?.cancellation
           : undefined;
       if (proof?.lineage?.kind !== "verified-first-run") continue;
+      // Attested at an epoch cut, from history the new root no longer reaches.
+      if (
+        lineageRequest?.claimId !== record.id &&
+        archive.manifest.epoch?.lineage?.[record.id] === lineageDigest(proof)
+      )
+        continue;
       if (!record.settled?.runId)
         throw new Error(
           "Retained queue cancellation has no original run identity",
@@ -6615,7 +6896,7 @@ async function freshArchiveOwnedStrict(
       ...archive,
       ...(archivedSnapshots
         ? {
-            archivedSnapshots: readArchivedSnapshots(
+            archivedSnapshots: await readArchivedSnapshots(
               directory,
               commit,
               config,
@@ -6667,6 +6948,11 @@ async function freshArchiveOwnedStrict(
       rmSync(directory, { recursive: true, force: true });
       delete context.directory;
     }
+    // A verifier that read across a cut holds retired history; it is not
+    // sealed (-1), so the next process fetches the current epoch alone.
+    if (context)
+      context.epoch =
+        context.epoch === undefined || context.epoch === epoch ? epoch : -1;
     observed.complete();
     return result;
   } catch (error) {
@@ -7069,18 +7355,94 @@ function replicaAncestor(
 }
 /**
  * Whether `commit` is this installation's last acknowledged checkpoint or one
- * of its ancestors in the local replica (#1307 retention hardening).
+ * of its ancestors in the local replica (#1307 retention hardening), or in
+ * the history of an epoch that checkpoint closed (#1657).
  */
 export function acknowledgedArchiveCommit(
   config: FactoryConfig,
   commit: string,
 ): boolean {
+  return acknowledgedArchiveEpochs(config)(commit) !== undefined;
+}
+/** Per local replica: the epoch of one acknowledged manifest. */
+const acknowledgedEpochs = new Map<
+  string,
+  { commit: string; epoch: ArchiveEpoch; carried: Map<string, number> }
+>();
+/** Per local replica and closed epoch's final checkpoint: proven ancestry. */
+const closedHistory = new Map<string, Map<string, boolean>>();
+/**
+ * The archive epoch that holds a commit in this installation's acknowledged
+ * history, or undefined when it holds none. A closed epoch's history never
+ * changes, so its answers are kept.
+ */
+function acknowledgedArchiveEpochs(
+  config: FactoryConfig,
+): (commit: string) => number | undefined {
   const options = settings(config);
-  if (!options || options.scope !== "private-history") return false;
+  if (!options || options.scope !== "private-history") return () => undefined;
   const last = journal(config, options).lastAcknowledged?.commitSha;
-  if (!last) return false;
-  if (last === commit) return true;
+  if (!last) return () => undefined;
   const directory = paths(config.repository).git;
+  let known = acknowledgedEpochs.get(directory);
+  if (known?.commit !== last) {
+    try {
+      const manifest = JSON.parse(
+        git(directory, options, ["show", `${last}:checkpoint.json`]).toString(
+          "utf8",
+        ),
+      ) as RecoveryCheckpointManifest;
+      const epoch = manifestEpoch(manifest);
+      // A replica restored or rebuilt after a cut holds only the current
+      // epoch. Evidence the acknowledged manifest already places in a closed
+      // epoch stays acknowledged there.
+      const carried = new Map<string, number>();
+      for (const gap of manifest.gaps)
+        if (
+          gap.availability === ARCHIVED_EVIDENCE &&
+          gap.evidenceCommit &&
+          gap.evidenceEpoch !== undefined &&
+          gap.evidenceEpoch < epoch.number
+        )
+          carried.set(gap.evidenceCommit, gap.evidenceEpoch);
+      known = { commit: last, epoch, carried };
+    } catch {
+      // An unreadable manifest proves nothing now and is not cached.
+      return () => undefined;
+    }
+    acknowledgedEpochs.set(directory, known);
+  }
+  const { epoch, carried } = known;
+  return (commit) => {
+    const closed = carried.get(commit);
+    if (closed !== undefined) return closed;
+    if (acknowledgedCurrentCommit(directory, options, last, commit))
+      return epoch.number;
+    for (let index = epoch.closed.length - 1; index >= 0; index--) {
+      const final = epoch.closed[index]!;
+      const key = `${directory}\0${final}`;
+      const proven = closedHistory.get(key) ?? new Map<string, boolean>();
+      closedHistory.set(key, proven);
+      let ancestor = proven.get(commit);
+      if (ancestor === undefined) {
+        ancestor =
+          commit === final ||
+          replicaAncestor(directory, options, commit, final);
+        if (ancestor === undefined) continue;
+        proven.set(commit, ancestor);
+      }
+      if (ancestor) return index;
+    }
+    return undefined;
+  };
+}
+function acknowledgedCurrentCommit(
+  directory: string,
+  options: GitPersistenceConfig,
+  last: string,
+  commit: string,
+): boolean {
+  if (last === commit) return true;
   let known = acknowledgedHistory.get(directory);
   if (known?.tip !== last) {
     // Ancestry is transitive: when the earlier tip is an ancestor of the new
@@ -7516,6 +7878,146 @@ async function packPublisher(
     observed.fail(error);
   }
 }
+/**
+ * A publication starts a new archive epoch once this many Objectives retired
+ * in the current one (#1657). Retirement is the moment history becomes dead
+ * weight for a cold reader: the retired Objective's whole run stays in the
+ * epoch, and nothing but restoration ever reads it. A cut is cheap: the push
+ * carries one tree, one manifest and two commits, because every body is
+ * already on the remote, and the next cold read fetches only active work. So
+ * a cold read carries at most the runs of this many retired Objectives on top
+ * of active work, and the number of epoch refs (one per this many
+ * retirements) stays small. A count is deterministic and needs no byte
+ * measurement: logical sizes overstate Git's packed, deltified history many
+ * times over, and a packed size would need a walk of the whole epoch.
+ */
+const EPOCH_RETIREMENTS = 8;
+function retiredInEpoch(
+  closure: RecoveryCheckpointClosure,
+  epoch: number,
+): number {
+  const files = new Set(closure.files.map((file) => file.path));
+  return closure.gaps.filter(
+    (gap) =>
+      gap.availability === ARCHIVED_EVIDENCE &&
+      gap.evidenceEpoch === epoch &&
+      /^objectives\/[1-9][0-9]*\/state\.json$/.test(gap.path) &&
+      !files.has(gap.path),
+  ).length;
+}
+function lineageDigest(proof: {
+  lineage: unknown;
+  originalClaim: ContentRef;
+  initialSnapshot: ContentRef;
+}): string {
+  return hash(
+    canonical([proof.lineage, proof.originalClaim, proof.initialSnapshot]),
+  );
+}
+/**
+ * A settled verified first-run cancellation is re-verified on every read from
+ * first-parent history, which a new epoch root cuts. At a cut the publisher
+ * re-verifies each such proof against the base in its local archive copy and
+ * attests its digest (ArchiveEpoch.lineage); one the base epoch already
+ * attests is carried. No epoch starts while an unsettled claim without a run
+ * binding may still request lineage, or when any proof does not verify.
+ */
+async function epochLineage(
+  config: FactoryConfig,
+  options: GitPersistenceConfig,
+  directory: string,
+  base: string,
+  attested: ArchiveEpoch["lineage"],
+): Promise<Record<string, string> | undefined> {
+  const { localQueueHistory } = await import("./project-queue-state.js");
+  const lineage: Record<string, string> = {};
+  let observation: QueueAncestryObservation | undefined;
+  try {
+    for (const record of localQueueHistory(config)) {
+      if (record.kind !== "project-queue-owner" || record.runBinding) continue;
+      if (!record.settled) return undefined;
+      const proof = record.settled.cancellation;
+      if (proof?.lineage?.kind !== "verified-first-run") continue;
+      const digest = lineageDigest(proof);
+      if (attested?.[record.id] !== digest) {
+        observation ??= observeQueueAncestry(directory, options, config, base);
+        const verified = queueOwnerLineage(
+          options,
+          config,
+          base,
+          {
+            objective: record.objective,
+            claimId: record.id,
+            runId: record.settled.runId!,
+          },
+          undefined,
+          observation,
+        );
+        if (
+          lineageDigest({
+            lineage: {
+              kind: "verified-first-run",
+              checkpoints: verified.checkpoints,
+            },
+            originalClaim: verified.originalClaim,
+            initialSnapshot: verified.initialSnapshot,
+          }) !== digest
+        )
+          return undefined;
+      }
+      lineage[record.id] = digest;
+    }
+  } catch (error) {
+    if (error instanceof UnsettledSubprocessError) throw error;
+    return undefined;
+  }
+  return lineage;
+}
+/**
+ * An epoch cut moves two refs in one atomic push. A remote that refuses
+ * atomic pushes (a dry run's exit status) leaves this publication uncut.
+ */
+async function atomicPushAccepted(
+  directory: string,
+  options: GitPersistenceConfig,
+  base: string,
+  epoch: number,
+): Promise<boolean> {
+  try {
+    await gitRemote(directory, options, [
+      "push",
+      "--porcelain",
+      "--dry-run",
+      "--atomic",
+      "--",
+      options.remote,
+      `${base}:${epochRef(options, epoch)}`,
+      `${base}:${epochRef(options, epoch + 1)}`,
+    ]);
+    return true;
+  } catch (error) {
+    if (error instanceof UnsettledSubprocessError) throw error;
+    return false;
+  }
+}
+/** Name the epoch that holds each archived gap's evidence commit. */
+function withEvidenceEpochs<T extends RecoveryCheckpointClosure>(
+  config: FactoryConfig,
+  closure: T,
+): T {
+  const epochOf = acknowledgedArchiveEpochs(config);
+  return {
+    ...closure,
+    gaps: closure.gaps.map((gap) => {
+      const { evidenceEpoch: _prior, ...rest } = gap;
+      const epoch =
+        gap.availability === ARCHIVED_EVIDENCE && gap.evidenceCommit
+          ? epochOf(gap.evidenceCommit)
+          : undefined;
+      return epoch === undefined ? rest : { ...rest, evidenceEpoch: epoch };
+    }),
+  };
+}
 async function publishCheckpoint(
   config: FactoryConfig,
   input: CheckpointAdmissionInput & {
@@ -7605,13 +8107,26 @@ async function publishCheckpointLocked(
         const parents = [
           ...commit.toString("utf8").matchAll(/^parent ([a-f0-9]{40,64})$/gm),
         ].map((match) => match[1]);
+        // A new epoch's root names its base only as the closed epoch's end.
+        const epochRoot =
+          previous.base !== undefined &&
+          parents.length === 0 &&
+          manifestEpoch(
+            JSON.parse(
+              git(p.git, options, [
+                "show",
+                `${previous.candidate}:checkpoint.json`,
+              ]).toString("utf8"),
+            ),
+          ).closed.at(-1) === previous.base;
         if (
           createHash(previous.candidate.length === 40 ? "sha1" : "sha256")
             .update(`commit ${commit.length}\0`)
             .update(commit)
             .digest("hex") !== previous.candidate ||
-          canonical(parents) !==
-            canonical(previous.base ? [previous.base] : []) ||
+          (canonical(parents) !==
+            canonical(previous.base ? [previous.base] : []) &&
+            !epochRoot) ||
           previous.base !== record.lastAcknowledged?.commitSha
         )
           throw new Error(
@@ -7695,7 +8210,7 @@ async function publishCheckpointLocked(
       const local = await withFiniteCheckpointReads(
         config,
         async () => {
-          const closure = await buildScoped();
+          const closure = withEvidenceEpochs(config, await buildScoped());
           const currentRecord = journal(config, options);
           assertRetentionResolved(currentRecord);
           const manifest: RecoveryCheckpointManifest = {
@@ -7850,7 +8365,8 @@ async function publishCheckpointLocked(
       }
       // A verified immutable parent is not live remote authority. The existing
       // fresh pre-push exact-ref check below still admits the sole publication.
-      const base = reusedParent ? knownBase : await remoteTip(p.git, options);
+      const head = reusedParent ? undefined : await archiveHead(p.git, options);
+      const base = reusedParent ? knownBase : head!.tip;
       let verifiedBaseEntries: { ref: ContentRef; oid: string }[] = [];
       if (base) {
         if (!record.lastAcknowledged) {
@@ -7878,7 +8394,7 @@ async function publishCheckpointLocked(
             "--no-tags",
             "--",
             options.remote,
-            options.ref,
+            epochRef(options, head!.epoch),
           ]);
         const fetched = reusedParent
           ? base
@@ -7918,6 +8434,44 @@ async function publishCheckpointLocked(
         throw new CheckpointConflict(
           "Acknowledged archive ref is missing; no branch recreation is admitted",
         );
+      // The acknowledged base names its epoch. Once enough Objectives retired
+      // in it, this publication starts the next epoch (see EPOCH_RETIREMENTS).
+      const [baseManifest] = base
+        ? authenticatedObjects(p.git, options, [`${base}:checkpoint.json`])
+        : [];
+      if (base && baseManifest?.type !== "blob")
+        throw new Error("Acknowledged base manifest is unavailable");
+      const baseEpoch = manifestEpoch(
+        baseManifest ? JSON.parse(baseManifest.bytes.toString("utf8")) : {},
+      );
+      if (head && head.epoch !== baseEpoch.number)
+        throw new CheckpointConflict(
+          "Remote archive epoch differs from the acknowledged base",
+        );
+      // The replica now holds the base, so gaps a cold closure could not
+      // place get their epoch here.
+      manifest.gaps = withEvidenceEpochs(config, manifest).gaps;
+      const lineage =
+        base !== undefined &&
+        options.scope === "private-history" &&
+        retiredInEpoch(manifest, baseEpoch.number) >= EPOCH_RETIREMENTS
+          ? await epochLineage(config, options, p.git, base, baseEpoch.lineage)
+          : undefined;
+      const cutRefused =
+        lineage !== undefined &&
+        !(await atomicPushAccepted(p.git, options, base!, baseEpoch.number));
+      const cut = lineage !== undefined && !cutRefused;
+      const epoch: ArchiveEpoch = cut
+        ? {
+            number: baseEpoch.number + 1,
+            closed: [...baseEpoch.closed, base!],
+            ...(Object.keys(lineage).length ? { lineage } : {}),
+          }
+        : baseEpoch;
+      if (epoch.number) {
+        manifest.epoch = epoch;
+        assertManifest(manifest, manifest.binding, options);
+      }
       const manifestBytes = Buffer.from(canonical(manifest));
       const manifestBlob = git(
         p.git,
@@ -7977,12 +8531,27 @@ async function publishCheckpointLocked(
           "user.email=checkpoint@factory.invalid",
           "commit-tree",
           tree,
-          ...(base ? ["-p", base] : []),
+          ...(base && !cut ? ["-p", base] : []),
         ],
         "Factory exact recovery checkpoint\n",
       )
         .toString("utf8")
         .trim();
+      // A new epoch's root has no parent; its closing commit fast-forwards the
+      // old epoch's ref, and both refs move in one atomic push.
+      const closing = cut
+        ? git(
+            p.git,
+            options,
+            ["hash-object", "-w", "-t", "commit", "--stdin"],
+            closingCommit(
+              git(p.git, options, ["cat-file", "commit", candidate]),
+              base!,
+            ),
+          )
+            .toString("utf8")
+            .trim()
+        : undefined;
       const attempt: CheckpointAttempt = {
         ...(base ? { base } : {}),
         candidate,
@@ -8031,6 +8600,9 @@ async function publishCheckpointLocked(
           reason: input.reason,
           sequence: attempt.sequence,
           candidate: attempt.candidate,
+          epoch: epoch.number,
+          epochCut: cut,
+          epochCutRefused: cutRefused,
         }),
       );
       submittedObservation.start("push");
@@ -8038,9 +8610,19 @@ async function publishCheckpointLocked(
         await gitRemote(p.git, options, [
           "push",
           "--porcelain",
-          "--",
-          options.remote,
-          `${candidate}:${options.ref}`,
+          ...(closing
+            ? [
+                "--atomic",
+                "--",
+                options.remote,
+                `${candidate}:${epochRef(options, epoch.number)}`,
+                `${closing}:${epochRef(options, baseEpoch.number)}`,
+              ]
+            : [
+                "--",
+                options.remote,
+                `${candidate}:${epochRef(options, epoch.number)}`,
+              ]),
         ]);
       } catch (error) {
         submittedObservation.fail(error);

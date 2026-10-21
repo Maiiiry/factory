@@ -7390,6 +7390,151 @@ test("stopped collection freezes a completed owned local return before restart a
   assert.equal(complete.status, "acknowledged");
   assert.equal(complete.pendingChanges, false);
   assert((await archivedAccounting()).includes(later));
+  // Archive epochs (#1657): once 8 Objectives retired in an epoch, the next
+  // publication roots a new epoch ref at active work only. The old ref only
+  // fast-forwards to its closing commit; nothing is force-pushed.
+  const remoteGit = (...args) =>
+    execFileSync("git", ["--git-dir", remote, ...args], {
+      encoding: "utf8",
+    }).trim();
+  const snapshots = new Map();
+  for (let objective = 2; objective <= 9; objective++) {
+    const terminal = structuredClone(readState(repository, 1));
+    Object.assign(terminal, {
+      objective,
+      cancelledAt: new Date().toISOString(),
+    });
+    terminal.graph.objective = objective;
+    terminal.planGraphDigest = graphDigest(terminal.graph);
+    terminal.approvedPlaybookAdmission.graphDigest = terminal.planGraphDigest;
+    // History only: no live worker return or session.
+    delete terminal.work.local.execution;
+    terminal.agentSessions = {};
+    saveState(statePath(repository, objective), terminal);
+    snapshots.set(objective, readFileSync(statePath(repository, objective)));
+  }
+  const retiring = await publish("explicit");
+  appendFromWorker("epoch-cut");
+  const cut = await publish("explicit");
+  const epochRef = "refs/heads/history-epoch-1";
+  const root = remoteGit("rev-parse", epochRef);
+  assert.equal(root, cut.lastAcknowledged.commitSha);
+  assert.equal(remoteGit("rev-list", "--count", root), "1");
+  assert.equal(
+    remoteGit("rev-parse", "refs/heads/history^"),
+    retiring.lastAcknowledged.commitSha,
+  );
+  assert.equal(
+    remoteGit("rev-parse", "refs/heads/history^{tree}"),
+    remoteGit("rev-parse", `${root}^{tree}`),
+  );
+  // A cold verifier fetches only the current epoch: the copy sealed after it
+  // holds exactly the epoch's objects, far fewer than all history.
+  const objectCount = (tip) =>
+    Number(remoteGit("rev-list", "--objects", "--count", tip));
+  const sealed = join(privateRoot, "recovery", "verifier.git");
+  rmSync(sealed, { recursive: true, force: true });
+  await withRecoveryCheckpointControllerVerification(
+    { config, buildClosure: racingBuild },
+    () => readVerifiedRecoveryCheckpoint(config),
+  );
+  assert.equal(
+    execFileSync(
+      "git",
+      ["--git-dir", sealed, "cat-file", "--batch-all-objects", "--batch-check"],
+      { encoding: "utf8" },
+    )
+      .trim()
+      .split("\n").length,
+    objectCount(root),
+  );
+  assert(objectCount(root) < objectCount("refs/heads/history"));
+  // Restoration reads retired snapshots from the closed epoch's ref on demand.
+  const restored = await readVerifiedRecoveryCheckpoint(
+    config,
+    undefined,
+    undefined,
+    true,
+  );
+  assert.equal(restored.commitSha, root);
+  assert.deepEqual(
+    restored.archivedSnapshots
+      .map(({ file, bytes }) => [file.path, Buffer.from(bytes)])
+      .sort(),
+    [...snapshots].map(([objective, bytes]) => [
+      `objectives/${objective}/state.json`,
+      bytes,
+    ]),
+  );
+  // Restoring a checkpoint of the closed epoch by SHA is a structured refusal.
+  await assert.rejects(
+    readVerifiedRecoveryCheckpoint(
+      config,
+      retiring.lastAcknowledged.commitSha,
+      undefined,
+      true,
+    ),
+    { code: "checkpoint-in-closed-epoch" },
+  );
+  // A stale pointer is refused: without the new ref, the old ref's tip is its
+  // closing commit, which names the missing epoch.
+  remoteGit("update-ref", "-d", epochRef);
+  await assert.rejects(
+    readVerifiedRecoveryCheckpoint(config),
+    /successor epoch is missing/,
+  );
+  remoteGit("update-ref", epochRef, root);
+  appendFromWorker("after-epoch-cut");
+  const next = await publish("explicit");
+  assert.equal(
+    remoteGit("rev-parse", `${epochRef}^`),
+    root,
+    "publication continues the new epoch as a fast-forward",
+  );
+  assert.equal(
+    remoteGit("rev-parse", epochRef),
+    next.lastAcknowledged.commitSha,
+  );
+  // A host restored after the cut holds only the current epoch, yet its
+  // publications keep each retired Objective's evidence in its closed epoch.
+  rmSync(privateRoot, { recursive: true, force: true });
+  const restoredHost = await restoreRecoveryCheckpoint({
+    config,
+    checkpoint: next.lastAcknowledged.commitSha,
+  });
+  assert.equal(restoredHost.checkpoint, next.lastAcknowledged.commitSha);
+  // Its publisher is a fresh process with an empty replica.
+  appendFromWorker("restored-host");
+  execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { synchronizeRecoveryCheckpoint } from ${JSON.stringify(
+        new URL("../dist/recovery-checkpoint.js", import.meta.url).href,
+      )};import { buildRecoveryCheckpointClosure } from ${JSON.stringify(
+        new URL("../dist/recovery-checkpoint-closure.js", import.meta.url).href,
+      )};const config=${JSON.stringify(
+        config,
+      )};await synchronizeRecoveryCheckpoint(config,{reason:"explicit",buildClosure:()=>buildRecoveryCheckpointClosure({config})});`,
+    ],
+    { stdio: "pipe", timeout: 60000 },
+  );
+  const republished = await readVerifiedRecoveryCheckpoint(config);
+  assert.equal(
+    republished.commitSha,
+    gitPersistenceStatus(config).lastAcknowledged.commitSha,
+  );
+  assert.notEqual(republished.commitSha, next.lastAcknowledged.commitSha);
+  assert.deepEqual(
+    [...snapshots.keys()].map(
+      (objective) =>
+        republished.manifest.gaps.find(
+          (gap) => gap.path === `objectives/${objective}/state.json`,
+        )?.evidenceEpoch,
+    ),
+    [...snapshots.keys()].map(() => 0),
+  );
 });
 
 // A real finite process writes the failure result a provider stop produces.
