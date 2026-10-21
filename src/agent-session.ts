@@ -812,6 +812,8 @@ export async function settleAbandonedPlanningTurn(
         ref.scope.role === "planning" && ref.currentTurn?.invocationId === id,
     );
   let invocationId: string;
+  // Whether an owner step still runs to recover a completed result.
+  let recoverable = true;
   let abandon: () => void;
   let restore: () => void;
   if (isPreparationState(state)) {
@@ -853,40 +855,71 @@ export async function settleAbandonedPlanningTurn(
     };
   } else {
     if (state.finalAcceptance || state.objectiveClosure === "complete") return;
+    // The owned diagnosis is the item's current one or, once its attempt was
+    // archived (an amendment's reattempt), only an archived copy (#1674).
+    const holders = (work: (typeof state.work)[string]) =>
+      work.recovery ? [work.recovery, ...(work.recovery.history ?? [])] : [];
     const [itemId, diagnosed] =
-      Object.entries(state.work).find(([, work]) => {
-        const id = work.recovery?.diagnosisInvocation?.id;
-        return id !== undefined && owner(id) !== undefined;
-      }) ?? [];
-    const recovery = diagnosed?.recovery;
-    const invocation = recovery?.diagnosisInvocation;
+      Object.entries(state.work).find(([, work]) =>
+        holders(work).some((holder) => {
+          const id = holder.diagnosisInvocation?.id;
+          return id !== undefined && owner(id) !== undefined;
+        }),
+      ) ?? [];
+    if (!diagnosed) return;
+    const invocation = holders(diagnosed).find(
+      (holder) =>
+        holder.diagnosisInvocation &&
+        owner(holder.diagnosisInvocation.id) !== undefined,
+    )?.diagnosisInvocation;
     if (
-      !recovery ||
       !invocation?.submitted ||
       invocation.response !== undefined ||
       invocation.nativeReturns?.length
     )
       return;
     invocationId = invocation.id;
+    const current =
+      diagnosed.recovery!.diagnosisInvocation?.id === invocationId;
+    // Only a failed item's current diagnosis is recovered by its step.
+    recoverable = current && diagnosed.status === "failed";
+    const copies = holders(diagnosed).filter(
+      (holder) =>
+        holder.diagnosisInvocation?.id === invocationId &&
+        holder.diagnosisInvocation.response === undefined,
+    );
+    const archived = copies.map((holder) => holder.diagnosisInvocation);
     let undoMarker: (() => void) | undefined;
     abandon = () => {
-      undoMarker = settleInterruptedPaidCall(
-        state,
-        { item: itemId! },
-        "diagnose",
-      );
-      recovery.diagnosisInvocation = abandonedDiagnosis(invocation);
+      // An archived attempt's step records were cleared with it.
+      if (current)
+        undoMarker = settleInterruptedPaidCall(
+          state,
+          { item: itemId! },
+          "diagnose",
+        );
+      for (const holder of copies)
+        holder.diagnosisInvocation = abandonedDiagnosis(
+          holder.diagnosisInvocation!,
+        );
     };
     restore = () => {
       undoMarker?.();
-      recovery.diagnosisInvocation = invocation;
+      copies.forEach((holder, index) => {
+        holder.diagnosisInvocation = archived[index];
+      });
     };
   }
   const turn = owner(invocationId);
   if (!turn) return;
   if (turn.status !== "in-flight") {
-    // A completed turn its adapter still holds is recovered by its owner.
-    if (turn.status === "ready" && turn.currentTurn!.terminal === "completed")
+    // A completed turn its adapter still holds is recovered by its owner,
+    // unless no owner step runs to recover it.
+    if (
+      recoverable &&
+      turn.status === "ready" &&
+      turn.currentTurn!.terminal === "completed"
+    )
       return;
     abandon();
     save();

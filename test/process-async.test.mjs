@@ -17,7 +17,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { readAccountingRecords } from "../dist/accounting.js";
-import { agentSessionContinuation } from "../dist/agent-session.js";
+import {
+  agentSessionContinuation,
+  settleAbandonedPlanningTurn,
+} from "../dist/agent-session.js";
 import { analyzeInteractions, renderAnalysis } from "../dist/analysis.js";
 import { runAnalysisCommand } from "../dist/analysis-cli.js";
 import { readInteractionContent } from "../dist/capture.js";
@@ -105,6 +108,7 @@ import {
 } from "../dist/qa.js";
 import { preflightItemEnvironment } from "../dist/qa-execution.js";
 import {
+  archiveAttempt,
   charge,
   chargeRepair,
   consumption,
@@ -3785,6 +3789,18 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       readState(config.repository, 3).work.local,
       held.work.local,
     );
+    // An amendment's reattempt leaves it held; when the reattempt fails, only
+    // the archived copy remains, and the run settles its completed turn (#1674).
+    const { history } = archiveAttempt(structuredClone(held.work.local));
+    held.work.local = { status: "failed", recovery: { history } };
+    const [turn, _] = [Object.values(held.agentSessions)[0], () => {}];
+    turn.status = "ready";
+    turn.currentTurn = { ...turn.currentTurn, terminal: "completed" };
+    turn.currentTurn.resources = "settled";
+    await settleAbandonedPlanningTurn(held, { reconcileSession: _ }, _);
+    assert.deepEqual(history.at(-1).diagnosisInvocation.abandoned, [
+      lostDiagnosis,
+    ]);
     saveState(statePath(config.repository, 3), unbound);
     assert.equal(retryWorkItem(retryConfig, 3, "local"), "attempt");
     const settledRetry = readState(config.repository, 3);
@@ -3801,14 +3817,21 @@ console.log(JSON.stringify({receipt: process.argv[2] === "escape" ? "../receipt.
       /diagnosis/,
     );
     // An archived diagnosis whose native return was retained but never
-    // answered keeps its refs and no longer holds the handoff (#1674).
-    settledRetry.work.local.recovery.history.at(-1).diagnosisInvocation = {
-      id: lostDiagnosis,
-      submitted: true,
-      nativeReturns: [
-        { digest: "b".repeat(64), bytes: 2, mediaType: "application/json" },
-      ],
-    };
+    // answered stays in history only, keeps its refs, holds no handoff.
+    const archived = archiveAttempt({
+      status: "failed",
+      recovery: {
+        diagnosisInvocation: {
+          id: lostDiagnosis,
+          submitted: true,
+          nativeReturns: [
+            { digest: "b".repeat(64), bytes: 2, mediaType: "application/json" },
+          ],
+        },
+      },
+    });
+    assert.equal(archived.diagnosisInvocation, undefined);
+    settledRetry.work.local.recovery.history.push(...archived.history);
     assert.doesNotMatch(
       restoredContinuationOwnershipHold(settledRetry, true) ?? "",
       /diagnosis/,
