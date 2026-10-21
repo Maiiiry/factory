@@ -1644,6 +1644,8 @@ export interface ProjectQueueExpectedTarget {
 export type ProjectQueueAction =
   | { action: "ensure-card"; issueNodeId: string }
   | { action: "set-metadata"; itemId: string; metadata: string }
+  /** Archives an Objective card that no current admission binds. */
+  | { action: "archive-card"; itemId: string }
   | {
       action: "set-admission-fields";
       itemId: string;
@@ -1665,6 +1667,7 @@ export type ProjectQueueItemSelector =
   | { resultOf: string };
 export type ProjectQueuePlannedAction =
   | { action: "ensure-card"; issueNodeId: string }
+  | { action: "archive-card"; target: { itemId: string } }
   | {
       action: "set-metadata";
       target: ProjectQueueItemSelector;

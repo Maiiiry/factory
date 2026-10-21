@@ -169,7 +169,7 @@ export interface QueueOperation {
   binding: ProjectQueueBinding;
   authorityDigest: string;
   at: string;
-  action: "admit" | "withdraw" | "control" | "roadmap";
+  action: "admit" | "withdraw" | "control" | "roadmap" | "archive";
   /** Original explicit local operation; these historical receipts never supply membership. */
   approval: {
     kind: "queue-command" | "background-setup" | "proposal";
@@ -645,7 +645,7 @@ export function parseQueueRecord(
     ]);
     if (
       row.kind !== "project-queue-operation" ||
-      !["admit", "withdraw", "control", "roadmap"].includes(
+      !["admit", "withdraw", "control", "roadmap", "archive"].includes(
         String(row.action),
       ) ||
       typeof row.scope !== "string" ||
@@ -1610,6 +1610,7 @@ function producer(
   if (
     !last ||
     last.intent.action === "ensure-card" ||
+    last.intent.action === "archive-card" ||
     (record.action === "admit"
       ? last.intent.action !== "set-admission-fields" ||
         last.intent.order !== record.order
@@ -1908,7 +1909,7 @@ export function verifyQueueInspection(
           !member ||
           member.itemId !== inspection.target.itemId ||
           member.archived !== inspection.target.archived)) ||
-      (!inspection.target && member)
+      (!inspection.target && member && !member.archived)
     )
       throw new Error(
         "Issue membership differs from the inspected exact target",
@@ -2351,7 +2352,8 @@ function assertCommandRecipe(
         (step.action !== "set-metadata" ||
           !("itemId" in step.target) ||
           step.target.itemId !== first.binding.controlItemId)) ||
-      (operation.action === "withdraw" && step.action !== "set-metadata")
+      (operation.action === "withdraw" && step.action !== "set-metadata") ||
+      (operation.action === "archive") !== (step.action === "archive-card")
     )
       throw new Error(
         "Command effect differs from its immutable operation header",
@@ -2371,7 +2373,9 @@ function assertCommandRecipe(
         ? ["ensure-card", "set-admission-fields"]
         : operation.action === "roadmap"
           ? ["ensure-card"]
-          : ["set-metadata"];
+          : operation.action === "archive"
+            ? ["archive-card"]
+            : ["set-metadata"];
     if (JSON.stringify(actualActions) !== JSON.stringify(actions))
       throw new Error(
         "Command must declare every admission effect and operation",
