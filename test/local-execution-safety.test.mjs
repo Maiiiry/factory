@@ -109,8 +109,10 @@ import {
 } from "../dist/workflow-reflection.js";
 import {
   archiveAttempt,
+  archiveUncorrectedAttempt,
   consumption,
   resolveAutonomy,
+  retainedFailedResultFor,
 } from "../dist/repair-policy.js";
 import { materializeGraphExpansion } from "../dist/graph-expansion.js";
 import { authenticateExpansionInputs } from "../dist/runner/expansion.js";
@@ -2977,6 +2979,73 @@ test("private handoffs retain exact source bytes and scoped DAG knowledge across
       ),
       /Worker produced no repository change/,
     );
+    // A diagnosed repair of a failed validation command may be environmental:
+    // the unchanged result is collected for validation again (#1665). A review
+    // refusal, or a retry without a correction, still stops as no change.
+    const archived = (failure, correction) =>
+      retainedFailedResultFor({
+        history: [
+          {
+            work: {
+              status: "failed",
+              step: "validate",
+              attempt: refusedCandidate.attemptId,
+              changeRef: refusedCandidate.commitSha,
+              treeSha: refusedCandidate.treeSha,
+            },
+            failure: { classification: "implementation", ...failure },
+            ...(correction && { correction }),
+          },
+        ],
+      });
+    const correction = { kind: "implementation" };
+    const commandFailure = { validationCaptureDigest: "a".repeat(64) };
+    assert.equal(archived(commandFailure, correction).revalidate, true);
+    assert.equal(archived(commandFailure).revalidate, undefined);
+    assert.equal(
+      archived({ semanticRefusal: {} }, correction).revalidate,
+      undefined,
+    );
+    // A diagnosis the controller stopped before admitting it leaves its
+    // correction on the failed attempt; a plain retry is not that repair.
+    const retried = retainedFailedResultFor(
+      archiveUncorrectedAttempt({
+        status: "failed",
+        step: "validate",
+        attempt: refusedCandidate.attemptId,
+        changeRef: refusedCandidate.commitSha,
+        treeSha: refusedCandidate.treeSha,
+        recovery: {
+          failure: { classification: "implementation", ...commandFailure },
+          correction,
+          phase: "stopped",
+        },
+      }),
+    );
+    assert.equal(retried.commitSha, refusedCandidate.commitSha);
+    assert.equal(retried.revalidate, undefined);
+    await assert.rejects(
+      collectWorktreeResult(
+        checkout,
+        continued.worktree,
+        { ...continued.request, retainedFailedResult: retried },
+        store,
+        { evidence: { finalResponse: "Nothing left to change." } },
+      ),
+      /Worker produced no repository change/,
+    );
+    const resubmitted = await collectWorktreeResult(
+      checkout,
+      continued.worktree,
+      {
+        ...continued.request,
+        retainedFailedResult: { ...refusedCandidate, revalidate: true },
+      },
+      store,
+      { evidence: { finalResponse: "The environment was fixed." } },
+    );
+    assert.equal(resubmitted.treeSha, refusedCandidate.treeSha);
+    assert.equal(git(continued.worktree, "rev-parse", "HEAD^"), loaded.baseSha);
     // Rereview archives the current attempt while its execution, and the
     // retained result it continued from, stay: the state still saves.
     {

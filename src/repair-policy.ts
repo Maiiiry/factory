@@ -591,6 +591,35 @@ export function archiveAttempt(work: WorkState): WorkRecovery {
   };
 }
 /**
+ * Archive an attempt for a retry or a replanned attempt, which admit no
+ * correction. A correction still on a failed attempt was never admitted
+ * (admission archives the attempt and leaves the item pending), so it is
+ * not archived as the repair of that failure.
+ */
+export function archiveUncorrectedAttempt(work: WorkState): WorkRecovery {
+  if (work.status !== "failed" || !work.recovery?.correction)
+    return archiveAttempt(work);
+  const { correction: _unadmitted, ...recovery } = work.recovery;
+  return {
+    ...archiveAttempt({ ...work, recovery }),
+    ...(recovery.phase === "ready" && { phase: "stopped" }),
+  };
+}
+
+/** An archived failed result, and whether it may be resubmitted unchanged. */
+export interface RetainedFailedResult {
+  attemptId: string;
+  commitSha: string;
+  treeSha: string;
+  /**
+   * A validation command refused it and a diagnosed repair corrected that:
+   * the correction may be environmental, so returning it unchanged
+   * resubmits it for validation and review instead of failing (#1665).
+   */
+  revalidate?: true;
+}
+
+/**
  * The exact unpublished failed result the next attempt continues from: a
  * wrong result refused at validation, retried or repaired with an
  * implementation correction. A planning correction changes the approach, so
@@ -598,7 +627,7 @@ export function archiveAttempt(work: WorkState): WorkRecovery {
  */
 function retainedFailedResultContext(
   prior: NonNullable<WorkRecovery["history"]>[number] | undefined,
-): { attemptId: string; commitSha: string; treeSha: string } | undefined {
+): RetainedFailedResult | undefined {
   const work = prior?.work;
   if (
     prior?.failure?.classification !== "implementation" ||
@@ -617,6 +646,11 @@ function retainedFailedResultContext(
     attemptId: work.attempt,
     commitSha: work.changeRef,
     treeSha: work.treeSha,
+    ...(prior.correction !== undefined &&
+      prior.failure.validationCaptureDigest !== undefined &&
+      prior.failure.semanticRefusal === undefined && {
+        revalidate: true as const,
+      }),
   };
 }
 
@@ -631,7 +665,7 @@ function retainedFailedResultContext(
 export function retainedFailedResultFor(
   recovery: WorkRecovery | undefined,
   attempt?: string,
-): { attemptId: string; commitSha: string; treeSha: string } | undefined {
+): RetainedFailedResult | undefined {
   if (!recovery || recovery.freshBase) return undefined;
   const history = recovery.history ?? [];
   for (let index = history.length - 1; index >= 0; index--) {
