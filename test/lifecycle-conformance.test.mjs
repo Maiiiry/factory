@@ -658,6 +658,16 @@ const LIVE_RUN_ROWS = [
     bound: LIVE.settle,
   },
   {
+    // An auxiliary step holds the loop past the deadline's timer; the final
+    // admission, outside the deadline, still settles the run (#1743).
+    name: "settling past its deadline under a live service",
+    phase: "running",
+    build: completedState,
+    reach: "settling",
+    live: {},
+    settles: true,
+  },
+  {
     name: "planning under a live service run",
     phase: "planning",
     build: () => undefined,
@@ -1530,6 +1540,11 @@ function liveServices(composed, config, directory) {
         if (state?.objectiveClosure !== "complete")
           return target.objective(number);
         writeFileSync(join(directory, `settling-${number}`), "");
+        if (existsSync(join(directory, "held"))) {
+          rmSync(join(directory, "held"));
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_500);
+          throw new Error("fixture");
+        }
         const signal = currentProcessSignal();
         return new Promise((_, reject) =>
           signal?.addEventListener("abort", () => reject(signal.reason), {
@@ -1796,6 +1811,7 @@ else {
       if (state)
         saveState(statePath(fixture.config.repository, objective), state);
       rmSync(join(fixture.directory, "stalled"), { force: true });
+      if (row.settles) writeFileSync(join(fixture.directory, "held"), "");
       const service = owner(fixture, "live", 0);
       try {
         assert.equal(await service.ready(), "live");
@@ -1809,6 +1825,20 @@ else {
             assert(elapsed < (row.bound ?? LIVE.upgrade), `${elapsed} ms`);
           });
         }
+        if (row.settles)
+          await t.test(`${row.name} / live / settled`, async () => {
+            const up = new Promise((resolve) =>
+              setTimeout(resolve, 3_000, "up"),
+            );
+            assert.equal(await Promise.race([service.exited, up]), "up");
+            const { result } = await requestControl(fixture.config.repository, {
+              objective: 0,
+              action: "status",
+            });
+            assert(
+              !result.waitingObjectives?.some((w) => w.objective === objective),
+            );
+          });
       } finally {
         await service.stop();
       }
