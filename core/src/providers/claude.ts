@@ -1,16 +1,12 @@
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
-  realpathSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isAbsolute, join, resolve } from "node:path";
 import type {
   Options,
   Query,
@@ -20,11 +16,13 @@ import type {
   SDKSystemMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { isRecord } from "../planning/graph.js";
+import { workerEnvironment } from "../worktree.js";
 import {
   callImages,
   detail,
-  loggedCall,
   IdleWatchdog,
+  loggedCall,
   type ModelChoice,
   modelChoice,
   type Planner,
@@ -41,7 +39,7 @@ export interface ClaudePlannerOptions extends PlannerModels<ClaudeEffort> {
   maxOutputTokens?: number;
 }
 
-const DEFAULT_MAX_OUTPUT_TOKENS = 64000;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 64000;
 
 export const DEFAULT_CLAUDE_MODELS: ClaudePlannerOptions = {
   planner: { model: "claude-opus-5-5", effort: "medium" },
@@ -66,7 +64,7 @@ function modelResponseTimeoutMs(reasoningEffort?: string): number {
   );
 }
 /** The quiet bound while a read tool runs. */
-const ACTIVE_TOOL_IDLE_MS = 45 * 60 * 1_000;
+export const ACTIVE_TOOL_IDLE_MS = 45 * 60 * 1_000;
 /** How long a rate or usage limit with no reset time waits before a retry. */
 const LIMIT_WAIT_MS = 15 * 60 * 1_000;
 
@@ -113,10 +111,6 @@ const UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
 ]);
 const SCHEMA_MAPS = new Set(["properties", "$defs", "definitions"]);
 const SCHEMA_LISTS = new Set(["anyOf", "allOf"]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
 
 /** An array the shared schema fixes to exactly this many entries. */
 function exactLength(schema: Record<string, unknown>): number | undefined {
@@ -383,22 +377,6 @@ const CLAUDE_NETWORK_ENVIRONMENT = [
   "NODE_EXTRA_CA_CERTS",
 ];
 
-const BASE_ENVIRONMENT = new Set([
-  "PATH",
-  "HOME",
-  "USER",
-  "LOGNAME",
-  "LANG",
-  "TERM",
-  "TMPDIR",
-  "TMP",
-  "TEMP",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_STATE_HOME",
-  "XDG_RUNTIME_DIR",
-]);
-
 /** Claude login values a supervised service may load with LoadCredential. */
 const CLAUDE_LOGIN_CREDENTIALS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -411,7 +389,7 @@ const CLAUDE_LOGIN_CREDENTIALS = [
  * them; only the Claude SDK child receives them. An unreadable or invalid
  * credential holds with its name.
  */
-function serviceLoginEnvironment(): Record<string, string> {
+export function serviceLoginEnvironment(): Record<string, string> {
   const directory = process.env.CREDENTIALS_DIRECTORY;
   const env: Record<string, string> = {};
   if (!directory || !isAbsolute(directory)) return env;
@@ -437,71 +415,23 @@ function serviceLoginEnvironment(): Record<string, string> {
   return env;
 }
 
-/** The current npm installation's sole Factory launcher is controller-only.
- * Never grant a private bin directory or remove unrelated tools from PATH.
- */
-function workerToolchainPath(path: string | undefined): string | undefined {
-  if (path === undefined) return undefined;
-  const launcher = fileURLToPath(new URL("../cli.js", import.meta.url));
-  const bin = resolve(dirname(dirname(launcher)), "..", "..", ".bin");
-  try {
-    return path
-      .split(":")
-      .filter((entry) => {
-        if (!isAbsolute(entry) || !existsSync(entry) || !existsSync(bin))
-          return true;
-        if (realpathSync(entry) !== realpathSync(bin)) return true;
-        const contents = readdirSync(entry);
-        if (contents.length !== 1 || contents[0] !== "factory") return true;
-        const candidate = join(entry, "factory");
-        return (
-          !lstatSync(candidate).isSymbolicLink() ||
-          realpathSync(candidate) !== realpathSync(launcher)
-        );
-      })
-      .join(":");
-  } catch {
-    // Unknown installation identity keeps the original guarded PATH.
-    return path;
-  }
-}
-
 /**
- * The SDK child's environment: the operator's login (HOME keeps
- * ~/.claude, or the service's loaded credentials), network settings, the
- * worker toolchain PATH and nothing of GitHub, Git or SSH. gh reads an
- * empty config directory and git has no credential helper.
+ * The SDK child's environment: a worker's (worktree.ts workerEnvironment)
+ * with the operator's login (HOME keeps ~/.claude, or the service's loaded
+ * credentials) and network settings, and nothing of GitHub, Git or SSH.
  */
-function claudeEnvironment(
+export function claudeEnvironment(
   credentialDirectory: string,
   maxOutputTokens: number,
   login: Record<string, string>,
 ): Record<string, string> {
-  const declared = new Set([
-    ...CLAUDE_AUTHENTICATION_ENVIRONMENT,
-    ...CLAUDE_NETWORK_ENVIRONMENT,
-  ]);
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env))
-    if (
-      value &&
-      (BASE_ENVIRONMENT.has(key) ||
-        /^LC_[A-Z_]+$/.test(key) ||
-        (declared.has(key) && !/^(GH_|GITHUB_|GIT_|SSH_)/i.test(key)))
-    )
-      env[key] = value;
-  if (env.PATH !== undefined) env.PATH = workerToolchainPath(env.PATH)!;
   // A service's bound login reaches Claude SDK children only.
   return {
-    ...env,
+    ...workerEnvironment(credentialDirectory, [
+      ...CLAUDE_AUTHENTICATION_ENVIRONMENT,
+      ...CLAUDE_NETWORK_ENVIRONMENT,
+    ]),
     ...login,
-    GH_CONFIG_DIR: credentialDirectory,
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "credential.helper",
-    GIT_CONFIG_VALUE_0: "",
-    GIT_TERMINAL_PROMPT: "0",
-    GCM_INTERACTIVE: "Never",
     CLAUDE_AGENT_SDK_CLIENT_APP: "clockgrove-factory/core",
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOutputTokens),
     DISABLE_TELEMETRY: "1",
@@ -622,7 +552,7 @@ function checkInitialization(
 }
 
 /** The runtime's stand-in for a model message it produced itself. */
-const SYNTHETIC_MODEL = "<synthetic>";
+export const SYNTHETIC_MODEL = "<synthetic>";
 
 /** Claude Agent SDK assistant errors that mean the login cannot be used. */
 const AUTHENTICATION_ERRORS = new Set<SDKAssistantMessageError>([
@@ -635,7 +565,7 @@ const AUTHENTICATION_ERRORS = new Set<SDKAssistantMessageError>([
 ]);
 
 /** What the stream showed beside the result. */
-interface SessionFacts {
+export interface SessionFacts {
   initialized: boolean;
   modelResponded: boolean;
   assistantError?: SDKAssistantMessageError;
@@ -643,7 +573,7 @@ interface SessionFacts {
   limit?: SDKRateLimitInfo;
 }
 
-function apiErrorStatus(result: SDKResultMessage): number | undefined {
+export function apiErrorStatus(result: SDKResultMessage): number | undefined {
   return result.subtype === "success" &&
     typeof result.api_error_status === "number"
     ? result.api_error_status
@@ -665,6 +595,60 @@ function authenticationFailure(
       : result.startup_failure_reason === "gateway_signin_required") ||
     (assistantError !== undefined && AUTHENTICATION_ERRORS.has(assistantError))
   );
+}
+
+/** A failed result's class, in the order planner and worker check it. */
+export type FailedResult =
+  | { kind: "billing"; message: string }
+  | { kind: "login" }
+  | { kind: "too-long" }
+  | { kind: "limit"; message: string; afterMs: number }
+  | { kind: "other" };
+
+/**
+ * Classify a failed result from its structured fields only: billing, login,
+ * context, limits, then anything else. `ended` describes the result.
+ */
+export function failedResult(
+  result: SDKResultMessage,
+  facts: SessionFacts,
+  ended: string,
+): FailedResult {
+  if (
+    facts.assistantError === "billing_error" ||
+    facts.limit?.errorCode === "credits_required"
+  )
+    return {
+      kind: "billing",
+      message: `Restore the Claude plan, credits or billing for the service's Claude login, then answer retry (${ended})`,
+    };
+  if (authenticationFailure(result, facts.assistantError))
+    return { kind: "login" };
+  if (result.terminal_reason === "prompt_too_long") return { kind: "too-long" };
+  const status = apiErrorStatus(result);
+  const resetsAt = facts.limit?.resetsAt;
+  if (
+    resetsAt !== undefined &&
+    Number.isFinite(resetsAt) &&
+    (status === 429 || facts.assistantError === "rate_limit")
+  )
+    return {
+      kind: "limit",
+      message: `Claude usage limit until ${new Date(resetsAt * 1000).toISOString()}: ${ended}`,
+      afterMs: Math.max(0, resetsAt * 1000 - Date.now()),
+    };
+  // A limit with no reset time waits instead of spending the error count.
+  if (
+    status === 429 ||
+    facts.assistantError === "rate_limit" ||
+    facts.limit !== undefined
+  )
+    return {
+      kind: "limit",
+      message: `Claude rate or usage limit: ${ended}`,
+      afterMs: LIMIT_WAIT_MS,
+    };
+  return { kind: "other" };
 }
 
 /**
@@ -691,51 +675,27 @@ function settle(
       "fail",
       "Claude response ended with stop_reason refusal",
     );
-  if (
-    !succeeded &&
-    (facts.assistantError === "billing_error" ||
-      facts.limit?.errorCode === "credits_required")
-  )
-    throw new PlannerError(
-      "hold",
-      `Restore the Claude plan, credits or billing for the service's Claude login, then answer retry (${ended})`,
-    );
-  if (authenticationFailure(result, facts.assistantError)) {
-    if (!facts.modelResponded && status === 401)
-      throw new CredentialRejected("retry", `${LOGIN_HOLD} (${ended})`);
-    throw new PlannerError("hold", `${LOGIN_HOLD} (${ended})`);
-  }
   if (!succeeded) {
-    if (result.terminal_reason === "prompt_too_long")
-      throw new PlannerError(
-        "fail",
-        `The request is larger than the model's context window: ${ended}`,
-      );
-    const resetsAt = facts.limit?.resetsAt;
-    if (
-      resetsAt !== undefined &&
-      Number.isFinite(resetsAt) &&
-      (status === 429 || facts.assistantError === "rate_limit")
-    )
-      throw new PlannerError(
-        "retry",
-        `Claude usage limit until ${new Date(resetsAt * 1000).toISOString()}: ${ended}`,
-        Math.max(0, resetsAt * 1000 - Date.now()),
-      );
-    // A limit with no reset time waits instead of spending the error count.
-    if (
-      status === 429 ||
-      facts.assistantError === "rate_limit" ||
-      facts.limit !== undefined
-    )
-      throw new PlannerError(
-        "retry",
-        `Claude rate or usage limit: ${ended}`,
-        LIMIT_WAIT_MS,
-      );
-    // Overload, connection, turn or output limits, structured output
-    // retries and anything unknown: a fresh call may succeed.
-    throw new PlannerError("retry", ended);
+    const failed = failedResult(result, facts, ended);
+    switch (failed.kind) {
+      case "billing":
+        throw new PlannerError("hold", failed.message);
+      case "login":
+        if (!facts.modelResponded && status === 401)
+          throw new CredentialRejected("retry", `${LOGIN_HOLD} (${ended})`);
+        throw new PlannerError("hold", `${LOGIN_HOLD} (${ended})`);
+      case "too-long":
+        throw new PlannerError(
+          "fail",
+          `The request is larger than the model's context window: ${ended}`,
+        );
+      case "limit":
+        throw new PlannerError("retry", failed.message, failed.afterMs);
+      // Overload, connection, turn or output limits, structured output
+      // retries and anything unknown: a fresh call may succeed.
+      case "other":
+        throw new PlannerError("retry", ended);
+    }
   }
   if (!facts.initialized)
     throw new PlannerError(
@@ -750,7 +710,7 @@ function settle(
   return claudeOutputValue(schema, result.structured_output);
 }
 
-function usageOf(result: SDKResultMessage): PlannerAnswer["usage"] {
+export function usageOf(result: SDKResultMessage): PlannerAnswer["usage"] {
   const models = Object.values(result.modelUsage ?? {});
   if (models.length)
     return models.reduce(
@@ -907,12 +867,24 @@ export class ClaudePlanner implements Planner {
           tree,
         }),
       });
+      const callStarted = Date.now();
       const events = session[Symbol.asyncIterator]();
       let result: SDKResultMessage | undefined;
       for (;;) {
         const next = await watchdog.race(events.next());
         if (next.done) break;
         const message = next.value;
+        call.activity?.();
+        // Every message's kind and timing, so a stall can be read afterwards.
+        if (message.type !== "stream_event")
+          call.log({
+            event: "claude-event",
+            type:
+              message.type === "system"
+                ? `system.${message.subtype}`
+                : message.type,
+            ms: Date.now() - callStarted,
+          });
         // A retry announces its backoff; that silence is not inactivity.
         watchdog.progress(
           message.type === "system"

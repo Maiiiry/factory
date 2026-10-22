@@ -2,19 +2,21 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
-import { configPath, loadConfig } from "./config.js";
-import { DEFAULT_LIMITS } from "./engine.js";
+import { type CoreConfig, configPath, loadConfig } from "./config.js";
+import { DEFAULT_LIMITS, hostLimits } from "./engine.js";
 import { GitHub } from "./github.js";
 import { GitHubSync } from "./github-sync.js";
 import { RunLog } from "./log.js";
+import { installationPaths, type Paths } from "./paths.js";
 import {
   ClaudePlanner,
   type ClaudePlannerOptions,
   DEFAULT_CLAUDE_MODELS,
 } from "./providers/claude.js";
+import { ClaudeWorker } from "./providers/claude-worker.js";
 import { CodexPlanner, DEFAULT_CODEX_MODELS } from "./providers/codex.js";
-import { objectiveWorkflow } from "./workflow.js";
-import { installationPaths, type Paths } from "./paths.js";
+import { CodexWorker } from "./providers/codex-worker.js";
+import { HedgedPlanner } from "./providers/planner.js";
 import { type Request, writeRequest } from "./requests.js";
 import { serve } from "./service.js";
 import {
@@ -23,6 +25,7 @@ import {
   loadState,
   type ObjectiveStatus,
 } from "./state.js";
+import { objectiveWorkflow } from "./workflow.js";
 
 const USAGE = `Usage: factory <command> --repo OWNER/NAME
 
@@ -57,12 +60,14 @@ async function main(argv: string[]): Promise<number> {
   switch (command) {
     case "serve": {
       let sync: GitHubSync | undefined;
+      let loaded: CoreConfig | undefined;
       let workflow = objectiveWorkflow();
       if (existsSync(configPath(repository))) {
         const config = loadConfig(repository);
+        loaded = config;
         const github = new GitHub(config.repository);
         sync = new GitHubSync(github, config, new RunLog(paths.logs, "sync"));
-        const planner =
+        const planner = new HedgedPlanner(
           config.planning.provider === "claude"
             ? new ClaudePlanner({
                 ...DEFAULT_CLAUDE_MODELS,
@@ -71,29 +76,54 @@ async function main(argv: string[]): Promise<number> {
             : new CodexPlanner({
                 ...DEFAULT_CODEX_MODELS,
                 ...(config.planning.models ?? {}),
-              } as typeof DEFAULT_CODEX_MODELS);
+              } as typeof DEFAULT_CODEX_MODELS),
+        );
         workflow = objectiveWorkflow({
           config,
           github,
           planner,
           workDir: (issue) => join(paths.root, "work", String(issue)),
+          worker: (plan, body) =>
+            config.execution.workerProvider === "claude"
+              ? new ClaudeWorker({
+                  sandbox: config.sandbox,
+                  plan,
+                  body,
+                  config: config.execution.claudeWorker,
+                  allowedSecretNames: config.policy.allowedSecretNames,
+                })
+              : new CodexWorker({
+                  sandbox: config.sandbox,
+                  network: config.execution.codexNetwork,
+                  allowedSecretNames: config.policy.allowedSecretNames,
+                }),
         });
       }
+      if (loaded)
+        hostLimits.configure({
+          worker: loaded.execution.workers,
+          cpu: loaded.execution.validations,
+        });
       return await serve({
         paths,
         workflow,
+        ...(loaded ? { maxActive: loaded.queue.maxActiveObjectives } : {}),
         ...(sync ? { sync } : {}),
         ...(process.env.FACTORY_TICK_MS
           ? { tickMs: Number(process.env.FACTORY_TICK_MS) }
           : {}),
-        ...(process.env.FACTORY_BACKOFF_MS
-          ? {
-              limits: {
-                ...DEFAULT_LIMITS,
-                baseBackoffMs: Number(process.env.FACTORY_BACKOFF_MS),
-              },
-            }
-          : {}),
+        limits: {
+          ...DEFAULT_LIMITS,
+          ...(loaded
+            ? {
+                concurrency: loaded.execution.concurrency,
+                maxRepairs: loaded.execution.repairs,
+              }
+            : {}),
+          ...(process.env.FACTORY_BACKOFF_MS
+            ? { baseBackoffMs: Number(process.env.FACTORY_BACKOFF_MS) }
+            : {}),
+        },
       });
     }
     case "status":

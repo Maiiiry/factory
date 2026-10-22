@@ -1,3 +1,4 @@
+import { errorMessage } from "../text.js";
 import {
   coverageCriterion,
   ownsPath,
@@ -67,7 +68,7 @@ const shapeError = (error: unknown): boolean =>
   error instanceof Shape || !(error instanceof Refusal);
 
 const finding = (error: unknown, itemId?: string): Finding => {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   const id = error instanceof Refusal ? (error.itemId ?? itemId) : itemId;
   return { source: "check", message, ...(id ? { itemId: id } : {}) };
 };
@@ -1069,6 +1070,10 @@ export function decodePlan(
       if (pinned.path === "OBJECTIVE" || !spanText?.trim())
         throw new Refusal(
           `Planner source obligation ${position} must select an existing nonblank line range of a cited source, not the Objective`,
+        );
+      if (pinned.context)
+        throw new Refusal(
+          `Planner source obligation ${position} cites ${pinned.path}, which is repository context, not a Source the Objective pins. Obligations come only from the Objective's Sources: remove it, and follow ${pinned.path} as guidance instead.`,
         );
       // A null statement is the exact cited lines, already checked nonblank.
       const statement = entry.statement === null ? spanText : entry.statement;

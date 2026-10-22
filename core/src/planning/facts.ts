@@ -5,6 +5,7 @@ import { gitEnvironment } from "../git.js";
 import { TransientError } from "../github.js";
 import { markdownLines } from "../markdown.js";
 import { parseObjective, type SourceRef, validPath } from "../objective.js";
+import { errorMessage } from "../text.js";
 import type {
   CoverageObligation,
   PinnedSource,
@@ -139,7 +140,7 @@ export class BaseFiles {
     } catch (error) {
       if (this.signal?.aborted) throw this.signal.reason;
       throw new TransientError(
-        `git ${args[0]} at base ${this.base.slice(0, 12)} in ${this.checkout}: ${error instanceof Error ? error.message : String(error)}`,
+        `git ${args[0]} at base ${this.base.slice(0, 12)} in ${this.checkout}: ${errorMessage(error)}`,
       );
     }
   }
@@ -235,7 +236,7 @@ export function sectionText(text: string, heading: string): string | undefined {
  * each pinned Source (whole file or one exact heading). A source that can't
  * be read is a problem that says how to fix the Sources entry.
  */
-async function planningSources(
+export async function planningSources(
   body: string,
   files: BaseFiles,
 ): Promise<{ sources: PinnedSource[]; problems: string[] }> {
@@ -268,15 +269,26 @@ async function planningSources(
       );
       continue;
     }
-    sources.push({ ...ref, content });
+    // A default is context unless the Objective also pins it.
+    const isDefault =
+      defaults.some((d) => d.path === ref.path && !ref.heading) &&
+      !parseObjective(body).objective.sources.some(
+        (pin) => pin.path === ref.path && !pin.heading,
+      );
+    sources.push({
+      ...ref,
+      content,
+      ...(isDefault ? { context: true as const } : {}),
+    });
   }
   return { sources, problems };
 }
 
 // ── Command shapes ──────────────────────────────────────────────────────
 
-const PINNED_PNPM_BOOTSTRAP = "pnpm install --frozen-lockfile --ignore-scripts";
-const PINNED_NPM_BOOTSTRAP = "npm ci --ignore-scripts";
+export const PINNED_PNPM_BOOTSTRAP =
+  "pnpm install --frozen-lockfile --ignore-scripts";
+export const PINNED_NPM_BOOTSTRAP = "npm ci --ignore-scripts";
 
 /** Exact script-disabled root installs; this classification grants no authority. */
 export function packageBootstrap(command: string): "npm" | "pnpm" | undefined {
@@ -289,7 +301,7 @@ export function packageBootstrap(command: string): "npm" | "pnpm" | undefined {
  * A version-only invocation may be followed by a source-declared shell
  * assertion. Every package-manager token must belong to that exact probe.
  */
-function packageManagerVersionProbe(command: string): boolean {
+export function packageManagerVersionProbe(command: string): boolean {
   if (!/\b(?:npm|pnpm)\b/.test(command)) return false;
   const withoutProbes = command.replace(
     /\b(?:npm|pnpm) --version(?=\s*(?:[;&|)\n]|$))/g,
@@ -303,7 +315,7 @@ const PACKAGE_SCRIPT_FORMS =
   "`npm test`, `pnpm test`, `pnpm check`, `npm run NAME` or `pnpm run NAME`, with no other arguments";
 
 /** Supported root script forms; shell wrappers and package-manager flags are ambiguous. */
-function packageScriptInvocation(
+export function packageScriptInvocation(
   check: string,
 ): { manager: "npm" | "pnpm"; name: string } | undefined {
   const match = check
@@ -728,7 +740,7 @@ function fixedPackageScripts(commands: readonly string[]): string[] {
  * package.json defines them. Validation keeps these bodies fixed, so the
  * planner needs them to own the files a new check has to extend (#819).
  */
-async function fixedScripts(
+export async function fixedScripts(
   commands: readonly string[],
   files: BaseFiles,
 ): Promise<{ name: string; body: string }[]> {
@@ -825,7 +837,7 @@ function jobsOf(workflow: unknown): [string, Job][] {
  * reusable workflow "caller / callee" per called job. A workflow that can't
  * be read or parsed reports nothing.
  */
-async function workflowCheckNames(files: BaseFiles): Promise<string[]> {
+export async function workflowCheckNames(files: BaseFiles): Promise<string[]> {
   const paths = (await files.paths()).filter((path) =>
     new RegExp(`^${WORKFLOWS}/[^/]+\\.ya?ml$`).test(path),
   );

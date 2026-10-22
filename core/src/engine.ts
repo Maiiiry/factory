@@ -7,20 +7,53 @@ import {
   saveState,
   TERMINAL,
 } from "./state.js";
+import { errorMessage } from "./text.js";
 
 /** What a step reports. Every step ends in exactly one of these. */
 export type Outcome =
-  | { kind: "done"; result?: unknown }
+  | {
+      kind: "done";
+      result?: unknown;
+      /** Facts that outlive repairs, such as the heads already pushed (`state.kept`). */
+      keep?: Record<string, unknown>;
+    }
   /** Transient: network, 5xx, rate or usage limit, overload. */
-  | { kind: "retry"; reason: string; afterMs?: number }
+  | {
+      kind: "retry";
+      reason: string;
+      afterMs?: number;
+      keep?: Record<string, unknown>;
+    }
   | {
       kind: "hold";
       question: string;
       answers: string[];
       recommended: string;
+      keep?: Record<string, unknown>;
     }
   /** The step can't succeed as planned. */
-  | { kind: "fail"; reason: string };
+  | { kind: "fail"; reason: string }
+  /**
+   * The work is wrong (validation, review or CI refused it): clear `clear`
+   * from the finished steps and run `target` again with the finding, within
+   * the repair budget.
+   */
+  | {
+      kind: "repair";
+      finding: string;
+      target: string;
+      clear: string[];
+      keep?: Record<string, unknown>;
+    };
+
+/** A question for the operator; the first answer is recommended unless another is named. */
+export function hold(
+  question: string,
+  answers = ["retry", "cancel"],
+  recommended = answers[0]!,
+): Extract<Outcome, { kind: "hold" }> {
+  return { kind: "hold", question, answers, recommended };
+}
 
 export interface StepContext {
   /** A copy: steps read state, the engine writes it. */
@@ -35,6 +68,8 @@ export interface Step {
   /** Stable for the Objective, such as `plan` or `item:a:work`. */
   readonly key: string;
   readonly deadlineMs: number;
+  /** A host-wide limit this step counts against: model-bound workers or CPU-heavy validation. */
+  readonly resource?: HostResource;
   run(context: StepContext): Promise<Outcome>;
 }
 
@@ -45,9 +80,43 @@ export interface Workflow {
   status(state: ObjectiveState): ObjectiveStatus;
 }
 
+export type HostResource = "worker" | "cpu";
+
+/**
+ * Host-wide caps shared by every Objective in the service: how many worker
+ * runs and how many CPU-heavy steps (validation) run at once.
+ */
+export class HostLimiter {
+  private readonly used: Record<HostResource, number> = { worker: 0, cpu: 0 };
+  constructor(private caps: Record<HostResource, number>) {}
+
+  configure(caps: Record<HostResource, number>): void {
+    this.caps = caps;
+  }
+
+  acquire(resource: HostResource): boolean {
+    if (this.used[resource] >= this.caps[resource]) return false;
+    this.used[resource] += 1;
+    return true;
+  }
+
+  release(resource: HostResource): void {
+    this.used[resource] = Math.max(0, this.used[resource] - 1);
+  }
+
+  usage(): Record<HostResource, number> {
+    return { ...this.used };
+  }
+}
+
+/** The service's limiter; `serve` sets its caps from configuration. */
+export const hostLimits = new HostLimiter({ worker: 2, cpu: 2 });
+
 export interface EngineLimits {
   /** Escaped errors and missed deadlines in a row before a step holds. */
   maxErrors: number;
+  /** Repairs of one target before Factory asks. */
+  maxRepairs: number;
   /** How long transient retries may go on before the step holds. */
   maxRetryMs: number;
   baseBackoffMs: number;
@@ -58,6 +127,7 @@ export interface EngineLimits {
 
 export const DEFAULT_LIMITS: EngineLimits = {
   maxErrors: 3,
+  maxRepairs: 6,
   maxRetryMs: 6 * 60 * 60 * 1000,
   baseBackoffMs: 30_000,
   maxBackoffMs: 15 * 60 * 1000,
@@ -139,7 +209,13 @@ export class ObjectiveRunner {
       if (this.running.has(step.key)) continue;
       const retry = this.state.retries[step.key];
       if (retry && Date.parse(retry.nextAt) > now) continue;
-      this.start(step);
+      if (step.resource && !hostLimits.acquire(step.resource)) continue;
+      try {
+        this.start(step);
+      } catch (error) {
+        if (step.resource) hostLimits.release(step.resource);
+        throw error;
+      }
     }
   }
 
@@ -170,12 +246,14 @@ export class ObjectiveRunner {
     const run = (async () => step.run(context))().catch(
       (error: unknown): Outcome => ({
         kind: "retry",
-        reason: `error: ${error instanceof Error ? error.message : String(error)}`,
+        reason: `error: ${errorMessage(error)}`,
         afterMs: -1,
       }),
     );
     void Promise.race([run, deadline]).then((outcome) => {
       clearTimeout(timer);
+      // Released once per start, even when cancel already dropped the step.
+      if (step.resource) hostLimits.release(step.resource);
       if (this.running.get(step.key)?.token !== token) return;
       this.running.delete(step.key);
       try {
@@ -231,6 +309,10 @@ export class ObjectiveRunner {
     const state = this.state;
     const now = this.now();
     delete state.attempts[key];
+    if ("keep" in outcome && outcome.keep) {
+      state.kept ??= {};
+      Object.assign(state.kept, outcome.keep);
+    }
     if (TERMINAL.includes(state.status) && outcome.kind !== "done") {
       // Cleanup after the end never asks and never blocks: it retries in
       // the background with the usual backoff.
@@ -245,7 +327,12 @@ export class ObjectiveRunner {
         attempts,
         since: previous?.since ?? now.toISOString(),
         nextAt: new Date(now.getTime() + backoff).toISOString(),
-        lastError: "reason" in outcome ? outcome.reason : outcome.question,
+        lastError:
+          "reason" in outcome
+            ? outcome.reason
+            : "question" in outcome
+              ? outcome.question
+              : outcome.finding,
       };
       return;
     }
@@ -306,6 +393,33 @@ export class ObjectiveRunner {
           "retry",
         );
         break;
+      case "repair": {
+        delete state.retries[key];
+        for (const cleared of outcome.clear) {
+          delete state.done[cleared];
+          delete state.answers[cleared];
+        }
+        state.repairs ??= {};
+        const repair = state.repairs[outcome.target] ?? {
+          count: 0,
+          findings: [],
+        };
+        repair.count += 1;
+        repair.findings = [...repair.findings, outcome.finding].slice(-10);
+        state.repairs[outcome.target] = repair;
+        // Over budget: ask, on the step that would repair. Each `retry` allows one more.
+        if (
+          repair.count > this.limits.maxRepairs &&
+          state.answers[outcome.target]?.answer !== "retry"
+        )
+          this.hold(
+            outcome.target,
+            `${outcome.target} has been repaired ${repair.count - 1} times and still fails:\n\n${outcome.finding}\n\n\`retry\` allows one more repair.`,
+            ERROR_ANSWERS,
+            "retry",
+          );
+        break;
+      }
     }
   }
 

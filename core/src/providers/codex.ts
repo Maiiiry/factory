@@ -1,26 +1,30 @@
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type {
   Input,
   ModelReasoningEffort,
   ThreadEvent,
   ThreadOptions,
 } from "@openai/codex-sdk";
+import { within } from "../paths.js";
+import { errorMessage } from "../text.js";
 import {
   callImages,
   detail,
-  loggedCall,
   IdleWatchdog,
+  loggedCall,
   type ModelChoice,
   modelChoice,
   type Planner,
@@ -124,7 +128,7 @@ const ENVIRONMENT = [
 ];
 
 /** The installed Codex runtime; its Linux sandbox helper re-executes it. */
-function codexRuntimeDirectory(): string {
+export function codexRuntimeDirectory(): string {
   const cli = createRequire(
     createRequire(import.meta.url).resolve("@openai/codex/package.json"),
   );
@@ -155,34 +159,75 @@ enabled = false
 `;
 }
 
-/**
- * A private CODEX_HOME, HOME and TMPDIR for one call, with Factory's config
- * and a link to the operator's subscription login. Operator config is never
- * read. `readDir` turns on the read-only shell over that directory alone.
- */
-function codexHome(readDir: string | undefined): {
+/** Codex's model list, shared between calls so each skips a fetch on start. */
+function sharedModelsCache(): string {
+  return join(
+    process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+    "factory",
+    "codex-models_cache.json",
+  );
+}
+
+/** Seed a private Codex home with the shared model list, when there is one. */
+function seedModelsCache(codexDir: string): void {
+  try {
+    copyFileSync(sharedModelsCache(), join(codexDir, "models_cache.json"));
+  } catch {
+    // No shared list yet: Codex fetches one.
+  }
+}
+
+/** Keep the model list a call fetched, for the next call. */
+export function saveModelsCache(codexDir: string): void {
+  try {
+    const target = sharedModelsCache();
+    mkdirSync(dirname(target), { recursive: true });
+    const temporary = `${target}.${process.pid}.tmp`;
+    copyFileSync(join(codexDir, "models_cache.json"), temporary);
+    renameSync(temporary, target);
+  } catch {
+    // Nothing fetched, or the cache directory is unwritable: not needed.
+  }
+}
+
+/** A private Codex home's directories and environment. */
+export interface CodexHome {
   root: string;
-  workdir: string;
+  home: string;
+  codexDir: string;
+  temporary: string;
   env: Record<string, string>;
-} {
+}
+
+/**
+ * A private CODEX_HOME, HOME and TMPDIR under a new temporary root, with
+ * `config` as Factory's config and a link to the operator's subscription
+ * login. Operator config is never read. `outside` is the tree Codex works
+ * in: the root must stay out of it, and Git there takes no optional locks.
+ * `finish` completes the home; on any failure the root is removed.
+ */
+export function privateCodexHome<T>(options: {
+  outside?: { directory: string; name: string };
+  config: (home: CodexHome) => string;
+  /** The environment the ambient variables come from; process.env by default. */
+  source?: NodeJS.ProcessEnv;
+  /** More variables to keep beside ENVIRONMENT. */
+  keep?: readonly string[];
+  finish: (home: CodexHome) => T;
+}): T {
   const root = mkdtempSync(join(tmpdir(), "factory-codex-"));
   try {
-    if (readDir) {
-      const tree = realpathSync(readDir);
-      const inside = relative(tree, realpathSync(root));
-      if (!inside.startsWith(`..${sep}`) && inside !== "..")
-        throw new Error("Codex homes must stay outside the read directory");
-    }
+    const { outside, keep = [] } = options;
+    if (outside && within(realpathSync(root), realpathSync(outside.directory)))
+      throw new Error(`Codex homes must stay outside the ${outside.name}`);
     const home = join(root, "home");
     const codexDir = join(root, "codex-home");
     const temporary = join(root, "tmp");
-    const workdir = join(root, "work");
-    for (const directory of [home, codexDir, temporary, workdir])
+    for (const directory of [home, codexDir, temporary])
       mkdirSync(directory, { mode: 0o700 });
-    const config = readDir
-      ? `default_permissions = "factory"\n${CODEX_TREE_REVIEW_CONFIG}\n${permissionProfile()}`
-      : CODEX_PLANNING_CONFIG;
-    writeFileSync(join(codexDir, "config.toml"), config, {
+    const env: Record<string, string> = {};
+    const created: CodexHome = { root, home, codexDir, temporary, env };
+    writeFileSync(join(codexDir, "config.toml"), options.config(created), {
       mode: 0o600,
       flag: "wx",
     });
@@ -191,22 +236,46 @@ function codexHome(readDir: string | undefined): {
       "auth.json",
     );
     if (existsSync(login)) symlinkSync(login, join(codexDir, "auth.json"));
-    const env: Record<string, string> = {};
-    for (const [name, value] of Object.entries(process.env))
+    seedModelsCache(codexDir);
+    for (const [name, value] of Object.entries(options.source ?? process.env))
       if (
         value !== undefined &&
-        ENVIRONMENT.some((pattern) => pattern.test(name))
+        (ENVIRONMENT.some((pattern) => pattern.test(name)) ||
+          keep.includes(name))
       )
         env[name] = value;
     env.HOME = home;
     env.CODEX_HOME = codexDir;
     env.TMPDIR = temporary;
-    if (readDir) env.GIT_OPTIONAL_LOCKS = "0";
-    return { root, workdir, env };
+    if (outside) env.GIT_OPTIONAL_LOCKS = "0";
+    return options.finish(created);
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;
   }
+}
+
+/**
+ * A planning call's home with a working directory. `readDir` turns on the
+ * read-only shell over that directory alone.
+ */
+function codexHome(readDir: string | undefined): {
+  root: string;
+  workdir: string;
+  env: Record<string, string>;
+} {
+  return privateCodexHome({
+    ...(readDir && { outside: { directory: readDir, name: "read directory" } }),
+    config: () =>
+      readDir
+        ? `default_permissions = "factory"\n${CODEX_TREE_REVIEW_CONFIG}\n${permissionProfile()}`
+        : CODEX_PLANNING_CONFIG,
+    finish: ({ root, env }) => {
+      const workdir = join(root, "work");
+      mkdirSync(workdir, { mode: 0o700 });
+      return { root, workdir, env };
+    },
+  });
 }
 
 /**
@@ -232,7 +301,7 @@ function jsonStatus(message: string): unknown {
  * texts (exec reports no structured kind). Anything unmatched is a retry, so
  * a miss costs only time.
  */
-function codexFailure(message: string): PlannerError {
+export function codexFailure(message: string): PlannerError {
   const text = message.toLowerCase();
   const has = (...phrases: string[]) =>
     phrases.some((phrase) => text.includes(phrase));
@@ -344,8 +413,11 @@ export class CodexPlanner implements Planner {
           : choice.serviceTier === "standard"
             ? "default"
             : undefined;
+      const callStarted = Date.now();
+      const traced = traceWrapper(home.root, home.env);
       const codex = new Codex({
         env: home.env,
+        ...(traced ? { codexPathOverride: traced } : {}),
         ...(tier && { config: { service_tier: tier } }),
       });
       const options: ThreadOptions = {
@@ -382,6 +454,25 @@ export class CodexPlanner implements Planner {
         const next = await watchdog.race(events.next());
         if (next.done) break;
         const event = next.value;
+        call.activity?.();
+        // Every event's kind and timing, so a stall can be read afterwards.
+        call.log({
+          event: "codex-event",
+          type: event.type,
+          ...("item" in event && event.item
+            ? {
+                item: event.item.type,
+                id: event.item.id,
+                ...("status" in event.item
+                  ? { status: event.item.status }
+                  : {}),
+                ...(event.item.type === "command_execution"
+                  ? { command: event.item.command.slice(0, 200) }
+                  : {}),
+              }
+            : {}),
+          ms: Date.now() - callStarted,
+        });
         const item =
           event.type === "item.started" ||
           event.type === "item.updated" ||
@@ -450,9 +541,7 @@ export class CodexPlanner implements Planner {
       // The step was cancelled or hit its deadline: the engine decides.
       if (call.signal.aborted) throw call.signal.reason ?? error;
       // A failed codex process: its stderr is in the message.
-      throw codexFailure(
-        error instanceof Error ? error.message : String(error),
-      );
+      throw codexFailure(errorMessage(error));
     } finally {
       watchdog.stop();
       // Closing the stream makes the SDK kill a codex process still running.
@@ -467,7 +556,56 @@ export class CodexPlanner implements Planner {
         ]);
         clearTimeout(timer);
       }
-      rmSync(home.root, { recursive: true, force: true });
+      saveModelsCache(home.env.CODEX_HOME!);
+      keepOrRemove(home.root, record.thread as string | undefined);
     }
   }
+}
+
+/**
+ * With FACTORY_PROVIDER_TRACE set, run codex through a wrapper that appends
+ * its stderr to <home>/codex-stderr.log, with RUST_LOG from
+ * FACTORY_CODEX_RUST_LOG. Returns the wrapper's path, or undefined.
+ */
+function traceWrapper(
+  root: string,
+  env: Record<string, string>,
+): string | undefined {
+  if (!process.env.FACTORY_PROVIDER_TRACE) return undefined;
+  const require = createRequire(import.meta.url);
+  const vendor = join(
+    dirname(require.resolve("@openai/codex-linux-x64/package.json")),
+    "vendor",
+    "x86_64-unknown-linux-musl",
+    "bin",
+    "codex",
+  );
+  if (process.env.FACTORY_CODEX_RUST_LOG)
+    env.RUST_LOG = process.env.FACTORY_CODEX_RUST_LOG;
+  const wrapper = join(root, "codex-traced");
+  writeFileSync(
+    wrapper,
+    `#!/bin/sh\nexec '${vendor}' "$@" 2>>'${join(root, "codex-stderr.log")}'\n`,
+    { mode: 0o700 },
+  );
+  return wrapper;
+}
+
+/**
+ * FACTORY_PROVIDER_TRACE=<dir> keeps each call's private Codex home (its
+ * session record and logs) under <dir>/<thread>, for investigating a call
+ * afterwards. Without it the home is removed.
+ */
+function keepOrRemove(root: string, thread: string | undefined): void {
+  const trace = process.env.FACTORY_PROVIDER_TRACE;
+  if (trace) {
+    try {
+      mkdirSync(trace, { recursive: true });
+      renameSync(root, join(trace, thread ?? `call-${Date.now()}`));
+      return;
+    } catch {
+      // Fall through and remove it.
+    }
+  }
+  rmSync(root, { recursive: true, force: true });
 }
