@@ -45,7 +45,11 @@ import {
   projectQueueReceiptTarget,
 } from "./github-project-queue.js";
 import { planningPrerequisites } from "./objective-prerequisites.js";
-import { expandSplitPredecessors, splitSettled } from "./objective-split.js";
+import {
+  childIdentity,
+  expandSplitPredecessors,
+  splitSettled,
+} from "./objective-split.js";
 import { settleSplitParent, splitReadyToClose } from "./runner/split.js";
 import {
   currentProcessSignal,
@@ -56,6 +60,7 @@ import {
   gitAsync,
   withProcessCancellation,
 } from "./process.js";
+import { preflightObjective } from "./local-preflight.js";
 import {
   QueueAuthorityChanged,
   admitQueueCommand,
@@ -863,6 +868,8 @@ function commandAcknowledgment(
 }
 interface EnqueueOptions {
   expectedBodyDigests?: Record<string, string>;
+  /** Children of a reviewed split, already preflighted with their parent. */
+  childAdmission?: boolean;
 }
 interface ProjectPublicationProvenance {
   kind: "proposal";
@@ -880,6 +887,23 @@ async function enqueueOwned(
   return projectMutation(config, github, () =>
     enqueueMutation(config, github, objectives, options, cached),
   );
+}
+function admissionPreflight(
+  config: FactoryConfig,
+  objective: number,
+  body: string,
+): void {
+  try {
+    // The checkout's head, as the read-only preview uses: no network on
+    // queue add. Dispatch repeats the check at the fetched default head.
+    preflightObjective(config, body, git(config.checkout, "rev-parse", "HEAD"));
+  } catch (error) {
+    throw new LifecycleRefusal(
+      "objective_preflight_failed",
+      `Objective #${objective} was not added: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 async function enqueueMutation(
   config: FactoryConfig,
@@ -946,6 +970,11 @@ async function enqueueMutation(
       });
       continue;
     }
+    // Fail fast: dispatch runs this same preflight and would hold the
+    // Objective silently. Child admissions were checked with their parent;
+    // the flag counts only for a genuine child body.
+    if (!(options.childAdmission && childIdentity(issue.body)))
+      admissionPreflight(config, objective, issue.body);
     const existing = readContinuation(config.repository, objective);
     if (existing && !terminal(existing) && prior?.bodyDigest !== bodyDigest)
       throw new LifecycleRefusal(
@@ -1082,7 +1111,10 @@ export async function admitChildObjectives(
   // admissions take turns under the queue mutation lock (projectMutation).
   await queueOperation(config, () =>
     scoped(config, () =>
-      enqueueOwned(config, github, objectives, { expectedBodyDigests }),
+      enqueueOwned(config, github, objectives, {
+        expectedBodyDigests,
+        childAdmission: true,
+      }),
     ),
   );
 }
@@ -2345,6 +2377,7 @@ async function runIntakeOwned(
               admitChildObjectives: (objectives, expectedBodyDigests) =>
                 enqueueIntake(config, services.github, objectives, {
                   expectedBodyDigests,
+                  childAdmission: true,
                 }).then(() => undefined),
               // Held behind an overlapping Objective after planning: the run
               // hands its slot back and selection passes over it until the
