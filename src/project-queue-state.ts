@@ -25,6 +25,7 @@ import {
   queueConfigDigest,
   stateRoot,
 } from "./config.js";
+import { attachFault, transient } from "./fault.js";
 import { LocalContentStore } from "./content/local.js";
 import type {
   ContentRef,
@@ -2184,10 +2185,22 @@ export async function observeProjectQueue(
       "The configured GitHub gateway cannot read the bound Project queue",
     );
   const history = await readQueueHistory(config);
-  const snapshot = await github.projectQueueRead(
-    binding,
-    queueObservationTargets(history),
-  );
+  // A failed read is the GitHub listing's, not the run's: the Objective that
+  // met it retries on the next pass instead of holding for the operator.
+  const snapshot = await github
+    .projectQueueRead(binding, queueObservationTargets(history))
+    .catch((error: unknown) => {
+      throw attachFault(
+        error,
+        transient(
+          error instanceof Error ? error.message : String(error),
+          false,
+          new Date(
+            Date.now() + (config.queue?.pollSeconds ?? 30) * 1000,
+          ).toISOString(),
+        ),
+      );
+    });
   return verifyQueueObservation(config, snapshot, history);
 }
 export function createQueueOperation(
@@ -3490,6 +3503,14 @@ function assertClaimOwnerCeased(claim: QueueOwnerClaim): void {
     throw new Error(
       "Stopped Project handoff requires the original source-host namespace and settled subprocess ownership",
     );
+  // The running service resumes its own earlier run: its controller for that
+  // run has ended, and the subprocess check above and the worker checks of the
+  // handoff still hold. Any other live process still refuses.
+  if (
+    originalOwner.pid === process.pid &&
+    originalOwner.startTime === linuxProcessIdentity(process.pid)?.startTime
+  )
+    return;
   assertCeased(originalOwner.pid, originalOwner.startTime);
 }
 

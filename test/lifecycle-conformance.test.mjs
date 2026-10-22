@@ -958,7 +958,7 @@ function projectFixture(repository, binding, file) {
           __typename: "ProjectV2",
           id: binding.projectId,
           items: {
-            nodes: [wireCard(project)],
+            nodes: project.omitControlFromItems ? [] : [wireCard(project)],
             pageInfo: { hasNextPage: false, endCursor: null },
           },
         },
@@ -2018,6 +2018,19 @@ else {
     github.projectQueueInspect = inspect;
     assert.equal(await dispatch(fixture, "queue-add", objective), "ok");
     assert.equal(await dispatch(fixture, "queue-remove", objective), "ok");
+  });
+
+  test("observation reads a control card the paged listing omits (#1762)", async (t) => {
+    const fixture = await installation(t);
+    const file = join(fixture.directory, "project.json");
+    const project = JSON.parse(readFileSync(file, "utf8"));
+    project.omitControlFromItems = true;
+    writeFileSync(file, JSON.stringify(project));
+    const snapshot = await fixture.services.github.projectQueueRead(
+      fixture.config.queue.project,
+      [],
+    );
+    assert.equal(snapshot.control.itemId, "PVTI_control");
   });
 
   // Fail fast (#1741): queue add runs dispatch's Objective preflight.

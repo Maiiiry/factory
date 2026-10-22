@@ -1143,8 +1143,18 @@ async function readQueueFresh(
     cursors.add(page.endCursor);
     after = page.endCursor;
   }
-  if (!control)
-    throw new Error("Project queue lacks its configured control card");
+  if (!control) {
+    // A paged listing can omit the control item transiently. Read it by its ID;
+    // this fails only when the item is truly missing or archived.
+    const direct = await projectQueueInspectOnGitHub(
+      repository,
+      binding,
+      graphql,
+    );
+    if (direct.actorId !== access.actorId || direct.owner !== access.owner)
+      throw new Error("Project queue access changed during observation");
+    control = direct.control;
+  }
   // A complete Project.items cursor can omit a mapped item that current Issue
   // membership still exposes. Original receipts are lookup hints only: read all
   // current membership/fields/body/control before adding any missing cards.
