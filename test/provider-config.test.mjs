@@ -2,16 +2,20 @@
 import "./isolate-env.mjs";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { assertKnownFlags } from "../dist/cli-flags.js";
 import {
   assertNoCiOnlyValidation,
+  assertPlanBoundaries,
   assertRequiredFinalCommands,
   fixedScripts,
+  validateCommandProvenance,
 } from "../dist/compiler.js";
+import { PLAN_CHECKS, PLAN_CHECK_EXEMPT } from "../dist/compiler/sources.js";
+import { planGraphLint, planStandardLint } from "../dist/compiler-wire.js";
 import { prepareCompilationRequest } from "../dist/compiler/planning.js";
 import {
   ciOnlyCommands,
@@ -483,4 +487,172 @@ test("setup adds a provider without changing the others", () => {
     () => addProvider(["--provider", "claude"], path),
     /already configured/,
   );
+});
+
+test("every plan check gives the planner its facts and refuses with what would pass (#1732)", () => {
+  const repo = checkout("example/plan-facts");
+  writeFileSync(
+    join(repo, "package.json"),
+    JSON.stringify({
+      scripts: {
+        test: "node --test",
+        lint: "biome lint .",
+        audit: "npm audit",
+        "infra:validate": "tofu init && tofu validate",
+      },
+    }),
+  );
+  mkdirSync(join(repo, "docs"));
+  writeFileSync(
+    join(repo, "docs", "dev.md"),
+    "Run first:\n\n`node --test`\n\n```ts\nconst key = 'sk-secret';\nrm -rf build\n```\n",
+  );
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", [
+    "-C",
+    repo,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-qm",
+    "base",
+  ]);
+  const baseSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const request = prepareCompilationRequest({
+    objective: 1,
+    body: "## Acceptance\n- It works.\n\n## Sources\n- docs/dev.md\n",
+    baseSha,
+    checkout: repo,
+    ciOnlyCommands: ["npm run audit"],
+  });
+  // The planner request carries the exact list the check uses: scripts in
+  // supported forms, minus CI-only and network commands.
+  const authorized = request.compileContext.authorizedCommands;
+  // Scripts lead, then inline source commands; no CI-only script in any form,
+  // no fenced code lines.
+  assert.deepEqual(authorized, ["npm test", "npm run lint", "node --test"]);
+  const note = request.objective.match(
+    /Authorized validation commands[^\n]*/,
+  )[0];
+  assert.match(note, /`npm test`, `npm run lint`, `node --test`/);
+  assert.ok(Buffer.byteLength(note) < 200, `${Buffer.byteLength(note)} bytes`);
+
+  const item = (id, fields) => ({
+    id,
+    kind: "work",
+    ownedPaths: ["src/a.ts"],
+    acceptance: ["It works."],
+    validation: [],
+    dependencies: [],
+    ...fields,
+  });
+  const command = (text) => ({
+    command: text,
+    provenance: "base-observed",
+    source: "package.json",
+  });
+  const refusal = (fn) => {
+    try {
+      fn();
+    } catch (error) {
+      return error.message;
+    }
+    assert.fail("expected a refusal");
+  };
+  const graph = (...items) => ({ baseSha, items });
+  const refusals = {
+    "command-authority": refusal(() =>
+      validateCommandProvenance(
+        graph(item("a", { validation: [command("pnpm --filter x test")] })),
+        [{ path: "OBJECTIVE", content: "## Acceptance\n- It works.\n" }],
+        repo,
+      ),
+    ),
+    "ci-only": refusal(() =>
+      assertNoCiOnlyValidation(
+        graph(item("a", { validation: [command("npm run audit")] })),
+        ["npm run audit"],
+      ),
+    ),
+    network: refusal(() =>
+      assertPlanBoundaries(
+        graph(item("a", { validation: [command("npm run infra:validate")] })),
+        repo,
+        [],
+        [],
+        authorized,
+      ),
+    ),
+    "new-file-name": refusal(() =>
+      assertPlanBoundaries(
+        graph(item("a", { acceptance: ["test/new-thing.test.mjs passes"] })),
+        repo,
+      ),
+    ),
+    "path-overlap": planGraphLint(
+      graph(item("a", {}), item("b", {})),
+      new Set(),
+      new Map(),
+      authorized,
+    )[0],
+    "local-proof": planGraphLint(
+      graph(
+        item("a", { validation: [command("npm test")] }),
+        item("b", { ownedPaths: ["src/b.ts"] }),
+      ),
+      new Set(),
+      new Map(),
+      authorized,
+    )[0],
+    "plan-standard": planStandardLint(
+      { id: "a", acceptance: ["Fix store.ts:88"] },
+      null,
+    )[0],
+  };
+  // The registry and this table move together: a new check adds both.
+  assert.deepEqual(
+    Object.keys(refusals).sort(),
+    PLAN_CHECKS.map((c) => c.id).sort(),
+  );
+  // A plan-check function in the sources is registered or explicitly exempt.
+  const functions = ["src/compiler/sources.ts", "src/compiler-wire.ts"].flatMap(
+    (file) =>
+      readFileSync(new URL(`../${file}`, import.meta.url), "utf8")
+        .split(/\n(?=(?:export )?(?:async )?function )/)
+        .flatMap((chunk) => {
+          const name = chunk.match(/^export (?:async )?function (\w+)/)?.[1];
+          return name &&
+            (/new GraphValidationError\(/.test(chunk) || /Lint$/.test(name))
+            ? [name]
+            : [];
+        }),
+  );
+  const known = new Set([
+    ...PLAN_CHECKS.map((c) => c.entry),
+    ...PLAN_CHECK_EXEMPT,
+  ]);
+  assert.deepEqual(
+    functions.filter((name) => !known.has(name)),
+    [],
+    "register new plan checks in PLAN_CHECKS",
+  );
+  const fix = {
+    "command-authority": /Authorized commands: `npm test`, `npm run lint`/,
+    "ci-only": /use an offline authorized command/,
+    network:
+      /select an offline authorized command instead \(`npm test`, `npm run lint`, `node --test`\)/,
+    "new-file-name": /describe it by role and data/,
+    "path-overlap": /narrow each item's ownedPaths/,
+    "local-proof":
+      /select one of the authorized commands \(`npm test`, `npm run lint`, `node --test`\)/,
+    "plan-standard": /state the behaviour instead/,
+  };
+  for (const { id, facts } of PLAN_CHECKS) {
+    assert.ok(facts, `${id} names the facts it puts in the request`);
+    assert.match(refusals[id], fix[id], id);
+  }
 });
