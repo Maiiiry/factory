@@ -2392,11 +2392,15 @@ test("a Codex worker shell gets the configured read-only mounts and environment,
     config,
     new RegExp(`${JSON.stringify(realpathSync(tools))} = "read"`),
   );
-  assert.equal(home.env.TOOL_DIR, tools);
+  assert.match(config, /\[shell_environment_policy\.set\]\n"TOOL_DIR" = /);
+  assert.equal(home.env.TOOL_DIR, undefined);
   // Without the configuration, neither appears; a mount under /tmp is refused.
   const bare = createCodexHome({ config: "", sandbox });
   t.after(() => bare.dispose());
-  assert.equal(bare.env.TOOL_DIR, undefined);
+  assert.doesNotMatch(
+    readFileSync(join(bare.root, "codex-home", "config.toml"), "utf8"),
+    /TOOL_DIR/,
+  );
   assert.throws(
     () =>
       createCodexHome({

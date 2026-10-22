@@ -1003,7 +1003,7 @@ export function packageCacheEnvironment(root: string): Record<string, string> {
 }
 
 /** Variables that name host directories the sandbox does not mount. */
-const HOST_DIRECTORY_VARIABLES = [
+export const HOST_DIRECTORY_VARIABLES = [
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
   "XDG_STATE_HOME",

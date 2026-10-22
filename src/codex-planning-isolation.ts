@@ -28,13 +28,14 @@ import {
 } from "./codex-native-capture.js";
 import {
   gitMetadata,
+  HOST_DIRECTORY_VARIABLES,
+  resolveReadOnlyPaths,
   packageCacheEnvironment,
   real,
   toolchainDirectories,
   within,
 } from "./execution/sandbox.js";
 import { StepFault } from "./fault.js";
-import { resolveReadOnlyPaths } from "./execution/sandbox.js";
 import { workerToolchainPath } from "./process.js";
 
 /** Replaces native coding-agent boilerplate only for isolated read-only roles. */
@@ -586,8 +587,21 @@ export function createCodexHome(options: {
       }
     }
     const codexIdentity = privateDirectory(codexHome);
+    // Configured values reach the shell only, never the Codex process itself.
+    const shellValues =
+      options.sandbox?.workspace === "write"
+        ? Object.entries(options.sandbox.provisioned?.environment ?? {})
+            .filter(
+              ([name]) =>
+                !["HOME", "TMPDIR", ...HOST_DIRECTORY_VARIABLES].includes(name),
+            )
+            .map(
+              ([name, value]) =>
+                `${JSON.stringify(name)} = ${JSON.stringify(value)}\n`,
+            )
+        : [];
     const config = options.sandbox
-      ? `default_permissions = "factory"\n${options.config}\n${permissionProfile(options.sandbox, source, home, temporary)}`
+      ? `default_permissions = "factory"\n${options.config}\n${permissionProfile(options.sandbox, source, home, temporary)}${shellValues.length ? `\n[shell_environment_policy.set]\n${shellValues.join("")}` : ""}`
       : options.config;
     const configPath = join(codexHome, "config.toml");
     const configFd = openSync(
@@ -632,9 +646,6 @@ export function createCodexHome(options: {
           options.keep?.includes(name))
       )
         env[name] = value;
-    // Configured values first, so Factory's own variables win.
-    if (options.sandbox?.workspace === "write")
-      Object.assign(env, options.sandbox.provisioned?.environment);
     env.HOME = home;
     env.CODEX_HOME = codexHome;
     env.TMPDIR = temporary;
