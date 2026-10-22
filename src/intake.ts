@@ -111,6 +111,8 @@ import {
   collectStoppedWorkerReturns,
   controlStoppedObjective,
   runObjective,
+  SETTLE_DEADLINE_MS,
+  SettleDeadlineElapsed,
 } from "./runner.js";
 import { type ContinuationState, isExecutionState } from "./state.js";
 import {
@@ -161,6 +163,28 @@ export interface IntakeAuthorization {
   };
 }
 const DEFAULT_QUEUE_POLL_SECONDS = 30;
+/** Runs ending, waited for no longer than their settle deadline. */
+async function settledWithin(runs: Promise<void>[]): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.all(runs),
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, SETTLE_DEADLINE_MS + 5_000);
+    }),
+  ]);
+  clearTimeout(timer);
+}
+/** The hold of an Objective whose settlement was cut off at its deadline. */
+function unsettledReason(objective: number, detail: string): string {
+  return `${detail}; \`factory cancel --objective ${objective}\` finishes settling it`;
+}
+/** One Objective the service runs: its control while it serves one, and its end. */
+interface ActiveRun {
+  control?: (request: ControlRequest) => Promise<unknown>;
+  /** The run ended its steps and is settling (#1714). */
+  settling?: boolean;
+  done?: Promise<void>;
+}
 export const QUEUE_COMMAND_TIMEOUT_MS = 180_000;
 /** The archive holds this installation's publication; only the operator can resolve it. */
 export class ColdPublicationHeld extends Error {}
@@ -1669,15 +1693,12 @@ async function runIntakeOwned(
     lock = acquireInstallationLock(config.repository);
   let server: Awaited<ReturnType<typeof serveControl>> | undefined;
   // Runs asked to hand off because they wait behind an overlap while the
-  // service stops, or to take a plan refusal: their handoff is not the
-  // service's.
+  // service stops, to take a plan refusal, or for an upgrade: their
+  // handoff is not the service's.
   const yielded = new Set<number>();
   // The Objectives this service runs at once, each with the control its run
   // registers; at most queue.maxActiveObjectives (default 1).
-  const active = new Map<
-    number,
-    { control?: (request: ControlRequest) => Promise<unknown> }
-  >();
+  const active = new Map<number, ActiveRun>();
   const slots = maxActiveObjectives(config);
   const activeControls = () =>
     [...active].flatMap(([objective, entry]) =>
@@ -1693,7 +1714,13 @@ async function runIntakeOwned(
   // decision or cancellation, releases it to the next pass.
   const waiting = new Map<
     number,
-    { reason: string; state: string; retryAt?: number }
+    {
+      reason: string;
+      state: string;
+      retryAt?: number;
+      /** Settling stopped at its deadline: held even once terminal (#1714). */
+      unsettled?: true;
+    }
   >();
   const stateDigest = (state: ContinuationState | undefined) =>
     queueDigest(JSON.stringify(state ?? null));
@@ -1713,6 +1740,7 @@ async function runIntakeOwned(
     objective: number,
     reason: string,
     retryAt?: number,
+    unsettled?: true,
   ) => {
     let state: string;
     try {
@@ -1725,12 +1753,24 @@ async function runIntakeOwned(
       reason,
       state,
       ...(retryAt !== undefined && Number.isFinite(retryAt) ? { retryAt } : {}),
+      ...(unsettled ? { unsettled } : {}),
     });
   };
   // Upgrade drain (`factory supervisor upgrade` with several Objectives): no
   // new dispatch while the active runs finish; `queue resume` lifts it.
   let finishing = false;
   let handingOff = false;
+  /** Ask a run to hand off for an upgrade; true when it executes a step. */
+  const finishRun = async (
+    objective: number,
+    control: NonNullable<ActiveRun["control"]>,
+  ): Promise<boolean> => {
+    yielded.add(objective);
+    const reply = await control({ objective, action: "handoff" }).catch(
+      () => undefined,
+    );
+    return (reply as { executing?: boolean } | undefined)?.executing === true;
+  };
   let localMode: QueueMode | undefined;
   let completedCheckpointFailure: IntakeAuthorization["observation"];
   let wake: (() => void) | undefined;
@@ -1919,6 +1959,10 @@ async function runIntakeOwned(
         }
       }
       if (STOPPED_CONTROL.includes(request.action)) {
+        // A settling run ends within its deadline (#1714); the command then
+        // applies to the state it saved.
+        const run = active.get(request.objective);
+        if (run?.settling && run.done) await settledWithin([run.done]);
         // The Objective's run registers its control late and clears it early;
         // in those windows it may be writing state it has not saved yet.
         if (active.has(request.objective))
@@ -2016,9 +2060,26 @@ async function runIntakeOwned(
     // is checked above before any local dispatch state changes.
     if (request.action === "status") return handleOwned(request);
     if (request.objective === 0 && request.action === "finish") {
+      // Restart means handoff (#1714): no new dispatch, and every run hands
+      // off at its safe point, a pause or CI wait included, as the service's
+      // own drain that resumes after the restart (#1702). This returns once
+      // those have settled; only a run executing a step remains, and it
+      // hands off when the step ends.
       finishing = true;
       signalWake();
-      return Promise.resolve(localStatus());
+      return (async () => {
+        const runs = [...active];
+        const executing = await Promise.all(
+          runs.map(([objective, { control }]) =>
+            control ? finishRun(objective, control) : false,
+          ),
+        );
+        const settling = runs.flatMap(([, { done }], index) =>
+          executing[index] || !done ? [] : [done],
+        );
+        await settledWithin(settling);
+        return localStatus();
+      })();
     }
     if (request.objective === 0)
       backgroundObservation?.abort(observationPreempted);
@@ -2251,8 +2312,7 @@ async function runIntakeOwned(
       );
     };
     const launch = (selected: number, reasons: Record<string, string>) => {
-      const entry: { control?: (request: ControlRequest) => Promise<unknown> } =
-        {};
+      const entry: ActiveRun = {};
       active.set(selected, entry);
       const run = (async () => {
         try {
@@ -2278,6 +2338,8 @@ async function runIntakeOwned(
                 return true;
               },
               observeControl: async (handler) => {
+                // Its control clears when the run starts settling.
+                if (!handler && entry.control) entry.settling = true;
                 entry.control = handler;
                 if (
                   handler &&
@@ -2290,7 +2352,9 @@ async function runIntakeOwned(
                     objective: selected,
                     action: "resume",
                   }).catch(() => undefined);
-                if (handler && (handingOff || localMode))
+                if (handler && finishing && !handingOff && !localMode)
+                  await finishRun(selected, handler);
+                else if (handler && (handingOff || localMode))
                   await handler({
                     objective: selected,
                     action: handingOff
@@ -2310,10 +2374,26 @@ async function runIntakeOwned(
               result.coordinator?.waitReason ??
                 "Inspect retained Objective status",
             );
-        } catch (error) {
+        } catch (caught) {
+          let error = caught;
           if (error instanceof CoordinatorHandoff) {
             if (!yielded.delete(selected)) handingOff = true;
             return;
+          }
+          // Settling stopped at its deadline (#1714): the run's saved state
+          // stands, and the Objective waits for the operator to finish it,
+          // unless the run's own failure holds the whole installation.
+          if (error instanceof SettleDeadlineElapsed) {
+            if (error.cause === undefined || !installationWide(error.cause)) {
+              holdObjective(
+                selected,
+                unsettledReason(selected, error.message),
+                undefined,
+                true,
+              );
+              return;
+            }
+            error = error.cause;
           }
           const observation = {
             at: new Date().toISOString(),
@@ -2370,6 +2450,7 @@ async function runIntakeOwned(
           signalWake();
         }
       })().catch(holdInstallation);
+      entry.done = run;
       runs.add(run);
       void run.finally(() => runs.delete(run));
     };
@@ -2462,8 +2543,8 @@ async function runIntakeOwned(
             if (
               !queued.has(id) ||
               state === "history" ||
-              terminal(state) ||
-              state?.cancelRequested
+              (!waiting.get(id)?.unsettled &&
+                (terminal(state) || state?.cancelRequested))
             )
               waiting.delete(id);
           }
@@ -2528,6 +2609,17 @@ async function runIntakeOwned(
               continue;
             }
             if (terminal(state)) {
+              // A settlement cut off at its deadline leaves its claim
+              // unsettled; only `factory cancel` settles it (#1714).
+              if (locallyClaimedObjectives(config)?.includes(entry.objective)) {
+                const reason = unsettledReason(
+                  entry.objective,
+                  "Its queue claim is unsettled",
+                );
+                holdObjective(entry.objective, reason, undefined, true);
+                reasons[entry.objective] = reason;
+                continue;
+              }
               // A split parent whose last child settle failed closes here; it
               // needs only local state and the parent's own provider.
               if (splitReadyToClose(config.repository, state))
