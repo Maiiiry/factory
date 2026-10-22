@@ -1015,6 +1015,32 @@ const HOST_DIRECTORY_VARIABLES = [
 ];
 
 /**
+ * The real directories `sandbox.readOnlyPaths` names, refused when one is
+ * missing or would show HOME, logins, Factory's files, runtime sockets or the
+ * shared temporary directory. Every provider's sandbox mounts exactly these.
+ */
+export function resolveReadOnlyPaths(
+  paths: readonly string[],
+  checkout: string,
+): string[] {
+  const { exposes } = privatePaths(process.env, checkout);
+  return paths.map((path) => {
+    if (!existsSync(path))
+      throw configFault(
+        `sandbox.readOnlyPaths entry ${path} does not exist`,
+        "Create it or remove it from sandbox.readOnlyPaths",
+      );
+    const resolved = realpathSync(path);
+    if (exposes(resolved) || showsHostSockets(resolved))
+      throw configFault(
+        `sandbox.readOnlyPaths entry ${resolved} would show sandboxed commands your HOME, a login, Factory's own files, runtime sockets or the shared temporary directory`,
+        "Point sandbox.readOnlyPaths at a directory of its own, outside /tmp and the runtime directories",
+      );
+    return resolved;
+  });
+}
+
+/**
  * The process to spawn for `command`: `sh -c` inside bubblewrap, or plain
  * `sh -c` only when the operator set `sandbox.required` false and bubblewrap
  * is not installed. Run it with subprocessAsync, passing `bubblewrap`: that
@@ -1086,16 +1112,7 @@ export function sandboxedCommand(input: SandboxedCommandInput): {
       "Run Factory with a PATH whose directories hold only tools",
     );
   }
-  const readOnly = input.policy.readOnlyPaths.map((path) => {
-    if (!existsSync(path))
-      throw configFault(
-        `sandbox.readOnlyPaths entry ${path} does not exist`,
-        "Create it or remove it from sandbox.readOnlyPaths",
-      );
-    const resolved = realpathSync(path);
-    unsafe(resolved, "sandbox.readOnlyPaths entry");
-    return resolved;
-  });
+  const readOnly = resolveReadOnlyPaths(input.policy.readOnlyPaths, checkout);
   const env: Record<string, string> = { ...input.env };
   // Configured values come first, so Factory's own variables win; the
   // networked install never receives them.

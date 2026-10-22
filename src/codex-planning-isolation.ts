@@ -34,6 +34,7 @@ import {
   within,
 } from "./execution/sandbox.js";
 import { StepFault } from "./fault.js";
+import { resolveReadOnlyPaths } from "./execution/sandbox.js";
 import { workerToolchainPath } from "./process.js";
 
 /** Replaces native coding-agent boilerplate only for isolated read-only roles. */
@@ -127,6 +128,11 @@ interface CodexSandbox {
   network: boolean;
   /** The operator's `sandbox.required`; absent is strict. */
   required?: boolean;
+  /** The operator's `sandbox.readOnlyPaths` and `sandbox.environment`, as validation gets them. */
+  provisioned?: {
+    readOnlyPaths: readonly string[];
+    environment: Record<string, string>;
+  };
 }
 
 /**
@@ -197,6 +203,10 @@ function permissionProfile(
               "Codex workers",
             ),
             ...gitMetadata(real(sandbox.directory)),
+            ...resolveReadOnlyPaths(
+              sandbox.provisioned?.readOnlyPaths ?? [],
+              real(sandbox.directory),
+            ),
           ].map((directory) => `${path(directory)} = "read"`),
           `${path(home)} = "write"`,
           `${path(temporary)} = "write"`,
@@ -622,6 +632,9 @@ export function createCodexHome(options: {
           options.keep?.includes(name))
       )
         env[name] = value;
+    // Configured values first, so Factory's own variables win.
+    if (options.sandbox?.workspace === "write")
+      Object.assign(env, options.sandbox.provisioned?.environment);
     env.HOME = home;
     env.CODEX_HOME = codexHome;
     env.TMPDIR = temporary;

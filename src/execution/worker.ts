@@ -185,6 +185,13 @@ async function runCodexWorker(
       ...sandbox,
       directory: request.worktree,
       required: request.commandSandbox?.required,
+      ...(!discovery &&
+        request.commandSandbox && {
+          provisioned: {
+            readOnlyPaths: request.commandSandbox.readOnlyPaths,
+            environment: request.commandSandbox.environment,
+          },
+        }),
     },
     keep: discovery ? [] : allowedSecretNames,
   });

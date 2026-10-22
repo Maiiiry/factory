@@ -2365,3 +2365,47 @@ test("a root controller runs no sandboxed command unless the sandbox is optional
     sandbox: { ...shell, required: false },
   }).dispose();
 });
+
+test("a Codex worker shell gets the configured read-only mounts and environment, nothing else", {
+  skip: new URL("..", import.meta.url).pathname.startsWith(`${tmpdir()}/`),
+}, (t) => {
+  const tools = outsideTemporary();
+  t.after(() => rmSync(tools, { recursive: true, force: true }));
+  const directory = mkdtempSync(join(tmpdir(), "factory-codex-provisioned-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  execFileSync("git", ["init", "-q", directory]);
+  const provisioned = {
+    readOnlyPaths: [tools],
+    environment: { TOOL_DIR: tools },
+  };
+  const sandbox = { directory, workspace: "write", network: false };
+  const home = createCodexHome({
+    config: "",
+    sandbox: { ...sandbox, provisioned },
+  });
+  t.after(() => home.dispose());
+  const config = readFileSync(
+    join(home.root, "codex-home", "config.toml"),
+    "utf8",
+  );
+  assert.match(
+    config,
+    new RegExp(`${JSON.stringify(realpathSync(tools))} = "read"`),
+  );
+  assert.equal(home.env.TOOL_DIR, tools);
+  // Without the configuration, neither appears; a mount under /tmp is refused.
+  const bare = createCodexHome({ config: "", sandbox });
+  t.after(() => bare.dispose());
+  assert.equal(bare.env.TOOL_DIR, undefined);
+  assert.throws(
+    () =>
+      createCodexHome({
+        config: "",
+        sandbox: {
+          ...sandbox,
+          provisioned: { readOnlyPaths: [directory], environment: {} },
+        },
+      }),
+    /sandbox\.readOnlyPaths entry .* shared temporary/,
+  );
+});
