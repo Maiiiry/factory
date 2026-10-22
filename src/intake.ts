@@ -108,10 +108,8 @@ import { checkRequiredEnvironment } from "./repair-policy.js";
 import {
   type ApplicationServices,
   CoordinatorHandoff,
-  cancelStoppedObjective,
   collectStoppedWorkerReturns,
-  decideStoppedObjective,
-  parseDecisionInput,
+  controlStoppedObjective,
   runObjective,
 } from "./runner.js";
 import { type ContinuationState, isExecutionState } from "./state.js";
@@ -1622,6 +1620,34 @@ export interface IntakeStartupOptions {
   /** Services for a queued Objective's frozen provider when it is not the service's own. */
   servicesFor?: (config: FactoryConfig) => ApplicationServices;
 }
+/**
+ * Operator commands the service runs itself on an Objective that no run
+ * owns (#1714); the foreground implementation refuses what the state does
+ * not allow, with its stable code.
+ */
+const STOPPED_CONTROL: readonly ControlRequest["action"][] = [
+  "decide",
+  "cancel",
+  "retry",
+  "repair",
+  "rereview",
+  "select",
+  "pause",
+  "drain",
+  "resume",
+  "propose-amendment",
+  "decline-discovery",
+];
+/** Of those, the commands that let work start: they need a queue admission. */
+const STARTS_WORK: readonly ControlRequest["action"][] = [
+  "retry",
+  "resume",
+  "select",
+  "repair",
+  "rereview",
+  "propose-amendment",
+];
+
 export function runIntake(
   config: FactoryConfig,
   services: ApplicationServices,
@@ -1642,6 +1668,10 @@ async function runIntakeOwned(
   const lockPath = join(stateRoot(config.repository), "controller.lock"),
     lock = acquireInstallationLock(config.repository);
   let server: Awaited<ReturnType<typeof serveControl>> | undefined;
+  // Runs asked to hand off because they wait behind an overlap while the
+  // service stops, or to take a plan refusal: their handoff is not the
+  // service's.
+  const yielded = new Set<number>();
   // The Objectives this service runs at once, each with the control its run
   // registers; at most queue.maxActiveObjectives (default 1).
   const active = new Map<
@@ -1857,6 +1887,10 @@ async function runIntakeOwned(
     // An operator command naming a held Objective releases its hold, so the
     // next pass dispatches it again; a run that still needs a person holds
     // it again. A queue resume releases every hold, the installation's too.
+    // Admitted under the current queue authority: work may start for it.
+    const admitted =
+      record.objectives.includes(request.objective) ||
+      waiting.has(request.objective);
     if (request.objective !== 0 && request.action !== "status")
       waiting.delete(request.objective);
     else if (request.action === "enqueue" || request.action === "dequeue")
@@ -1868,44 +1902,46 @@ async function runIntakeOwned(
     }
     if (request.objective !== 0) {
       const control = active.get(request.objective)?.control;
-      if (control) return control(request);
-      if (request.action === "decide" || request.action === "cancel") {
+      if (control) {
+        // A paused planning owner hands this Objective alone off to take a
+        // plan refusal, which lands once the run settles (#1714).
+        const refusal =
+          request.action === "decide" && request.input?.outcome === "refuse";
+        if (refusal) yielded.add(request.objective);
+        try {
+          const result = await control(request);
+          if (refusal && result !== "plan-handed-off")
+            yielded.delete(request.objective);
+          return result;
+        } catch (error) {
+          if (refusal) yielded.delete(request.objective);
+          throw error;
+        }
+      }
+      if (STOPPED_CONTROL.includes(request.action)) {
         // The Objective's run registers its control late and clears it early;
         // in those windows it may be writing state it has not saved yet.
         if (active.has(request.objective))
           throw new LifecycleRefusal(
             "owner_settling",
-            `Objective #${request.objective} is starting or settling under the service; retry the ${request.action === "decide" ? "decision" : "cancellation"}`,
+            `Objective #${request.objective} is starting or settling under the service; retry the ${request.action}`,
           );
-        // A queued Objective no run owns, such as one stopped for a person:
-        // the service owns the installation, so it records the decision or
-        // the cancellation itself, on the provider the Objective froze. This
-        // request is pending control, which holds new dispatch until it
-        // settles (#1290, #1711).
-        if (record.objectives.includes(request.objective)) {
-          const input =
-            request.action === "decide"
-              ? parseDecisionInput(request.input)
-              : undefined;
-          const { config: objectiveConfig, services: objectiveServices } =
-            objectiveRuntime(request.objective);
-          if (!input)
-            return asInstallationOwner(lock, () =>
-              cancelStoppedObjective(
-                objectiveConfig,
-                request.objective,
-                objectiveServices,
-              ),
-            );
-          return asInstallationOwner(lock, () =>
-            decideStoppedObjective(
-              objectiveConfig,
-              request.objective,
-              objectiveServices,
-              input,
-            ),
+        // Paid work starts only under queue authority.
+        if (STARTS_WORK.includes(request.action) && !admitted)
+          throw new LifecycleRefusal(
+            "objective_not_admitted",
+            `Objective #${request.objective} has no current queue admission; run \`factory queue add ${request.objective}\` first`,
           );
-        }
+        // An Objective no run owns, such as one stopped for a person or
+        // paused: the service owns the installation, so it runs the command
+        // itself, on the provider the Objective froze. This request is
+        // pending control, which holds new dispatch until it settles
+        // (#1290, #1711, #1714).
+        const { config: objectiveConfig, services: objectiveServices } =
+          objectiveRuntime(request.objective);
+        return asInstallationOwner(lock, () =>
+          controlStoppedObjective(objectiveConfig, objectiveServices, request),
+        );
       }
       const state = readContinuation(config.repository, request.objective);
       if (
@@ -2154,9 +2190,6 @@ async function runIntakeOwned(
       bindRecoveryCheckpointControllerScope(handle),
     );
     const runs = new Set<Promise<void>>();
-    // Runs asked to hand off because they wait behind an overlap while the
-    // service stops; their handoff is not the service's.
-    const yielded = new Set<number>();
     // Selected Objectives whose drain the service left itself (its own
     // handoff, before or after a restart): their run here resumes them.
     const requeued = new Set<number>();
