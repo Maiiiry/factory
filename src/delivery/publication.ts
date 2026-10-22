@@ -592,29 +592,50 @@ export function mergeControl(
       );
   };
   return {
-    async beforeMerge(identity) {
+    async beforeMerge(identity, observed) {
       assertCurrent(identity);
-      if (intent!.effects?.some((effect) => effect.request.kind === "merge"))
+      const request = {
+        kind: "merge" as const,
+        pullRequest: identity.number,
+        branch: identity.branch,
+        headSha: identity.headSha,
+      };
+      const retained = intent!.effects?.find(
+        (effect) => effect.request.kind === "merge",
+      );
+      // A blocked request was never sent. A possibly sent one for this PR
+      // took no effect when the caller just read it open and unmerged at the
+      // request head: GitHub merges atomically, and a request guarded by an
+      // earlier head cannot merge this one. Either is sent again (#1749).
+      if (
+        retained &&
+        (retained.disposition === "observed" ||
+          observed.state !== "open" ||
+          observed.merged ||
+          observed.headSha !== request.headSha ||
+          (retained.disposition === "intent" &&
+            (retained.request.pullRequest !== request.pullRequest ||
+              retained.request.branch !== request.branch)))
+      )
         throw fenced(
           "Merge request is already retained; only exact read-only reconciliation is admitted",
         );
-      intent!.effects ??= [];
-      intent!.effects.push({
-        request: {
-          kind: "merge",
-          pullRequest: identity.number,
-          branch: identity.branch,
-          headSha: identity.headSha,
-        },
+      const effect = {
+        request,
         recordedAt: new Date().toISOString(),
-        disposition: "intent",
-      });
+        disposition: "intent" as const,
+      };
+      intent!.effects ??= [];
+      if (retained) intent!.effects[intent!.effects.indexOf(retained)] = effect;
+      else intent!.effects.push(effect);
       save();
       try {
         await awaitCheckpointAdmission(state.repository, "before-effect");
       } catch (error) {
         if (isCheckpointAdmissionFailure(error)) {
-          intent!.effects!.at(-1)!.disposition = "blocked";
+          intent!.effects!.find(
+            (effect) => effect.request.kind === "merge",
+          )!.disposition = "blocked";
           save();
         }
         throw error;
