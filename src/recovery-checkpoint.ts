@@ -4663,8 +4663,9 @@ function observeQueueAncestry(
     transportBytes += charge;
     return { oid: match[1]!, size };
   });
-  const manifestTransportBytes =
-    transportBytes + (prefix?.manifestTransportBytes ?? 0);
+  // Only the history after the authenticated witness is read, so only it is
+  // charged: an archive's age alone must not exhaust the bound (#1763).
+  const manifestTransportBytes = transportBytes;
   const manifestBufferBytes = options.maxBytes + 65536;
   if (manifestTransportBytes > manifestBufferBytes)
     throw new CheckpointBoundsExceeded(
@@ -5128,6 +5129,19 @@ function queueOwnerLineage(
     }),
   };
 }
+/** A witness applies only if its tip is an ancestor whose exact manifest it names. */
+function witnessApplies(
+  directory: string,
+  options: GitPersistenceConfig,
+  cached: CachedQueueLineage,
+  tip: string,
+): boolean {
+  if (!reachableFrom(directory, options, cached.tip, tip)) return false;
+  return (
+    hash(git(directory, options, ["show", `${cached.tip}:checkpoint.json`])) ===
+    cached.manifestDigest
+  );
+}
 function reuseQueueLineage(
   config: FactoryConfig,
   options: GitPersistenceConfig,
@@ -5139,7 +5153,7 @@ function reuseQueueLineage(
   includeBodies: boolean,
   observeCapacity?: (capacity: QueueLineageCapacity) => void,
 ): { lineage: VerifiedQueueOwnerLineage; cache: CachedQueueLineage } {
-  const originals = new Map(cached.originals.map((ref) => [ref.digest, ref]));
+  const originals = new Map<string, ContentRef>();
   observation?.prefetchOriginals(request);
   const read = (commit: string, ref: ContentRef) => {
     const bytes = observation
@@ -6028,6 +6042,8 @@ function reportColdVerification(): void {
  * `verify-<uuid>.git` name, which the sweep removes.
  */
 const VERIFIER_SEAL = "factory-verifier.json";
+/** Verified cancellation witnesses sealed with the verifier; the newest survive a restart. */
+const SEALED_LINEAGES = 32;
 /**
  * At close, consolidate a verifier holding more than this many object files
  * (loose objects and pack files) into one pack. A cold start compares and
@@ -6084,6 +6100,10 @@ async function retainVerifier(
       key: sealKey(config, options),
       tip,
       objects: [...objects!],
+      lineages: {
+        key: verification.key,
+        entries: [...verification.lineages].slice(-SEALED_LINEAGES),
+      },
     });
     const shared = paths(config.repository).verifier;
     const replaced = join(dirname(shared), `verify-${randomUUID()}.git`);
@@ -6172,6 +6192,22 @@ function adoptRetainedVerifier(
     context.objectBytes = objectBytes;
     retainVerifiedNegotiationTip(context, options, seal.tip);
     if (context.negotiationTip === seal.tip) context.adoptedTip = seal.tip;
+    // Witnesses ride on the sealed objects and are re-checked against the
+    // archive before every use (witnessApplies), so the seal adds no trust.
+    if (
+      seal.lineages?.key === context.key &&
+      Array.isArray(seal.lineages.entries)
+    )
+      for (const [key, entry] of seal.lineages.entries as [
+        string,
+        CachedQueueLineage,
+      ][])
+        if (
+          typeof key === "string" &&
+          typeof entry?.tip === "string" &&
+          entry.proof?.checkpoints
+        )
+          retainQueueLineage(context, options, key, entry);
   } catch {
     delete context.objects;
     context.objectBytes = 0;
@@ -6449,7 +6485,10 @@ async function freshArchiveOwnedStrict(
     const verifyLineage = (request: QueueOwnerLineageRequest) => {
       assertQueueLineageRequest(options, request);
       const key = canonical(request);
-      const cached = context?.objects ? context.lineages.get(key) : undefined;
+      let cached = context?.objects ? context.lineages.get(key) : undefined;
+      // A witness the archive no longer supports is rebuilt, never trusted.
+      if (cached && !witnessApplies(directory, options, cached, tip))
+        cached = undefined;
       if (cached) {
         let suffix: QueueAncestryObservation | undefined;
         if (cached.tip !== tip) {

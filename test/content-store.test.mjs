@@ -2146,7 +2146,13 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       assert.equal(cold.commitSha, multiWitnessInspection.commitSha);
       assert.equal(warm.commitSha, cold.commitSha);
       assert.deepEqual(cold.capacity, multiWitnessInspection.capacity);
-      assert.deepEqual(warm.capacity, cold.capacity);
+      // A verified witness charges only the history after it (#1763).
+      warm.capacity.cancellationAncestry.traversals.forEach((row, index) =>
+        assert.ok(
+          row.chargedBytes <=
+            cold.capacity.cancellationAncestry.traversals[index].chargedBytes,
+        ),
+      );
     },
     { queueControlVerification: true },
   );
@@ -3367,6 +3373,11 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const sealedTip = () =>
     JSON.parse(readFileSync(join(retainedVerifier, "factory-verifier.json")))
       .tip;
+  // Verified cancellation witnesses outlive the process with the seal (#1763).
+  assert.ok(
+    JSON.parse(readFileSync(join(retainedVerifier, "factory-verifier.json")))
+      .lineages.entries.length > 0,
+  );
   const storedObjects = (directory) => {
     const counts = Object.fromEntries(
       execFileSync("git", ["--git-dir", directory, "count-objects", "-v"], {
