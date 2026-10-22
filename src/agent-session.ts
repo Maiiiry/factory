@@ -31,6 +31,7 @@ import {
 import { settleInterruptedPaidCall } from "./step.js";
 import type { ContinuationState } from "./state.js";
 import type { WorkRecovery } from "./repair-policy.js";
+import { LifecycleRefusal } from "./lifecycle-refusal.js";
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -768,7 +769,8 @@ export function abandonRetriedDiagnoses(
     onHeld === "refuse" &&
     unanswered.some((holder) => held(holder.diagnosisInvocation!.id))
   )
-    throw new Error(
+    throw new LifecycleRefusal(
+      "diagnosis_held",
       "A diagnosis of this Work Item is still held by its planning session; run the Objective to settle it, then try again",
     );
   for (const holder of unanswered)
@@ -1023,7 +1025,10 @@ export async function releaseAgentSessions(
       ...(state.agentSessionHistory ?? []),
     ].some((ref) => ref.currentTurn && ref.currentTurn.resources !== "settled")
   )
-    throw new Error("Agent session disposal requires settled native resources");
+    throw new LifecycleRefusal(
+      "session_unsettled",
+      "Agent session disposal requires settled native resources",
+    );
   // Every session is settled, so one acknowledgment covers all their storage.
   await withCheckpointDisposals(async () => {
     for (const [entryKey, ref] of Object.entries(state.agentSessions ?? {})) {

@@ -103,6 +103,7 @@ import {
 } from "./status-summary.js";
 import { supervise } from "./supervision.js";
 import { runWorkflowRecipePreview } from "./workflow-recipes-cli.js";
+import { LifecycleRefusal, lifecycleCode } from "./lifecycle-refusal.js";
 
 /** Whether a live controller owns this Objective; null when a lock is unreadable. */
 function controllerActive(
@@ -804,7 +805,8 @@ async function dispatchMain(
     // A rejected amendment keeps the Objective paused: the resume or drain
     // changed nothing, so say what does (#1297).
     if (result?.hold)
-      throw new Error(
+      throw new LifecycleRefusal(
+        "rejection_hold",
         `Objective #${objective} stays paused: a rejected graph amendment holds it; ${result.hold.next ? `run ${result.hold.next}` : "submit a replacement or cancel"}`,
       );
     console.log(JSON.stringify(result));
@@ -1361,6 +1363,10 @@ main().catch((error: unknown) => {
           "Inspect retained status; do not replay an unknown mutation",
       }),
     );
+  // A lifecycle refusal names its stable code for tools, once: the outermost
+  // code of the cause chain. The message stays for people (#1714).
+  const code = lifecycleCode(error);
+  if (code) console.error(JSON.stringify({ kind: "lifecycle-refusal", code }));
   console.error(
     `Factory: ${error instanceof Error ? error.message : String(error)}`,
   );
