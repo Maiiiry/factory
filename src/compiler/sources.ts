@@ -17,7 +17,10 @@ import {
 } from "../workspace-membership.js";
 import type { PlanCandidate } from "./candidate.js";
 import { normalizedCommand } from "../qa.js";
-import { validationEnvironmentInstructions } from "../validation-environment.js";
+import {
+  networkToolIn,
+  validationEnvironmentInstructions,
+} from "../validation-environment.js";
 import { finalValidationCommands } from "../config.js";
 import { GraphValidationError } from "../scheduler.js";
 import {
@@ -1334,6 +1337,145 @@ export function assertNoCiOnlyValidation(
           item.id,
           `Work Item ${item.id} validation runs ${command}, which the installation marks CI-only: it needs network and validation runs offline. Leave it to CI; when a criterion needs it, ask through decisionRequired`,
         );
+}
+
+/**
+ * Segments that run offline: the authorized package bootstrap (the one
+ * command granted a network) and npx/pnpx/bunx, which run a local bin.
+ */
+function offlineSegment(segment: string): boolean {
+  if (packageBootstrap(segment) !== undefined) return true;
+  const first = segment
+    .split(/\s+/)
+    .find((word) => word && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+  return first !== undefined && /^(?:npx|pnpx|bunx)$/.test(first);
+}
+
+/** The network tool a validation command reaches, directly or through root package scripts (to a fixed depth). */
+function networkToolOfCommand(
+  command: string,
+  scripts: Record<string, unknown>,
+  depth = 0,
+): string | undefined {
+  const direct = networkToolIn(command, offlineSegment);
+  if (direct) return direct;
+  const invocation = packageScriptInvocation(command);
+  const body = invocation ? scripts[invocation.name] : undefined;
+  if (typeof body !== "string" || depth > 3) return undefined;
+  const own = networkToolIn(body, offlineSegment);
+  if (own) return own;
+  for (const segment of body.split(/&&|\|\||[;|\n&]/))
+    if (packageScriptInvocation(segment.trim())) {
+      const nested = networkToolOfCommand(segment.trim(), scripts, depth + 1);
+      if (nested) return nested;
+    }
+  return undefined;
+}
+
+/** A new migration number or test file named in acceptance text; a glob is never a file name. */
+const NUMBERED_SQL =
+  /(?<![\w./*?\]}-])((?:[\w.-]+\/)*\d{3,}[_-][\w.-]*\.sql)(?![\w*?-])/g;
+const NUMBERED_MIGRATION =
+  /(?<![\w./*?\]}-])((?:[\w.-]+\/)*migrat[\w.-]*\/(?:[\w.-]+\/)*\d{3,}[_-][\w.-]*\.(?:[cm]?[jt]s|py|rb|exs?|kt|java|go|rs))(?![\w*?-])/g;
+const TEST_FILE =
+  /(?<![\w./*?\]}-])((?:[\w.-]+\/)*(?:[\w.-]*\.(?:test|spec)\.[cm]?[jt]sx?|test_[\w.-]+\.py|[\w.-]+_test\.(?:py|go|rs|rb)))(?![\w*?-])/g;
+
+/**
+ * The plan standard's checks that need the base: a validation command whose
+ * script reaches a network (validation has none; only the authorized
+ * bootstrap and local npx bins are offline), and acceptance that names a migration number or test
+ * file absent from the base tree (the worker names new files). Structural
+ * only: command words, script bodies and file-name shapes. One correction.
+ */
+export function assertPlanBoundaries(
+  graph: WorkGraph,
+  checkout: string,
+  ciOnlyCommands: readonly string[] = [],
+  /** The Objective and pinned sources: a name they use is fixed, not the worker's choice. */
+  fixedTexts: readonly string[] = [],
+): void {
+  const ciOnly = new Set(ciOnlyCommands.map(normalizedCommand));
+  let scripts: Record<string, unknown> | undefined;
+  const rootScripts = (): Record<string, unknown> => {
+    if (scripts) return scripts;
+    try {
+      const parsed = JSON.parse(
+        pinnedText(checkout, graph.baseSha, "package.json"),
+      ) as { scripts?: unknown };
+      scripts =
+        parsed.scripts && typeof parsed.scripts === "object"
+          ? (parsed.scripts as Record<string, unknown>)
+          : {};
+    } catch {
+      scripts = {};
+    }
+    return scripts;
+  };
+  let tree: { paths: Set<string>; names: Set<string> } | null | undefined;
+  const baseTree = () => {
+    if (tree !== undefined) return tree;
+    try {
+      const paths = pinnedGitRaw(
+        checkout,
+        "ls-tree",
+        "-rz",
+        "--name-only",
+        graph.baseSha,
+      )
+        .toString("utf8")
+        .split("\0")
+        .filter(Boolean);
+      tree = {
+        paths: new Set(paths),
+        names: new Set(paths.map((path) => path.replace(/^.*\//, ""))),
+      };
+    } catch {
+      tree = null;
+    }
+    return tree;
+  };
+  const findings: string[] = [];
+  let first: string | undefined;
+  const found = (id: string, finding: string) => {
+    first ??= id;
+    findings.push(finding);
+  };
+  for (const item of workShapes(graph)) {
+    for (const { command } of item.validation) {
+      if (packageBootstrap(command) || ciOnly.has(normalizedCommand(command)))
+        continue;
+      const tool = networkToolOfCommand(command, rootScripts());
+      if (tool)
+        found(
+          item.id,
+          `Work Item ${item.id} validation runs ${command}, which reaches a network (${tool}) that validation does not have: select the item's offline commands instead, leave this one to CI, or, when a criterion needs it, ask through decisionRequired`,
+        );
+    }
+    const named = new Set<string>();
+    for (const entry of item.acceptance)
+      for (const pattern of [NUMBERED_SQL, NUMBERED_MIGRATION, TEST_FILE])
+        for (const match of entry.matchAll(pattern)) named.add(match[1]!);
+    for (const file of named) {
+      const base = baseTree();
+      if (!base) break;
+      if (file.includes("/") ? base.paths.has(file) : base.names.has(file))
+        continue;
+      if (
+        fixedTexts.some((text) => text.includes(file)) ||
+        item.ownedPaths.some((owned) =>
+          file.includes("/")
+            ? owned === file || (owned.endsWith("/") && file.startsWith(owned))
+            : owned.replace(/^.*\//, "") === file,
+        )
+      )
+        continue;
+      found(
+        item.id,
+        `Work Item ${item.id} acceptance names ${file}, which does not exist at the base: a new migration number or test file is the worker's choice, so describe it by role and data and leave the name out`,
+      );
+    }
+  }
+  if (first) throw new GraphValidationError(first, findings.join("; "));
 }
 
 /** The planner's note on the installation's CI-only commands; empty when none. */
