@@ -51,6 +51,7 @@ import {
   redactDiagnosticDetail,
 } from "./diagnostics.js";
 import { attachFault, decision, type Fault, transient } from "./fault.js";
+import { LifecycleRefusal } from "./lifecycle-refusal.js";
 import {
   assertProcessActive,
   currentProcessDeadlineAt,
@@ -65,6 +66,7 @@ import {
   subprocessAsync,
   takeGuard,
   UnsettledSubprocessError,
+  withBoundedPublication,
   withCheckpointPublication,
   withProcessCancellation,
 } from "./process.js";
@@ -7599,6 +7601,22 @@ const MAINTENANCE_BUDGET_MS = 10_000;
  * publication in any process has priority over housekeeping.
  */
 const PACK_LOCK_WAIT_MS = 100;
+/**
+ * An operator command waits this long for another process's publication,
+ * then refuses with `publication_lock_held`. It covers one pack batch (about
+ * two seconds, see packPublisher): maintenance pauses PACK_LOCK_WAIT_MS
+ * between batches so a waiting publication takes the lock first.
+ */
+const OPERATOR_PUBLICATION_WAIT_MS = 3_000;
+const operatorCommands = new AsyncLocalStorage<{ waitMs: number }>();
+/**
+ * Run a one-shot operator command: every mutating CLI command except `run`,
+ * queue commands included. Its publications together wait at most
+ * OPERATOR_PUBLICATION_WAIT_MS for another process's publication lock.
+ */
+export function withOperatorCommand<T>(task: () => Promise<T>): Promise<T> {
+  return operatorCommands.run({ waitMs: OPERATOR_PUBLICATION_WAIT_MS }, task);
+}
 export interface RecoveryCheckpointMaintenance {
   /** False when the budget ran out with work left; the next pass continues. */
   complete: boolean;
@@ -7651,6 +7669,8 @@ export async function maintainRecoveryCheckpoint(
       complete = false;
       break;
     }
+    // Let a publication waiting in another process take the lock first.
+    await new Promise((resolve) => setTimeout(resolve, PACK_LOCK_WAIT_MS));
   }
   let reclaimedObjectives = 0;
   if (persistence.scope === "private-history" && !stopped())
@@ -7795,7 +7815,25 @@ async function publishCheckpointLocked(
   if (!options) return gitPersistenceStatus(config);
   const p = paths(config.repository);
   mkdirSync(p.root, { recursive: true, mode: 0o700 });
-  return withCheckpointPublication(p.publicationGuard, async () => {
+  // A one-shot operator command waits a bounded time behind another
+  // process's publication (#1714). A controller waits its turn.
+  const operator = operatorCommands.getStore();
+  const waitFrom = Date.now();
+  const bound = !operator
+    ? undefined
+    : {
+        waitMs: operator.waitMs,
+        refuse: (holder?: number) => {
+          operator.waitMs = 0;
+          return new LifecycleRefusal(
+            "publication_lock_held",
+            `${holder === undefined ? "Another Factory process" : `Factory process ${holder}`} has held the archive publication lock for over ${OPERATOR_PUBLICATION_WAIT_MS / 1000} s. This command's local change is saved but not yet archived; run the same command again once that publication ends.`,
+          );
+        },
+      };
+  return withBoundedPublication(p.publicationGuard, bound, async () => {
+    if (operator)
+      operator.waitMs = Math.max(0, operator.waitMs - (Date.now() - waitFrom));
     try {
       const capturedAt = new Date().toISOString();
       let record = journal(config, options);
