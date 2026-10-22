@@ -4599,6 +4599,7 @@ function observeQueueAncestry(
   config: FactoryConfig,
   tip: string,
   prefix?: CachedQueueLineage,
+  claimId?: string,
 ): QueueAncestryObservation {
   const capturedKey = verificationKey(config, options);
   const completeCommits = git(directory, options, [
@@ -4620,7 +4621,31 @@ function observeQueueAncestry(
     throw new Error(
       "Cached queue witness is absent from exact first-parent ancestry",
     );
-  const commits = completeCommits.slice(prefixIndex + 1);
+  // A cold walk starts at the checkpoint just before the claim first appears:
+  // the claim is never removed, so presence is monotonic and found by bisection.
+  // The walk below rejects any history that is not exactly before/claimed.
+  let start = prefixIndex + 1;
+  if (!prefix && claimId) {
+    const claimPath = `project-queue-history/${claimId}.json`;
+    const claimed = (commit: string) =>
+      historicalManifestSummary(
+        git(directory, options, ["show", `${commit}:checkpoint.json`]),
+        config,
+        options,
+        capturedKey,
+      ).files.some((file) => file.path === claimPath);
+    if (claimed(completeCommits.at(-1)!)) {
+      let low = 0;
+      let high = completeCommits.length - 1;
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        if (claimed(completeCommits[mid]!)) high = mid;
+        else low = mid + 1;
+      }
+      start = Math.max(0, low - 1);
+    }
+  }
+  const commits = completeCommits.slice(start);
   // Each manifest below is found through its commit and root tree.
   const linked = authenticatedObjects(
     directory,
@@ -6480,7 +6505,7 @@ async function freshArchiveOwnedStrict(
       remoteTip: tip,
     };
     semanticBodyReads = archive.semanticBodyReads;
-    let observation: QueueAncestryObservation | undefined;
+    const observations = new Map<string, QueueAncestryObservation>();
     const suffixes = new Map<string, QueueAncestryObservation>();
     const verifyLineage = (request: QueueOwnerLineageRequest) => {
       assertQueueLineageRequest(options, request);
@@ -6518,8 +6543,18 @@ async function freshArchiveOwnedStrict(
         retainQueueLineage(context!, options, key, reused.cache);
         return reused.lineage;
       }
-      if (!observation)
-        observation = observeQueueAncestry(directory, options, config, tip);
+      let observation = observations.get(request.claimId);
+      if (!observation) {
+        observation = observeQueueAncestry(
+          directory,
+          options,
+          config,
+          tip,
+          undefined,
+          request.claimId,
+        );
+        observations.set(request.claimId, observation);
+      }
       let originals: ContentRef[] = [];
       const verified = queueOwnerLineage(
         options,
@@ -6770,7 +6805,11 @@ async function freshArchiveOwnedStrict(
         context.objects,
       );
     }
-    if (observation && observation.key !== verificationKey(config, options))
+    if (
+      [...observations.values()].some(
+        (observation) => observation.key !== verificationKey(config, options),
+      )
+    )
       throw new Error(
         "Queue ancestry observation binding changed during archive verification",
       );

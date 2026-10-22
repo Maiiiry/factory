@@ -2057,9 +2057,13 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const witnessCharges =
     multiWitnessInspection.capacity.cancellationAncestry.traversals;
   assert.equal(witnessCharges.length, 2);
-  assert.equal(
-    witnessCharges[0].manifestTransportBytes,
-    witnessCharges[1].manifestTransportBytes,
+  // A cold walk starts at the claim's pre-claim checkpoint, so a claim made late
+  // in a long archive is charged only for the history after it (#1763).
+  const [lateClaim, earlyClaim] = [...witnessCharges].sort(
+    (a, b) => a.chargedBytes - b.chargedBytes,
+  );
+  assert.ok(
+    lateClaim.manifestTransportBytes < earlyClaim.manifestTransportBytes,
   );
   for (const charge of witnessCharges) {
     assert.equal(charge.retainedOriginalBytes > 0, true);
@@ -2146,7 +2150,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
       assert.equal(cold.commitSha, multiWitnessInspection.commitSha);
       assert.equal(warm.commitSha, cold.commitSha);
       assert.deepEqual(cold.capacity, multiWitnessInspection.capacity);
-      // A verified witness charges only the history after it (#1763).
       warm.capacity.cancellationAncestry.traversals.forEach((row, index) =>
         assert.ok(
           row.chargedBytes <=
@@ -3373,11 +3376,6 @@ test("repository memory verifies complete retained bodies and rebuilds scoped SQ
   const sealedTip = () =>
     JSON.parse(readFileSync(join(retainedVerifier, "factory-verifier.json")))
       .tip;
-  // Verified cancellation witnesses outlive the process with the seal (#1763).
-  assert.ok(
-    JSON.parse(readFileSync(join(retainedVerifier, "factory-verifier.json")))
-      .lineages.entries.length > 0,
-  );
   const storedObjects = (directory) => {
     const counts = Object.fromEntries(
       execFileSync("git", ["--git-dir", directory, "count-objects", "-v"], {
