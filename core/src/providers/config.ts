@@ -382,12 +382,25 @@ function workerConfig(
           "acceptEdits",
           "dontAsk",
         ] as const);
-      if (worker.settingSources !== undefined)
-        settings.settingSources = names(
-          "settingSources",
-          ["user", "project", "local"] as const,
-          true,
-        );
+      if (worker.settingSources !== undefined) {
+        // Project and local settings are files in the worktree, which the
+        // repository or the worker writes; the CLI runs their hooks on the
+        // host, outside the sandbox.
+        const sources = worker.settingSources;
+        if (
+          Array.isArray(sources) &&
+          sources.some((source) => source === "project" || source === "local")
+        )
+          problems.push(
+            `${path}.settingSources may name only "user": project and local settings come from the worktree, and their hooks would run outside the sandbox`,
+          );
+        else
+          settings.settingSources = names(
+            "settingSources",
+            ["user"] as const,
+            true,
+          );
+      }
       if (worker.tools !== undefined)
         settings.tools = names("tools", CLAUDE_TOOLS, false);
       if (worker.allowedTools !== undefined) {

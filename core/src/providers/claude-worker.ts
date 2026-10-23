@@ -72,14 +72,15 @@ import { detail, IdleWatchdog, PlannerError } from "./planner.js";
 
 // Configuration
 
-export type ClaudeSettingSource = "user" | "project" | "local";
+/** Only the operator's own settings: worktree settings are refused at load (providers/config.ts). */
+export type ClaudeSettingSource = "user";
 
 /** The operator's Claude worker settings. */
 export interface ClaudeWorkerConfig {
   model: string;
   effort: ClaudeEffort;
   permissionMode: "acceptEdits" | "dontAsk";
-  /** Filesystem settings the CLI loads; project or local withholds the shell. */
+  /** Filesystem settings the CLI loads: none, or the operator's user settings. */
   settingSources: ClaudeSettingSource[];
   /** Offered tools: Read, Edit, Write, Glob, Grep and Validate. */
   tools: string[];
@@ -1075,16 +1076,12 @@ export class ClaudeWorker implements Worker {
     const validate =
       granted(VALIDATE) && input.commands.length > 0 && !gitlinks;
     // Write and Validate together grant the shell: it adds nothing they
-    // don't grant together. Not when project or local settings load (their
-    // hooks run outside the sandbox), not as root (the sandbox refuses
-    // root), and only where bubblewrap runs.
+    // don't grant together. Not as root (the sandbox refuses root), and
+    // only where bubblewrap runs.
     const shell =
       granted("Write") &&
       granted(VALIDATE) &&
       !gitlinks &&
-      !config.settingSources.some(
-        (source) => source === "project" || source === "local",
-      ) &&
       process.geteuid?.() !== 0 &&
       sandboxAvailable().available;
     const attempt = new Attempt(
