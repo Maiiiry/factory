@@ -13,7 +13,7 @@ import {
   type StepContext,
 } from "../engine.js";
 import { defaultHead } from "../git.js";
-import type { GitHub } from "../github.js";
+import { type GitHub, sameLogin } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
 import { prose } from "../markdown.js";
 import { checkObjective } from "../objective.js";
@@ -22,14 +22,15 @@ import { resolvedProvider } from "../providers/selection.js";
 import { logRefused } from "../providers/usage.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import { readShown, type ShownObjective, shownDigest } from "../shown.js";
-import type { Answer, ObjectiveState } from "../state.js";
+import { type Answer, findState, type ObjectiveState } from "../state.js";
 import { adaptiveWorkflow, declarationProblems } from "../validate.js";
 import { checkPlan } from "./checks.js";
 import { observeLocalExecutables } from "./executables.js";
 import {
   BaseFiles,
   buildFacts,
-  childIdentity,
+  childDigest,
+  childOf,
   commandInstructions,
   finalCommands,
   objectiveCommandProblems,
@@ -42,6 +43,7 @@ import {
   generationInputs,
   position,
   proposalsOf,
+  splitRecord,
 } from "./plan.js";
 import {
   type PredecessorEvidence,
@@ -126,7 +128,13 @@ export function planningStep(
   const { g, n } = position(state);
   const planKey = `plan:${g}:${n}`;
   const planned = state.done[planKey] as PlanRound | undefined;
-  if (!planned) return forgetting(planRoundStep(planKey, g, n, deps));
+  if (!planned)
+    return g === 1 &&
+      n === 1 &&
+      generationInputs(state, 1).adopt &&
+      !state.kept[ADOPT_TRIED]
+      ? adoptStep(planKey, deps)
+      : forgetting(planRoundStep(planKey, g, n, deps));
   const reviewKey = `review:${g}:${n}`;
   if (cleanDraft(planned) && !state.done[reviewKey])
     return reviewStep(reviewKey, g, n, deps);
@@ -148,6 +156,13 @@ export interface ObjectiveInputs {
   writer?: true;
   /** A Factory-created split child, from the raw body's marker (structure, never text). */
   child?: true;
+  /**
+   * A split child Factory wrote: its parent, key and title and body digest
+   * (facts.ts childDigest). Its first plan round takes the graph its
+   * parent's pass planned for it when the parent's record names this
+   * issue with this digest (`adoptedGraph`).
+   */
+  adopt?: { parent: number; key: string; digest: string };
   base: string;
   title: string;
   /**
@@ -179,6 +194,33 @@ interface PlanRound {
   question?: string;
   /** The operator answered `replan` to a problem with the Objective. */
   replan?: true;
+  /** The draft is the graph this split parent's pass planned (no planner answer). */
+  adopted?: number;
+}
+
+/**
+ * The graph a split parent's accepted plan holds for this child: only
+ * while the parent's record names this issue for `key` with the digest of
+ * the title and body it wrote, and the child has no dependencies (a stub is
+ * planned now, against its dependencies' merged code).
+ */
+function adoptedGraph(
+  objectives: string,
+  issue: number,
+  adopt: NonNullable<ObjectiveInputs["adopt"]>,
+): Draft | undefined {
+  const found = findState(objectives, adopt.parent);
+  if (found?.kind !== "ok") return undefined;
+  const record = splitRecord(found.state);
+  if (
+    record?.children[adopt.key] !== issue ||
+    record.bodies[adopt.key] !== adopt.digest
+  )
+    return undefined;
+  const child = currentPlan(found.state)?.split?.children.find(
+    (each) => each.key === adopt.key,
+  );
+  return child && !child.dependsOn.length ? child.graph : undefined;
 }
 
 interface ReviewRound {
@@ -367,6 +409,50 @@ async function citedSections(
 
 // ---------------------------------------------------------------------------
 // plan:g:n
+
+/** Set once a split child found no graph of its parent's to adopt: its first round asks the planner. */
+const ADOPT_TRIED = "plan:adopt-tried";
+
+/**
+ * A ready split child's first round: the graph its parent's pass planned
+ * and reviewed for it, checked here against its own Objective, with no
+ * planner call and no planner slot; review follows as for any round.
+ * Without one to adopt (`adoptedGraph`), the round asks the planner.
+ */
+function adoptStep(key: string, deps: PlanningDeps): Step {
+  return {
+    key,
+    deadlineMs: 10 * MINUTE,
+    run: async (context): Promise<Outcome> => {
+      const { state, signal } = context;
+      const inputs = generationInputs(state, 1);
+      const adopt = inputs.adopt!;
+      const adopted = adoptedGraph(deps.objectives, state.issue, adopt);
+      if (!adopted)
+        return {
+          kind: "retry",
+          reason: "No planned graph of its parent's to adopt: planning it.",
+          progress: true,
+          keep: { [ADOPT_TRIED]: true },
+        };
+      const files = new BaseFiles(deps.config.checkout, inputs.base, signal);
+      const built = await planningFacts(state, inputs, files, deps.config);
+      if ("problems" in built)
+        return objectiveProblemsHold(built.problems, "replan");
+      const draft: Draft = { ...adopted, base: inputs.base };
+      const findings = [
+        ...(await checkPlan(draft, built.facts, files)),
+        ...(inputs.recipe ? recipeFindings(draft, inputs.recipe.recipe) : []),
+      ];
+      context.log({ event: "child-graph-adopted", parent: adopt.parent });
+      return done({
+        draft,
+        adopted: adopt.parent,
+        ...(findings.length ? { findings } : {}),
+      });
+    },
+  };
+}
 
 function planRoundStep(
   key: string,
@@ -1166,22 +1252,46 @@ export async function readObjective(
   const author = found.user?.login;
   const writer = !!author && (await deps.github.canWrite(author, signal));
   const shown = readShown(found.body_html, { sources: writer });
-  if (!writer) {
+  // A child Objective Factory created from an accepted split carries only
+  // its parent's approved text and the accepted plan: it inherits the
+  // parent's approval (work/split.ts).
+  const marked = childOf(found.body ?? "");
+  const factoryChild =
+    marked !== undefined &&
+    !!author &&
+    sameLogin(author, await deps.github.login(signal));
+  if (!writer && !factoryChild) {
     const unapproved = authorHold(author, shown, context);
     if (unapproved) return { hold: unapproved };
   }
   const inputs: ObjectiveInputs = {
     shown,
     ...(writer && { writer: true as const }),
-    ...(childIdentity(found.body ?? "") && { child: true as const }),
+    ...(marked && { child: true as const }),
+    ...(factoryChild && {
+      adopt: {
+        ...marked,
+        digest: childDigest(found.title, found.body ?? ""),
+      },
+    }),
     base: await defaultHead(config.checkout, config.repository, signal),
     title: found.title,
     reviewArtifacts: config.reviewArtifacts,
   };
   const problems = await objectiveProblems(config, inputs, signal);
   if (problems.length) return { hold: objectiveProblemsHold(problems, again) };
-  // Planning reads a base that has its predecessors' accepted work.
-  const predecessors = predecessorEvidence(state);
+  // Planning reads a base that has its predecessors' accepted work; a
+  // split child's include its parent's, whose plan it carries.
+  const parent = inputs.adopt
+    ? findState(deps.objectives, inputs.adopt.parent)
+    : null;
+  const direct = predecessorEvidence(state);
+  const predecessors = [
+    ...(parent?.kind === "ok" ? predecessorEvidence(parent.state) : []).filter(
+      (evidence) => !direct.some((each) => each.issue === evidence.issue),
+    ),
+    ...direct,
+  ];
   if (predecessors.length) {
     const off = await predecessorsOnBase(
       config.checkout,
