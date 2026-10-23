@@ -740,7 +740,12 @@ function startRecord(
               .filter(([, attempt]) => attempt.run === previous.runId)
               .map(([step]) => ({ issue: runner.state.issue, step })),
           ),
-          progressed: (previous.finished ?? 0) > 0,
+          // The heartbeat's count can trail a death; the saved states can't.
+          progressed:
+            (previous.finished ?? 0) > 0 ||
+            [...runners.values()].some(
+              (runner) => runner.state.finishedRun === previous.runId,
+            ),
         },
       ].slice(-SUSPECT_CRASHES)
     : [];

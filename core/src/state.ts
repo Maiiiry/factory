@@ -111,6 +111,8 @@ export interface ObjectiveState {
    * each. One found after a restart was interrupted, and runs again.
    */
   attempts: Record<string, { startedAt: string; run?: string }>;
+  /** The service run that last finished a step of this Objective, saved with the step's outcome. */
+  finishedRun?: string;
   /** The latest applied requests and their results, so a request is never applied twice. */
   appliedRequests: { id: string; message: string }[];
   /** Per-capability data. Modules own their key. */

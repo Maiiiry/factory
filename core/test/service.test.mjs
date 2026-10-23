@@ -459,8 +459,11 @@ test("three deaths while two Objectives run hold neither; the restart backs off"
 test("the one step running at three deaths, with progress between, holds", async () => {
   const inst = installation();
   const at = new Date().toISOString();
+  // The dead run's progress is in the saved state only: it died before
+  // its heartbeat counted the finished step.
   seed(inst, 61, "checking", {
     attempts: { check: { startedAt: at, run: "dead" } },
+    finishedRun: "dead",
   });
   const running = (...issues) =>
     issues.map((issue) => ({ issue, step: "check" }));
@@ -472,7 +475,7 @@ test("the one step running at three deaths, with progress between, holds", async
       at,
       startedAt: at,
       starts: [at],
-      finished: 4,
+      finished: 0,
       crashes: [
         { at, running: running(61, 62), progressed: false },
         { at, running: running(61), progressed: true },

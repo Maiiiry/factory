@@ -404,6 +404,8 @@ export class ObjectiveRunner {
     const state = this.state;
     const now = this.now();
     delete state.attempts[key];
+    // Saved with the outcome, so a death right after still counts as progress.
+    state.finishedRun = this.run.id;
     if ("keep" in outcome && outcome.keep) {
       // null forgets a fact: readers see it as absent, never as null.
       state.kept ??= {};
