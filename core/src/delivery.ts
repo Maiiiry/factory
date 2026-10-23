@@ -6,18 +6,27 @@
  * again carries on from whatever the last run left. Each function returns
  * data the item steps return as their outcome; GitHub's transient errors
  * come back as `retry`.
+ *
+ * Native-stack delivery reuses publish and observeCi per layer, with the
+ * layer below as the PR's base, and merges the whole chain at once with
+ * mergeUnit.
  */
+import { setTimeout as sleep } from "node:timers/promises";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome } from "./engine.js";
 import { defaultHead, type GitExit, operatorGit } from "./git.js";
 import {
+  type AsyncMerge,
   type CheckRun,
   type GitHub,
   GitHubError,
   type PullRequest,
+  type Stack,
   TransientError,
+  Unreadable,
 } from "./github.js";
 import { redact } from "./log.js";
+import { lfsPushIfPointers } from "./media.js";
 import { BaseFiles, workflowCheckNames } from "./planning/facts.js";
 import type { WorkItem } from "./planning/types.js";
 import { errorMessage } from "./text.js";
@@ -102,8 +111,12 @@ export interface DeliveryContext {
   secrets?: string[];
 }
 
-/** The fixed branch of a Work Item; the only key that finds its PR again. */
-function itemBranch(issue: number, item: string): string {
+/**
+ * The fixed branch of a Work Item; the only key that finds its PR again.
+ * A native-stack layer above the bottom passes its predecessor's branch as
+ * `baseBranch` to publish and observeCi.
+ */
+export function itemBranch(issue: number, item: string): string {
   return `factory/${issue}/${item}`;
 }
 
@@ -126,6 +139,29 @@ export interface PublishInput {
   };
   /** The operator answered REPUBLISH to this step's question. */
   republish?: boolean;
+  /**
+   * The PR's base: omitted (the default branch) for a regular item or the
+   * bottom layer of a native stack; the predecessor layer's branch
+   * (`itemBranch(issue, predecessor)`) for a layer above it.
+   */
+  baseBranch?: string;
+}
+
+/**
+ * The bases a PR may show: the one Factory set, or the default branch,
+ * which GitHub retargets a layer to once the layer below it has merged.
+ */
+async function acceptedBases(
+  context: DeliveryContext,
+  baseBranch: string | undefined,
+): Promise<{ expected: string; defaultBranch: string; bases: string[] }> {
+  const defaultBranch = await context.github.defaultBranch(context.signal);
+  const expected = baseBranch ?? defaultBranch;
+  return {
+    expected,
+    defaultBranch,
+    bases: [...new Set([expected, defaultBranch])],
+  };
 }
 
 export type PublishResult =
@@ -139,6 +175,7 @@ export type PublishResult =
     }
   | Empty
   | Retry
+  | Repair
   | Hold;
 
 /**
@@ -146,8 +183,14 @@ export type PublishResult =
  * The remote branch is read first: holding the commit (or GitHub's update
  * of it), nothing is pushed; holding a head Factory pushed earlier, or
  * nothing, it is pushed with a lease on exactly that; holding anything
- * else, Factory asks. The PR is found by its head branch; only when there
- * is none is one opened, so a lost create is found by the next run.
+ * else, Factory asks. Before a push, the LFS objects behind any pointer the
+ * result adds are uploaded (Factory runs no pre-push hook); a pointer with
+ * no object is a `repair`. The PR is found by its head branch; only when
+ * there is none is one opened, so a lost create is found by the next run.
+ *
+ * Outcomes for the publish step: `published` → done; `empty` and `repair`
+ * → the item's delivery repair with the finding; `retry` and `hold` as
+ * they are.
  */
 export function publish(
   context: DeliveryContext,
@@ -158,7 +201,10 @@ export function publish(
     const branch = itemBranch(input.issue, input.item.id);
     const origin = await originHold(context);
     if (origin) return origin;
-    const baseBranch = await github.defaultBranch(signal);
+    const { expected: baseBranch, bases } = await acceptedBases(
+      context,
+      input.baseBranch,
+    );
     const current = new Set([input.commit]);
     const earlier = new Set(
       input.pushedHeads.filter((h) => h !== input.commit),
@@ -168,7 +214,7 @@ export function publish(
     const merged = pulls.filter((pull) => pull.merged_at);
     // A merged PR of this result: the merge step confirms it.
     for (const pull of merged)
-      if (await updates(context, pull.head.sha, current, baseBranch))
+      if (await updates(context, pull.head.sha, current, bases))
         return {
           kind: "published",
           pr: pull.number,
@@ -179,7 +225,7 @@ export function publish(
     // on the default branch.
     if (!input.republish)
       for (const pull of merged)
-        if (await updates(context, pull.head.sha, earlier, baseBranch))
+        if (await updates(context, pull.head.sha, earlier, bases))
           return hold(
             `PR #${pull.number} merged an earlier head of ${branch} (${pull.head.sha}), not the current result ${input.commit}, so that result is not on ${baseBranch}. Answer ${REPUBLISH} to open a new PR for the current result, or cancel.`,
             [REPUBLISH, "cancel"],
@@ -187,12 +233,22 @@ export function publish(
     const remote = await remoteHead(context, branch);
     // The branch's head once pushed: the commit, or GitHub's update of it.
     let delivered = remote ?? input.commit;
-    if (!remote || !(await updates(context, remote, current, baseBranch))) {
-      if (remote && !(await updates(context, remote, earlier, baseBranch)))
+    if (!remote || !(await updates(context, remote, current, bases))) {
+      if (remote && !(await updates(context, remote, earlier, bases)))
         return hold(
           `Remote branch ${branch} holds a commit Factory did not push (${remote}; Factory pushed ${[...known].join(", ")}). Inspect it; delete or restore the branch and answer retry, or cancel.`,
           ["cancel", "retry"],
         );
+      // Only before a push: a branch that holds the result already has its objects.
+      const media = await lfsPushIfPointers({
+        checkout: context.checkout,
+        repository: github.repository,
+        base: input.base,
+        commit: input.commit,
+        signal,
+      });
+      if (media.kind === "retry") return retry(media.reason);
+      if (media.kind !== "done") return media;
       const pushed = await pushBranch(context, branch, input.commit, remote);
       if (pushed) return pushed;
       delivered = input.commit;
@@ -205,18 +261,18 @@ export function publish(
       );
     const pull = open[0];
     if (pull) {
-      if (pull.base.ref !== baseBranch)
+      if (!bases.includes(pull.base.ref))
         return hold(
-          `PR #${pull.number} for ${branch} targets ${pull.base.ref}, not the default branch ${baseBranch}. Change its base back and answer retry, or cancel.`,
+          `PR #${pull.number} for ${branch} targets ${pull.base.ref}, not ${baseBranch}. Change its base back and answer retry, or cancel.`,
         );
-      if (await updates(context, pull.head.sha, current, baseBranch))
+      if (await updates(context, pull.head.sha, current, bases))
         return {
           kind: "published",
           pr: pull.number,
           head: pull.head.sha,
           merged: false,
         };
-      if (await updates(context, pull.head.sha, earlier, baseBranch))
+      if (await updates(context, pull.head.sha, earlier, bases))
         return lagging(
           context,
           `PR #${pull.number} does not show the pushed head ${input.commit} yet`,
@@ -451,6 +507,8 @@ export interface PullInput {
   requiredChecks: string[];
   /** The operator answered REPUBLISH to this step's question. */
   republish?: boolean;
+  /** The PR's base, as given to publish (see PublishInput.baseBranch). */
+  baseBranch?: string;
 }
 
 export type CiResult =
@@ -491,7 +549,7 @@ export function observeCi(
 }
 
 type Judged =
-  | { kind: "ready"; head: string; pull: PullRequest; baseBranch: string }
+  | { kind: "ready"; head: string; pull: PullRequest; defaultBranch: string }
   | Retry
   | Repair
   | Hold
@@ -515,14 +573,18 @@ async function judge(
       [REPUBLISH, "cancel"],
     );
   }
-  const baseBranch = await github.defaultBranch(signal);
-  if (pull.base.ref !== baseBranch)
+  const { expected, defaultBranch, bases } = await acceptedBases(
+    context,
+    input.baseBranch,
+  );
+  if (!bases.includes(pull.base.ref))
     return hold(
-      `PR #${pr} targets ${pull.base.ref}, not the default branch ${baseBranch}. Change its base back and answer retry, or cancel.`,
+      `PR #${pr} targets ${pull.base.ref}, not ${expected}. Change its base back and answer retry, or cancel.`,
     );
-  const head = await deliveredHead(context, pull, input, baseBranch);
+  const baseBranch = pull.base.ref;
+  const head = await deliveredHead(context, pull, input, bases);
   if (typeof head !== "string") return head;
-  if (pull.merged) return { kind: "ready", head, pull, baseBranch };
+  if (pull.merged) return { kind: "ready", head, pull, defaultBranch };
   const state = await github.mergeState(pr, signal);
   if (
     state.headRefOid !== head ||
@@ -540,7 +602,7 @@ async function judge(
       `PR #${pr} was made a draft. Mark it ready, then answer retry; or cancel.`,
     );
   // Strict protection: GitHub merges the base into Factory's head.
-  if (readiness === "behind") return updateBranch(context, { pr, head });
+  if (readiness === "behind") return updateBranch(context, { pr, head, bases });
   const runs = (await github.checkRuns(head, signal)).filter(
     (run) => run.head_sha === head,
   );
@@ -629,7 +691,7 @@ async function judge(
     const absent = named.filter((name) => !runs.some((r) => r.name === name));
     const renamed = await renamedChecks(
       context,
-      { pr, head, baseBranch },
+      { pr, head, baseBranch: defaultBranch },
       absent,
       unreported,
     );
@@ -672,7 +734,7 @@ async function judge(
     runs,
     reported.size > 0,
   );
-  return unregistered ?? { kind: "ready", head, pull, baseBranch };
+  return unregistered ?? { kind: "ready", head, pull, defaultBranch };
 }
 
 /**
@@ -934,18 +996,24 @@ async function unregisteredChecks(
 
 /**
  * Bring a PR that is BEHIND its base under strict protection up to date:
- * GitHub merges the base into `head`, guarded by the expected head. GitHub
+ * GitHub merges the base into `head`, guarded by the expected head, while
+ * the PR still targets one of `bases` (a stack layer's predecessor branch,
+ * or the default branch). GitHub
  * makes the merge asynchronously, so this always ends in a retry; the next
  * observation accepts the new head by its shape (see deliveredHead).
  */
 function updateBranch(
   context: DeliveryContext,
-  input: { pr: number; head: string },
+  input: { pr: number; head: string; bases: string[] },
 ): Promise<Retry | Hold> {
   return guarded(context, async () => {
     const { github, signal } = context;
     const pull = await github.pull(input.pr, signal);
-    if (pull.state !== "open" || pull.head.sha !== input.head)
+    if (
+      pull.state !== "open" ||
+      pull.head.sha !== input.head ||
+      !input.bases.includes(pull.base.ref)
+    )
       return retry(`PR #${input.pr} changed before its branch update`);
     crashPoint("deliver:update-branch:before");
     try {
@@ -974,11 +1042,10 @@ async function deliveredHead(
   context: DeliveryContext,
   pull: PullRequest,
   input: PullInput,
-  baseBranch: string,
+  bases: string[],
 ): Promise<string | Retry | Hold> {
   const sha = pull.head.sha;
-  if (await updates(context, sha, new Set([input.head]), baseBranch))
-    return sha;
+  if (await updates(context, sha, new Set([input.head]), bases)) return sha;
   if (input.pushedHeads.includes(sha))
     return lagging(
       context,
@@ -991,13 +1058,13 @@ async function deliveredHead(
 /**
  * Whether `sha` is one of `heads`, or GitHub's update-branch of one: a
  * merge committed by web-flow whose first parent is the earlier head and
- * whose second is on the base branch, followed back a few updates.
+ * whose second is on one of the base branches, followed back a few updates.
  */
 async function updates(
   context: DeliveryContext,
   sha: string,
   heads: Set<string>,
-  baseBranch: string,
+  bases: string[],
 ): Promise<boolean> {
   for (let step = 0; step <= MAX_BRANCH_UPDATES; step++) {
     if (heads.has(sha)) return true;
@@ -1012,12 +1079,19 @@ async function updates(
       !merged
     )
       return false;
-    const compared = await context.github.compare(
-      merged,
-      baseBranch,
-      context.signal,
-    );
-    if (compared !== "identical" && compared !== "ahead") return false;
+    let onBase = false;
+    for (const base of bases) {
+      const compared = await context.github.compare(
+        merged,
+        base,
+        context.signal,
+      );
+      if (compared === "identical" || compared === "ahead") {
+        onBase = true;
+        break;
+      }
+    }
+    if (!onBase) return false;
     sha = first;
   }
   return false;
@@ -1072,12 +1146,10 @@ async function mergeOnce(
   if (origin) return origin;
   const judged = await judge(context, input);
   if (judged.kind !== "ready") return judged;
-  const { head, pull, baseBranch } = judged;
+  const { head, pull, defaultBranch } = judged;
   if (pull.merged) return confirmMerged(context, input, pull);
-  if (!(await github.mergeCommitsAllowed(baseBranch, signal)))
-    return hold(
-      `The repository does not allow merge commits into ${baseBranch}, which Factory needs to bind each delivered head into the default branch. Allow merge commits in the repository settings (Settings → General → Pull Requests) and any ruleset, then answer retry; or cancel.`,
-    );
+  const disallowed = await mergeCommitsHold(context, defaultBranch);
+  if (disallowed) return disallowed;
   crashPoint("deliver:merge:before");
   let merged: { merged?: boolean; sha?: string };
   try {
@@ -1110,7 +1182,21 @@ async function mergeOnce(
     if (after.merged) return confirmMerged(context, input, after);
     return retry(`GitHub did not confirm the merge of PR #${pr} yet`);
   }
-  return integrate(context, input, merged.sha);
+  return integrate(context, input.pr, input.integrated, merged.sha);
+}
+
+async function mergeCommitsHold(
+  context: DeliveryContext,
+  defaultBranch: string,
+): Promise<Hold | undefined> {
+  return (await context.github.mergeCommitsAllowed(
+    defaultBranch,
+    context.signal,
+  ))
+    ? undefined
+    : hold(
+        `The repository does not allow merge commits into ${defaultBranch}, which Factory needs to bind each delivered head into the default branch. Allow merge commits in the repository settings (Settings → General → Pull Requests) and any ruleset, then answer retry; or cancel.`,
+      );
 }
 
 /**
@@ -1132,7 +1218,7 @@ async function confirmMerged(
       `PR #${pull.number} merge is not on its timeline yet`,
       `GitHub shows PR #${pull.number} merged but names no merge commit. Inspect it, then answer retry; or cancel.`,
     );
-  return integrate(context, input, mergeSha);
+  return integrate(context, input.pr, input.integrated, mergeSha);
 }
 
 /**
@@ -1143,18 +1229,19 @@ async function confirmMerged(
  */
 async function integrate(
   context: DeliveryContext,
-  input: PullInput & { integrated?: string },
+  pr: number,
+  integrated: string | undefined,
   mergeSha: string,
-): Promise<MergeResult> {
+): Promise<Extract<MergeResult, { kind: "merged" }> | Retry | Hold> {
   const tip = await defaultHead(context.checkout, context.signal);
   if (!(await ancestor(context, mergeSha, tip)))
     return lagging(
       context,
-      `The default branch does not show the merge of PR #${input.pr} (${mergeSha}) yet`,
-      `The default branch (at ${tip}) does not contain the merge of PR #${input.pr} (${mergeSha}). Inspect it, then answer retry; or cancel.`,
+      `The default branch does not show the merge of PR #${pr} (${mergeSha}) yet`,
+      `The default branch (at ${tip}) does not contain the merge of PR #${pr} (${mergeSha}). Inspect it, then answer retry; or cancel.`,
     );
   // Merges can be recorded out of order, so the integrated head never moves back.
-  const recorded = input.integrated;
+  const recorded = integrated;
   if (
     !recorded ||
     recorded === mergeSha ||
@@ -1164,7 +1251,7 @@ async function integrate(
   if (await ancestor(context, mergeSha, recorded))
     return { kind: "merged", mergeSha, integratedSha: recorded };
   return hold(
-    `The merge of PR #${input.pr} (${mergeSha}) and Factory's integrated head ${recorded} have diverged. Inspect the default branch, then answer retry; or cancel.`,
+    `The merge of PR #${pr} (${mergeSha}) and Factory's integrated head ${recorded} have diverged. Inspect the default branch, then answer retry; or cancel.`,
   );
 }
 
@@ -1192,6 +1279,539 @@ async function ancestor(
   throw new TransientError(
     `git merge-base --is-ancestor ${older} ${newer} ${result.code === null ? `ended by ${result.signal}` : `exited ${result.code}`}: ${result.stderr}`,
   );
+}
+
+// ── Native stack ────────────────────────────────────────────────────────
+
+/**
+ * How long one merge step polls a pending stack merge inside the merge
+ * lock; then it retries outside the lock, so other merges are not held up.
+ */
+const STACK_MERGE_POLL_MS = 6_000;
+const STACK_POLL_INTERVAL_MS = 2_000;
+const STACK_PERMISSION =
+  "Contents: write and Pull requests: write, with stacked pull requests enabled for the repository";
+
+/** A delivery result pinned to the layer (Work Item) it belongs to. */
+export type LayerResult = (Retry | Repair | Hold | Republish) & {
+  item: string;
+};
+
+export type UnitMergeResult =
+  | {
+      kind: "merged";
+      /** The unit's merge commit (the top layer's; one shared by every layer). */
+      mergeSha: string;
+      /** The later of `integrated` and the merge: what the next item builds on. */
+      integratedSha: string;
+      /** Every layer's item, bottom first: each is merged with `mergeSha`. */
+      items: string[];
+    }
+  | LayerResult;
+
+interface Layer {
+  input: PullInput;
+  /** Factory's head of the layer, as judged. */
+  head: string;
+  pull: PullRequest;
+}
+
+/**
+ * Merge a native-stack delivery unit (a linear chain of Work Items, bottom
+ * first) as one effect, or confirm the merge already made. A one-layer unit
+ * is a regular merge.
+ *
+ * In order: every layer is judged again (each against the branch below it,
+ * the bottom against the default branch), so a failed check or conflict is
+ * pinned to its own layer; merge commits must be allowed; the stack is found
+ * by its bottom PR, or created and checked; each layer must contain the
+ * head of the layer below it; then GitHub merges it through the top PR at
+ * Factory's top head. Every layer must then be merged at its own head with
+ * one shared merge commit, on the default branch, on every path (fresh,
+ * already merged, refused as merged, after a crash). Layers merged with
+ * different commits, or only some layers merged, are a question once
+ * GitHub's lag window has passed.
+ *
+ * Nothing is recorded between runs. A run after a crash or a lost answer
+ * finds the stack by its bottom PR, and a repeated merge request is answered
+ * with the pending request (409, polled) or a refusal of merged layers (403,
+ * confirmed), so nothing is created or merged twice.
+ *
+ * How the merge step of the unit's top item calls it:
+ * - `layers`: each layer's `PullInput` (as for observeCi, with `head` from
+ *   its CI step), bottom first. Their `baseBranch` is set here from the
+ *   order. `integrated`: as for merge.
+ * - `merged` → `done` with `{ mergeSha, integratedSha }`; every item in
+ *   `items` counts as merged at `mergeSha`.
+ * - `repair` → the delivery repair of `item` (the layer that failed, or a
+ *   layer that does not contain its predecessor's head), which also clears
+ *   the layers above it.
+ * - `republish` → the republish repair of `item`.
+ * - `retry` and `hold` → returned as they are; `item` names the layer the
+ *   wait or question is about (the top layer for the unit as a whole). A
+ *   failed merge request, a refused stack creation and stack data Factory
+ *   can't read retry, then hold after GitHub's lag window.
+ * - Escaped exceptions are the engine's retry, as for every step.
+ * - `accept`: the operator answered ACCEPT to a partial-merge or
+ *   different-merge-commit question. The unit is delivered when every
+ *   layer is merged at Factory's head and each merge commit is on the
+ *   default branch; otherwise the question names what is still missing.
+ */
+export function mergeUnit(
+  context: DeliveryContext,
+  layers: [PullInput, ...PullInput[]],
+  integrated?: string,
+  accept?: boolean,
+): Promise<UnitMergeResult> {
+  const top = layers[layers.length - 1]!.item;
+  const result = mergeTail.then(async () => {
+    const outcome = await guarded(context, () =>
+      accept && layers.length > 1
+        ? acceptUnit(context, layers, integrated)
+        : mergeUnitOnce(context, layers, integrated),
+    );
+    return outcome.kind === "merged" || "item" in outcome
+      ? (outcome as UnitMergeResult)
+      : { ...outcome, item: top };
+  });
+  mergeTail = result.catch(() => undefined);
+  return result;
+}
+
+function pin(result: Retry | Repair | Hold | Republish, item: PullInput) {
+  return { ...result, item: item.item };
+}
+
+/**
+ * The answer that takes a native stack merged by other means (layer by
+ * layer, or with different merge commits) as delivered. Steps pass it to
+ * mergeUnit as `accept`.
+ */
+export const ACCEPT = "accept";
+const UNIT_ANSWERS = ["retry", ACCEPT, "cancel"];
+const ACCEPT_HELP = `answer ${ACCEPT} to take the unit as delivered once every layer is merged on the default branch`;
+
+/**
+ * The operator's ACCEPT: every layer merged at Factory's head with a merge
+ * commit on the default branch. The unit then integrates at the latest of
+ * those merge commits; otherwise the question names what is missing.
+ */
+async function acceptUnit(
+  context: DeliveryContext,
+  input: PullInput[],
+  integrated: string | undefined,
+): Promise<UnitMergeResult> {
+  const { github, signal } = context;
+  const top = input[input.length - 1]!;
+  const tip = await defaultHead(context.checkout, signal);
+  const missing: string[] = [];
+  const shas: string[] = [];
+  for (const [index, layer] of input.entries()) {
+    const pull = await github.pull(layer.pr, signal);
+    if (!pull.merged) {
+      missing.push(`PR #${layer.pr} is not merged`);
+      continue;
+    }
+    const below = input[index - 1];
+    const judged = await judge(context, {
+      ...layer,
+      ...(below ? { baseBranch: itemBranch(layer.issue, below.item) } : {}),
+    });
+    if (judged.kind !== "ready") return pin(judged, layer);
+    const sha = await github.mergeCommitOf(layer.pr, signal);
+    if (!sha) missing.push(`PR #${layer.pr} names no merge commit`);
+    else if (!(await ancestor(context, sha, tip)))
+      missing.push(
+        `PR #${layer.pr}'s merge ${sha} is not on the default branch (${tip})`,
+      );
+    else shas.push(sha);
+  }
+  if (missing.length)
+    return pin(
+      hold(
+        `The native stack is not delivered yet: ${missing.join("; ")}. Merge the rest, then ${ACCEPT_HELP}; or answer retry to merge it as a stack; or cancel.`,
+        UNIT_ANSWERS,
+        ACCEPT,
+      ),
+      top,
+    );
+  let latest = shas[0]!;
+  for (const sha of shas.slice(1))
+    if (await ancestor(context, latest, sha)) latest = sha;
+  const result = await integrate(context, top.pr, integrated, latest);
+  if (result.kind !== "merged") return pin(result, top);
+  return {
+    kind: "merged",
+    mergeSha: latest,
+    integratedSha: result.integratedSha,
+    items: input.map((layer) => layer.item),
+  };
+}
+
+/** Repairs first, so the layer at fault is repaired; then questions, then waits. */
+const PINNED_ORDER = ["repair", "republish", "hold", "retry"] as const;
+
+async function mergeUnitOnce(
+  context: DeliveryContext,
+  input: PullInput[],
+  integrated: string | undefined,
+): Promise<UnitMergeResult> {
+  const { github, signal } = context;
+  const top = input[input.length - 1]!;
+  if (input.length === 1) {
+    const result = await mergeOnce(context, {
+      ...top,
+      ...(integrated ? { integrated } : {}),
+    });
+    return result.kind === "merged"
+      ? { ...result, items: [top.item] }
+      : pin(result, top);
+  }
+  const origin = await originHold(context);
+  if (origin) return pin(origin, top);
+  const judged = await judgeLayers(context, input);
+  if ("kind" in judged) return judged;
+  const { layers, defaultBranch } = judged;
+  const merged = layers.filter((layer) => layer.pull.merged);
+  if (merged.length === layers.length)
+    return confirmUnit(context, layers, integrated);
+  // A stack merge in progress can show its layers merging one by one; past
+  // the lag window the unit no longer merges as one stack (old
+  // native-stack: an operator decision, never a merge by hand).
+  if (merged.length) {
+    const open = layers.find((layer) => !layer.pull.merged)!;
+    return pin(
+      lagging(
+        context,
+        `Not every layer of the native stack shows its merge yet`,
+        `${merged.map((layer) => `PR #${layer.pull.number}`).join(", ")} merged, but PR #${open.pull.number} did not, so the native stack did not merge as one. Inspect the stack and the default branch, then answer retry; or ${ACCEPT_HELP}; or cancel.`,
+        UNIT_ANSWERS,
+      ),
+      open.input,
+    );
+  }
+  const disallowed = await mergeCommitsHold(context, defaultBranch);
+  if (disallowed) return pin(disallowed, top);
+  // Only the chain Factory built becomes a stack.
+  for (const [index, layer] of layers.entries()) {
+    const { pull } = layer;
+    const branch = itemBranch(layer.input.issue, layer.input.item);
+    const base = index ? layers[index - 1]!.pull.head.ref : defaultBranch;
+    if (
+      pull.state !== "open" ||
+      pull.head.ref !== branch ||
+      pull.head.sha !== layer.head ||
+      pull.base.ref !== base
+    )
+      return pin(
+        hold(
+          `PR #${pull.number} is not the stack layer Factory built: it should be open with head ${branch} at ${layer.head} and base ${base}, and shows ${pull.state} with head ${pull.head.ref} at ${pull.head.sha} and base ${pull.base.ref}. Restore it, then answer retry; or cancel.`,
+        ),
+        layer.input,
+      );
+    // Each layer must be built on its predecessor's current head (#619).
+    const below = layers[index - 1];
+    if (below) {
+      const relation = await github.compare(below.head, layer.head, signal);
+      if (relation === undefined)
+        return pin(
+          lagging(
+            context,
+            `GitHub shows no comparison of ${below.head} and ${layer.head}`,
+            `GitHub shows no comparison of ${below.head} (PR #${below.pull.number}) and ${layer.head} (PR #${pull.number}), so Factory can't tell whether the layer contains the one below it. Inspect both branches, then answer retry; or cancel.`,
+          ),
+          layer.input,
+        );
+      if (relation !== "identical" && relation !== "ahead")
+        return pin(
+          {
+            kind: "repair",
+            finding: `PR #${pull.number} (${branch}) at ${layer.head} does not contain the head ${below.head} of the layer below it (PR #${below.pull.number}, ${below.pull.head.ref}): it was built on an older head of that layer. Rebuild the change on the current ${below.pull.head.ref}.`,
+          },
+          layer.input,
+        );
+    }
+  }
+  const stacked = await ensureStack(
+    context,
+    layers.map((layer) => layer.pull.number),
+    defaultBranch,
+  );
+  if (stacked) return pin(stacked, top);
+  const last = layers[layers.length - 1]!;
+  crashPoint("stack:merge:before");
+  let request: AsyncMerge;
+  try {
+    request = await github.mergeAsync(last.pull.number, last.head, signal);
+  } catch (error) {
+    // 403: GitHub refuses a stack whose layers merged already (an earlier
+    // request whose answer was lost). 405: not mergeable, or merging; 409
+    // without a pending request: a head that moved.
+    if (
+      !(error instanceof GitHubError && [403, 405, 409].includes(error.status))
+    )
+      throw needing(error, MERGE_PERMISSION);
+    if (await allMerged(context, layers))
+      return confirmUnit(context, layers, integrated);
+    if (error.status === 403) throw needing(error, MERGE_PERMISSION);
+    return pin(
+      lagging(
+        context,
+        `GitHub refused to merge the native stack through PR #${last.pull.number} (HTTP ${error.status})`,
+        `GitHub refused to merge the native stack through PR #${last.pull.number} (not mergeable, or a repository rule): ${error.message}. Inspect the stack, then answer retry; or cancel.`,
+      ),
+      top,
+    );
+  }
+  crashPoint("stack:merge:after");
+  const settled = await settleMerge(context, last.pull.number, request);
+  if (settled.status === "merged" && settled.sha)
+    return confirmUnit(context, layers, integrated, settled.sha);
+  if (settled.status === "failed") {
+    // Often a check that was still pending or failed: judge every layer
+    // again first, so a CI wait or a repair is pinned to its layer. Left
+    // unexplained, retry (a fresh request) until the lag window, then ask.
+    const again = await judgeLayers(context, input);
+    if ("kind" in again) return again;
+    const why = settled.message ? `: ${settled.message}` : "";
+    return pin(
+      lagging(
+        context,
+        `GitHub's merge of the native stack through PR #${last.pull.number} failed${why}`,
+        `GitHub did not merge the native stack through PR #${last.pull.number}${why}, and every layer still reads ready. Inspect the stack and the repository's rules, then answer retry; or cancel.`,
+      ),
+      top,
+    );
+  }
+  // Still pending: poll again from a fresh run, outside the merge lock (a
+  // repeated request is answered with the pending one). Queued without a
+  // request to poll: a CI wait.
+  if (settled.status === "pending" || settled.status === "queued")
+    return pin(
+      {
+        kind: "retry",
+        reason: `Awaiting GitHub's merge of the native stack through PR #${last.pull.number} (${settled.status})`,
+        afterMs: settled.status === "queued" ? CI_POLL_MS : LAG_POLL_MS,
+      },
+      top,
+    );
+  // An answer Factory can't read ("unknown", or merged with no commit).
+  return pin(
+    lagging(
+      context,
+      `GitHub's answer to the native stack merge through PR #${last.pull.number} is unreadable (${settled.status})`,
+      `GitHub answered the native stack merge through PR #${last.pull.number} with status ${settled.status}${settled.sha ? "" : " and no merge commit"}, which Factory can't read. Inspect the stack, then answer retry; or cancel.`,
+    ),
+    top,
+  );
+}
+
+/**
+ * Judge every layer (each against the branch below it, the bottom against
+ * the default branch) before any wait, so a failure is pinned to its
+ * layer: repairs first, then questions, then waits.
+ */
+async function judgeLayers(
+  context: DeliveryContext,
+  input: PullInput[],
+): Promise<{ layers: Layer[]; defaultBranch: string } | LayerResult> {
+  const layers: Layer[] = [];
+  const refused: LayerResult[] = [];
+  let defaultBranch = "";
+  for (const [index, layer] of input.entries()) {
+    const below = input[index - 1];
+    const judged = await judge(context, {
+      ...layer,
+      ...(below ? { baseBranch: itemBranch(layer.issue, below.item) } : {}),
+    });
+    if (judged.kind === "ready") {
+      layers.push({ input: layer, head: judged.head, pull: judged.pull });
+      defaultBranch = judged.defaultBranch;
+    } else refused.push(pin(judged, layer));
+  }
+  for (const kind of PINNED_ORDER) {
+    const first = refused.find((result) => result.kind === kind);
+    if (first) return first;
+  }
+  return { layers, defaultBranch };
+}
+
+/**
+ * The stack of `pulls` (bottom first) onto `defaultBranch`: found by its
+ * bottom PR, or created and checked. Another stack holding these PRs is a
+ * question; Factory never adopts a stack it did not build. A refused
+ * creation, or stack data Factory can't read, retries and becomes a
+ * question after GitHub's lag window.
+ */
+async function ensureStack(
+  context: DeliveryContext,
+  pulls: number[],
+  defaultBranch: string,
+): Promise<Retry | Hold | undefined> {
+  const { github, signal } = context;
+  const expected = `base ${defaultBranch} and PRs ${pulls.map((pr) => `#${pr}`).join(", ")}`;
+  const shown = (stack: Stack) =>
+    `stack ${stack.number} (base ${stack.base}, PRs ${stack.pulls.map((pr) => `#${pr}`).join(", ")})`;
+  const same = (stack: Stack) =>
+    stack.base === defaultBranch && stack.pulls.join() === pulls.join();
+  const unreadable = (error: Unreadable) =>
+    lagging(
+      context,
+      error.message,
+      `${error.message} (for ${expected}). GitHub's native stack API may have changed: inspect the stack, or set the installation's delivery to regular, then answer retry; or cancel.`,
+    );
+  let found: Stack[];
+  try {
+    found = await github.findStack(pulls[0]!, signal);
+  } catch (error) {
+    if (error instanceof Unreadable) return unreadable(error);
+    if (error instanceof GitHubError && error.status === 404)
+      return hold(
+        `GitHub shows no native stacks for ${github.repository} (${error.message.slice(0, 300)}). Enable stacked pull requests for the repository, or set the installation's delivery to regular, then answer retry; or cancel.`,
+      );
+    throw error;
+  }
+  const other = found.find((stack) => !same(stack));
+  if (found.length > 1 || other)
+    return hold(
+      `PR #${pulls[0]} is in ${found.map(shown).join(" and ")}, not the native stack Factory builds (${expected}). Inspect it; remove the other stack, then answer retry; or cancel.`,
+    );
+  if (found.length) return undefined;
+  crashPoint("stack:create:before");
+  let created: Stack;
+  try {
+    created = await github.createStack(pulls, signal);
+  } catch (error) {
+    // Made but unreadable: the next run finds it by its bottom PR.
+    if (error instanceof Unreadable) return unreadable(error);
+    // A stack an earlier request made (its answer was lost), or a chain
+    // GitHub does not show yet: the next run finds it, or tries again.
+    // Past the lag window the refusal stands (a PR held by another stack,
+    // or a rule), and Factory asks.
+    if (error instanceof GitHubError && error.status === 422)
+      return lagging(
+        context,
+        `GitHub refused the native stack of ${expected}: ${error.message}`,
+        `GitHub refuses to make the native stack of ${expected}: ${error.message.slice(0, 500)}. Inspect the PRs (one may be in another stack), then answer retry; or cancel.`,
+      );
+    throw needing(error, STACK_PERMISSION);
+  }
+  crashPoint("stack:create:after");
+  return same(created)
+    ? undefined
+    : hold(
+        `GitHub made ${shown(created)}, not the native stack Factory asked for (${expected}). Inspect it; remove it, then answer retry; or cancel.`,
+      );
+}
+
+/**
+ * Poll a merge request by its uuid for up to STACK_MERGE_POLL_MS, inside
+ * the merge lock. The uuid lives only here: a later run sends the request
+ * again and gets the pending one back.
+ */
+async function settleMerge(
+  context: DeliveryContext,
+  top: number,
+  request: AsyncMerge,
+): Promise<AsyncMerge> {
+  const until = Date.now() + STACK_MERGE_POLL_MS;
+  let current = request;
+  const { uuid } = request;
+  while (
+    uuid &&
+    (current.status === "pending" || current.status === "queued") &&
+    Date.now() < until
+  ) {
+    await sleep(STACK_POLL_INTERVAL_MS, undefined, { signal: context.signal });
+    try {
+      current = await context.github.mergeStatus(top, uuid, context.signal);
+    } catch (error) {
+      // A request just made may not be readable by its uuid yet.
+      if (!(error instanceof GitHubError && error.status === 404)) throw error;
+    }
+  }
+  return current;
+}
+
+/** Whether GitHub shows every layer merged. */
+async function allMerged(
+  context: DeliveryContext,
+  layers: Layer[],
+): Promise<boolean> {
+  for (const layer of layers)
+    if (!(await context.github.pull(layer.pull.number, context.signal)).merged)
+      return false;
+  return true;
+}
+
+/**
+ * Every layer merged at its own head with one shared merge commit, on the
+ * default branch: on every path, so layers merged one by one are never
+ * accepted. After Factory's own stack merge that commit must be
+ * `expected`, the one GitHub reported. A difference may be GitHub's lag at
+ * first; past the window it is a question.
+ */
+async function confirmUnit(
+  context: DeliveryContext,
+  layers: Layer[],
+  integrated: string | undefined,
+  expected?: string,
+): Promise<UnitMergeResult> {
+  const { github, signal } = context;
+  const top = layers[layers.length - 1]!.input;
+  const shas: string[] = [];
+  for (const layer of layers) {
+    const { pr } = layer.input;
+    const pull = await github.pull(pr, signal);
+    if (!pull.merged)
+      return pin(
+        lagging(
+          context,
+          `PR #${pr} does not show the native stack's merge yet`,
+          `GitHub merged the native stack, but PR #${pr} does not show it merged. Inspect the stack and the default branch, then answer retry; or cancel.`,
+        ),
+        layer.input,
+      );
+    if (
+      pull.head.sha !== layer.head ||
+      pull.head.ref !== itemBranch(layer.input.issue, layer.input.item)
+    )
+      return pin(foreign(pull, layer.head), layer.input);
+    const sha = await github.mergeCommitOf(pr, signal);
+    if (!sha)
+      return pin(
+        lagging(
+          context,
+          `PR #${pr} merge is not on its timeline yet`,
+          `GitHub shows PR #${pr} merged but names no merge commit. Inspect it, then answer retry; or cancel.`,
+        ),
+        layer.input,
+      );
+    shas.push(sha);
+  }
+  const mergeSha = shas[0]!;
+  if (
+    shas.some((sha) => sha !== mergeSha) ||
+    (expected && mergeSha !== expected)
+  )
+    return pin(
+      lagging(
+        context,
+        `The native stack's layers do not all show one merge commit${expected ? ` (${expected})` : ""} yet`,
+        `The native stack's layers ${layers.map((layer) => `PR #${layer.input.pr}`).join(", ")} show the merge commits ${shas.join(", ")}${expected ? `, not GitHub's stack merge ${expected}` : ""}: they did not merge as one stack. Inspect the stack and the default branch, then ${ACCEPT_HELP}; or answer retry; or cancel.`,
+        // Merge commits never change, so retry alone can't pass.
+        [ACCEPT, "retry", "cancel"],
+      ),
+      top,
+    );
+  const result = await integrate(context, top.pr, integrated, mergeSha);
+  if (result.kind !== "merged") return pin(result, top);
+  return {
+    kind: "merged",
+    mergeSha,
+    integratedSha: result.integratedSha,
+    items: layers.map((layer) => layer.input.item),
+  };
 }
 
 /**

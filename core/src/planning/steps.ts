@@ -46,7 +46,7 @@ import type {
 } from "./types.js";
 import {
   applyRevision,
-  CONTROLLER_GUARANTEES,
+  controllerGuarantees,
   decodePlan,
   planChoices,
   planSchema,
@@ -311,7 +311,10 @@ function planRoundStep(
             : []),
         ];
         const revising = Boolean(previous?.answer);
-        const wire = { child: childIdentity(inputs.body) };
+        const wire = {
+          child: childIdentity(inputs.body),
+          reviewArtifacts: config.reviewArtifacts.length > 0,
+        };
         const cited = revising
           ? await citedSections(previous!.draft, fixes, facts, files)
           : [];
@@ -342,6 +345,7 @@ function planRoundStep(
           workers: WORKERS,
           citedSections: cited,
           localExecutables: local.observations,
+          reviewArtifacts: config.reviewArtifacts,
         });
         const answer = await deps.planner.answer({
           role: "planner",
@@ -459,7 +463,10 @@ function reviewStep(
             inputs.body,
             config.finalValidation.requiredCommands,
           ),
-          controllerCapabilities: CONTROLLER_GUARANTEES,
+          controllerCapabilities: controllerGuarantees(
+            config.reviewArtifacts.length > 0,
+          ),
+          reviewArtifacts: config.reviewArtifacts,
           repository,
           workers: WORKERS,
           ...(scope
@@ -736,6 +743,9 @@ function acceptStep(g: number, n: number, deps: PlanningDeps): Step {
             deps.config.finalValidation.requiredCommands,
           ),
           decisions: decisions(state),
+          ...(deps.config.reviewArtifacts.length
+            ? { reviewArtifacts: deps.config.reviewArtifacts }
+            : {}),
         };
         await postPlan(deps, state.issue, plan, signal);
         return done(plan);

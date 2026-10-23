@@ -3,7 +3,8 @@
  * candidate tree and judges every criterion. The reviewer's working
  * directory is a private read-only evidence root with `candidate/` (the
  * exported result), `base/` (the base copy of each changed path),
- * `changes/` (each changed path's complete patch) and `changes/INDEX.json`.
+ * `changes/` (each changed path's complete patch), `changes/INDEX.json`
+ * and, when validation captured review artifacts, `artifacts/`.
  * The prompt carries the criteria and indexed evidence rows; the reviewer
  * cites rows by index. A refusal lists every refused criterion at once, for
  * repair (repair.ts); a needs-human verdict becomes a question for the
@@ -26,6 +27,11 @@ import { DESIGN_CHECKLIST, ENGINEERING_STANDARD } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
 import type { Planner } from "../providers/planner.js";
 import { hostGit } from "../worktree.js";
+import {
+  REVIEW_ARTIFACT_GUIDANCE,
+  type ReviewArtifact,
+  reviewArtifactEvidence,
+} from "./artifacts.js";
 
 /**
  * The criteria a result review judges: the item's own acceptance, then each
@@ -128,6 +134,11 @@ export interface ResultReviewInput {
   dir: string;
   /** The worker's handoff and verification notes, rendered. */
   notes?: string;
+  /**
+   * What the validate step captured (its passed result's artifacts): text
+   * rows, and images the reviewer sees. Captures of another tree are ignored.
+   */
+  artifacts?: readonly ReviewArtifact[];
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
   decisions?: readonly CriterionDecision[];
   signal: AbortSignal;
@@ -156,18 +167,31 @@ export async function reviewResult(
   const root = await evidenceRoot(input.dir, tree);
   try {
     const { changes, rows } = await materialize(input, root);
+    const captured = await reviewArtifactEvidence(
+      [{ artifacts: input.artifacts ?? [] }],
+      tree,
+      root,
+    );
     const evidence = [
       ...sourceRows(input.sources),
       ...controllerRows(input, changes),
+      ...captured.rows,
       ...rows,
     ];
     const ask = async (previousInvalid?: string) => {
       const answer = await input.planner.answer({
         role: "reviewer",
         phase: "result-review",
-        prompt: renderResultReview(input, criteria, evidence, previousInvalid),
+        prompt: renderResultReview(
+          input,
+          criteria,
+          evidence,
+          captured.rows.length > 0,
+          previousInvalid,
+        ),
         schema: resultReviewSchema(evidence),
         readDir: root,
+        ...(captured.images.length ? { images: captured.images } : {}),
         signal: input.signal,
         log: input.log,
       });
@@ -1007,6 +1031,7 @@ function renderResultReview(
   input: ResultReviewInput,
   criteria: readonly string[],
   evidence: readonly ResultEvidence[],
+  artifacts: boolean,
   previousInvalid?: string,
 ): string {
   const itemCriteria = input.item.acceptance.length;
@@ -1027,6 +1052,7 @@ function renderResultReview(
     REVIEW_GUIDANCE.design,
     REVIEW_GUIDANCE.labels,
     REVIEW_GUIDANCE.evidenceRoot,
+    ...(artifacts ? [REVIEW_ARTIFACT_GUIDANCE] : []),
   ].join("\n");
   return reviewPrompt(
     instructions,

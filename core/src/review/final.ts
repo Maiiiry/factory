@@ -18,6 +18,11 @@ import { DESIGN_CHECKLIST } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
 import type { Planner } from "../providers/planner.js";
 import {
+  REVIEW_ARTIFACT_GUIDANCE,
+  type ReviewArtifactGroup,
+  reviewArtifactEvidence,
+} from "./artifacts.js";
+import {
   type CriterionDecision,
   changeIndexRow,
   decisionRows,
@@ -48,6 +53,13 @@ export async function reviewObjective(input: {
   /** Each Work Item's merge commit, in merge order: the change under review. */
   merges: readonly string[];
   validation: PassedValidation;
+  /**
+   * Captures of the integrated tree: final validation's (no itemId), then
+   * each merged Work Item's validate captures with its itemId, reused only
+   * where their tree is the integrated tree and final validation didn't
+   * capture the same output.
+   */
+  artifacts?: readonly ReviewArtifactGroup[];
   sources: readonly PinnedSource[];
   /** A private directory for the evidence root. */
   dir: string;
@@ -70,6 +82,11 @@ export async function reviewObjective(input: {
   const root = await evidenceRoot(input.dir, tree);
   try {
     const { changes, rows } = await materialize(input, root);
+    const captured = await reviewArtifactEvidence(
+      input.artifacts ?? [],
+      tree,
+      root,
+    );
     const evidence: ResultEvidence[] = [
       ...sourceRows(input.sources),
       ...input.plan.items.map(
@@ -83,6 +100,7 @@ export async function reviewObjective(input: {
       ...decisionRows(input.plan),
       changeIndexRow(input.base, input.commit, tree, changes, input.merges),
       validationRow(input.validation),
+      ...captured.rows,
       ...rows,
     ];
     const ask = async (previousInvalid?: string) => {
@@ -90,7 +108,9 @@ export async function reviewObjective(input: {
         role: "reviewer",
         phase: "objective-review",
         prompt: reviewPrompt(
-          FINAL_INSTRUCTIONS,
+          captured.rows.length
+            ? `${FINAL_INSTRUCTIONS}\n${REVIEW_ARTIFACT_GUIDANCE}`
+            : FINAL_INSTRUCTIONS,
           criteria,
           evidence,
           input.base,
@@ -99,6 +119,7 @@ export async function reviewObjective(input: {
         ),
         schema: resultReviewSchema(evidence),
         readDir: root,
+        ...(captured.images.length ? { images: captured.images } : {}),
         signal: input.signal,
         log: input.log,
       });

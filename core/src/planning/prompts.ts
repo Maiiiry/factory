@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { objectiveSection } from "../objective.js";
+import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import { REPOSITORY_DIRECTORY, type RepositoryView } from "./repository.js";
 import type { ReviewEvidence } from "./review.js";
 import {
@@ -124,7 +125,7 @@ const REVIEW_ARTIFACT_GUIDANCE =
 
 /** The installation's exact selectors. */
 function configuredReviewArtifacts(
-  reviewArtifacts?: readonly unknown[],
+  reviewArtifacts?: readonly ReviewArtifactSelector[],
 ): string {
   return reviewArtifacts?.length
     ? `Configured review artifact selectors (installation configuration, not command authority):\n${JSON.stringify(reviewArtifacts)}\n`
@@ -234,7 +235,8 @@ export interface CompilationInput {
   citedSections?: readonly { content: string }[];
   repository?: RepositoryView;
   workers?: Readonly<Record<string, WorkerCommandAccess>>;
-  reviewArtifacts?: readonly unknown[];
+  /** The installation's selectors (`config.reviewArtifacts`); the plan records them for validation's planned-selector check. */
+  reviewArtifacts?: readonly ReviewArtifactSelector[];
   /** True when the installation offers execution profiles to choose from. */
   executionProfiles?: boolean;
   prerequisites?: unknown;
@@ -481,7 +483,8 @@ export interface GraphReviewInput {
   scope?: RevisionScope;
   repository?: RepositoryView;
   workers?: Readonly<Record<string, WorkerCommandAccess>>;
-  reviewArtifacts?: readonly unknown[];
+  /** The installation's selectors (`config.reviewArtifacts`), the same the planner was given. */
+  reviewArtifacts?: readonly ReviewArtifactSelector[];
   /** The installation's execution profile policy; absent means one configured harness. */
   executionProfiles?: unknown;
 }

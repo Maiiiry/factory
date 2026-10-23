@@ -221,6 +221,7 @@ function itemFields(value: unknown, at: number, found: Found): boolean {
     );
   if (value.priority !== undefined && !Number.isSafeInteger(value.priority))
     found(`Work Item ${label} priority must be an integer or left out`, id);
+  // The one validation of scheduling hints; wire.ts only decodes them.
   const hint = value.scheduling;
   if (
     hint !== undefined &&
@@ -234,7 +235,7 @@ function itemFields(value: unknown, at: number, found: Found): boolean {
     )
   )
     found(
-      `Work Item ${label} scheduling needs a positive integer estimatedDurationMs and a reason, or leave it out`,
+      `Work Item ${label} scheduling needs a positive whole number of milliseconds as estimatedDurationMs and a reason, or no estimate (null) when unknown`,
       id,
     );
   if (

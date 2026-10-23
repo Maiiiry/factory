@@ -2,13 +2,19 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  read,
+  readSync,
   realpathSync,
 } from "node:fs";
 import { chmod, open, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import { errorMessage } from "./text.js";
 
 /** Where one installation keeps its files. Nothing here is inside the target. */
 export interface Paths {
@@ -150,5 +156,157 @@ async function grantOwner(path: string): Promise<void> {
       if (entry.isDirectory()) await grantOwner(join(pinned, entry.name));
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * A file Factory refuses to read: missing, reached through a link, not a
+ * regular file, over its byte bound, or changed while read. The message
+ * names the path and, for size, the bound.
+ */
+export class ContainedError extends Error {}
+
+/**
+ * The regular file `relative` (`/`-separated) under `root`, opened
+ * read-only: every directory on the way through openParent, the file with
+ * O_NOFOLLOW, and the opened file must be the one lstat saw (same device
+ * and inode). Returns its descriptor, which the caller closes, and size.
+ */
+function openContained(
+  root: string,
+  relative: string,
+  maximum: number,
+  allowEmpty: boolean,
+): { fd: number; size: number } {
+  if (
+    relative.split("/").some((part) => !part || part === "." || part === "..")
+  )
+    throw new ContainedError(
+      `${relative} is not a relative path inside its root`,
+    );
+  let parent: ReturnType<typeof openParent>;
+  try {
+    parent = openParent(root, relative, false);
+  } catch (error) {
+    throw new ContainedError(errorMessage(error));
+  }
+  try {
+    const target = `${parent.anchor}/${parent.name}`;
+    const seen = lstatSync(target, { throwIfNoEntry: false });
+    if (!seen) throw new ContainedError(`${relative} does not exist`);
+    if (!seen.isFile())
+      throw new ContainedError(
+        `${relative} is not a regular file reached without links`,
+      );
+    let fd: number;
+    try {
+      fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      throw new ContainedError(
+        `${relative} could not be opened: ${errorMessage(error)}`,
+      );
+    }
+    const opened = fstatSync(fd);
+    const problem =
+      !opened.isFile() || opened.dev !== seen.dev || opened.ino !== seen.ino
+        ? `${relative} changed while it was opened`
+        : opened.size > maximum
+          ? `${relative} has ${opened.size} bytes, above its bound of ${maximum}`
+          : opened.size === 0 && !allowEmpty
+            ? `${relative} is empty`
+            : undefined;
+    if (problem) {
+      closeSync(fd);
+      throw new ContainedError(problem);
+    }
+    return { fd, size: opened.size };
+  } finally {
+    closeSync(parent.fd);
+  }
+}
+
+/**
+ * The bytes of the regular file `relative` under `root`, reached without
+ * links (openContained), within `maximum` bytes and unchanged while read.
+ */
+export function readContained(
+  root: string,
+  relative: string,
+  maximum: number,
+  allowEmpty = false,
+): Buffer {
+  const { fd, size } = openContained(root, relative, maximum, allowEmpty);
+  try {
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (!count) break;
+      offset += count;
+    }
+    if (offset !== size || readSync(fd, Buffer.alloc(1), 0, 1, offset) !== 0)
+      throw new ContainedError(`${relative} changed while it was read`);
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+const readAt = promisify(read);
+const COPY_CHUNK = 1024 * 1024;
+
+/**
+ * Copy the regular file `relative` under `root`, reached without links
+ * (openContained) and within `maximum` bytes, to the new file `to` (mode
+ * 0600, never through a link), or with `replace` over the existing regular
+ * file `to`. Returns the sha256 and size of exactly the bytes copied. A
+ * failure removes a new `to`.
+ */
+export async function copyContained(
+  root: string,
+  relative: string,
+  to: string,
+  maximum: number,
+  replace = false,
+): Promise<{ sha256: string; bytes: number }> {
+  const { fd, size } = openContained(root, relative, maximum, true);
+  try {
+    const output = await open(
+      to,
+      constants.O_WRONLY |
+        constants.O_NOFOLLOW |
+        (replace ? constants.O_TRUNC : constants.O_CREAT | constants.O_EXCL),
+      0o600,
+    );
+    let copied = false;
+    try {
+      const hash = createHash("sha256");
+      const buffer = Buffer.alloc(Math.min(COPY_CHUNK, Math.max(size, 1)));
+      let offset = 0;
+      for (;;) {
+        const { bytesRead } = await readAt(
+          fd,
+          buffer,
+          0,
+          buffer.length,
+          offset,
+        );
+        if (!bytesRead) break;
+        offset += bytesRead;
+        if (offset > size) break;
+        const chunk = buffer.subarray(0, bytesRead);
+        hash.update(chunk);
+        await output.write(chunk);
+      }
+      if (offset !== size)
+        throw new ContainedError(`${relative} changed while it was read`);
+      copied = true;
+      return { sha256: hash.digest("hex"), bytes: size };
+    } finally {
+      await output.close();
+      if (!copied && !replace) await rm(to, { force: true });
+    }
+  } finally {
+    closeSync(fd);
   }
 }

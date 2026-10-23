@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { TransientError } from "./github.js";
 import { errorMessage } from "./text.js";
@@ -140,6 +141,27 @@ export function batchObjects(
     offset = newline + 1 + size + 1;
   }
   return objects;
+}
+
+/** The lowercase hex SHA-256 of `bytes`. */
+export function sha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+const LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1\n";
+/** Git LFS reads blobs up to this size as possible pointers. */
+export const LFS_POINTER_MAX_BYTES = 1024;
+
+/** A Git LFS pointer's object id (sha256) and size, or undefined. */
+export function lfsPointer(
+  bytes: Buffer,
+): { oid: string; size: number } | undefined {
+  if (bytes.length > LFS_POINTER_MAX_BYTES) return undefined;
+  const body = bytes.toString("utf8");
+  if (!body.startsWith(LFS_POINTER_HEADER)) return undefined;
+  const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(body)?.[1];
+  const size = /^size (\d+)$/m.exec(body)?.[1];
+  return oid && size ? { oid, size: Number(size) } : undefined;
 }
 
 /**

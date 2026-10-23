@@ -1,4 +1,5 @@
 import type { SourceRef } from "../objective.js";
+import type { ReviewArtifactSelector } from "../review/artifacts.js";
 
 /**
  * Plan data as the core stores it: plain JSON in the state file. The
@@ -220,6 +221,11 @@ export interface Draft {
 export interface Plan extends Draft {
   /** The final commands as reviewed, so a config edit mid-run can't change them. */
   finalCommands: string[];
+  /**
+   * The installation's review artifact selectors the plan was compiled and
+   * reviewed with; validation holds when one is no longer configured.
+   */
+  reviewArtifacts?: ReviewArtifactSelector[];
   /** Operator answers; workers and final review get them. */
   decisions: PlannerDecision[];
 }

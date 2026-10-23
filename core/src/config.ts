@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import {
+  loadReviewArtifacts,
+  type ReviewArtifactSelector,
+} from "./review/artifacts.js";
 
 /** The installation's configuration, checked once when it's loaded. */
 export interface CoreConfig {
@@ -56,6 +60,20 @@ export interface CoreConfig {
     /** Commands that need network and run only in CI. */
     ciOnlyCommands: string[];
   };
+  delivery: {
+    /**
+     * `regular` (the default): one PR per Work Item. `native-stack`: each
+     * linear chain of the plan (planning/units.ts) is delivered as chained
+     * PRs and merged as one GitHub native stack; single-item units stay
+     * ordinary PRs.
+     */
+    kind: "regular" | "native-stack";
+  };
+  /**
+   * Validation outputs captured as review evidence (review/artifacts.ts);
+   * empty when the operator names none.
+   */
+  reviewArtifacts: ReviewArtifactSelector[];
   /** The OS sandbox every worker-caused command runs in (sandbox.ts). */
   sandbox: SandboxConfig;
 }
@@ -254,6 +272,27 @@ function sandboxConfig(value: unknown, problems: string[]): SandboxConfig {
   return config;
 }
 
+/** The `delivery` section checked, with defaults; problems are appended. */
+function deliveryConfig(
+  value: unknown,
+  problems: string[],
+): CoreConfig["delivery"] {
+  const config: CoreConfig["delivery"] = { kind: "regular" };
+  if (value === undefined) return config;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    problems.push("delivery must be an object");
+    return config;
+  }
+  const delivery = value as Record<string, unknown>;
+  for (const key of Object.keys(delivery))
+    if (key !== "kind") problems.push(`delivery.${key} is not a setting`);
+  if (delivery.kind === "regular" || delivery.kind === "native-stack")
+    config.kind = delivery.kind;
+  else if (delivery.kind !== undefined)
+    problems.push('delivery.kind must be "regular" or "native-stack"');
+  return config;
+}
+
 export type QueueOption =
   | "queued"
   | "planning"
@@ -406,6 +445,8 @@ export function loadConfig(repository: string): CoreConfig {
       "finalValidation.ciOnlyCommands",
     ),
   };
+  config.delivery = deliveryConfig(raw.delivery, problems);
+  config.reviewArtifacts = loadReviewArtifacts(raw.reviewArtifacts, problems);
   config.sandbox = sandboxConfig(raw.sandbox, problems);
   if (config.repository && config.repository !== repository)
     problems.push(

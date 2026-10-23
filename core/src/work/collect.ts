@@ -16,6 +16,7 @@ import {
   readFile,
   realpath,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { SandboxConfig } from "../config.js";
@@ -35,7 +36,8 @@ import {
   workerEnvironment,
 } from "../worktree.js";
 
-const FACTORY_EMAIL = "factory@users.noreply.github.com";
+/** The committer email on every commit Factory writes. */
+export const FACTORY_EMAIL = "factory@users.noreply.github.com";
 
 /** The commit message of a collected result. */
 function collectionMessage(item: Pick<WorkItem, "title">): string {
@@ -160,7 +162,12 @@ async function collectResult(collected: CollectInput): Promise<Collection> {
       throw new WorkFinding(
         "Handoff manifest must be untracked private staging",
       );
-    await scanPrivateStaging(input, ".factory-handoff.json");
+    const stopped = await scanStaging(
+      input,
+      ".factory-handoff.json",
+      await readFile(handoffPath),
+    );
+    if (stopped) throw new CollectionStop(stopped);
   }
   const discoveryPath = join(worktree, ".factory-discovery.json");
   const discovery = await readDiscovery(discoveryPath);
@@ -807,6 +814,9 @@ interface SecretFinding {
 /** Collection's input with the Secretlint rules it scans with. */
 type Scan = CollectInput & { rules: string };
 
+/** What a scan needs: the rules and the call's signal. */
+type Scanner = Pick<Scan, "rules" | "signal">;
+
 const RECOMMENDED_RULES = JSON.stringify({
   rules: [{ id: "@secretlint/secretlint-rule-preset-recommend" }],
 });
@@ -861,7 +871,7 @@ async function scannerRules(
  * collection with a retry.
  */
 async function scanFile(
-  input: Scan,
+  input: Scanner,
   path: string,
   source: string,
   scanRoot: string,
@@ -916,17 +926,37 @@ async function scanFile(
   };
 }
 
-/** Private worker notes cross the same secret boundary before retention. */
-async function scanPrivateStaging(input: Scan, path: string): Promise<void> {
+/**
+ * Private staging Factory keeps (handoff notes, the media manifest) crosses
+ * the same secret boundary as the result before it is retained. Scans the
+ * exact `bytes` Factory read from staging file `name`, not the worker's
+ * file again. Undefined when clean; otherwise the secret hold (`repair` →
+ * repair to work, `retry` → collect again, `cancel`), or a retry when the
+ * scanner can't run or a hold when FACTORY_SECRETLINT_CONFIG is unusable.
+ * collect and media's captureAssets both call it.
+ */
+export async function scanStaging(
+  input: Pick<CollectInput, "checkout" | "worktree" | "signal"> & {
+    rules?: string;
+  },
+  name: string,
+  bytes: Buffer,
+): Promise<Exclude<Collection, { kind: "collected" | "repair" }> | undefined> {
   const scanRoot = await mkdtemp(join(dirname(input.worktree), "secret-scan-"));
   try {
-    const finding = await scanFile(
-      input,
-      path,
-      join(input.worktree, path),
-      scanRoot,
-    );
-    if (finding) throw new CollectionStop(secretHold([finding]));
+    const scanner = {
+      rules:
+        input.rules ?? (await scannerRules(input.checkout, input.worktree)),
+      signal: input.signal,
+    };
+    const source = join(scanRoot, name);
+    await writeFile(source, bytes, { mode: 0o600, flag: "wx" });
+    const finding = await scanFile(scanner, name, source, scanRoot);
+    return finding ? secretHold([finding]) : undefined;
+  } catch (error) {
+    if (error instanceof CollectionStop && error.outcome.kind !== "repair")
+      return error.outcome;
+    throw error;
   } finally {
     await rm(scanRoot, { recursive: true, force: true });
   }
