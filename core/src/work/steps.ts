@@ -550,6 +550,7 @@ async function workStep(
       item,
       base,
       body,
+      localAssetRoots: config.media.localAssetRoots,
       selection: selection(state),
       ...(own ? { kept: own.selection } : {}),
       githubToken: () => deps.github.serviceToken(),

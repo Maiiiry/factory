@@ -914,6 +914,8 @@ export interface FactsArgs {
   extraCommands?: readonly string[];
   /** The approved playbook text. */
   playbook?: string;
+  /** The operator's media.localAssetRoots. */
+  localAssetRoots?: readonly string[];
   signal?: AbortSignal;
 }
 
@@ -951,6 +953,7 @@ export async function buildFacts(
     ),
     coverageObligations: coverageObligations(args.body),
     playbook: args.playbook ?? "",
+    localAssetRoots: args.localAssetRoots ?? [],
   };
   return { facts };
 }

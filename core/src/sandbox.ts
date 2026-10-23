@@ -217,6 +217,54 @@ function showsHostSockets(path: string): boolean {
 }
 
 /**
+ * Why a directory can't be a `media.localAssetRoots` entry (config load),
+ * or undefined when it can: it would show workers what the sandbox seals.
+ */
+export function localRootRefusal(root: string): string | undefined {
+  const path = real(root);
+  return privatePaths(process.env, "/", false).exposes(path) ||
+    showsHostSockets(path)
+    ? `${root} would show workers your HOME, a login, Factory's own files, runtime sockets or the shared temporary directory`
+    : undefined;
+}
+
+/**
+ * Where a "local" source asset is read from: its real path under the real
+ * path of one of the operator's `media.localAssetRoots`, split as the root
+ * and the path below it, so the copy reaches it without links from there.
+ * Refused, with the reason, when no root holds it (no roots means local
+ * assets are off) or when it is anything the sandbox seals from workers.
+ * Planning's source-asset check and the copy both call this.
+ */
+export function localAssetPlace(
+  path: string,
+  roots: readonly string[],
+): { root: string; relative: string } | { refused: string } {
+  if (!isAbsolute(path)) return { refused: `${path} is not an absolute path` };
+  if (!roots.length)
+    return {
+      refused:
+        "local source assets are off: media.localAssetRoots in the Factory configuration names no directory",
+    };
+  const file = real(path);
+  if (
+    privatePaths(process.env, "/", false).exposes(file) ||
+    showsHostSockets(file)
+  )
+    return {
+      refused: `${path} is in a login directory, Factory's own files, runtime sockets or the shared temporary directory, which workers never see`,
+    };
+  for (const entry of roots) {
+    const root = real(entry);
+    if (within(file, root) && file !== root)
+      return { root, relative: relative(root, file) };
+  }
+  return {
+    refused: `${path} is not under a directory media.localAssetRoots names (${roots.join(", ")})`,
+  };
+}
+
+/**
  * The directories a sandboxed shell reads, never writes, so the tools on its
  * PATH run: every PATH directory, and the directory of the real file behind
  * each link in one. A directory named `bin` or `sbin` stands for its install

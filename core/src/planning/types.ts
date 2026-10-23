@@ -276,4 +276,6 @@ export interface PlanningFacts {
   coverageObligations: CoverageObligation[];
   /** The approved playbook text; empty when there is none. */
   playbook: string;
+  /** The operator's media.localAssetRoots: the only places a local source asset may come from. */
+  localAssetRoots: readonly string[];
 }

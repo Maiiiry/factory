@@ -7,6 +7,7 @@ import {
   loadReviewArtifacts,
   type ReviewArtifactSelector,
 } from "./review/artifacts.js";
+import { localRootRefusal } from "./sandbox.js";
 
 /** The installation's configuration, checked once when it's loaded. */
 export interface CoreConfig {
@@ -77,6 +78,14 @@ export interface CoreConfig {
   reviewArtifacts: ReviewArtifactSelector[];
   /** The OS sandbox every worker-caused command runs in (sandbox.ts). */
   sandbox: SandboxConfig;
+  media: {
+    /**
+     * Host directories a "local" source asset may come from, by real path;
+     * empty (the default) turns local assets off. A directory that would
+     * show workers what the sandbox seals is refused.
+     */
+    localAssetRoots: string[];
+  };
 }
 
 /** The operator's `sandbox` section, with defaults filled in. */
@@ -269,6 +278,43 @@ function sandboxConfig(value: unknown, problems: string[]): SandboxConfig {
           `sandbox.limits.${name} must be an integer of at least ${minimum}`,
         );
     }
+  }
+  return config;
+}
+
+/** The `media` section checked, with defaults; problems are appended. */
+function mediaConfig(value: unknown, problems: string[]): CoreConfig["media"] {
+  const config: CoreConfig["media"] = { localAssetRoots: [] };
+  if (value === undefined) return config;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    problems.push("media must be an object");
+    return config;
+  }
+  const media = value as Record<string, unknown>;
+  for (const key of Object.keys(media))
+    if (key !== "localAssetRoots")
+      problems.push(`media.${key} is not a setting`);
+  const roots = media.localAssetRoots;
+  if (roots === undefined) return config;
+  if (
+    !Array.isArray(roots) ||
+    !roots.every(
+      (root) =>
+        typeof root === "string" &&
+        isAbsolute(root) &&
+        resolve(root) === root &&
+        root !== "/",
+    )
+  ) {
+    problems.push(
+      "media.localAssetRoots must be absolute, normalized directory paths",
+    );
+    return config;
+  }
+  for (const root of roots as string[]) {
+    const refused = localRootRefusal(root);
+    if (refused) problems.push(`media.localAssetRoots: ${refused}`);
+    else config.localAssetRoots.push(root);
   }
   return config;
 }
@@ -471,6 +517,7 @@ export function loadConfig(repository: string): CoreConfig {
   config.delivery = deliveryConfig(raw.delivery, problems);
   config.reviewArtifacts = loadReviewArtifacts(raw.reviewArtifacts, problems);
   config.sandbox = sandboxConfig(raw.sandbox, problems);
+  config.media = mediaConfig(raw.media, problems);
   if (config.repository && config.repository !== repository)
     problems.push(
       `repository is ${config.repository}, but the command named ${repository}`,

@@ -36,7 +36,7 @@ import {
   lstatSync,
 } from "node:fs";
 import { chmod, copyFile, mkdir, open, rm, unlink } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebStream } from "node:stream/web";
@@ -60,6 +60,7 @@ import {
 } from "./paths.js";
 import { isRecord, ownsPath } from "./planning/graph.js";
 import type { Plan, SourceAssetBinding, WorkItem } from "./planning/types.js";
+import { localAssetPlace } from "./sandbox.js";
 import { errorMessage } from "./text.js";
 import {
   FACTORY_EMAIL,
@@ -226,6 +227,8 @@ export interface InputsRequest {
   base: string;
   /** The Objective body: a local source must be a path it names (namesPath). */
   body: string;
+  /** The operator's media.localAssetRoots: a local source must lie under one. */
+  localAssetRoots: readonly string[];
   /** Each dependency's select result, when it has one. */
   selection(itemId: string): Selection | undefined;
   /** The item's own selection kept across a repair that isn't about the media; its members are staged read-only. */
@@ -262,7 +265,12 @@ export async function resolveInputs(
       kind === "repository"
         ? await repositorySource(request, binding.path, file)
         : kind === "local"
-          ? await localSource(request.body, binding.path, file)
+          ? await localSource(
+              request.body,
+              binding.path,
+              request.localAssetRoots,
+              file,
+            )
           : await attachmentSource(request, binding.path, file);
     if (copied.kind !== "done") return copied;
     inputs.push({
@@ -368,12 +376,14 @@ async function repositorySource(
 
 /**
  * A private file the Objective names, checked again here as a whole path
- * token since this copies it to the worker. It is read without following
- * any link on its absolute path.
+ * token and against the operator's local asset roots (localAssetPlace),
+ * since this copies it to the worker. It is read from its root without
+ * following any link below it.
  */
 async function localSource(
   body: string,
   path: string,
+  roots: readonly string[],
   file: string,
 ): Promise<Copied> {
   if (!namesPath(body, path))
@@ -381,15 +391,19 @@ async function localSource(
       `Local source asset ${path} is not a path the Objective names, so Factory won't give it to the worker. Name the exact path in the Objective and answer replan, or cancel.`,
       ["replan", "cancel"],
     );
+  const place = localAssetPlace(path, roots);
+  if ("refused" in place)
+    return hold(
+      `Local source asset ${path} can't go to the worker: ${place.refused}. Put the file under a directory media.localAssetRoots names and answer retry; or replan or cancel.`,
+      ["retry", "replan", "cancel"],
+    );
   await mkdir(join(file, ".."), { recursive: true, mode: 0o700 });
   try {
-    if (!isAbsolute(path))
-      throw new ContainedError(`${path} is not an absolute path`);
     return {
       kind: "done",
       value: await copyContained(
-        "/",
-        path.slice(1),
+        place.root,
+        place.relative,
         file,
         Number.MAX_SAFE_INTEGER,
       ),

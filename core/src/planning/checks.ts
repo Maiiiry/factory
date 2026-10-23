@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import { markdownLines } from "../markdown.js";
 import { namesPath } from "../objective.js";
+import { localAssetPlace } from "../sandbox.js";
 import {
   type BaseFiles,
   ciOnlyKey,
@@ -54,7 +55,7 @@ export async function checkPlan(
   await boundaryFindings(shapes, facts, files, found);
   graphLint(draft, new Map(), facts.authorizedCommands, found);
   await citationFindings(shapes, facts.sources, files, found);
-  await mediaFindings(shapes, facts.body, files, found);
+  await mediaFindings(shapes, facts, files, found);
   gateFindings(draft, facts, found);
   return findings;
 }
@@ -502,10 +503,11 @@ function recognizedObjectiveAttachment(value: string): boolean {
 /** Output roles, candidate counts, LFS roles and source assets. */
 async function mediaFindings(
   shapes: readonly WorkItem[],
-  body: string,
+  facts: PlanningFacts,
   files: BaseFiles,
   found: Found,
 ): Promise<void> {
+  const { body } = facts;
   const tracked = new Set(await files.paths());
   for (const item of shapes) {
     const roles = item.expectedOutputRoles ?? [];
@@ -529,6 +531,16 @@ async function mediaFindings(
       );
     for (const asset of item.sourceAssets ?? []) {
       const kind = asset.kind ?? "repository";
+      if (kind === "local" && namesPath(body, asset.path)) {
+        const place = localAssetPlace(asset.path, facts.localAssetRoots);
+        if ("refused" in place) {
+          found(
+            `Work Item ${item.id} cites local source asset ${asset.path}, which can't go to a worker: ${place.refused}. Use a file tracked at the base or a GitHub attachment URL instead; only the operator can allow a local file, by adding a directory that holds it to media.localAssetRoots`,
+            item.id,
+          );
+          continue;
+        }
+      }
       const available =
         kind === "repository"
           ? /^[A-Za-z0-9_./-]+$/.test(asset.path) &&

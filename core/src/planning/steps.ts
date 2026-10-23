@@ -939,6 +939,7 @@ async function planningFacts(
     requiredCommands: config.finalValidation.requiredCommands,
     ciOnlyCommands: config.finalValidation.ciOnlyCommands,
     extraCommands: allowedCommands(state),
+    localAssetRoots: config.media.localAssetRoots,
     // No playbook in the target reads as empty. Knowledge adds the pinned
     // Dream playbook and, for Adaptive workflow, planning context and memory.
     playbook: await planningKnowledge({
