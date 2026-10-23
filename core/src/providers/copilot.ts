@@ -53,7 +53,7 @@ const LOGIN_HOLD =
  * request), so the answer is the setting, then `switch` to re-freeze the
  * provider's new settings or to move to another provider.
  */
-function modelHold(model: string, why: string): PlannerError {
+function modelHold(why: string): PlannerError {
   return new PlannerError(
     "hold",
     `${why}. Set this provider's model to one the Copilot login can use and restart the service, then answer \`switch NAME\` with this provider's name to run on its new settings, or with another configured provider's name; or cancel.`,
@@ -200,6 +200,19 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
         "hold",
         `${LOGIN_HOLD} (${detail(auth.statusMessage ?? "not authenticated")})`,
       );
+    // Before any session: a session on a model the login can't use bills
+    // a request for whatever Copilot serves instead.
+    const models = await watchdog.race(client.listModels());
+    const listed = models.find((entry) => entry.id === turn.choice.model);
+    if (!listed || listed.policy?.state === "disabled")
+      throw modelHold(
+        `The Copilot login ${listed ? "has model" : "doesn't offer model"} ${turn.choice.model}${listed ? " disabled by policy" : ""} (it offers ${detail(
+          models
+            .filter((entry) => entry.policy?.state !== "disabled")
+            .map((entry) => entry.id)
+            .join(", "),
+        )})`,
+      );
     let text = "";
 
     const usage = { input: 0, output: 0, cached: 0 };
@@ -255,7 +268,6 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
           )
             fail(
               modelHold(
-                turn.choice.model,
                 `Copilot served ${event.data.model}, not the configured ${turn.choice.model}`,
               ),
             );
