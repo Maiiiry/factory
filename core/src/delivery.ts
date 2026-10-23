@@ -412,6 +412,50 @@ async function factoryMade(
   return true;
 }
 
+/**
+ * Delete Factory's branch once its PR merged (a native stack's layers once
+ * the whole unit merged) or cancel closed it. Only a branch whose every
+ * commit beyond the default branch is Factory's (factoryMade) goes, by a
+ * push with a lease on the head read, so a commit pushed meanwhile keeps
+ * it. A branch already gone (GitHub's auto-delete, or a run before a
+ * crash) is done. Returns why a branch was kept; a refused delete never
+ * blocks the step. A failure to reach origin throws, for a retry.
+ */
+export async function deleteFactoryBranch(
+  context: DeliveryContext,
+  branch: string,
+  point: string,
+): Promise<string | undefined> {
+  const remote = await remoteHead(context, branch);
+  if (!remote) return undefined;
+  const defaultBranch = await context.github.defaultBranch(context.signal);
+  if (!(await factoryMade(context, remote, defaultBranch)))
+    return `${branch} holds commits Factory did not make`;
+  crashPoint(`${point}:before`);
+  try {
+    await remoteGit(context, [
+      "push",
+      "--porcelain",
+      `--force-with-lease=refs/heads/${branch}:${remote}`,
+      "origin",
+      `:refs/heads/${branch}`,
+    ]);
+  } catch (error) {
+    if (context.signal.aborted) throw error;
+    const refused = pushRefusal(
+      (error as { stdout?: unknown }).stdout?.toString() ?? "",
+    );
+    if (!refused)
+      throw new TransientError(
+        `git push --delete ${branch}: ${message(error)}`,
+      );
+    if (!(await remoteHead(context, branch))) return undefined;
+    return `the remote refused deleting ${branch} (${refused})`;
+  }
+  crashPoint(`${point}:after`);
+  return undefined;
+}
+
 /** The hidden marker in the body of every PR Factory opens. */
 function pullMarker(issue: number, item: string): string {
   return `<!-- factory:${issue}:pr:${item} -->`;

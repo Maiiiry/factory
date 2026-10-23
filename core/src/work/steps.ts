@@ -4,6 +4,7 @@ import { crashPoint } from "../crash.js";
 import {
   ACCEPT,
   type DeliveryContext,
+  deleteFactoryBranch,
   itemBranch,
   merge,
   mergeUnit,
@@ -1402,6 +1403,7 @@ async function mergeStep(
   );
   switch (result.kind) {
     case "merged": {
+      await deleteBranches(context, deps, [item]);
       const done: MergeResult = {
         mergeSha: result.mergeSha,
         integratedSha: result.integratedSha,
@@ -1415,6 +1417,28 @@ async function mergeStep(
       return republishOutcome(item, result.reason);
     default:
       return result;
+  }
+}
+
+/** Delete the merged items' branches (deleteFactoryBranch); a kept one is logged. */
+async function deleteBranches(
+  context: StepContext,
+  deps: BuildDeps,
+  items: readonly WorkItem[],
+): Promise<void> {
+  const where = {
+    github: deps.github,
+    checkout: deps.config.checkout,
+    signal: context.signal,
+  };
+  for (const item of items) {
+    const branch = itemBranch(context.state.issue, item.id);
+    const kept = await deleteFactoryBranch(
+      where,
+      branch,
+      "deliver:branch-delete",
+    );
+    if (kept) context.log({ event: "branch-kept", branch, reason: kept });
   }
 }
 
@@ -1445,6 +1469,9 @@ async function mergeStack(
     unit.items.find((entry) => entry.id === id) ?? top;
   switch (result.kind) {
     case "merged": {
+      // Lower layers' branches are the upper PRs' bases: they go only
+      // once the whole unit merged.
+      await deleteBranches(context, deps, unit.items);
       const done: MergeResult = {
         mergeSha: result.mergeSha,
         integratedSha: result.integratedSha,
@@ -2022,12 +2049,12 @@ export function reportStep(deps: BuildDeps): Step {
   };
 }
 
-/** After cancel: close Factory's open PRs and remove the work files. It retries; it never asks. */
+/** After cancel: close Factory's open PRs, delete its branches and remove the work files. It retries; it never asks. */
 export function cancelCleanupStep(deps: BuildDeps): Step {
   return {
     key: "cancel:cleanup",
     deadlineMs: 10 * MINUTE,
-    run: async ({ state, signal }) => {
+    run: async ({ state, signal, log }) => {
       await closeFactoryPulls(
         deps,
         state.issue,
@@ -2035,6 +2062,19 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
         `Factory cancelled Objective #${state.issue}; closing this PR.`,
         signal,
       );
+      // Cancel ends the Objective, so its branches go once their PRs are
+      // closed (a stack's upper PRs first); a re-run reuses them instead.
+      for (const branch of await deps.github.branches(
+        `factory/${state.issue}/`,
+        signal,
+      )) {
+        const kept = await deleteFactoryBranch(
+          { github: deps.github, checkout: deps.config.checkout, signal },
+          branch,
+          "cancel:branch-delete",
+        );
+        if (kept) log({ event: "branch-kept", branch, reason: kept });
+      }
       // The Objective's issue closes as not planned, so the queue and the
       // issue agree; the operator can reopen and queue it again.
       await deps.github.closeIssue(
