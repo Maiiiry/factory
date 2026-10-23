@@ -325,7 +325,7 @@ Status words:
 - Crash points around GitHub effects (sync, plan, report, cancel, rerun) are listed in the CI loop as skipped: CI has no GitHub. Drilled 2026-10-22 on the scratch repository: 26 of 30 pass. **owed**: plan:data before/after (needs a plan over 65,000 characters) and sync:remind before/after (needs a human gate on the scratch repository); both go to the drill suite.
 - The slice gate drill: cut the network for a minute and stop a model mid-turn, on a real Objective (design plan section 7.2; CORE.md#Testing). **ported**: drilled 2026-10-22 on the stability build. A one-minute cut during planning, during a hold and during the CI wait was retried, not held, and a Codex planner and worker killed mid-turn reran with no error counted. The drill suite repeats it on demand.
 - A test that bounded cost holds (rule 6). **ported**: drilled 2026-10-22 through a counting proxy. Each queue poll is exactly 2 GraphQL requests plus one comment read per unfinished Objective, flat as the Project grows.
-- A CI test of step order (CORE.md#Testing lists it). **owed**: no service test checks it yet; every drill exercises it. Add one with the next engine change.
+- A CI test of step order (CORE.md#Testing lists it). **ported**: core/test/service.test.mjs runs the real service on a two-item plan with GitHub down. With the first item done through review, only its publish runs (not work again, not ci or merge) and its dependent doesn't start; once the first item has merged, the dependent's work step is the one that runs.
 
 ## Milestone log
 

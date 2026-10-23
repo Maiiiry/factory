@@ -771,3 +771,62 @@ test("a state file that can't be read now is read again, not marked unreadable",
   );
   await stopped(service);
 });
+
+test("a plan's steps run in order, and a dependent waits for its dependency's merge", async () => {
+  const inst = installation();
+  // GitHub is down: each step that runs reaches its first GitHub or Git
+  // read and waits there, which shows which step the engine chose.
+  configured(inst, `http://127.0.0.1:${await closedPort()}`);
+  const plan = {
+    items: [
+      { id: "a", ownedPaths: ["src/a.ts"], dependencies: [] },
+      { id: "b", ownedPaths: ["src/b.ts"], dependencies: ["a"] },
+    ],
+  };
+  const fields = (done) => ({
+    done: { check: {}, plan, ...done },
+    kept: { "plan:acceptedAt": "2026-01-01T00:00:00.000Z" },
+  });
+  const tried = (state) =>
+    Object.keys({ ...state.attempts, ...state.retries }).filter((key) =>
+      key.startsWith("item:"),
+    );
+  // a has done work, validate and review: publish is next, not ci or merge.
+  seed(
+    inst,
+    51,
+    "building",
+    fields({
+      "item:a:work": {},
+      "item:a:validate": {},
+      "item:a:review": {},
+    }),
+  );
+  let service = serve(inst);
+  await until(
+    () => stateOf(inst, 51).retries["item:a:publish"],
+    "a's publish runs",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual(tried(stateOf(inst, 51)), ["item:a:publish"]);
+  await stopped(service);
+  // Once a has merged, b starts with its first step.
+  seed(
+    inst,
+    51,
+    "building",
+    fields({
+      "item:a:work": {},
+      "item:a:validate": {},
+      "item:a:review": {},
+      "item:a:publish": {},
+      "item:a:ci": {},
+      "item:a:merge": { pr: 1 },
+    }),
+  );
+  service = serve(inst);
+  await until(() => stateOf(inst, 51).retries["item:b:work"], "b's work runs");
+  assert.deepEqual(tried(stateOf(inst, 51)), ["item:b:work"]);
+  assert.equal(cli(inst, "cancel", "51").code, 0);
+  await stopped(service);
+});
