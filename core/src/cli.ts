@@ -35,9 +35,9 @@ import { type Request, writeRequest } from "./requests.js";
 import { serve } from "./service.js";
 import {
   type FrozenProvider,
+  findState,
   type Hold,
-  listObjectives,
-  loadState,
+  listAllObjectives,
   type ObjectiveState,
   type ObjectiveStatus,
   TERMINAL,
@@ -237,7 +237,7 @@ function knowledge(config: CoreConfig, paths: Paths): KnowledgeSettings {
 
 /** An Objective's state once it is terminal with nothing left to run, or why not. */
 function settledState(paths: Paths, issue: number): ObjectiveState | string {
-  const loaded = loadState(paths.objectives, issue);
+  const loaded = findState(paths.objectives, issue);
   if (!loaded) return `Factory has no Objective #${issue}`;
   if (loaded.kind === "unreadable")
     return `#${issue} has unreadable state (${loaded.error})`;
@@ -281,11 +281,11 @@ function envLimits(): EngineLimits {
 async function status(paths: Paths, args: Args): Promise<number> {
   const only = args.positional[1] ? Number(args.positional[1]) : undefined;
   const rows: StatusRow[] = [];
-  for (const issue of listObjectives(paths.objectives)) {
+  for (const issue of listAllObjectives(paths.objectives)) {
     if (only !== undefined && issue !== only) continue;
-    let loaded: ReturnType<typeof loadState>;
+    let loaded: ReturnType<typeof findState>;
     try {
-      loaded = loadState(paths.objectives, issue);
+      loaded = findState(paths.objectives, issue);
     } catch (error) {
       process.stderr.write(`#${issue}: can't read its state now: ${error}\n`);
       continue;

@@ -307,9 +307,13 @@ test("the service retries a failed observation, and one run keeps one episode ac
   );
   await first.stop();
 
-  // A save after the run settled (a display or reply update) moves updatedAt.
+  // A save after the run settled (a display or reply update) moves updatedAt
+  // and writes the active file again; the settled run's moved to finished/.
   const path = join(inst.objectives, "7.json");
-  const state = JSON.parse(readFileSync(path, "utf8"));
+  const finished = join(inst.objectives, "finished", "7.json");
+  const state = JSON.parse(
+    readFileSync(existsSync(path) ? path : finished, "utf8"),
+  );
   state.updatedAt = "2026-10-05T00:00:00.000Z";
   state.modules.github = {
     itemId: "PVTI_x",

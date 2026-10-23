@@ -167,18 +167,58 @@ export function saveState(dir: string, state: ObjectiveState): void {
   }
   crashPoint("state:before-rename");
   renameSync(temporary, path);
-  const dirFd = openSync(dir, "r");
-  try {
-    fsyncSync(dirFd);
-  } finally {
-    closeSync(dirFd);
-  }
+  syncDirectory(dir);
   crashPoint("state:saved");
 }
 
 /** Remove the Objective's state: it was dequeued before it started. */
 export function removeState(dir: string, issue: number): void {
   rmSync(statePath(dir, issue), { force: true });
+  syncDirectory(dir);
+}
+
+/**
+ * Settled Objectives' files, under the state directory: the service never
+ * reads them at startup (rule 6: cost follows active work, never history);
+ * findState reads one when a request, a re-queue or status names it.
+ */
+const FINISHED = "finished";
+
+/**
+ * Move a settled Objective's file into finished/, once its cleanup, its
+ * final sync and its settled observation are done. A later save (a request
+ * to the finished Objective) writes the active file again, and it moves
+ * again. Nothing to move is not an error.
+ */
+export function finishState(dir: string, issue: number): void {
+  const finished = join(dir, FINISHED);
+  mkdirSync(finished, { recursive: true });
+  try {
+    renameSync(statePath(dir, issue), statePath(finished, issue));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  syncDirectory(finished);
+  syncDirectory(dir);
+}
+
+/** The Objective's active state, else its finished one; null when it has neither. */
+export function findState(dir: string, issue: number): Loaded | null {
+  return loadState(dir, issue) ?? loadState(join(dir, FINISHED), issue);
+}
+
+/** Every issue with an active or a finished state file. */
+export function listAllObjectives(dir: string): number[] {
+  return [
+    ...new Set([
+      ...listObjectives(dir),
+      ...listObjectives(join(dir, FINISHED)),
+    ]),
+  ].sort((a, b) => a - b);
+}
+
+function syncDirectory(dir: string): void {
   const dirFd = openSync(dir, "r");
   try {
     fsyncSync(dirFd);

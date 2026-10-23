@@ -120,16 +120,20 @@ export async function observeObjective(
   settings: { root: string; repository: string; checkout: string },
   state: ObjectiveState,
   settled: boolean,
-  busyMs?: number,
+  options: { busyMs?: number; signal?: AbortSignal } = {},
 ): Promise<number> {
-  const records = await withDigests(stateRecords(state), settings.checkout);
+  const records = await withDigests(
+    stateRecords(state),
+    settings.checkout,
+    options.signal,
+  );
   return withStore(
     settings.root,
     (db) =>
       settled
         ? releaseRun(db, settings.repository, state, records)
         : retain(db, records),
-    busyMs,
+    options.busyMs,
   );
 }
 
@@ -167,20 +171,23 @@ export function runOf(state: ObjectiveState): string {
 async function withDigests(
   records: MemoryRecord[],
   checkout: string,
+  signal?: AbortSignal,
 ): Promise<MemoryRecord[]> {
   const trees = new Map<string, BaseFiles>();
   for (const record of records) {
     if (!record.tree) continue;
     let files = trees.get(record.tree);
     if (!files) {
-      files = new BaseFiles(checkout, record.tree);
+      files = new BaseFiles(checkout, record.tree, signal);
       trees.set(record.tree, files);
     }
     for (const path of record.paths) {
       try {
         const digest = await pathDigest(files, path);
         if (digest) record.digests[path] = digest;
-      } catch {
+      } catch (error) {
+        // Past the deadline the observation fails and is tried again.
+        if (signal?.aborted) throw error;
         // The tree is gone (an unmerged branch was pruned): unverified.
         break;
       }

@@ -155,10 +155,15 @@ async function silentServer() {
   return server.address().port;
 }
 
+/** The Objective's state: active, else moved to finished/ once settled. */
 function stateOf(inst, issue) {
-  return JSON.parse(
-    readFileSync(join(inst.objectives, `${issue}.json`), "utf8"),
-  );
+  const read = (dir) => readFileSync(join(dir, `${issue}.json`), "utf8");
+  try {
+    return JSON.parse(read(inst.objectives));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return JSON.parse(read(join(inst.objectives, "finished")));
+  }
 }
 
 async function until(predicate, what, ms = 10_000) {
@@ -379,7 +384,7 @@ for (const point of CRASH_POINTS) {
       state.appliedRequests.length,
     );
     const leftovers = readdirSync(inst.objectives).filter(
-      (n) => n !== "11.json",
+      (n) => n !== "11.json" && n !== "finished",
     );
     assert.deepEqual(leftovers, [], "temporary files left after restart");
     assert.ok(
@@ -494,15 +499,26 @@ test("two spellings of one state directory share one lock", async () => {
   await stopped(first);
 });
 
-test("a finished Objective can't be cancelled", async () => {
+test("a finished Objective leaves the startup set, and can't be cancelled", async () => {
   const inst = installation();
   seed(inst, 13, "done");
+  const first = serve(inst);
+  const moved = join(inst.objectives, "finished", "13.json");
+  await until(() => existsSync(moved), "the move to finished/");
+  assert.ok(!existsSync(join(inst.objectives, "13.json")));
+  await stopped(first);
+  // Startup reads no history: a broken finished file is never read.
+  writeFileSync(join(inst.objectives, "finished", "12.json"), "{ not json");
   const service = serve(inst);
   await until(() => status(inst).service === "running", "service");
   const result = cli(inst, "cancel", "13");
   assert.equal(result.code, 1);
   assert.match(result.out, /already finished \(done\)/);
   assert.equal(stateOf(inst, 13).status, "done");
+  const record = JSON.parse(
+    readFileSync(join(inst.root, "service.json"), "utf8"),
+  );
+  assert.deepEqual(record.unreadable, {});
   await stopped(service);
 });
 

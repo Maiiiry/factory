@@ -598,7 +598,9 @@ export async function runDream(
           state ??
             `Objective #${command.objective} has no settled terminal state`,
         );
-      const added = await observeObjective(settings, state, true, 10_000);
+      const added = await observeObjective(settings, state, true, {
+        busyMs: 10_000,
+      });
       const episode = cliStore(settings, (db) =>
         episodes(db).find(
           (record) =>

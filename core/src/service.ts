@@ -35,8 +35,9 @@ import {
 } from "./requests.js";
 import {
   type FrozenProvider,
+  findState,
+  finishState,
   listObjectives,
-  loadState,
   newObjective,
   type ObjectiveState,
   removeState,
@@ -63,17 +64,24 @@ export interface ServeOptions {
 
 /**
  * `observe` sees an Objective once each time its status (or settledness:
- * terminal with nothing left to run) changes, and once at startup. It gets
- * a copy and runs beside the loop; a failure is retried with backoff until
- * it succeeds. `release` ends a run that a new admission of the same issue
- * replaces, before the new run starts; if it throws, the admission waits.
+ * terminal with nothing left to run) changes, and once when the service
+ * reads an active state file. It gets a copy and runs beside the loop,
+ * aborted by `signal` past its deadline; a failure is retried with backoff
+ * until it succeeds. `release` ends a run that a new admission of the same
+ * issue replaces, before the new run starts; if it throws, the admission
+ * waits.
  */
 export interface StateObserver {
-  observe(state: ObjectiveState, settled: boolean): Promise<void>;
+  observe(
+    state: ObjectiveState,
+    settled: boolean,
+    signal: AbortSignal,
+  ): Promise<void>;
   release(state: ObjectiveState): void;
 }
 
 const OBSERVE_BACKOFF_MS = 1000;
+const OBSERVE_DEADLINE_MS = 5 * 60 * 1000;
 
 /** Terminal with nothing left to run. */
 const settled = (runner: ObjectiveRunner): boolean =>
@@ -110,9 +118,11 @@ export async function serve(options: ServeOptions): Promise<number> {
   const run: ServiceRun = { id: runId, finished: 0, resumeAt: 0 };
   // The last run's record, read before this run's first heartbeat replaces it.
   const previous = readServiceRecord(paths.root);
-  // Unfinished Objectives, and finished ones until their cleanup and their
-  // final sync are done. Other finished ones are read from disk only when a
-  // request or the queue names them (rule 6: cost follows active work).
+  // Unfinished Objectives, and finished ones until their cleanup, their
+  // final sync and their settled observation are done; then their files
+  // move to finished/, which startup never reads. A finished one is read
+  // from disk again only when a request or the queue names it (rule 6:
+  // cost follows active work, never history).
   const runners = new Map<number, ObjectiveRunner>();
   const unreadable = new Map<number, UnreadableObjective>();
   /** Per Objective: the mark last observed, an observation in flight, the failure backoff. */
@@ -142,7 +152,7 @@ export async function serve(options: ServeOptions): Promise<number> {
   const find = (issue: number): ObjectiveRunner | undefined => {
     const known = runners.get(issue);
     if (known || unreadable.has(issue)) return known;
-    const loaded = loadState(paths.objectives, issue);
+    const loaded = findState(paths.objectives, issue);
     if (loaded?.kind === "unreadable")
       unreadable.set(issue, { error: loaded.error });
     return loaded?.kind === "ok" ? open(loaded.state) : undefined;
@@ -162,14 +172,27 @@ export async function serve(options: ServeOptions): Promise<number> {
     unloaded.delete(issue);
     // A finished one stays only until its cleanup and its final sync are
     // done, and, with an observer, until it is observed once: the service
-    // may have died before its end was recorded.
+    // may have died before its end was recorded, or before its file moved.
     if (
       runner &&
       settled(runner) &&
       (options.sync?.synced(runner.state) ?? true) &&
       !options.observer
     )
-      runners.delete(issue);
+      retire(issue);
+  };
+  /** A settled Objective leaves memory, and its file moves to finished/. */
+  const retire = (issue: number): void => {
+    try {
+      finishState(paths.objectives, issue);
+    } catch (error) {
+      // It stays, and moves on a later tick.
+      log.write(issue, { event: "finish-failed", error: String(error) });
+      return;
+    }
+    runners.delete(issue);
+    options.sync?.forget(issue);
+    observed.delete(issue);
   };
   /**
    * The observer ends a run that is replaced (a re-queue) or withdrawn,
@@ -377,7 +400,11 @@ export async function serve(options: ServeOptions): Promise<number> {
       entry.busy = true;
       // The mark is kept only once the observation succeeded.
       options
-        .observer!.observe(structuredClone(state), settled(runner))
+        .observer!.observe(
+          structuredClone(state),
+          settled(runner),
+          AbortSignal.timeout(OBSERVE_DEADLINE_MS),
+        )
         .then(
           () => {
             entry.mark = mark;
@@ -460,20 +487,17 @@ export async function serve(options: ServeOptions): Promise<number> {
       },
       result: (id: string) => readResult(paths.requests, id),
     });
-    // A finished Objective leaves memory once its cleanup, its final sync
-    // and its settled observation are done; a request or a re-queue reads
-    // it again from disk.
+    // A finished Objective leaves memory, and its file objectives/, once
+    // its cleanup, its final sync and its settled observation are done; a
+    // request or a re-queue reads it again from finished/.
     for (const runner of [...runners.values()]) {
       const issue = runner.state.issue;
       if (
         settled(runner) &&
         (options.sync?.idle(issue) ?? true) &&
         (!options.observer || observed.get(issue)?.mark === observeMark(runner))
-      ) {
-        runners.delete(issue);
-        options.sync?.forget(issue);
-        observed.delete(issue);
-      }
+      )
+        retire(issue);
     }
     heartbeat();
   };

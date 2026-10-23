@@ -87,9 +87,13 @@ export async function planningKnowledge(input: {
  * that a new admission of the same issue replaces.
  */
 export const knowledgeObserver = {
-  async observe(state: ObjectiveState, settled: boolean): Promise<void> {
+  async observe(
+    state: ObjectiveState,
+    settled: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
     const settings = knowledgeSettings();
-    if (settings) await observeObjective(settings, state, settled);
+    if (settings) await observeObjective(settings, state, settled, { signal });
   },
   release(state: ObjectiveState): void {
     const settings = knowledgeSettings();
