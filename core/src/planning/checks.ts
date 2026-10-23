@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path";
 import { markdownLines } from "../markdown.js";
-import { namesPath } from "../objective.js";
+import { namesPath, objectiveText } from "../objective.js";
 import { localAssetPlace } from "../sandbox.js";
 import {
   type BaseFiles,
@@ -507,7 +507,7 @@ async function mediaFindings(
   files: BaseFiles,
   found: Found,
 ): Promise<void> {
-  const { body } = facts;
+  const shown = objectiveText(facts.blocks);
   const tracked = new Set(await files.paths());
   for (const item of shapes) {
     const roles = item.expectedOutputRoles ?? [];
@@ -531,7 +531,7 @@ async function mediaFindings(
       );
     for (const asset of item.sourceAssets ?? []) {
       const kind = asset.kind ?? "repository";
-      if (kind === "local" && namesPath(body, asset.path)) {
+      if (kind === "local" && namesPath(shown, asset.path)) {
         const place = localAssetPlace(asset.path, facts.localAssetRoots);
         if ("refused" in place) {
           found(
@@ -549,9 +549,9 @@ async function mediaFindings(
           : kind === "local"
             ? asset.visibility === "private" &&
               isAbsolute(asset.path) &&
-              namesPath(body, asset.path)
+              namesPath(shown, asset.path)
             : recognizedObjectiveAttachment(asset.path) &&
-              body.includes(asset.path);
+              shown.includes(asset.path);
       if (!available)
         found(
           `Work Item ${item.id} cites an unavailable or invalid source asset: ${asset.path}. Use a file tracked at the base, a private absolute local path or a GitHub attachment URL that the Objective names`,

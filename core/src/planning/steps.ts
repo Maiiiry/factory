@@ -2,13 +2,13 @@ import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CoreConfig } from "../config.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
-import { defaultHead, sha256 } from "../git.js";
+import { defaultHead } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
-import { shownMarkdown } from "../markdown.js";
-import { parseObjective } from "../objective.js";
+import { checkObjective } from "../objective.js";
 import { type Planner, PlannerError } from "../providers/planner.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
+import { readShown, type ShownObjective, shownDigest } from "../shown.js";
 import type { Answer, ObjectiveState } from "../state.js";
 import { declarationProblems } from "../validate.js";
 import { checkPlan } from "./checks.js";
@@ -103,8 +103,10 @@ export function planningStep(
 
 /** The issue and base a planning generation reads; the check step's result. */
 export interface ObjectiveInputs {
-  /** What GitHub shows of the issue body (shownMarkdown): the planning text. */
-  body: string;
+  /** What GitHub shows of the issue body (shown.ts): its structure and the planner text. */
+  shown: ShownObjective;
+  /** The author can write: mermaid and math sources stay as code. */
+  writer?: true;
   /** A Factory-created split child, from the raw body's marker (structure, never text). */
   child?: true;
   base: string;
@@ -349,7 +351,7 @@ function planRoundStep(
         const data = {
           ...planChoices(facts, wire),
           instructions: `${renderPlanningInstructions(
-            inputs.body,
+            inputs.shown.blocks,
             corrections,
             revising,
           )}${await commandInstructions(facts, config.checkout, signal)}`,
@@ -492,7 +494,7 @@ function reviewStep(
           evidence,
           decisions: all,
           finalCommands: finalCommands(
-            inputs.body,
+            inputs.shown.blocks,
             config.finalValidation.requiredCommands,
           ),
           controllerCapabilities: controllerGuarantees(
@@ -672,8 +674,10 @@ async function objectiveChanged(
   deps: PlanningDeps,
   signal: AbortSignal,
 ): Promise<boolean> {
+  const inputs = generationInputs(state, g);
   const issue = await deps.github.renderedIssue(state.issue, signal);
-  return shownMarkdown(issue.body_html) !== generationInputs(state, g).body;
+  const shown = readShown(issue.body_html, { sources: inputs.writer === true });
+  return shownDigest(shown) !== shownDigest(inputs.shown);
 }
 
 /** The question this round needs answered, if any. Recomputed, so an answer re-derives the same text. */
@@ -776,7 +780,7 @@ function acceptStep(g: number, n: number, deps: PlanningDeps): Step {
         const plan: Plan = {
           ...draft,
           finalCommands: finalCommands(
-            inputs.body,
+            inputs.shown.blocks,
             deps.config.finalValidation.requiredCommands,
           ),
           decisions: decisions(state),
@@ -886,23 +890,29 @@ export async function readObjective(
       ),
     };
   // Planning reads what GitHub shows; Factory's own marker is structure.
-  const body = shownMarkdown(found.body_html);
-  const unapproved = await authorHold(found.user?.login, body, deps, context);
-  if (unapproved) return { hold: unapproved };
+  const author = found.user?.login;
+  const writer = !!author && (await deps.github.canWrite(author, signal));
+  const shown = readShown(found.body_html, { sources: writer });
+  if (!writer) {
+    const unapproved = authorHold(author, shown, context);
+    if (unapproved) return { hold: unapproved };
+  }
   const inputs: ObjectiveInputs = {
-    body,
+    shown,
+    ...(writer && { writer: true as const }),
     ...(childIdentity(found.body ?? "") && { child: true as const }),
     base: await defaultHead(config.checkout, signal),
     title: found.title,
     reviewArtifacts: config.reviewArtifacts,
   };
-  const { problems } = parseObjective(body);
+  const { problems } = checkObjective(shown.blocks);
   // The optional declarations (Package manager update, Quality checkpoint,
-  // Workspace package additions): checked here once, trusted afterwards.
-  problems.push(...declarationProblems(body));
+  // Workspace package additions, Adaptive workflow): checked here once,
+  // trusted afterwards.
+  problems.push(...declarationProblems(shown.blocks));
   if (!problems.length)
     problems.push(
-      ...(await objectiveCommandProblems(body, inputs.base, config.checkout, {
+      ...(await objectiveCommandProblems(shown, inputs.base, config.checkout, {
         child: inputs.child === true,
         requiredCommands: config.finalValidation.requiredCommands,
         ciOnlyCommands: config.finalValidation.ciOnlyCommands,
@@ -921,20 +931,18 @@ const AUTHOR_APPROVAL = "objective:author-approval";
 /**
  * An issue a non-writer wrote is planned only once a writer approves its
  * text: until then nothing in it (its commands, Sources, local assets or
- * instructions) counts. The approval holds for that exact visible text, by
- * digest, so a later edit asks again. The question names the digest, and
- * an `approve` counts only while the text still has it, so an edit made
+ * instructions) counts. The approval holds for that exact shown Objective,
+ * by digest, so a later edit asks again. The question names the digest, and
+ * an `approve` counts only while the Objective still has it, so an edit made
  * between the question and the answer asks again too.
  */
-async function authorHold(
+function authorHold(
   author: string | undefined,
-  body: string,
-  deps: PlanningDeps,
+  shown: ShownObjective,
   context: StepContext,
-): Promise<Outcome | undefined> {
-  const { state, answer, signal } = context;
-  if (author && (await deps.github.canWrite(author, signal))) return undefined;
-  const digest = sha256(Buffer.from(body)).slice(0, 16);
+): Outcome | undefined {
+  const { state, answer } = context;
+  const digest = shownDigest(shown).slice(0, 16);
   const approval = state.kept?.[AUTHOR_APPROVAL] as
     | { digest: string }
     | undefined;
@@ -949,7 +957,7 @@ async function authorHold(
       },
     };
   return hold(
-    `Issue #${state.issue} was written by ${author ? `@${author}` : "a deleted account"}, who has no write access; approve to plan it.\n\nFactory plans from what GitHub shows of it (body digest \`${digest}\`), so content GitHub hides never reaches a model. Nothing in it counts until you approve, and an edit asks again.`,
+    `Issue #${state.issue} was written by ${author ? `@${author}` : "a deleted account"}, who has no write access; approve to plan it.\n\nFactory plans from what GitHub shows of it (digest \`${digest}\`), so content GitHub hides never reaches a model. Diagram and math sources aren't planner input either: each mermaid diagram is \`[mermaid diagram]\` and each math block \`[math]\`, as you see only the drawing. Nothing in it counts until you approve, and an edit asks again.`,
     ["approve", "cancel"],
   );
 }
@@ -970,7 +978,7 @@ async function planningFacts(
 ): ReturnType<typeof buildFacts> {
   return buildFacts({
     objective: state.issue,
-    body: inputs.body,
+    shown: inputs.shown,
     child: inputs.child === true,
     base: inputs.base,
     checkout: config.checkout,
@@ -982,7 +990,7 @@ async function planningFacts(
     // Dream playbook and, for Adaptive workflow, planning context and memory.
     playbook: await planningKnowledge({
       state,
-      body: inputs.body,
+      shown: inputs.shown,
       child: inputs.child === true,
       files,
       playbook: (await files.text(config.planning.playbook)) ?? "",
@@ -999,9 +1007,9 @@ function localExecutables(
   return observeLocalExecutables({
     checkout: config.checkout,
     base: inputs.base,
-    body: inputs.body,
+    blocks: inputs.shown.blocks,
     finalCommands: finalCommands(
-      inputs.body,
+      inputs.shown.blocks,
       config.finalValidation.requiredCommands,
     ),
     signal,

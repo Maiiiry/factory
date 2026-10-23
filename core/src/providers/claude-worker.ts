@@ -42,6 +42,7 @@ import { ownsPath } from "../planning/graph.js";
 import { DESIGN_QUESTIONS } from "../planning/rubric.js";
 import type { Plan } from "../planning/types.js";
 import { runSandboxed, sandboxAvailable } from "../sandbox.js";
+import type { ObjectiveBlock } from "../shown.js";
 import { BoundedText, errorMessage, headAndTail } from "../text.js";
 import { validateTree } from "../validate.js";
 import {
@@ -111,8 +112,8 @@ export interface ClaudeWorkerOptions {
   sandbox: SandboxConfig;
   /** The accepted plan: Validate's pins and the handoff's peers. */
   plan: Plan;
-  /** The Objective body as planned: its package-manager and workspace pins. */
-  body: string;
+  /** The Objective's shown structure as planned: its package-manager and workspace pins. */
+  blocks: readonly ObjectiveBlock[];
   /** Origin's `owner/name`: Validate fetches Git LFS objects the local store lacks from it. */
   repository: string;
   /** Operator variables the worker's commands may see, by name. */
@@ -733,7 +734,7 @@ class Attempt {
       commit,
       item: input.item,
       plan: options.plan,
-      body: options.body,
+      blocks: options.blocks,
       sandbox: options.sandbox,
       returnTo: input.worktree,
       predecessor: input.base !== options.plan.base ? input.base : undefined,

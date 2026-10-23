@@ -18,7 +18,6 @@ import {
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead } from "../git.js";
 import { GitHubError } from "../github.js";
-import { shownMarkdown } from "../markdown.js";
 import {
   type CandidateSet,
   captureAssets,
@@ -38,6 +37,7 @@ import {
   validationMembers,
   verifyOriginMedia,
 } from "../media.js";
+import { checkObjective, objectiveText } from "../objective.js";
 import { forceRemove } from "../paths.js";
 import {
   BaseFiles,
@@ -69,6 +69,7 @@ import {
   receiptPath,
   reviewResult,
 } from "../review/result.js";
+import { type ObjectiveBlock, readShown, shownDigest } from "../shown.js";
 import type { ObjectiveState } from "../state.js";
 import { validateTree } from "../validate.js";
 import {
@@ -90,7 +91,7 @@ const MINUTE = 60_000;
 /** What execution needs from the installation, beyond planning. */
 export interface BuildDeps extends PlanningDeps {
   /** The worker for an Objective's plan. */
-  worker(plan: Plan, body: string): Worker;
+  worker(plan: Plan, blocks: readonly ObjectiveBlock[]): Worker;
 }
 
 /*
@@ -420,7 +421,8 @@ async function workStep(
   const { state, signal } = context;
   const { config } = deps;
   const plan = state.done.plan as Plan;
-  const body = objectiveInputs(state).body;
+  const { shown } = objectiveInputs(state);
+  const body = shown.body;
   const workDir = deps.workDir(state.issue);
   const worktree = worktreePath(workDir, state.issue, item.id);
   const media = mediaDirectory(workDir, item.id);
@@ -544,7 +546,7 @@ async function workStep(
       plan,
       item,
       base,
-      body,
+      body: objectiveText(shown.blocks),
       localAssetRoots: config.media.localAssetRoots,
       selection: selection(state),
       ...(own ? { kept: own.selection } : {}),
@@ -558,10 +560,10 @@ async function workStep(
 
     const files = new BaseFiles(config.checkout, base, signal);
     const scripts = await fixedScripts(
-      finalCommands(body, config.finalValidation.requiredCommands),
+      finalCommands(shown.blocks, config.finalValidation.requiredCommands),
       files,
     );
-    const pin = packageManagerUpdate(body);
+    const pin = packageManagerUpdate(shown.blocks);
     const prepared = await prepareWorkPrompt({
       checkout: config.checkout,
       worktree,
@@ -594,7 +596,7 @@ async function workStep(
       );
 
     const spent = kept<WorkerSpend>(state, item.id, "spend");
-    const { spend, ...result } = await deps.worker(plan, body).run({
+    const { spend, ...result } = await deps.worker(plan, shown.blocks).run({
       worktree,
       prompt: prepared.prompt,
       item,
@@ -998,7 +1000,7 @@ async function validateStep(
     commit: candidate(state, item.id),
     item,
     plan,
-    body: objectiveInputs(state).body,
+    blocks: objectiveInputs(state).shown.blocks,
     ...(work.base !== plan.base ? { predecessor: work.base } : {}),
     reviewArtifacts: {
       configured: config.reviewArtifacts,
@@ -1802,7 +1804,7 @@ export function finalStep(deps: BuildDeps): Step {
           directory: join(workDir, "final"),
           commit: head,
           plan,
-          body: objectiveInputs(state).body,
+          blocks: objectiveInputs(state).shown.blocks,
           reviewArtifacts: {
             configured: config.reviewArtifacts,
             planned: plan.reviewArtifacts,
@@ -1920,6 +1922,8 @@ export function finalReviewStep(deps: BuildDeps): Step {
           }),
           inputs: workerInputs(state, mergedIds),
           sources: await pinnedSources(state, deps, signal),
+          acceptance: checkObjective(objectiveInputs(state).shown.blocks)
+            .objective.acceptance,
           dir: join(deps.workDir(state.issue), "final-review"),
           ...(decisions ? { decisions } : {}),
           signal,
@@ -1948,18 +1952,21 @@ async function objectiveEdited(
 ): Promise<Outcome | undefined> {
   const { state, signal } = context;
   const issue = await deps.github.renderedIssue(state.issue, signal);
-  const body = shownMarkdown(issue.body_html);
+  const planned = objectiveInputs(state);
+  const digest = shownDigest(
+    readShown(issue.body_html, { sources: planned.writer === true }),
+  );
   const accepted =
     ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
-    objectiveInputs(state).body;
+    shownDigest(planned.shown);
   if (context.answer?.answer === "continue")
-    return body === accepted
+    return digest === accepted
       ? undefined
       : {
           kind: "retry",
           reason: "Continuing with the edited Objective.",
           afterMs: 0,
-          keep: { "objective:accepted": body },
+          keep: { "objective:accepted": digest },
         };
   if (issue.state !== "open")
     return hold(
@@ -1967,7 +1974,7 @@ async function objectiveEdited(
       ["continue", "cancel"],
       "cancel",
     );
-  if (body !== accepted)
+  if (digest !== accepted)
     return hold(
       `Objective #${state.issue} was edited after its plan was accepted. \`continue\` keeps building this plan; \`replan\` plans again from the new text.`,
       ["continue", "replan", "cancel"],
@@ -2006,7 +2013,7 @@ async function pinnedSources(
   const plan = state.done.plan as Plan;
   const objective = objectiveInputs(state);
   const { sources } = await planningSources(
-    objective.body,
+    objective.shown,
     new BaseFiles(deps.config.checkout, plan.base, signal),
     objective.child === true,
   );

@@ -21,7 +21,8 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { micromark } from "micromark";
 import { gfm, gfmHtml } from "micromark-extension-gfm";
-import { parseObjective } from "../dist/objective.js";
+import { checkObjective } from "../dist/objective.js";
+import { readShown, shownDigest } from "../dist/shown.js";
 import { declarationProblems } from "../dist/validate.js";
 
 const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
@@ -841,13 +842,15 @@ test("a plan's steps run in order, and a dependent waits for its dependency's me
   await stopped(service);
 });
 
-// A non-writer's Objective: Factory plans from GitHub's rendering of it
-// (body_html), converted back to Markdown, and the approval names that
-// text's digest. The stand-in renders like GitHub (micromark + GFM), with
-// raw HTML let through, so attributes and comments reach the converter.
-// Shown text comes back unescaped (paths, a heading anchor), a shown
-// "## Acceptance" paragraph can't open a section, and a blank issue-form
-// field is the empty marker.
+// A non-writer's Objective: Factory reads its structure from GitHub's
+// rendering (body_html) and plans from that rendering as Markdown text; the
+// approval names their digest. The stand-in renders like GitHub (micromark
+// + GFM, a math block as GitHub's math-renderer), with raw HTML let
+// through, so attributes and comments reach the parser. Sections are
+// GitHub's headings (a <br> in one is a space), bullets its list items (a
+// shown "- `cmd`" line in a paragraph is not one), paths are shown text
+// (intraword bold is plain text), a blank form field is empty, and a
+// non-writer's diagram and math sources are placeholders.
 const HIDDEN_BODY = `## Goal
 Ship the parser.<!-- HIDDEN-COMMENT -->
 
@@ -858,22 +861,27 @@ Ship the parser.<!-- HIDDEN-COMMENT -->
 See [docs](https://example.com/docs "HIDDEN-TITLE"), [ref][d] and <a href="https://e.com" title="HIDDEN-ATTR">x</a>.
 
 ## Acceptance
+Run these:<br>- \`npm test\`<br>Never run:<br>- \`npm run deploy\`
+
 - [ ] parse works
-- [x] tests pass
+- \`npm run check\`
 
 Note[^a].
 
 \`\`\`mermaid
 %% HIDDEN-COMMENT
-accTitle: HIDDEN-TITLE
-accDescr { HIDDEN-DESCR
-HIDDEN-DESCR }
-graph TD; A-->B
+graph TD; HIDDEN-NODE[Build]-->B
 \`\`\`
+
+<math-renderer class="js-display-math">$$\\text{HIDDEN-MATH}$$</math-renderer>
+
+## Out of scope<br>never part of this
+- \`npm run deploy:prod\`
 
 ## Sources
 - src/_internal.ts
 - x/__tests__/a.ts
+- docs/foo**bar**.md
 - docs/A&B.md
 - docs/PLAN.md#Heading [draft] *x* & y
 
@@ -885,11 +893,16 @@ _No response_
 [^z]: HIDDEN-FOOTNOTE
 
 [d]: https://example.com/ref "HIDDEN-REF-TITLE"`;
+const HIDDEN_HTML = micromark(HIDDEN_BODY, {
+  allowDangerousHtml: true,
+  extensions: [gfm()],
+  htmlExtensions: [gfmHtml()],
+});
 const SHOWN = `## Goal
 
 Ship the parser.
 
-\u200B## Acceptance
+\\## Acceptance
 
 [image: shot.png]
 
@@ -897,21 +910,33 @@ See [docs](https://example.com/docs), [ref](https://example.com/ref) and [x](htt
 
 ## Acceptance
 
+Run these:\\
+\\- \`npm test\`\\
+Never run:\\
+\\- \`npm run deploy\`
+
 - [ ] parse works
-- [x] tests pass
+- \`npm run check\`
 
 Note[1].
 
-\`\`\`mermaid
-graph TD; A-->B
-\`\`\`
+[mermaid diagram]
+
+[math]
+
+Out of scope\\
+never part of this
+------------------
+
+- \`npm run deploy:prod\`
 
 ## Sources
 
-- src/_internal.ts
-- x/__tests__/a.ts
-- docs/A&B.md
-- docs/PLAN.md#Heading [draft] *x* & y
+- src/\\_internal.ts
+- x/**tests**/a.ts
+- docs/foo**bar**.md
+- docs/A\\&B.md
+- docs/PLAN.md#Heading \\[draft] *x* & y
 
 ### Package manager update
 
@@ -934,11 +959,7 @@ test("a non-writer's Objective is approved by the text GitHub shows", async () =
         body: HIDDEN_BODY,
         ...(req.headers.accept === "application/vnd.github.full+json"
           ? {
-              body_html: micromark(HIDDEN_BODY, {
-                allowDangerousHtml: true,
-                extensions: [gfm()],
-                htmlExtensions: [gfmHtml()],
-              }),
+              body_html: HIDDEN_HTML,
             }
           : {}),
         state: "open",
@@ -954,20 +975,36 @@ test("a non-writer's Objective is approved by the text GitHub shows", async () =
   seed(inst, 71);
   const service = serve(inst);
   await until(() => stateOf(inst, 71).hold, "#71 asks");
-  assert.doesNotMatch(SHOWN, /HIDDEN/);
-  const { objective, problems } = parseObjective(SHOWN);
+  const shown = readShown(HIDDEN_HTML, { sources: false });
+  assert.equal(shown.body, SHOWN);
+  assert.doesNotMatch(JSON.stringify(shown), /HIDDEN/);
+  const { objective, problems } = checkObjective(shown.blocks);
   assert.deepEqual(problems, []);
+  assert.deepEqual(objective.acceptance, [
+    "Run these: - `npm test` Never run: - `npm run deploy`",
+    "[ ] parse works",
+    "`npm run check`",
+    "Note[1].",
+    "[mermaid diagram]",
+    "[math]",
+  ]);
+  assert.deepEqual(objective.commands, ["npm run check"]);
   assert.deepEqual(objective.sources, [
     { path: "src/_internal.ts" },
-    { path: "x/__tests__/a.ts" },
+    { path: "x/tests/a.ts" },
+    { path: "docs/foobar.md" },
     { path: "docs/A&B.md" },
-    { path: "docs/PLAN.md", heading: "Heading [draft] *x* & y" },
+    { path: "docs/PLAN.md", heading: "Heading [draft] x & y" },
   ]);
-  assert.deepEqual(declarationProblems(SHOWN), []);
-  const digest = createHash("sha256").update(SHOWN).digest("hex");
+  assert.deepEqual(declarationProblems(shown.blocks), []);
+  // A writer's diagram and math stay as their sources.
+  assert.match(
+    readShown(HIDDEN_HTML, { sources: true }).body,
+    /```mermaid\n%% HIDDEN-COMMENT\ngraph TD; HIDDEN-NODE\[Build\]-->B\n```\n\n```math\n\\text\{HIDDEN-MATH\}\n```/,
+  );
   assert.match(
     stateOf(inst, 71).hold.question,
-    new RegExp(`body digest \`${digest.slice(0, 16)}\``),
+    new RegExp(`digest \`${shownDigest(shown).slice(0, 16)}\``),
   );
   await stopped(service);
 });

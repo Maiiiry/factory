@@ -226,7 +226,7 @@ export interface InputsRequest {
   item: WorkItem;
   /** The commit the item's worktree starts from: repository sources are read there. */
   base: string;
-  /** The Objective body: a local source must be a path it names (namesPath). */
+  /** The Objective's shown text (objectiveText): a local source must be a path it names (namesPath). */
   body: string;
   /** The operator's media.localAssetRoots: a local source must lie under one. */
   localAssetRoots: readonly string[];

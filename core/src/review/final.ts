@@ -13,7 +13,6 @@
  */
 import { rm } from "node:fs/promises";
 import type { CandidateRecord, InputRecord } from "../media.js";
-import { parseObjective } from "../objective.js";
 import { coverageCriterion } from "../planning/graph.js";
 import { DESIGN_CHECKLIST } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
@@ -66,6 +65,8 @@ export async function reviewObjective(input: {
    */
   artifacts?: readonly ReviewArtifactGroup[];
   sources: readonly PinnedSource[];
+  /** The Objective's Acceptance criteria, in order (objective.ts). */
+  acceptance: readonly string[];
   /** Each merged item's captured candidate sets and the operator's selection. */
   candidates?: readonly CandidateRecord[];
   /** Each merged item's read-only worker inputs. */
@@ -78,10 +79,7 @@ export async function reviewObjective(input: {
   log(event: Record<string, unknown>): void;
 }): Promise<ResultReview> {
   const tree = input.validation.tree;
-  const criteria = finalCriteria(
-    input.plan,
-    objectiveAcceptance(input.sources),
-  );
+  const criteria = finalCriteria(input.plan, input.acceptance);
   const decided = (criterion: string) =>
     input.decisions?.find(
       (entry) => entry.criterion === criterion && entry.tree === tree,
@@ -158,14 +156,6 @@ export async function reviewObjective(input: {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}
-
-/** The operator-written Objective body's Acceptance criteria, in order. */
-function objectiveAcceptance(sources: readonly PinnedSource[]): string[] {
-  const body = sources.find(
-    (source) => source.path === "OBJECTIVE" && !source.heading,
-  );
-  return body ? parseObjective(body.content).objective.acceptance : [];
 }
 
 /**

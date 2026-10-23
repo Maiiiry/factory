@@ -1,3 +1,4 @@
+import type { ObjectiveBlock } from "../shown.js";
 /**
  * Provider selection. Each configured provider gets its own planner,
  * worker and workflow; an Objective runs on the provider it froze when it
@@ -46,16 +47,16 @@ export function providerPlanner(provider: ProviderConfig): Planner {
 export function providerWorker(
   provider: ProviderConfig,
   config: CoreConfig,
-): (plan: Plan, body: string) => Worker {
+): (plan: Plan, blocks: readonly ObjectiveBlock[]) => Worker {
   const worker = provider.worker;
   const allowedSecretNames = config.policy.allowedSecretNames;
-  return (plan, body) => {
+  return (plan, blocks) => {
     switch (worker.kind) {
       case "claude":
         return new ClaudeWorker({
           sandbox: config.sandbox,
           plan,
-          body,
+          blocks,
           repository: config.repository,
           config: worker.settings,
           allowedSecretNames,
