@@ -1,5 +1,6 @@
 import type { CandidateSet, MediaInput, Selection } from "../media.js";
 import type { RepairFinding } from "../repair.js";
+import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import type { ObjectiveState } from "../state.js";
 import type { HandoffNote } from "./collect.js";
 import type { DiscoveryResult } from "./discovery.js";
@@ -53,6 +54,17 @@ export interface ItemFacts {
   secret: string;
   /** A read-only QA review refused the integrated result: its `retry` checks again from validation. */
   qaRefused: true;
+  /**
+   * The operator's `revalidate --review-artifacts` for this result: the
+   * selectors (empty for none), as configured when the answer landed, its
+   * validation captures instead of all. A repair, or a repair of the
+   * stack layer below, clears it.
+   */
+  rereview: {
+    reviewArtifacts: ReviewArtifactSelector[];
+    by: string;
+    at: string;
+  };
   /** A discovery item's complete result (work/discovery.ts): its dependents, conditions and expansions read it. */
   discovery: DiscoveryResult;
 }
@@ -107,6 +119,8 @@ export interface Refused {
   tree: string;
   notes: HandoffNote[];
   replayOnly?: true;
+  /** The work step found it can't be checked again as it is (gone, or off its base): `revalidate` isn't offered until a new repair. */
+  unrecheckable?: true;
 }
 
 type Writes<F> = { [N in keyof F]?: F[N] | null };

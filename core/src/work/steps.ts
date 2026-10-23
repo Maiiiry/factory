@@ -85,7 +85,11 @@ import {
   type RepairFinding,
   repeated,
 } from "../repair.js";
-import type { ReviewArtifact } from "../review/artifacts.js";
+import {
+  type ReviewArtifact,
+  type ReviewArtifactSelector,
+  selectorIdentity,
+} from "../review/artifacts.js";
 import { reviewObjective } from "../review/final.js";
 import {
   type CriterionDecision,
@@ -168,6 +172,9 @@ type Phase = (typeof PHASES)[number];
 
 const stepKey = (id: string, phase: Phase) => `item:${id}:${phase}`;
 
+/** A result rereview: the answer that checks a refused result again, unchanged. */
+const REVALIDATE = "revalidate";
+
 interface WorkResult {
   base: string;
   commit: string;
@@ -182,6 +189,8 @@ interface ValidateResult {
   tree: string;
   commands: string[];
   artifacts?: ReviewArtifact[];
+  /** A rereview's `--review-artifacts`: the selectors captured instead of all. */
+  reviewArtifacts?: ReviewArtifactSelector[];
 }
 
 interface PublishResult {
@@ -487,8 +496,50 @@ function itemStep(
           : phase === "validate"
             ? validationDeadlineMs(item, commandTimeoutMs(deps))
             : 45 * MINUTE,
-    run: (context) => run(item, context, deps, place),
+    run: async (context) => {
+      const outcome = await run(item, context, deps, place);
+      return phase === "work"
+        ? recheckMark(outcome, item, context, deps)
+        : outcome;
+    },
   };
+}
+
+/**
+ * A work-step question while the kept refused result can't be checked
+ * again as it is (gone, off the item's base, or its media selection
+ * gone): the refused fact is marked `unrecheckable`, so `revalidatable`
+ * stops offering `revalidate` for it, whichever question asks. The next
+ * repair writes a new refused fact.
+ */
+async function recheckMark(
+  outcome: Outcome,
+  item: WorkItem,
+  context: StepContext,
+  deps: BuildDeps,
+): Promise<Outcome> {
+  const { state, signal } = context;
+  const kept = refusedOf(state, item.id);
+  const key = `item:${item.id}:refused`;
+  if (
+    outcome.kind !== "hold" ||
+    !kept ||
+    kept.unrecheckable ||
+    (outcome.keep && key in outcome.keep)
+  )
+    return outcome;
+  const base =
+    (outcome.keep?.[`item:${item.id}:base`] as string | undefined) ??
+    fact(state, "base", item.id);
+  if (
+    base &&
+    (await refusedResult(state, item, deps.config.checkout, base, signal))
+  )
+    return outcome;
+  return withKeep(
+    outcome,
+    facts({ refused: { ...kept, unrecheckable: true } }, item.id),
+  );
 }
 
 /** Each validation command's limit, in ms. */
@@ -587,7 +638,7 @@ async function workStep(
       keep: keepBase,
     });
   }
-  if (!finished && context.answer?.answer === "revalidate") {
+  if (!finished && context.answer?.answer === REVALIDATE) {
     // The operator says the refused result is correct and Factory's check
     // was at fault: it is the step's result again, unchanged, with no
     // worker run, collection or repair. Only reads: a rerun does the same.
@@ -599,6 +650,7 @@ async function workStep(
       base,
       signal,
     );
+    // The hold is marked unrecheckable (`recheckMark`).
     if (!refused)
       return withKeep(
         hold(
@@ -612,7 +664,15 @@ async function workStep(
       result: refused,
       keep: {
         ...keepBase,
-        ...facts({ finished: null, finding: null, refused: null }, item.id),
+        ...facts(
+          {
+            finished: null,
+            finding: null,
+            refused: null,
+            rereview: rereviewOf(context.answer),
+          },
+          item.id,
+        ),
       },
     };
   }
@@ -1033,6 +1093,7 @@ async function repairContext(
     ))
       ? `\n\nIf the refused result is correct and Factory's own check was at fault (for example, the check could not see files the result has), answer \`revalidate\`: Factory runs validation, review and delivery again on the same result, unchanged, without running the worker. It doesn't count as a repair; it is a result rereview, and this Objective has used ${rereviewed.used} of ${rereviewed.allowed} (autonomy.allowances.resultRereviews).`
       : "";
+    // The engine offers `revalidate` itself (`revalidatable`).
     return {
       outcome: hold(
         `Work Item ${item.id} needs your decision before it is repaired:\n\n${result.question}\n\nAnswer \`answer <text>\` to send the worker your guidance, or \`retry\` to diagnose the failure again.${recheck}`,
@@ -1043,16 +1104,6 @@ async function repairContext(
             family: "retry",
             consequence: "Diagnoses the failure again.",
           },
-          ...(recheck
-            ? [
-                {
-                  answer: "revalidate",
-                  family: "accept",
-                  consequence:
-                    "Validates, reviews and delivers the same result again, without the worker; uses a result rereview.",
-                } as const,
-              ]
-            : []),
           "cancel",
         ],
       ),
@@ -1264,6 +1315,101 @@ async function refusedResult(
   return { base, commit, tree, notes, sets: own?.sets ?? [] };
 }
 
+/**
+ * Whether `revalidate` can answer a question of item step `key`
+ * (workflow.ts, for the engine): a coding item's work step while its
+ * refused result is kept (and, for media, its selection stands), or a QA
+ * item's review step after its review refused the integrated result.
+ * The work step checks that the result still sits on its base.
+ */
+export function revalidatable(state: ObjectiveState, key: string): boolean {
+  const item = currentPlan(state)?.items.find(
+    (entry) => entry.id === itemOf(key),
+  );
+  if (!item || mergeOf(state, item.id)) return false;
+  if (item.kind === "qa")
+    return (
+      key === stepKey(item.id, "review") && !!fact(state, "qaRefused", item.id)
+    );
+  return (
+    (item.kind ?? "work") === "work" &&
+    key === stepKey(item.id, "work") &&
+    !!refusedOf(state, item.id) &&
+    !refusedOf(state, item.id)?.unrecheckable &&
+    // The work step takes `revalidate` only before a finished worker
+    // run is collected and when no replay onto a new start is due.
+    !fact(state, "finished", item.id) &&
+    !fact(state, "rebase", item.id) &&
+    (!needsSelection(item) || !!fact(state, "selection", item.id))
+  );
+}
+
+/**
+ * The configured selectors `--review-artifacts` values name, resolved
+ * when the answer lands, or why they can't be: each a configured
+ * selector's number (from 1), or `none` alone.
+ */
+export function reviewArtifactSelection(
+  values: readonly string[],
+  configured: readonly ReviewArtifactSelector[],
+): ReviewArtifactSelector[] | string {
+  const listed = configured
+    .map((selector, index) => `${index + 1} \`${selector.command}\``)
+    .join(", ");
+  const known = configured.length
+    ? `The configured reviewArtifacts selectors are ${listed}; name them by number, or none.`
+    : "This installation configures no reviewArtifacts selectors, so the only choice is none.";
+  if (values.includes("none"))
+    return values.every((value) => value === "none")
+      ? []
+      : `--review-artifacts none can't be given with selectors. ${known}`;
+  const numbers = values.map(Number);
+  const bad = values.filter(
+    (_, index) =>
+      !Number.isInteger(numbers[index]) ||
+      numbers[index]! < 1 ||
+      numbers[index]! > configured.length,
+  );
+  if (bad.length)
+    return `--review-artifacts ${bad.join(", ")} names no configured selector. ${known}`;
+  return [...new Set(numbers)]
+    .sort((a, b) => a - b)
+    .map((number) => configured[number - 1]!);
+}
+
+/** The rereview fact a `revalidate` answer writes: its selectors, else none (null). */
+function rereviewOf(answer: Answer | undefined) {
+  return answer?.reviewArtifacts
+    ? { reviewArtifacts: answer.reviewArtifacts, by: answer.by, at: answer.at }
+    : null;
+}
+
+/** The selectors a rereview's validation captures, when the operator chose them. */
+function rereviewCapture(
+  state: ObjectiveState,
+  id: string,
+  configured: readonly ReviewArtifactSelector[],
+): { selected?: ReviewArtifactSelector[] } {
+  const chosen = fact(state, "rereview", id)?.reviewArtifacts;
+  if (!chosen) return {};
+  // Only selectors still configured: a restart may have changed them.
+  const named = new Set(chosen.map(selectorIdentity));
+  return {
+    selected: configured.filter((selector) =>
+      named.has(selectorIdentity(selector)),
+    ),
+  };
+}
+
+/** The rereview's selectors, recorded on the validation result. */
+function rereviewRecord(
+  state: ObjectiveState,
+  id: string,
+): { reviewArtifacts?: ReviewArtifactSelector[] } {
+  const chosen = fact(state, "rereview", id)?.reviewArtifacts;
+  return chosen ? { reviewArtifacts: chosen } : {};
+}
+
 // ---------------------------------------------------------------------------
 // validate
 
@@ -1293,6 +1439,7 @@ async function validateStep(
     reviewArtifacts: {
       configured: config.reviewArtifacts,
       planned: plan.reviewArtifacts,
+      ...rereviewCapture(state, item.id, config.reviewArtifacts),
       dir: join(workDir, "artifacts", item.id),
     },
     media: validationMembers(plan, item, selection(state)),
@@ -1307,6 +1454,7 @@ async function validateStep(
         tree: result.tree,
         commands: result.commands,
         ...(result.artifacts ? { artifacts: result.artifacts } : {}),
+        ...rereviewRecord(state, item.id),
       };
       return { kind: "done", result: done };
     }
@@ -1987,6 +2135,39 @@ function republishOutcome(item: WorkItem, reason: string): Outcome {
 }
 
 /**
+ * The facts of a native-stack layer the layer below moves (a repair of
+ * it): it replays its change onto the new head, keeping its selection,
+ * and keeps nothing of a rereview of its old result. Every move of a
+ * layer goes through here.
+ */
+function movedLayer(
+  state: ObjectiveState,
+  layer: WorkItem,
+  layerSelection: KeptSelection | undefined,
+  detail: string,
+): Record<string, unknown> {
+  const work = state.done[stepKey(layer.id, "work")] as WorkResult | undefined;
+  return {
+    ...facts(
+      {
+        ...(layerSelection ? { selection: layerSelection } : {}),
+        rebase: true,
+        finished: null,
+        onto: null,
+        rereview: null,
+      },
+      layer.id,
+    ),
+    ...(work
+      ? {
+          ...refusedFact(layer.id, work, false),
+          ...facts({ finding: { kind: "conflict", detail } }, layer.id),
+        }
+      : {}),
+  };
+}
+
+/**
  * Clear the item's steps from `work` and run the worker again with the
  * finding. In a native stack every layer above the item is cleared too: it
  * moves onto the repaired layer's new head and replays its own change.
@@ -2081,38 +2262,16 @@ function repairOutcome(
         ...facts({ selection: media ? null : (own ?? null) }, item.id),
         ...(result ? refusedFact(item.id, result, refusesResult) : {}),
       };
-  for (const layer of above) {
-    const layerSelection = standing(layer);
-    const work = state.done[stepKey(layer.id, "work")] as
-      | WorkResult
-      | undefined;
+  for (const layer of above)
     Object.assign(
       moved,
-      facts(
-        {
-          ...(layerSelection ? { selection: layerSelection } : {}),
-          rebase: true,
-          finished: null,
-          onto: null,
-        },
-        layer.id,
+      movedLayer(
+        state,
+        layer,
+        standing(layer),
+        `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
       ),
     );
-    if (work)
-      Object.assign(
-        moved,
-        refusedFact(layer.id, work, false),
-        facts(
-          {
-            finding: {
-              kind: "conflict",
-              detail: `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
-            },
-          },
-          layer.id,
-        ),
-      );
-  }
   return {
     kind: "repair",
     finding: text,
@@ -2125,7 +2284,7 @@ function repairOutcome(
       ...keep,
       ...facts({ finding: fresh ? null : kept }, item.id),
       ...moved,
-      ...facts({ finished: null }, item.id),
+      ...facts({ finished: null, rereview: null }, item.id),
     },
   };
 }
@@ -2310,6 +2469,7 @@ async function qaValidateStep(
     reviewArtifacts: {
       configured: config.reviewArtifacts,
       planned: plan.reviewArtifacts,
+      ...rereviewCapture(state, item.id, config.reviewArtifacts),
       dir: join(workDir, "artifacts", item.id),
     },
     media: validationMembers(plan, item, selection(state)),
@@ -2325,6 +2485,7 @@ async function qaValidateStep(
         tree: result.tree,
         commands: result.commands,
         ...(result.artifacts ? { artifacts: result.artifacts } : {}),
+        ...rereviewRecord(state, item.id),
         checks,
       };
       return { kind: "done", result: done };
@@ -2356,13 +2517,27 @@ async function qaReviewStep(
 ): Promise<Outcome> {
   const { state, signal } = context;
   const steps = [stepKey(item.id, "validate"), stepKey(item.id, "review")];
-  if (context.answer?.answer === "retry" && fact(state, "qaRefused", item.id))
+  const again = context.answer?.answer;
+  // `retry` after the operator's fix, or `revalidate` (a result rereview,
+  // charged when it landed): validation and review again, on the default
+  // branch as it is now.
+  if (
+    (again === "retry" || again === REVALIDATE) &&
+    fact(state, "qaRefused", item.id)
+  )
     return {
       kind: "repair",
-      finding: `Read-only QA item ${item.id} checks the default branch again after the operator's fix.`,
+      finding:
+        again === "retry"
+          ? `Read-only QA item ${item.id} checks the default branch again after the operator's fix.`
+          : `The operator asked to check read-only QA item ${item.id} again on the current default branch (a result rereview).`,
       target: steps[0]!,
       clear: steps,
-      keep: facts({ qaRefused: null }, item.id),
+      ...(again === REVALIDATE ? { rereview: true as const } : {}),
+      keep: facts(
+        { qaRefused: null, rereview: rereviewOf(context.answer) },
+        item.id,
+      ),
     };
   const plan = currentPlan(state)!;
   const checked = state.done[steps[0]!] as QaResult;

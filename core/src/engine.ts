@@ -1,5 +1,6 @@
 import {
   asked,
+  askedCaptures,
   askedFor,
   chargeRereview,
   countConflict,
@@ -14,6 +15,7 @@ import { duration } from "./display.js";
 import type { RunLog } from "./log.js";
 import type { FrozenConfig } from "./providers/selection.js";
 import { type RequestResult, refused } from "./requests.js";
+import type { ReviewArtifactSelector } from "./review/artifacts.js";
 import {
   type Answer,
   answerForm,
@@ -103,6 +105,8 @@ export type Outcome =
        * predecessor this outcome repairs. Applying it twice is harmless.
        */
       free?: { target: string; repair: number };
+      /** A result rereview (`revalidate`): charged to resultRereviews when the answer landed, so it counts against no repair allowance. */
+      rereview?: true;
       keep?: Record<string, unknown>;
     };
 
@@ -173,6 +177,11 @@ const COMMON = {
     family: "repair",
     consequence:
       "Discards the Work Item's result and work and starts it again on the current base; counts as a repair.",
+  },
+  revalidate: {
+    family: "accept",
+    consequence:
+      "Validates and reviews the same result again, without the worker; uses a result rereview. `--review-artifacts N` (repeatable; a configured selector's number, or none) changes what this rereview captures.",
   },
 } as const satisfies Record<string, Omit<HoldOption, "answer">>;
 
@@ -297,6 +306,20 @@ export interface Workflow {
    * like any repair.
    */
   fresh?(state: ObjectiveState, key: string, answer: Answer): Outcome;
+  /**
+   * Whether `revalidate` (a result rereview) can answer a question of Work
+   * Item step `key`: the item has a refused result to check again. The
+   * engine then offers it, charges it to resultRereviews when it lands,
+   * and runs the step without asking about repair allowances.
+   */
+  revalidatable?(state: ObjectiveState, key: string): boolean;
+  /**
+   * The configured review-artifact selectors `--review-artifacts` values
+   * name (by number from 1, or `none` for none), or why they can't.
+   */
+  reviewArtifacts?(
+    values: readonly string[],
+  ): ReviewArtifactSelector[] | string;
   /**
    * The configuration as an Objective freezes it now, per configured
    * provider, for the `switch NAME` and `adopt` answers.
@@ -660,10 +683,12 @@ export class ObjectiveRunner {
       }
       // A repair past an allowance asks before it runs (allowances.ts):
       // `more` grants as much again. Past the Objective's, every step waits.
-      // An interrupted attempt passed this check when it started.
-      const over = this.state.attempts[step.key]
-        ? []
-        : overrun(this.state, step.key);
+      // An interrupted attempt passed this check when it started, and a
+      // `revalidate` is no repair: it was charged to resultRereviews.
+      const over =
+        this.state.attempts[step.key] || answer?.answer === REVALIDATE
+          ? []
+          : overrun(this.state, step.key);
       if (over.length) {
         this.transact(() => {
           this.hold(step.key, {
@@ -674,6 +699,9 @@ export class ObjectiveRunner {
                 consequence:
                   "Allows as much again of each spent allowance, and the repair runs.",
               },
+              ...(this.workflow.revalidatable?.(this.state, step.key)
+                ? [common(REVALIDATE)]
+                : []),
               "cancel",
             ]),
             ...(over.includes("implementationRepairs")
@@ -876,6 +904,7 @@ export class ObjectiveRunner {
             delete state.repairs[cleared];
           break;
         }
+        if (outcome.rereview) break;
         // Counted against the allowances: past one, the target asks
         // before it runs again (`tick`).
         const repair = state.repairs[outcome.target] ?? {
@@ -1121,6 +1150,19 @@ export class ObjectiveRunner {
         0,
         common(FRESH),
       );
+    // So does a result rereview, where the item has a refused result.
+    if (
+      item !== undefined &&
+      !options.some(
+        (option) => option.answer === REVALIDATE || option.answer === MORE,
+      ) &&
+      this.workflow.revalidatable?.(state, key)
+    )
+      options.splice(
+        options.findIndex((option) => option.answer === "cancel"),
+        0,
+        common(REVALIDATE),
+      );
     // A recommended `switch` with several targets recommends this
     // Objective's own provider (re-freeze), else the next other answer:
     // never an arbitrary provider.
@@ -1193,6 +1235,8 @@ export class ObjectiveRunner {
     question?: string,
     /** The option's argument (`switch NAME`), passed apart from the text. */
     arg?: string,
+    /** `revalidate --review-artifacts`: the selectors this rereview captures. */
+    reviewArtifacts?: readonly string[],
   ): RequestResult | null {
     if (answer === "cancel") return this.cancel(by);
     const finished = this.finishedRefusal();
@@ -1293,6 +1337,20 @@ export class ObjectiveRunner {
     // `more` to an allowance question is the engine's; any other is the step's.
     const granting =
       answer === MORE ? askedFor(this.state, hold.id) : undefined;
+    const given = granting === "rereviews" ? REVALIDATE : answer;
+    // A rereview's `more` reuses what its `revalidate` gave, unless
+    // this answer gives its own.
+    let captures =
+      granting === "rereviews" ? askedCaptures(this.state, hold.id) : undefined;
+    if (reviewArtifacts !== undefined) {
+      const named =
+        given !== REVALIDATE
+          ? "--review-artifacts goes with `revalidate`: it changes what a result rereview captures."
+          : (this.workflow.reviewArtifacts?.(reviewArtifacts) ??
+            "This Objective can't check review-artifact selectors now.");
+      if (typeof named === "string") return refused("invalid_answer", named);
+      captures = named;
+    }
     const retry = this.state.retries[hold.step];
     this.close(hold);
     if (answer === WAIT && retry) {
@@ -1316,7 +1374,6 @@ export class ObjectiveRunner {
         // charged here, against the live state, so two at once can't both
         // pass the allowance; past it, the step asks instead.
         if (granting === "rereviews") grantRereviews(this.state);
-        const given = granting === "rereviews" ? REVALIDATE : answer;
         if (given === REVALIDATE && !chargeRereview(this.state)) {
           this.hold(
             hold.step,
@@ -1332,7 +1389,7 @@ export class ObjectiveRunner {
           );
           const question = this.state.holds.at(-1);
           if (question?.step === hold.step)
-            asked(this.state, question.id, "rereviews");
+            asked(this.state, question.id, "rereviews", captures);
           delete this.state.retries[hold.step];
           this.settle();
           return null;
@@ -1342,6 +1399,7 @@ export class ObjectiveRunner {
           question: hold.question,
           answer: given,
           ...(note ? { text: note } : {}),
+          ...(captures ? { reviewArtifacts: captures } : {}),
           by,
           at: this.now().toISOString(),
         };
