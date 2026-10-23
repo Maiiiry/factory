@@ -1,7 +1,7 @@
 import type { CoreConfig, QueueOption } from "./config.js";
 import { crashPoint } from "./crash.js";
 import type { EngineLimits, ObjectiveRunner } from "./engine.js";
-import { type GitHub, GitHubError, TransientError } from "./github.js";
+import { type GitHub, TransientError } from "./github.js";
 import type { RunLog } from "./log.js";
 import { QueueDisplay, type QueueItem, queued, readQueue } from "./queue.js";
 import { writeRequest } from "./requests.js";
@@ -144,7 +144,6 @@ export class GitHubSync {
   /** Finished Objectives whose final option and replies are written. */
   private readonly settled = new Set<number>();
   private readonly display: QueueDisplay;
-  private readonly writers = new Map<string, boolean>();
 
   constructor(
     private readonly github: GitHub,
@@ -633,7 +632,7 @@ export class GitHubSync {
         }
         let allowed: boolean;
         try {
-          allowed = await this.canWrite(comment.login);
+          allowed = await this.github.canWrite(comment.login);
         } catch (error) {
           const failures = comment.failures + 1;
           unchecked.push({
@@ -743,26 +742,6 @@ export class GitHubSync {
   ): Promise<boolean> {
     const from = new Date(Date.parse(since) - 10 * 60_000).toISOString();
     return (await this.github.findComment(issue, marker, from)) !== undefined;
-  }
-
-  /** Whether `login` may write to the repository; throws when GitHub can't say now. */
-  private async canWrite(login: string): Promise<boolean> {
-    const known = this.writers.get(login);
-    if (known !== undefined) return known;
-    let permission: string;
-    try {
-      ({ permission } = await this.github.rest<{ permission: string }>(
-        "GET",
-        `/repos/${this.config.repository}/collaborators/${encodeURIComponent(login)}/permission`,
-      ));
-    } catch (error) {
-      // No such user: a definite no. Anything else may pass.
-      if (!(error instanceof GitHubError && error.status === 404)) throw error;
-      permission = "none";
-    }
-    const ok = ["admin", "maintain", "write"].includes(permission);
-    this.writers.set(login, ok);
-    return ok;
   }
 
   /**

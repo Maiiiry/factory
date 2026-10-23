@@ -165,10 +165,14 @@ export interface AsyncMerge {
  * in the service; workers never see it. Every request has a deadline, and
  * every failure is either a TransientError (retry) or a GitHubError.
  */
+/** How long a write-access answer counts (canWrite). */
+const WRITER_TTL_MS = 10 * 60_000;
+
 export class GitHub {
   private token: string | undefined;
   private secrets: readonly string[] = [];
   private self: string | undefined;
+  private readonly writers = new Map<string, { ok: boolean; at: number }>();
 
   constructor(
     readonly repository: string,
@@ -484,6 +488,32 @@ export class GitHub {
   async canPush(signal?: AbortSignal): Promise<boolean | undefined> {
     const push = (await this.about(signal)).permissions?.push;
     return typeof push === "boolean" ? push : undefined;
+  }
+
+  /**
+   * Whether `login` may write to the repository (admin, maintain or write);
+   * throws when GitHub can't say now. An answer is kept for 10 minutes, so
+   * revoked access stops counting within that, without a restart.
+   */
+  async canWrite(login: string, signal?: AbortSignal): Promise<boolean> {
+    const known = this.writers.get(login);
+    if (known && Date.now() - known.at < WRITER_TTL_MS) return known.ok;
+    let permission: string;
+    try {
+      ({ permission } = await this.rest<{ permission: string }>(
+        "GET",
+        this.repo(`collaborators/${encodeURIComponent(login)}/permission`),
+        undefined,
+        signal,
+      ));
+    } catch (error) {
+      // No such user: a definite no. Anything else may pass.
+      if (!(error instanceof GitHubError && error.status === 404)) throw error;
+      permission = "none";
+    }
+    const ok = ["admin", "maintain", "write"].includes(permission);
+    this.writers.set(login, { ok, at: Date.now() });
+    return ok;
   }
 
   /** Every PR, open or closed, whose head is `branch` of this repository. */
