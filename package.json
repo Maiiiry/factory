@@ -72,6 +72,9 @@
     "@openai/codex-sdk": "0.160.0",
     "@secretlint/node": "13.0.5",
     "@secretlint/secretlint-rule-preset-recommend": "^13.0.5",
+    "mdast-util-from-markdown": "2.1.0",
+    "mdast-util-gfm": "3.1.0",
+    "micromark-extension-gfm": "3.0.0",
     "tar": "7.5.22",
     "yaml": "2.9.0"
   },
@@ -82,7 +85,10 @@
     "@secretlint/secretlint-rule-preset-recommend",
     "yaml",
     "tar",
-    "@anthropic-ai/sdk"
+    "@anthropic-ai/sdk",
+    "mdast-util-from-markdown",
+    "mdast-util-gfm",
+    "micromark-extension-gfm"
   ],
   "optionalDependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.281",

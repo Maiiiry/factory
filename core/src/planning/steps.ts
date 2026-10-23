@@ -5,7 +5,7 @@ import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead, sha256 } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
-import { visibleMarkdown } from "../markdown.js";
+import { UnreadableMarkdown, visibleMarkdown } from "../markdown.js";
 import { parseObjective } from "../objective.js";
 import { type Planner, PlannerError } from "../providers/planner.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
@@ -666,7 +666,8 @@ function changedHold(
  * The Objective body as planning reads it and as edits are compared: only
  * what GitHub shows a reader (visibleMarkdown), so a hidden comment never
  * reaches a model, with a split child's leading marker kept. GitHub may
- * send CRLF line ends.
+ * send CRLF line ends. Throws UnreadableMarkdown when the body can't be
+ * parsed; readObjective holds on it.
  */
 export function objectiveText(raw: string | null): string {
   const text = (raw ?? "").replace(/\r\n?/g, "\n");
@@ -898,7 +899,18 @@ export async function readObjective(
         "cancel",
       ),
     };
-  const body = objectiveText(found.body);
+  let body: string;
+  try {
+    body = objectiveText(found.body);
+  } catch (error) {
+    if (!(error instanceof UnreadableMarkdown)) throw error;
+    return {
+      hold: hold(
+        `Factory can't parse issue #${issue}'s body as Markdown (${error.message}), so it can't tell what GitHub shows a reader. Edit the issue, then answer \`${again}\`; or cancel.`,
+        [again, "cancel"],
+      ),
+    };
+  }
   const unapproved = await authorHold(found.user?.login, body, deps, context);
   if (unapproved) return { hold: unapproved };
   const inputs = {

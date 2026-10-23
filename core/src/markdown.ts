@@ -1,3 +1,8 @@
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
+import { errorMessage } from "./text.js";
+
 /** The ATX headings and fenced-code boundaries used by source selectors. */
 export function markdownLines(content: string): {
   text: string;
@@ -52,78 +57,79 @@ export function githubEmptyField(line: {
 }
 
 /** Characters GitHub shows as nothing: zero-width, bidi controls, tag characters. */
-const INVISIBLE = /[­᠎​-‏‪-‮⁠-⁤⁦-⁩﻿]|[\u{E0000}-\u{E007F}]/gu;
+const INVISIBLE =
+  /[\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\u{E0000}-\u{E007F}]/gu;
 
-/** A link reference definition, which GitHub doesn't render; its title is dropped. */
-const REFERENCE =
-  /^( {0,3}\[[^\]]+\]:[ \t]*(?:<[^>\n]*>|\S+))(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$/;
+/**
+ * What an HTML parser hides inside raw HTML: comments (an unclosed one runs
+ * to the end), processing instructions, CDATA and declarations.
+ */
+const HIDDEN_HTML =
+  /<!--(?:>|->|[\s\S]*?(?:-->|$))|<\?[\s\S]*?(?:\?>|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<![A-Za-z][\s\S]*?(?:>|$)/g;
+
+/** Markdown Factory can't parse, so it can't tell what GitHub shows. */
+export class UnreadableMarkdown extends Error {}
+
+interface MarkdownNode {
+  type: string;
+  position?: { start: { offset?: number }; end: { offset?: number } };
+  children?: MarkdownNode[];
+}
 
 /**
  * Markdown as GitHub shows it, for text a person approved by reading the
- * rendered issue: HTML comments outside code (an unclosed one hides the
- * rest), link reference titles and invisible characters are removed, since
- * the reader never sees them. Fenced code and code spans are kept.
+ * rendered issue. A CommonMark + GFM parser finds what the reader never
+ * sees: comments (and the like) inside raw HTML, and link reference
+ * definitions. Those source ranges are cut, a line left blank by a cut is
+ * dropped, and invisible characters are removed; everything else stays as
+ * written, so headings and sections survive. Throws UnreadableMarkdown
+ * when the parser fails: the caller holds rather than pass text through.
  */
 export function visibleMarkdown(content: string): string {
-  const out: string[] = [];
-  let comment = false;
-  let fence: { marker: string; length: number } | undefined;
-  for (const text of content.replace(/\r\n?/g, "\n").split("\n")) {
-    if (!comment) {
-      const delimiter = text.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-      if (fence) {
-        if (
-          delimiter &&
-          delimiter[1]![0] === fence.marker &&
-          delimiter[1]!.length >= fence.length &&
-          /^[ \t]*$/.test(delimiter[2]!)
-        )
-          fence = undefined;
-        out.push(text.replace(INVISIBLE, ""));
-        continue;
-      }
-      if (
-        delimiter &&
-        (delimiter[1]![0] !== "`" || !delimiter[2]!.includes("`"))
-      ) {
-        fence = { marker: delimiter[1]![0]!, length: delimiter[1]!.length };
-        out.push(text.replace(INVISIBLE, ""));
-        continue;
-      }
-    }
-    let line = "";
-    let at = 0;
-    while (at < text.length) {
-      if (comment) {
-        const end = text.indexOf("-->", at);
-        if (end < 0) break;
-        comment = false;
-        at = end + 3;
-        continue;
-      }
-      const open = text.indexOf("<!--", at);
-      const tick = text.indexOf("`", at);
-      if (tick >= 0 && (open < 0 || tick < open)) {
-        // A code span shows its text as written, comment markers included.
-        const run = /^`+/.exec(text.slice(tick))![0].length;
-        const closing = new RegExp(`(?<!\`)\`{${run}}(?!\`)`, "g");
-        closing.lastIndex = tick + run;
-        const close = closing.exec(text);
-        const end = close ? close.index + run : tick + run;
-        line += text.slice(at, end);
-        at = end;
-        continue;
-      }
-      if (open < 0) {
-        line += text.slice(at);
-        break;
-      }
-      line += text.slice(at, open);
-      comment = true;
-      at = open + 4;
-    }
-    if (!line.trim() && text.trim()) continue;
-    out.push(line.replace(INVISIBLE, "").replace(REFERENCE, "$1"));
+  // GitHub shows NUL as U+FFFD; NUL then marks the cuts below.
+  const source = content.replace(/\r\n?/g, "\n").replace(/\0/g, "\uFFFD");
+  let tree: MarkdownNode;
+  try {
+    tree = fromMarkdown(source, {
+      extensions: [gfm()],
+      mdastExtensions: [gfmFromMarkdown()],
+    });
+  } catch (error) {
+    throw new UnreadableMarkdown(errorMessage(error));
   }
-  return out.join("\n");
+  const cuts: [number, number][] = [];
+  const visit = (node: MarkdownNode): void => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (node.type === "definition" || node.type === "html") {
+      if (start === undefined || end === undefined)
+        throw new UnreadableMarkdown(`a ${node.type} node has no position`);
+      if (node.type === "definition") cuts.push([start, end]);
+      else
+        for (const hidden of source.slice(start, end).matchAll(HIDDEN_HTML))
+          cuts.push([
+            start + hidden.index,
+            start + hidden.index + hidden[0].length,
+          ]);
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(tree);
+  let marked = "";
+  let at = 0;
+  for (const [start, end] of cuts.sort((a, b) => a[0] - b[0])) {
+    if (end <= at) continue;
+    marked += `${source.slice(at, Math.max(at, start))}\0`;
+    at = end;
+  }
+  marked += source.slice(at);
+  return marked
+    .split("\n")
+    .flatMap((line) => {
+      if (!line.includes("\0")) return [line];
+      const kept = line.replaceAll("\0", "");
+      return kept.trim() ? [kept] : [];
+    })
+    .join("\n")
+    .replace(INVISIBLE, "");
 }
