@@ -1,3 +1,4 @@
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   ACCEPT,
@@ -20,6 +21,7 @@ import {
   type MediaOutcome,
   materializeSelection,
   mediaDirectory,
+  missingMember,
   needsSelection,
   readSelection,
   resolveInputs,
@@ -57,6 +59,7 @@ import { reviewObjective } from "../review/final.js";
 import {
   type CriterionDecision,
   type ResultReview,
+  receiptPath,
   reviewResult,
 } from "../review/result.js";
 import type { ObjectiveState } from "../state.js";
@@ -131,6 +134,16 @@ interface WorkResult {
   notes: HandoffNote[];
   validated?: { tree: string; commands: string[] };
   /** The candidate media sets captured; empty when the item has no select step. */
+  sets: CandidateSet[];
+}
+
+/**
+ * An operator's selection kept across a repair that isn't about the media,
+ * with the sets it was chosen from: the repaired attempt stages no media,
+ * and the select step writes the same set on the new work commit.
+ */
+interface KeptSelection {
+  selection: Selection;
   sets: CandidateSet[];
 }
 
@@ -446,7 +459,9 @@ async function workStep(
     [keptKey(item.id, "onto")]: null,
   };
   const finishedKey = keptKey(item.id, "finished");
+  const selectionKey = keptKey(item.id, "selection");
   let finished = kept<Finished>(state, item.id, "finished");
+  let own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
   let keepAll: Record<string, unknown> = keepBase;
   // The worker finished and collection asked: `repair` sends the result
   // back; any other answer collects it again.
@@ -465,6 +480,12 @@ async function workStep(
     const repair = await repairContext(item, context, deps, base);
     if (repair && "hold" in repair) return withKeep(repair.hold, keepBase);
     keepAll = { ...keepBase, ...(repair?.keep ?? {}) };
+    // A kept selection whose private copies are gone can't be written
+    // again: this attempt makes new candidates and the operator chooses.
+    if (own && (await missingMember(own.selection.set))) {
+      own = undefined;
+      keepAll = { ...keepAll, [selectionKey]: null };
+    }
     const inputs = await resolveInputs({
       checkout: config.checkout,
       repository: config.repository,
@@ -474,6 +495,7 @@ async function workStep(
       base,
       body,
       selection: selection(state),
+      ...(own ? { kept: own.selection } : {}),
       githubToken: () => deps.github.serviceToken(),
       signal,
     });
@@ -500,6 +522,14 @@ async function workStep(
       ...(pin ? { packageManagerUpdate: pin } : {}),
       ...(repair ? { repair: repair.context } : {}),
       mediaInputs: inputs.value,
+      ...(own
+        ? {
+            keptSelection: {
+              set: own.selection.set.id.toLowerCase(),
+              destinations: own.selection.set.members.map((m) => m.destination),
+            },
+          }
+        : {}),
       peerNotes: peerNotes(plan, acceptedNotes(state, plan), item),
       signal,
     });
@@ -527,7 +557,25 @@ async function workStep(
 
   // Capture before collection, which deletes the media manifest, and keep
   // the captured sets before anything destructive: the step runs again at
-  // once and collects with them.
+  // once and collects with them. A repair whose selection stands has no
+  // manifest and keeps the sets the selection came from; one that staged
+  // new sets anyway forgets the selection first (capture replaces the kept
+  // copies), and the operator chooses from the new sets.
+  if (!finished.sets && own) {
+    const staged = await lstat(join(worktree, ".factory-assets.json")).then(
+      () => true,
+      () => false,
+    );
+    if (staged)
+      return {
+        kind: "retry",
+        reason:
+          "The repair staged new candidate sets, so the operator chooses again",
+        afterMs: 0,
+        keep: { ...keepAll, [finishedKey]: finished, [selectionKey]: null },
+      };
+    finished = { ...finished, sets: own.sets };
+  }
   if (!finished.sets) {
     const captured = await captureAssets({
       checkout: config.checkout,
@@ -638,12 +686,13 @@ function mediaOutcome(
   context: StepContext,
   deps: BuildDeps,
   keep: Record<string, unknown> = {},
+  from: Phase = "work",
 ): Outcome {
   switch (outcome.kind) {
     case "repair":
       return repairOutcome(
         item,
-        "work",
+        from,
         outcome.finding,
         { ...keep, ...failure(item, outcome.finding) },
         context,
@@ -879,7 +928,8 @@ async function validateStep(
 /**
  * The operator picks one of the worker's candidate media sets; Factory
  * writes it at its destinations on top of the work commit. Until a valid
- * answer, the step asks with the candidates.
+ * answer, the step asks with the candidates. After a repair that wasn't
+ * about the media, the kept selection is written again without asking.
  */
 async function selectStep(
   item: WorkItem,
@@ -897,13 +947,26 @@ async function selectStep(
     mediaDirectory(workDir, item.id),
   );
   const answer = context.answer;
-  if (!answer || !question.answers.includes(answer.answer.toLowerCase()))
-    return question;
-  const read = readSelection(plan, item, work.sets, answer);
+  const own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
+  let read: ReturnType<typeof readSelection>;
+  let decided: { by?: string; at?: string };
+  if (!answer && own && work.sets.some((s) => s.id === own.selection.set.id)) {
+    read = {
+      kind: "chosen",
+      set: own.selection.set,
+      bound: own.selection.bound,
+    };
+    decided = own.selection;
+  } else {
+    if (!answer || !question.answers.includes(answer.answer.toLowerCase()))
+      return question;
+    read = readSelection(plan, item, work.sets, answer);
+    decided = answer;
+  }
   if (read.kind === "invalid")
     return { ...question, question: `${read.problem}\n\n${question.question}` };
   if (read.kind === "repair") {
-    const finding = `The operator asked for new candidates${answer.text ? `: ${answer.text}` : "."}`;
+    const finding = `The operator asked for new candidates${answer?.text ? `: ${answer.text}` : "."}`;
     return repairOutcome(
       item,
       "select",
@@ -922,14 +985,15 @@ async function selectStep(
     ref: selectionRef(state.issue, item.id),
     signal,
   });
-  if (made.kind !== "done") return mediaOutcome(item, made, context, deps);
+  if (made.kind !== "done")
+    return mediaOutcome(item, made, context, deps, {}, "select");
   const done: Selection = {
     commit: made.value.commit,
     tree: made.value.tree,
     set: read.set,
     bound: read.bound,
-    by: answer.by,
-    at: answer.at,
+    ...(decided.by ? { by: decided.by } : {}),
+    ...(decided.at ? { at: decided.at } : {}),
   };
   return { kind: "done", result: done };
 }
@@ -1323,10 +1387,15 @@ function republishOutcome(item: WorkItem, reason: string): Outcome {
  * Clear the item's steps from `work` and run the worker again with the
  * finding. In a native stack every layer above the item is cleared too: it
  * moves onto the repaired layer's new head and replays its own change.
+ *
+ * An operator's selection stands across the repair (see KeptSelection)
+ * unless the repair is about the media: it comes from the select step (the
+ * operator's `repair`, or the selected set couldn't be written), or the
+ * finding names a selected destination or cites the candidate receipt.
  */
 function repairOutcome(
   item: WorkItem,
-  _from: Phase,
+  from: Phase,
   finding: string,
   keep: Record<string, unknown>,
   context: StepContext,
@@ -1335,8 +1404,33 @@ function repairOutcome(
   const { state } = context;
   const place = stackLayer(state.done.plan as Plan, deps, item.id);
   const above = place ? place.unit.items.slice(place.layer + 1) : [];
-  const moved: Record<string, unknown> = {};
+  const standing = (entry: WorkItem): KeptSelection | undefined => {
+    const chosen = selection(state)(entry.id);
+    const work = state.done[stepKey(entry.id, "work")] as
+      | WorkResult
+      | undefined;
+    return chosen && work
+      ? { selection: chosen, sets: work.sets }
+      : (kept<KeptSelection>(state, entry.id, "selection") ?? undefined);
+  };
+  // The work step forgets a selection whose copies are gone.
+  const own =
+    keep[keptKey(item.id, "selection")] === null ? undefined : standing(item);
+  const media =
+    from === "select" ||
+    (own !== undefined &&
+      aboutMedia(
+        item,
+        own.selection.set,
+        finding,
+        keep[keptKey(item.id, "finding")] as RepairFinding | undefined,
+      ));
+  const moved: Record<string, unknown> = {
+    [keptKey(item.id, "selection")]: media ? null : (own ?? null),
+  };
   for (const layer of above) {
+    const layerSelection = standing(layer);
+    if (layerSelection) moved[keptKey(layer.id, "selection")] = layerSelection;
     const work = state.done[stepKey(layer.id, "work")] as
       | WorkResult
       | undefined;
@@ -1363,6 +1457,34 @@ function repairOutcome(
     ),
     keep: { ...keep, ...moved, [keptKey(item.id, "finished")]: null },
   };
+}
+
+/**
+ * Whether a repair is about the selected media: the finding (or the kept
+ * finding's detail) names one of the set's destinations, or a refused
+ * review criterion cites one or the item's candidate receipt.
+ */
+function aboutMedia(
+  item: WorkItem,
+  set: CandidateSet,
+  finding: string,
+  fact: RepairFinding | undefined,
+): boolean {
+  const cited =
+    fact?.kind === "review"
+      ? fact.refused.flatMap((r) =>
+          r.evidence.flatMap((e) => [e.path, e.file ?? ""]),
+        )
+      : [];
+  if (cited.includes(receiptPath(item.id))) return true;
+  const texts = [
+    finding,
+    ...cited,
+    fact && "detail" in fact ? fact.detail : "",
+  ];
+  return set.members.some((m) =>
+    texts.some((text) => text.includes(m.destination)),
+  );
 }
 
 /**

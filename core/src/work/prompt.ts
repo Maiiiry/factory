@@ -54,6 +54,8 @@ export interface WorkPromptInput {
   childAgents?: "disabled";
   /** Source assets and selected dependency media (media.ts resolveInputs), staged read-only. */
   mediaInputs?: readonly MediaInput[];
+  /** A repair of a media item whose selection stands: the chosen set and its destinations. */
+  keptSelection?: { set: string; destinations: readonly string[] };
   /** Earlier items' advisory notes for this item, with the item that wrote each. */
   peerNotes?: readonly (HandoffNote & { from: string })[];
   signal?: AbortSignal;
@@ -264,7 +266,7 @@ function renderWorkPrompt(
     (input.fixedScripts.length
       ? `\n\nFixed acceptance scripts and guarded hook names: ${input.fixedScripts.join(", ")}. Preserve existing bodies and pre/post hooks exactly as in the accepted base, or the established predecessor for scripts created earlier in this Objective; validation rejects changes. For an existing script, put new checks in files its body already runs. Create a script absent from both base and predecessor only for an exact source-declared acceptance command in this item's validation, with owned root package.json, no pre/post hooks and no nested npm/pnpm calls. Base observations, inference and model prose do not authorize scripts.`
       : "");
-  const mediaInstructions = mediaContract(item, assets);
+  const mediaInstructions = mediaContract(item, assets, input.keptSelection);
   const inputInstructions = assets.length
     ? `\n\nAuthorized read-only asset inputs, staged by Factory under .factory-inputs/assets (staged is each copy's checkout path; sha256 and bytes are Factory's record of it; a selected member's destination in this checkout may hold only its Git LFS pointer, so read the staged copy). Read them; do not edit, move or commit them: ${JSON.stringify(assets)}`
     : "";
@@ -297,10 +299,20 @@ function renderWorkPrompt(
 /**
  * The candidate contract a media item's worker follows: sets staged under
  * `.factory-media/`, described in `.factory-assets.json`, never written to
- * their destinations. media.ts captureAssets checks exactly this shape.
+ * their destinations. media.ts captureAssets checks exactly this shape. A
+ * repair whose selection stands stages nothing and leaves the destinations
+ * alone: Factory writes the chosen set again on the repaired result.
  */
-function mediaContract(item: WorkItem, assets: readonly StagedInput[]): string {
+function mediaContract(
+  item: WorkItem,
+  assets: readonly StagedInput[],
+  kept: WorkPromptInput["keptSelection"],
+): string {
   if (!needsSelection(item)) return "";
+  if (kept) {
+    const destinations = kept.destinations.join(", ");
+    return `\n\nMedia: the operator chose candidate set ${kept.set} for this item, and that choice stands for this repair. Factory writes the set's bytes at ${destinations} on top of your result before it validates, reviews and delivers it, as it did for the previous attempt; they are not in this checkout. Their read-only copies are staged under .factory-inputs/assets (origin selected) for reading. Do not stage candidates: write no .factory-media/ or .factory-assets.json, because new candidate sets discard the operator's choice and ask the operator again. Do not write, remove or otherwise change ${destinations}: a result that changes them is refused. A check that needs those files at their destinations can fail in this checkout for that reason alone: report it rather than writing them there. Fix what the findings name in the owned code, tests and documentation.`;
+  }
   const sources = assets.filter((asset) => asset.origin === "source");
   return `\n\nProduce at least ${item.minimumAssetSets ?? 1} complete candidate AssetSets. Candidate content and any required variation must follow the accepted brief and source requirements; preserve source bytes exactly when byte identity is required. Put candidate bytes under .factory-media/ and write .factory-assets.json at the checkout root. Use this format-neutral manifest shape, replacing every angle-bracket placeholder with the actual declared role, file, media type, and owned destination: {"sets":[{"id":"candidate-a","members":[{"role":"<expected role>","path":".factory-media/candidate-a/<file>","mediaType":"<declared media type>","destination":"<owned target path>"}],"provenance":{"source":"<source path or generated>","rights":"<basis for repository use>","visibility":"repository","lineage":["<source path or input identity>"]}}]}. Set ids are letters, digits, - and _, distinct ignoring case, and not repair, retry, replan, cancel or answer; the operator picks one by id. Each set's content must differ from every other set's. Include every expected role in each set, and give each member a distinct owned destination. When an authoritative tool supplies actual format fields, you may add member formatMetadata using this exact optional shape: {"source":"<authoritative tool or source>","values":{}}. Put all supplied format fields inside values; do not place them beside source. Omit formatMetadata when no authoritative format fields are supplied. Source byte identity alone does not require formatMetadata: Factory records each input's byte count and sha256. You may add set-level relationships with from, toRole, and kind when outputs are related, and production evidence with model, tool, request, or parameters when those values are actually supplied. Do not invent metadata or tool identities. .factory-media/, .factory-assets.json, .factory-discovery.json and .factory-handoff.json are private staging exceptions to owned paths. Do not write, remove, or otherwise change final destinations directly. Candidate files and the manifest are staging outputs; do not commit them. Factory owns capture, whole-set selection, final destination materialization (including an authorized byte-identical same-path LFS replacement), publication, and Objective lifecycle. Do not run Factory CLI operations or inspect controller installation, configuration, status, or logs. These staging instructions do not remove explicitly owned ordinary code work. Stop after completing the authorized owned code changes, candidate files, and manifest, and report the staged candidates; do not wait for or perform selection or delivery. If the accepted brief requires a controller operation, report the conflict rather than performing it.\nSource bindings: ${JSON.stringify(sources.map(({ kind, path, role, mediaType, visibility, staged }) => ({ kind, path, role, mediaType, visibility, staged })))}\nExpected output roles: ${item.expectedOutputRoles!.join(", ")}`;
 }

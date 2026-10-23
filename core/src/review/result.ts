@@ -783,6 +783,11 @@ function controllerRows(
   ];
 }
 
+/** The evidence path of an item's controller candidate receipt. */
+export function receiptPath(itemId: string): string {
+  return `Controller candidate receipt: ${itemId}`;
+}
+
 /** The controller candidate receipt of each item with a selection; see candidateReceipts. */
 export async function candidateRows(
   root: string,
@@ -790,7 +795,7 @@ export async function candidateRows(
 ): Promise<ResultEvidence[]> {
   return (await candidateReceipts(root, candidates)).map((receipt) => ({
     origin: "controller",
-    path: `Controller candidate receipt: ${receipt.item}`,
+    path: receiptPath(receipt.item),
     content: receipt.content,
     complete: true,
   }));

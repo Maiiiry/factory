@@ -226,6 +226,8 @@ export interface InputsRequest {
   body: string;
   /** Each dependency's select result, when it has one. */
   selection(itemId: string): Selection | undefined;
+  /** The item's own selection kept across a repair that isn't about the media; its members are staged read-only. */
+  kept?: Selection;
   /** The service's GitHub token, for attachments; the worker never sees it. */
   githubToken(): Promise<string>;
   signal: AbortSignal;
@@ -234,9 +236,10 @@ export interface InputsRequest {
 /**
  * Every file the item's worker reads as input: its source assets (a base
  * blob, LFS bytes from the local store or origin, a private local file or
- * a GitHub attachment) and the selected members its dependencies bound to
- * it. Each is copied fresh into `<directory>/inputs/` with its digest; pass
- * the list to prepareWorkPrompt as `mediaInputs`, which stages them.
+ * a GitHub attachment), the selected members its dependencies bound to
+ * it, and its own kept selection's members on a repair. Each is copied
+ * fresh into `<directory>/inputs/` with its digest; pass the list to
+ * prepareWorkPrompt as `mediaInputs`, which stages them.
  *
  * Step: call before prepareWorkPrompt on every attempt. done → pass on;
  * retry → retry; hold → hold. Its holds carry `retry` (run the work step
@@ -272,16 +275,23 @@ export async function resolveInputs(
     });
     signal.throwIfAborted();
   }
-  for (const dependency of item.dependencies) {
-    const selection = request.selection(dependency);
-    if (!selection?.bound.includes(item.id)) continue;
-    for (const member of selection.set.members) {
-      const held = await digestFile(member.file).catch(() => undefined);
-      if (held?.sha256 !== member.sha256 || held.bytes !== member.bytes)
-        return hold(
-          `Factory's copy of ${dependency}'s selected ${member.role} (${member.file}) is missing or changed, so Work Item ${item.id} can't get it as input. Restore it and answer retry, or answer replan or cancel.`,
-          ["retry", "replan", "cancel"],
-        );
+  const selected = [
+    ...item.dependencies.map((id) => [id, request.selection(id)] as const),
+    ...(request.kept ? [[item.id, request.kept] as const] : []),
+  ];
+  for (const [dependency, selection] of selected) {
+    if (
+      !selection ||
+      (dependency !== item.id && !selection.bound.includes(item.id))
+    )
+      continue;
+    const lost = await missingMember(selection.set);
+    if (lost)
+      return hold(
+        `Factory's copy of ${dependency}'s selected ${lost.role} (${lost.file}) is missing or changed, so Work Item ${item.id} can't get it as input. Restore it and answer retry, or answer replan or cancel.`,
+        ["retry", "replan", "cancel"],
+      );
+    for (const member of selection.set.members)
       inputs.push({
         origin: "selected",
         role: member.role,
@@ -297,7 +307,6 @@ export async function resolveInputs(
           formatMetadata: member.formatMetadata,
         }),
       });
-    }
   }
   return { kind: "done", value: inputs };
 }
@@ -974,14 +983,12 @@ export async function materializeSelection(input: {
 }): Promise<MediaOutcome<{ commit: string; tree: string }>> {
   const { checkout, directory, item, set, signal } = input;
   const again = set.id.toLowerCase();
-  for (const member of set.members) {
-    const held = await digestFile(member.file).catch(() => undefined);
-    if (held?.sha256 !== member.sha256 || held.bytes !== member.bytes)
-      return hold(
-        `Factory's copy of candidate ${set.id} ${member.role} (${member.file}) is missing or changed since capture. Answer repair to have the worker make new candidates, or cancel.`,
-        ["repair", "cancel"],
-      );
-  }
+  const lost = await missingMember(set);
+  if (lost)
+    return hold(
+      `Factory's copy of candidate ${set.id} ${lost.role} (${lost.file}) is missing or changed since capture. Answer repair to have the worker make new candidates, or cancel.`,
+      ["repair", "cancel"],
+    );
   await removeWorktree(checkout, directory, signal);
   await addWorktree(checkout, directory, input.commit, signal);
   try {
@@ -1093,6 +1100,18 @@ export async function materializeSelection(input: {
   } finally {
     await removeWorktree(checkout, directory, signal);
   }
+}
+
+/** The first member whose private copy is missing or no longer has its captured digest. */
+export async function missingMember(
+  set: CandidateSet,
+): Promise<CapturedMember | undefined> {
+  for (const member of set.members) {
+    const held = await digestFile(member.file).catch(() => undefined);
+    if (held?.sha256 !== member.sha256 || held.bytes !== member.bytes)
+      return member;
+  }
+  return undefined;
 }
 
 /**
