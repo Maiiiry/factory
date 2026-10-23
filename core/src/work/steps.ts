@@ -21,6 +21,8 @@ import {
   type CandidateSet,
   captureAssets,
   destinationFinding,
+  type InputRecord,
+  type MediaInput,
   type MediaOutcome,
   materializeSelection,
   mediaDirectory,
@@ -568,6 +570,8 @@ async function workStep(
     });
     if (inputs.kind !== "done")
       return mediaOutcome(item, inputs, context, deps, keepAll);
+    // Review gets the same inputs (InputRecord): the last ones resolved.
+    keepAll = { ...keepAll, [keptKey(item.id, "inputs")]: inputs.value };
 
     const files = new BaseFiles(config.checkout, base, signal);
     const scripts = await fixedScripts(
@@ -1169,6 +1173,7 @@ async function reviewStep(
     ...(chosen
       ? { candidates: [{ item, sets: work.sets, selection: chosen }] }
       : {}),
+    inputs: workerInputs(state, [item.id]),
     ...(validated.artifacts ? { artifacts: validated.artifacts } : {}),
     decisions,
     signal,
@@ -1192,6 +1197,14 @@ async function reviewStep(
       deps,
     ),
   );
+}
+
+/** The read-only inputs each item's worker last got, for review. */
+function workerInputs(state: ObjectiveState, ids: string[]): InputRecord[] {
+  return ids.map((id) => ({
+    item: id,
+    inputs: kept<MediaInput[]>(state, id, "inputs") ?? [],
+  }));
 }
 
 /** Pass is done, refused repairs, needs-human asks (saving the criteria it asks about under `pendingKey`). */
@@ -1863,6 +1876,7 @@ export function finalReviewStep(deps: BuildDeps): Step {
               ? [{ item, sets: work.sets, selection: chosen }]
               : [];
           }),
+          inputs: workerInputs(state, mergedIds),
           sources: await pinnedSources(state, deps, signal),
           dir: join(deps.workDir(state.issue), "final-review"),
           ...(decisions ? { decisions } : {}),

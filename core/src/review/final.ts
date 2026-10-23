@@ -12,7 +12,7 @@
  * operator. Provider failures escape as `PlannerError`.
  */
 import { rm } from "node:fs/promises";
-import type { CandidateRecord } from "../media.js";
+import type { CandidateRecord, InputRecord } from "../media.js";
 import { parseObjective } from "../objective.js";
 import { coverageCriterion } from "../planning/graph.js";
 import { DESIGN_CHECKLIST } from "../planning/rubric.js";
@@ -31,6 +31,8 @@ import {
   decisionRows,
   decodeResultReview,
   evidenceRoot,
+  INPUT_GUIDANCE,
+  inputRows,
   invalidReason,
   judge,
   materialize,
@@ -66,6 +68,8 @@ export async function reviewObjective(input: {
   sources: readonly PinnedSource[];
   /** Each merged item's captured candidate sets and the operator's selection. */
   candidates?: readonly CandidateRecord[];
+  /** Each merged item's read-only worker inputs. */
+  inputs?: readonly InputRecord[];
   /** A private directory for the evidence root. */
   dir: string;
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
@@ -93,6 +97,7 @@ export async function reviewObjective(input: {
       root,
     );
     const receipts = await candidateRows(root, input.candidates);
+    const given = await inputRows(root, input.inputs);
     const evidence: ResultEvidence[] = [
       ...sourceRows(input.sources),
       ...input.plan.items.map(
@@ -106,6 +111,7 @@ export async function reviewObjective(input: {
       ...decisionRows(input.plan),
       changeIndexRow(input.base, input.commit, tree, changes, input.merges),
       validationRow(input.validation),
+      ...given,
       ...receipts,
       ...captured.rows,
       ...rows,
@@ -119,6 +125,7 @@ export async function reviewObjective(input: {
             FINAL_INSTRUCTIONS,
             ...(captured.rows.length ? [REVIEW_ARTIFACT_GUIDANCE] : []),
             ...(receipts.length ? [CANDIDATE_GUIDANCE] : []),
+            ...(given.length ? [INPUT_GUIDANCE] : []),
           ].join("\n"),
           criteria,
           evidence,

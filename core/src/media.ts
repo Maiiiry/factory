@@ -245,7 +245,8 @@ export interface InputsRequest {
  * a GitHub attachment), the selected members its dependencies bound to
  * it, and its own kept selection's members on a repair. Each is copied
  * fresh into `<directory>/inputs/` with its digest; pass the list to
- * prepareWorkPrompt as `mediaInputs`, which stages them.
+ * prepareWorkPrompt as `mediaInputs`, which stages them, and keep it for
+ * result and final review (inputReceipts).
  *
  * Step: call before prepareWorkPrompt on every attempt. done → pass on;
  * retry → retry; hold → hold. Its holds carry `retry` (run the work step
@@ -1907,18 +1908,8 @@ export async function candidateReceipts(
       const members = [];
       for (const member of set.members) {
         const relative = `media-sets/${safeName(item.id)}/${set.id.toLowerCase()}/${basename(member.file)}`;
-        let copied = false;
-        if (member.bytes <= Math.min(REVIEW_MEMBER_BYTES, budget)) {
-          const target = join(root, relative);
-          await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
-          const held = await copyFile(member.file, target)
-            .then(() => digestFile(target))
-            .catch(() => undefined);
-          copied =
-            held?.sha256 === member.sha256 && held.bytes === member.bytes;
-          if (copied) budget -= member.bytes;
-          else await rm(target, { force: true });
-        }
+        const copied = await reviewCopy(root, relative, member, budget);
+        if (copied) budget -= member.bytes;
         members.push({
           role: member.role,
           destination: member.destination,
@@ -1978,6 +1969,76 @@ export async function candidateReceipts(
           "Only the selected set is written at its destinations, then validated (its members hydrated in the fresh validation checkout and checked against their sha256 and size before the validation commands ran), reviewed, published and merged. Unselected sets stay in Factory's private staging: they are never committed, validated or delivered.",
         reviewCopies:
           "reviewCopy is the evidence-root path of Factory's private copy of the member, checked against its sha256; null when the member exceeds the review copy bounds.",
+      }),
+    });
+  }
+  return receipts;
+}
+
+/**
+ * Factory's private copy of `file` at `relative` under `root`, when it is
+ * within the review bounds and still has its recorded digest.
+ */
+async function reviewCopy(
+  root: string,
+  relative: string,
+  file: { file: string; sha256: string; bytes: number },
+  budget: number,
+): Promise<boolean> {
+  if (file.bytes > Math.min(REVIEW_MEMBER_BYTES, budget)) return false;
+  const target = join(root, relative);
+  await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
+  const held = await copyFile(file.file, target)
+    .then(() => digestFile(target))
+    .catch(() => undefined);
+  if (held?.sha256 === file.sha256 && held.bytes === file.bytes) return true;
+  await rm(target, { force: true });
+  return false;
+}
+
+/** The read-only inputs one item's worker got (resolveInputs), for review. */
+export interface InputRecord {
+  item: string;
+  inputs: readonly MediaInput[];
+}
+
+/**
+ * The controller input receipt for result and final review: per item, each
+ * file its worker got as read-only input (a source asset's kind, path and
+ * visibility, or the dependency selection it came from), with media type,
+ * size and sha256. Factory's copy within the review bounds goes to
+ * `inputs/<item>/` under `root`, checked against its digest, so the
+ * reviewer judges the same bytes the worker read.
+ */
+export async function inputReceipts(
+  root: string,
+  records: readonly InputRecord[],
+): Promise<{ item: string; content: string }[]> {
+  let budget = REVIEW_CANDIDATE_BYTES;
+  const receipts = [];
+  for (const { item, inputs } of records) {
+    if (!inputs.length) continue;
+    const described = [];
+    for (const [index, { file, ...input }] of inputs.entries()) {
+      const relative = `inputs/${safeName(item)}/${index}-${safeName(input.destination ?? input.path ?? input.role)}`;
+      const copied = await reviewCopy(
+        root,
+        relative,
+        { file, ...input },
+        budget,
+      );
+      if (copied) budget -= input.bytes;
+      described.push({ ...input, reviewCopy: copied ? relative : null });
+    }
+    receipts.push({
+      item,
+      content: JSON.stringify({
+        record:
+          "Factory controller input receipt: the exact files Factory gave this Work Item's worker as read-only inputs (Objective source assets, and dependencies' selected media bound to it), with the digests Factory recorded when it fetched or copied them. Built by Factory, not written by the worker.",
+        workItem: item,
+        inputs: described,
+        reviewCopies:
+          "reviewCopy is the evidence-root path of Factory's copy of the input, checked against its sha256; null when it exceeds the review copy bounds or no longer matches.",
       }),
     });
   }
