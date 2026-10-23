@@ -48,6 +48,24 @@ const READ_TOOLS = ["view", "rg", "glob"];
 const LOGIN_HOLD =
   "Copilot login is missing or expired: run `copilot` and `/login` (or `gh auth login`) as the service's user, then answer retry";
 
+/**
+ * A model the login can't use: the answer is the setting, then `switch` to
+ * re-freeze the provider's new settings or to move to another provider.
+ * `listed`: the hold comes from the model list, before any session, so
+ * `retry` is offered too: it reads the list again and bills nothing, and
+ * succeeds once an admin enables the model or the list catches up. A
+ * session that served another model offers no retry: each bills a request.
+ */
+function modelHold(why: string, listed: boolean): PlannerError {
+  return new PlannerError(
+    "hold",
+    `${why}. Set this provider's model to one the Copilot login can use and restart the service, then answer \`switch NAME\` with this provider's name to run on its new settings, or with another configured provider's name;${listed ? " answer `retry` once the login can use the model (an admin enabled it), which checks the model list again before any request;" : ""} or cancel.`,
+    undefined,
+    undefined,
+    listed ? ["retry", "switch", "cancel"] : ["switch", "cancel"],
+  );
+}
+
 const WORKER_SYSTEM =
   "You are an implementation worker controlled by Factory. Work only in the current working directory and only on paths owned by the Work Item. Do not commit, push, publish, open or edit issues or pull requests, access GitHub tools, deploy, or change the current Git HEAD. You have file tools and no shell; Factory validates your result after you finish. Return a concise description and stop when complete or safely blocked.";
 
@@ -112,7 +130,20 @@ function sessionFailure(
           "hold",
           `Restore the Copilot plan or billing for the service's login, then answer retry (${shown})`,
         )
-      : new PlannerError("retry", `Copilot quota: ${shown}`, 15 * 60 * 1000);
+      : // A spent premium-request quota resets at a time Copilot doesn't
+        // say: Factory asks whether to wait or switch (CORE.md#Waits).
+        new PlannerError("retry", `Copilot quota: ${shown}`, undefined, {
+          kind: "reset",
+          provider: "copilot",
+        });
+  if (data.errorType === "rate_limit")
+    return data.errorCode === "user_weekly_rate_limited"
+      ? new PlannerError("retry", `Copilot weekly limit: ${shown}`, undefined, {
+          kind: "reset",
+          provider: "copilot",
+        })
+      : // A short rate limit is an unknown transient cause: back off.
+        new PlannerError("retry", `Copilot rate limit: ${shown}`);
   if (data.errorType === "context_limit")
     return new PlannerError(
       "fail",
@@ -172,6 +203,20 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
         "hold",
         `${LOGIN_HOLD} (${detail(auth.statusMessage ?? "not authenticated")})`,
       );
+    // Before any session: a session on a model the login can't use bills
+    // a request for whatever Copilot serves instead.
+    const models = await watchdog.race(client.listModels());
+    const listed = models.find((entry) => entry.id === turn.choice.model);
+    if (!listed || listed.policy?.state === "disabled")
+      throw modelHold(
+        `The Copilot login ${listed ? "has model" : "doesn't offer model"} ${turn.choice.model}${listed ? " disabled by policy" : ""} (it offers ${detail(
+          models
+            .filter((entry) => entry.policy?.state !== "disabled")
+            .map((entry) => entry.id)
+            .join(", "),
+        )})`,
+        true,
+      );
     let text = "";
 
     const usage = { input: 0, output: 0, cached: 0 };
@@ -226,9 +271,9 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
             event.data.model !== turn.choice.model
           )
             fail(
-              new PlannerError(
-                "hold",
-                `Copilot served ${event.data.model}, not the configured ${turn.choice.model}. Choose a model the Copilot login can use in the provider's settings, then answer retry.`,
+              modelHold(
+                `Copilot served ${event.data.model}, not the configured ${turn.choice.model}`,
+                false,
               ),
             );
           if (event.type === "assistant.usage") {
@@ -425,9 +470,10 @@ export class CopilotWorker implements Worker {
           kind: "retry",
           reason: error.message,
           ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+          ...(error.wait && { wait: error.wait }),
         };
       return error.outcome === "hold"
-        ? hold(error.message)
+        ? hold(error.message, error.answers)
         : hold(`${error.message}. Narrow the Work Item, then answer retry.`);
     } finally {
       record.ms = Date.now() - started;

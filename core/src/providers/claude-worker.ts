@@ -42,6 +42,7 @@ import { ownsPath } from "../planning/graph.js";
 import { DESIGN_QUESTIONS } from "../planning/rubric.js";
 import type { Plan } from "../planning/types.js";
 import { runSandboxed, sandboxAvailable } from "../sandbox.js";
+import type { ObjectiveBlock } from "../shown.js";
 import { BoundedText, errorMessage, headAndTail } from "../text.js";
 import { validateTree } from "../validate.js";
 import {
@@ -67,18 +68,20 @@ import {
   serviceLoginEnvironment,
   usageOf,
 } from "./claude.js";
+import { CLAUDE_TOOLS } from "./config.js";
 import { detail, IdleWatchdog, PlannerError } from "./planner.js";
 
 // Configuration
 
-export type ClaudeSettingSource = "user" | "project" | "local";
+/** Only the operator's own settings: worktree settings are refused at load (providers/config.ts). */
+export type ClaudeSettingSource = "user";
 
 /** The operator's Claude worker settings. */
 export interface ClaudeWorkerConfig {
   model: string;
   effort: ClaudeEffort;
   permissionMode: "acceptEdits" | "dontAsk";
-  /** Filesystem settings the CLI loads; project or local withholds the shell. */
+  /** Filesystem settings the CLI loads: none, or the operator's user settings. */
   settingSources: ClaudeSettingSource[];
   /** Offered tools: Read, Edit, Write, Glob, Grep and Validate. */
   tools: string[];
@@ -88,9 +91,9 @@ export interface ClaudeWorkerConfig {
   maxTurns: number;
 }
 
-const FILE_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"];
 /** Factory's own tool in `tools`, served over MCP, not an SDK built-in. */
 const VALIDATE = "Validate";
+const FILE_TOOLS: string[] = CLAUDE_TOOLS.filter((tool) => tool !== VALIDATE);
 
 const DEFAULT_CLAUDE_WORKER: ClaudeWorkerConfig = {
   model: "claude-opus-5-5",
@@ -109,8 +112,8 @@ export interface ClaudeWorkerOptions {
   sandbox: SandboxConfig;
   /** The accepted plan: Validate's pins and the handoff's peers. */
   plan: Plan;
-  /** The Objective body as planned: its package-manager and workspace pins. */
-  body: string;
+  /** The Objective's shown structure as planned: its package-manager and workspace pins. */
+  blocks: readonly ObjectiveBlock[];
   /** Origin's `owner/name`: Validate fetches Git LFS objects the local store lacks from it. */
   repository: string;
   /** Operator variables the worker's commands may see, by name. */
@@ -731,7 +734,7 @@ class Attempt {
       commit,
       item: input.item,
       plan: options.plan,
-      body: options.body,
+      blocks: options.blocks,
       sandbox: options.sandbox,
       returnTo: input.worktree,
       predecessor: input.base !== options.plan.base ? input.base : undefined,
@@ -992,7 +995,11 @@ function failure(
         `The Work Item's prompt is larger than the worker model's context window; choose a model with a larger window or replan the item smaller, then answer retry (${ended})`,
       );
     case "limit":
-      return { kind: "retry", reason: failed.message, afterMs: failed.afterMs };
+      return {
+        kind: "retry",
+        reason: failed.message,
+        ...(failed.wait ? { wait: failed.wait } : {}),
+      };
     case "other":
       return { kind: "retry", reason: ended };
   }
@@ -1070,16 +1077,12 @@ export class ClaudeWorker implements Worker {
     const validate =
       granted(VALIDATE) && input.commands.length > 0 && !gitlinks;
     // Write and Validate together grant the shell: it adds nothing they
-    // don't grant together. Not when project or local settings load (their
-    // hooks run outside the sandbox), not as root (the sandbox refuses
-    // root), and only where bubblewrap runs.
+    // don't grant together. Not as root (the sandbox refuses root), and
+    // only where bubblewrap runs.
     const shell =
       granted("Write") &&
       granted(VALIDATE) &&
       !gitlinks &&
-      !config.settingSources.some(
-        (source) => source === "project" || source === "local",
-      ) &&
       process.geteuid?.() !== 0 &&
       sandboxAvailable().available;
     const attempt = new Attempt(
@@ -1368,7 +1371,8 @@ export class ClaudeWorker implements Worker {
       }
     } catch (error) {
       const idle = watchdog.expired;
-      if (idle) return { kind: "retry", reason: idle.message };
+      // An idle model is an error: three in a row hold.
+      if (idle) return { kind: "retry", reason: idle.message, afterMs: -1 };
       // Cancelled, or past the step's deadline: the engine decides.
       if (input.signal.aborted) throw input.signal.reason ?? error;
       return {

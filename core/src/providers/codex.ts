@@ -1,5 +1,6 @@
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -43,8 +44,6 @@ export const DEFAULT_CODEX_MODELS: PlannerModels<CodexEffort> = {
 
 /** Exec JSON emits no reasoning deltas: a healthy answer can be silent this long. */
 const PLANNER_IDLE_MS = 15 * 60 * 1000;
-/** How long a usage limit with no readable reset time waits before a retry. */
-const USAGE_LIMIT_WAIT_MS = 15 * 60 * 1000;
 /** Lower-effort reviews get a finite five-minute outlier bound. */
 const LOWER_EFFORT_REVIEW_IDLE_MS = 5 * 60 * 1000;
 
@@ -323,17 +322,17 @@ export function codexFailure(message: string): PlannerError {
     );
   const usageLimit = /you[’']ve hit your usage limit\b/.test(text);
   // A limit naming its reset is a wait even beside a plan upgrade offer.
-  // 0.160.0 renders the reset as zoneless local wall-clock time, so the
-  // call waits a fixed interval instead of spending the error count.
   if (
     usageLimit &&
     (has("try again at ") || !has("upgrade to plus to continue using codex"))
-  )
-    return new PlannerError(
-      "retry",
-      `Codex usage limit: ${shown}`,
-      USAGE_LIMIT_WAIT_MS,
-    );
+  ) {
+    const at = codexResetAt(message);
+    return new PlannerError("retry", `Codex usage limit: ${shown}`, undefined, {
+      kind: "reset",
+      ...(at ? { at: at.toISOString() } : {}),
+      provider: "codex",
+    });
+  }
   if (
     usageLimit ||
     has(
@@ -348,6 +347,60 @@ export function codexFailure(message: string): PlannerError {
     );
   // Rate limit, capacity, connection and anything unknown: try again.
   return new PlannerError("retry", `Codex call failed: ${shown}`);
+}
+
+const MONTHS = [
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "may",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "oct",
+  "nov",
+  "dec",
+];
+
+/**
+ * The reset time in a Codex usage-limit message. codex-cli 0.160.0 prints
+ * it in the host's local zone without naming it ("Try again at 3:45 PM.",
+ * or "Oct 24th, 2026 3:45 PM." when it isn't today), and Codex runs on the
+ * service's host, so it reads as local time in this process's zone. A time
+ * alone that has already passed today is tomorrow's. Undefined when the
+ * message names no time Factory can read: the reset is then unknown.
+ */
+export function codexResetAt(
+  message: string,
+  now = new Date(),
+): Date | undefined {
+  const found =
+    /try again at (?:([a-z]{3}) (\d{1,2})(?:st|nd|rd|th), (\d{4}) )?(\d{1,2}):(\d{2}) ([ap]m)\b/i.exec(
+      message,
+    );
+  if (!found) return undefined;
+  const [, month, day, year, hour, minute, half] = found;
+  const h = Number(hour);
+  const m = Number(minute);
+  if (h < 1 || h > 12 || m > 59) return undefined;
+  const hours = (h % 12) + (half!.toLowerCase() === "pm" ? 12 : 0);
+  if (month) {
+    const index = MONTHS.indexOf(month.toLowerCase());
+    const date = new Date(Number(year), index, Number(day), hours, m);
+    return index >= 0 && date.getDate() === Number(day) ? date : undefined;
+  }
+  const today = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    hours,
+    m,
+  );
+  return today.getTime() >= now.getTime() - 60_000
+    ? today
+    : new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, hours, m);
 }
 
 /** Planning and review through the Codex SDK and the operator's `codex login`. */
@@ -538,7 +591,7 @@ export class CodexPlanner implements Planner {
     } catch (error) {
       if (error instanceof PlannerError) throw error;
       const idle = watchdog.expired;
-      if (idle) throw new PlannerError("retry", idle.message);
+      if (idle) throw new PlannerError("retry", idle.message, -1);
       // The step was cancelled or hit its deadline: the engine decides.
       if (call.signal.aborted) throw call.signal.reason ?? error;
       // A failed codex process: its stderr is in the message.
@@ -558,7 +611,7 @@ export class CodexPlanner implements Planner {
         clearTimeout(timer);
       }
       saveModelsCache(home.env.CODEX_HOME!);
-      keepOrRemove(home.root, record.thread as string | undefined);
+      keepOrRemove(home.root, record.thread as string | undefined, call.log);
     }
   }
 }
@@ -595,17 +648,32 @@ function traceWrapper(
 /**
  * FACTORY_PROVIDER_TRACE=<dir> keeps each call's private Codex home (its
  * session record and logs) under <dir>/<thread>, for investigating a call
- * afterwards. Without it the home is removed.
+ * afterwards: moved, or copied when <dir> is on another filesystem. A
+ * home that can't be kept is logged. Without it the home is removed.
  */
-function keepOrRemove(root: string, thread: string | undefined): void {
+function keepOrRemove(
+  root: string,
+  thread: string | undefined,
+  log: (event: Record<string, unknown>) => void,
+): void {
   const trace = process.env.FACTORY_PROVIDER_TRACE;
   if (trace) {
+    const target = join(trace, thread ?? `call-${Date.now()}`);
     try {
       mkdirSync(trace, { recursive: true });
-      renameSync(root, join(trace, thread ?? `call-${Date.now()}`));
-      return;
-    } catch {
-      // Fall through and remove it.
+      try {
+        renameSync(root, target);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+        cpSync(root, target, { recursive: true, verbatimSymlinks: true });
+      }
+    } catch (error) {
+      log({
+        event: "provider-trace-failed",
+        target,
+        error: errorMessage(error),
+      });
     }
   }
   rmSync(root, { recursive: true, force: true });

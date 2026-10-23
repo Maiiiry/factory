@@ -4,7 +4,13 @@ import { parse } from "yaml";
 import { gitEnvironment } from "../git.js";
 import { TransientError } from "../github.js";
 import { markdownLines } from "../markdown.js";
-import { parseObjective, type SourceRef, validPath } from "../objective.js";
+import {
+  checkObjective,
+  objectiveText,
+  type SourceRef,
+  validPath,
+} from "../objective.js";
+import type { ObjectiveBlock, ShownObjective } from "../shown.js";
 import { errorMessage } from "../text.js";
 import type {
   CoverageObligation,
@@ -156,10 +162,14 @@ function utf8(bytes: Buffer): string | undefined {
 
 // ── Objective ───────────────────────────────────────────────────────────
 
-/** A Factory-created child Objective carries its parent's model-written goal. */
-export function childIdentity(body: string): boolean {
-  return /^<!-- factory:parent=[1-9][0-9]*;child=[a-z][a-z0-9-]{0,63} -->\n/.test(
-    body,
+/**
+ * A Factory-created child Objective carries its parent's model-written goal.
+ * Read from the raw issue body by the marker's exact pattern, as structure;
+ * the marker is never planning text.
+ */
+export function childIdentity(raw: string): boolean {
+  return /^<!-- factory:parent=[1-9][0-9]*;child=[a-z][a-z0-9-]{0,63} -->\r?\n/.test(
+    raw,
   );
 }
 
@@ -167,28 +177,26 @@ export function childIdentity(body: string): boolean {
  * The Objective body as a pinned source. A split child's body carries the
  * model-written goal, so it isn't operator-authored.
  */
-function objectiveSource(body: string): PinnedSource {
+function objectiveSource(shown: ShownObjective, child: boolean): PinnedSource {
   return {
     path: "OBJECTIVE",
-    content: body,
-    ...(!childIdentity(body) && { operatorAuthored: true as const }),
+    content: shown.body,
+    shown: {
+      lines: objectiveText(shown.blocks).split("\n"),
+      spans: shown.spans,
+    },
+    ...(!child && { operatorAuthored: true as const }),
   };
 }
 
-/** The Objective's Acceptance criteria, in order. */
-function objectiveCriteria(body: string): string[] {
-  return parseObjective(body).objective.acceptance;
-}
-
 /**
- * Commands the integrated result must pass: the Acceptance bullets that are
- * exactly one backticked command. Any other bullet is a fact for review.
+ * Commands the integrated result must pass: the Acceptance list items that
+ * are exactly one code element. Any other criterion is a fact for review.
  */
-function finalObjectiveCommands(body: string): string[] {
-  return objectiveCriteria(body).flatMap((criterion) => {
-    const command = criterion.match(/^`([^`]+)`$/)?.[1];
-    return command?.trim() ? [command] : [];
-  });
+function finalObjectiveCommands(blocks: readonly ObjectiveBlock[]): string[] {
+  return checkObjective(blocks).objective.acceptance.flatMap((criterion) =>
+    criterion.command ? [criterion.command] : [],
+  );
 }
 
 /**
@@ -197,28 +205,44 @@ function finalObjectiveCommands(body: string): string[] {
  * review and final validation all use this one list.
  */
 export function finalCommands(
-  body: string,
+  blocks: readonly ObjectiveBlock[],
   required: readonly string[] = [],
 ): string[] {
-  const own = finalObjectiveCommands(body);
+  const own = finalObjectiveCommands(blocks);
   return [...own, ...required.filter((command) => !own.includes(command))];
 }
 
 /** Every Objective Acceptance criterion is one obligation, keyed by its index. */
-function coverageObligations(body: string): CoverageObligation[] {
-  return objectiveCriteria(body).map((text) => ({
-    source: { path: "OBJECTIVE", text },
-  }));
+function coverageObligations(
+  blocks: readonly ObjectiveBlock[],
+): CoverageObligation[] {
+  return checkObjective(blocks).objective.acceptance.map(
+    ({ text, command }) => ({
+      source: { path: "OBJECTIVE", text, ...(command ? { command } : {}) },
+    }),
+  );
 }
 
-/** One exact heading's section of a markdown file; undefined unless it occurs once. */
+/**
+ * One exact heading's section of a markdown file; undefined unless it
+ * occurs once. An exact match wins; otherwise `*` and `_` count as one
+ * emphasis marker (shown text writes emphasis with `_`), so `#Step _y_`
+ * finds the heading `Step *y*`.
+ */
 export function sectionText(text: string, heading: string): string | undefined {
   const lines = markdownLines(text);
-  const matches = lines.flatMap((line, index) =>
-    line.heading?.text === heading
-      ? [{ index, level: line.heading.level }]
-      : [],
-  );
+  const find = (same: (a: string) => boolean) =>
+    lines.flatMap((line, index) =>
+      line.heading !== undefined && same(line.heading.text)
+        ? [{ index, level: line.heading.level }]
+        : [],
+    );
+  // Exact first; the marker-folded match only when nothing matches exactly.
+  const marked = (value: string) => value.replaceAll("*", "_");
+  const exact = find((text) => text === heading);
+  const matches = exact.length
+    ? exact
+    : find((text) => marked(text) === marked(heading));
   if (matches.length !== 1) return undefined;
   const { index, level } = matches[0]!;
   const end = lines.findIndex(
@@ -237,16 +261,18 @@ export function sectionText(text: string, heading: string): string | undefined {
  * be read is a problem that says how to fix the Sources entry.
  */
 export async function planningSources(
-  body: string,
+  objective: ShownObjective,
   files: BaseFiles,
+  child = false,
 ): Promise<{ sources: PinnedSource[]; problems: string[] }> {
-  const sources: PinnedSource[] = [objectiveSource(body)];
+  const sources: PinnedSource[] = [objectiveSource(objective, child)];
+  const pinned = checkObjective(objective.blocks).objective.sources;
   const problems: string[] = [];
   const defaults: SourceRef[] = [];
   for (const path of ["AGENTS.md", "README.md"])
     if (await files.blob(path)) defaults.push({ path });
   const seen = new Set<string>();
-  for (const ref of [...defaults, ...parseObjective(body).objective.sources]) {
+  for (const ref of [...defaults, ...pinned]) {
     const identity = `${ref.path}#${ref.heading ?? ""}`;
     if (seen.has(identity)) continue;
     seen.add(identity);
@@ -272,9 +298,7 @@ export async function planningSources(
     // A default is context unless the Objective also pins it.
     const isDefault =
       defaults.some((d) => d.path === ref.path && !ref.heading) &&
-      !parseObjective(body).objective.sources.some(
-        (pin) => pin.path === ref.path && !pin.heading,
-      );
+      !pinned.some((pin) => pin.path === ref.path && !pin.heading);
     sources.push({
       ...ref,
       content,
@@ -344,24 +368,30 @@ export function ciOnlyKey(command: string): string {
 /** A leading executable word, no assignment, braces or statement separators. */
 const COMMAND_SHAPE = /^[a-z][\w.-]*(?: [^{}$;|&<>]*)?$/;
 
-/** Inline backticked spans outside fenced code. */
-function inlineSpans(content: string): string[] {
-  return markdownLines(content).flatMap(({ text, fenced }) =>
+/**
+ * Inline code spans outside fenced code: the Objective's shown code
+ * elements, a repository file's backticked spans.
+ */
+function inlineSpans(
+  source: Pick<PinnedSource, "content" | "shown">,
+): string[] {
+  if (source.shown) return source.shown.spans.map((span) => span.trim());
+  return markdownLines(source.content).flatMap(({ text, fenced }) =>
     fenced ? [] : [...text.matchAll(/`([^`]+)`/g)].map((m) => m[1]!.trim()),
   );
 }
 
-function inlineCommand(content: string, command: string): boolean {
+function inlineCommand(source: PinnedSource, command: string): boolean {
   if (!COMMAND_SHAPE.test(command) && !packageManagerVersionProbe(command))
     return false;
-  return inlineSpans(content).includes(command);
+  return inlineSpans(source).includes(command);
 }
 
-function exactLine(content: string, command: string): boolean {
+function exactLine(lines: readonly string[], command: string): boolean {
   // Only a command-shaped line is authority; doc code never is.
   if (!COMMAND_SHAPE.test(command) && !packageManagerVersionProbe(command))
     return false;
-  return content.split("\n").some((line) => {
+  return lines.some((line) => {
     const text = line
       .trim()
       .replace(/^[-*]\s+/, "")
@@ -563,12 +593,15 @@ async function authorizedCommand(
     return sources.some(
       (source) =>
         source.path === check.source &&
-        (exactLine(source.content, check.command) ||
+        (exactLine(
+          source.shown?.lines ?? source.content.split("\n"),
+          check.command,
+        ) ||
           // An operator-authored Objective body may declare a backticked
           // command in its prose. Repository docs and split-child bodies
           // (which carry a model-written goal) keep the own-line rule.
           (source.operatorAuthored === true &&
-            inlineCommand(source.content, check.command))),
+            inlineCommand(source, check.command))),
     );
   if (
     check.provenance !== "base-observed" ||
@@ -578,7 +611,7 @@ async function authorizedCommand(
     return false;
   const content = await files.text(check.source);
   if (content === undefined) return false;
-  if (exactLine(content, check.command)) return true;
+  if (exactLine(content.split("\n"), check.command)) return true;
   return check.source === "package.json" && Boolean(invocation);
 }
 
@@ -638,7 +671,7 @@ async function authorizedCommands(
   }
   // Only inline command spans: never fenced code, prose or code fragments.
   for (const source of sources)
-    for (const command of new Set(inlineSpans(source.content)))
+    for (const command of new Set(inlineSpans(source)))
       if (
         COMMAND_SHAPE.test(command) &&
         usable(command) &&
@@ -903,7 +936,10 @@ const REQUIRED_COMMANDS_SOURCE =
 
 export interface FactsArgs {
   objective: number;
-  body: string;
+  /** The Objective as shown: its structure and the planner text. */
+  shown: ShownObjective;
+  /** The Objective is a Factory-created split child (childIdentity). */
+  child?: boolean;
   base: string;
   checkout: string;
   /** The installation's required final commands; their scripts stay fixed. */
@@ -914,6 +950,8 @@ export interface FactsArgs {
   extraCommands?: readonly string[];
   /** The approved playbook text. */
   playbook?: string;
+  /** The operator's media.localAssetRoots. */
+  localAssetRoots?: readonly string[];
   signal?: AbortSignal;
 }
 
@@ -929,12 +967,17 @@ export async function buildFacts(
   args: FactsArgs,
 ): Promise<{ facts: PlanningFacts } | { problems: string[] }> {
   const files = new BaseFiles(args.checkout, args.base, args.signal);
-  const { sources, problems } = await planningSources(args.body, files);
+  const { sources, problems } = await planningSources(
+    args.shown,
+    files,
+    args.child,
+  );
   if (problems.length) return { problems };
   const ciOnlyCommands = [...(args.ciOnlyCommands ?? [])];
   const facts: PlanningFacts = {
     objective: args.objective,
-    body: args.body,
+    body: args.shown.body,
+    blocks: args.shown.blocks,
     base: args.base,
     sources,
     authorizedCommands: await authorizedCommands(
@@ -946,11 +989,12 @@ export async function buildFacts(
     ciOnlyCommands,
     checkNames: await workflowCheckNames(files),
     fixedScripts: await fixedScripts(
-      finalCommands(args.body, args.requiredCommands),
+      finalCommands(args.shown.blocks, args.requiredCommands),
       files,
     ),
-    coverageObligations: coverageObligations(args.body),
+    coverageObligations: coverageObligations(args.shown.blocks),
     playbook: args.playbook ?? "",
+    localAssetRoots: args.localAssetRoots ?? [],
   };
   return { facts };
 }
@@ -963,18 +1007,21 @@ export async function buildFacts(
  * and CI-only commands fit it.
  */
 export async function objectiveCommandProblems(
-  body: string,
+  shown: ShownObjective,
   base: string,
   checkout: string,
   options: {
     requiredCommands?: readonly string[];
     ciOnlyCommands?: readonly string[];
     signal?: AbortSignal;
+    /** The Objective is a Factory-created split child (childIdentity). */
+    child?: boolean;
   } = {},
 ): Promise<string[]> {
+  const child = options.child === true;
   const files = new BaseFiles(checkout, base, options.signal);
-  const { sources, problems } = await planningSources(body, files);
-  const finals = finalObjectiveCommands(body);
+  const { sources, problems } = await planningSources(shown, files, child);
+  const finals = finalObjectiveCommands(shown.blocks);
   const ciOnly = new Set((options.ciOnlyCommands ?? []).map(ciOnlyKey));
   let authorized: string[] | undefined;
   const list = async () => {
@@ -1004,9 +1051,9 @@ export async function objectiveCommandProblems(
   }
 
   // A Factory-created child carries its parent's prose; the parent was checked.
-  if (!finals.length && !childIdentity(body)) {
+  if (!finals.length && !child) {
     const named: string[] = [];
-    for (const span of new Set(inlineSpans(body))) {
+    for (const span of new Set(shown.spans.map((span) => span.trim()))) {
       if (!span) continue;
       const declared =
         (await authorizedCommand(
@@ -1045,7 +1092,7 @@ export async function objectiveCommandProblems(
 
   const required = options.requiredCommands ?? [];
   const requiredSources: PinnedSource[] = [
-    objectiveSource(body),
+    objectiveSource(shown, child),
     { path: REQUIRED_COMMANDS_SOURCE, content: required.join("\n") },
   ];
   for (const command of required)

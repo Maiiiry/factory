@@ -28,7 +28,9 @@ import {
   operatorGit,
   pinnedGitExit,
 } from "./git.js";
+import { TransientError } from "./github.js";
 import { forceRemove } from "./paths.js";
+import { errorMessage } from "./text.js";
 
 const run = promisify(execFile);
 const MINUTE = 60_000;
@@ -342,6 +344,31 @@ export async function hostGit(
   if (result.code === 0) return result.stdout;
   throw new Error(
     `git ${args.join(" ")} in ${directory} ${result.code === null ? `ended by ${result.signal}` : `exited ${result.code}`}: ${result.stderr}`,
+  );
+}
+
+/**
+ * `git merge-base --is-ancestor`: exit 0 is yes, exit 1 is no, and anything
+ * else (a missing object, a killed Git) is a TransientError to retry.
+ */
+export async function isAncestor(
+  directory: string,
+  older: string,
+  newer: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const args = ["merge-base", "--is-ancestor", older, newer];
+  let result: GitExit;
+  try {
+    result = await hostGitExit(directory, args, { signal, timeoutMs: MINUTE });
+  } catch (error) {
+    if (signal?.aborted || error instanceof GitRefusal) throw error;
+    throw new TransientError(`git ${args.join(" ")}: ${errorMessage(error)}`);
+  }
+  if (result.code === 0) return true;
+  if (result.code === 1) return false;
+  throw new TransientError(
+    `git ${args.join(" ")} ${result.code === null ? `ended by ${result.signal}` : `exited ${result.code}`}: ${result.stderr.slice(0, 2000)}`,
   );
 }
 

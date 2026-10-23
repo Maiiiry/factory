@@ -9,7 +9,7 @@ import {
 import { connect } from "node:net";
 import { join } from "node:path";
 import { type CoreConfig, configPath, loadConfig } from "./config.js";
-import { DEFAULT_LIMITS, hostLimits } from "./engine.js";
+import { DEFAULT_LIMITS, type EngineLimits, hostLimits } from "./engine.js";
 import { GitHub } from "./github.js";
 import { GitHubSync } from "./github-sync.js";
 import { dreamCommand, runDream } from "./knowledge/dream.js";
@@ -35,9 +35,9 @@ import { type Request, writeRequest } from "./requests.js";
 import { serve } from "./service.js";
 import {
   type FrozenProvider,
+  findState,
   type Hold,
-  listObjectives,
-  loadState,
+  listAllObjectives,
   type ObjectiveState,
   type ObjectiveStatus,
   TERMINAL,
@@ -57,6 +57,7 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
         [--default]              Add or change a named provider in the configuration
   status [ISSUE] [--json]        Show Objectives and open questions
   answer ISSUE ANSWER [--text T] Answer an Objective's open question
+                                 (switch NAME: run it on another provider)
   cancel ISSUE                   Cancel an Objective
   retry ISSUE                    Retry an Objective's waiting steps now
   dream [--preview] [--budget-bytes N] [--input-budget-bytes N] [--provider NAME]
@@ -72,7 +73,14 @@ interface StatusRow {
   status: ObjectiveStatus | "unreadable";
   hold: Hold | null;
   provider?: FrozenProvider;
-  waiting: { step: string; nextAt: string; lastError: string }[];
+  waiting: {
+    step: string;
+    nextAt: string;
+    lastError: string;
+    since: string;
+    /** A person outside Factory the step waits on, such as an environment approval. */
+    gate?: string;
+  }[];
   error?: string;
 }
 
@@ -91,6 +99,7 @@ async function main(argv: string[]): Promise<number> {
   const paths = installationPaths(repository);
   switch (command) {
     case "serve": {
+      const limits = envLimits();
       let sync: GitHubSync | undefined;
       let loaded: CoreConfig | undefined;
       let workflow = objectiveWorkflow();
@@ -111,12 +120,16 @@ async function main(argv: string[]): Promise<number> {
           selectedBy: args.flags.provider ? "--provider" : "defaultProvider",
           settings: frozenSettings(config.providers[name]!),
         };
-        const github = new GitHub(config.repository).redacting(
-          config.policy.allowedSecretNames.flatMap(
-            (name) => process.env[name] ?? [],
-          ),
+        const github = new GitHub(
+          config.repository,
+          process.env.FACTORY_GITHUB_API,
+        ).redacting(config.secrets);
+        sync = new GitHubSync(
+          github,
+          config,
+          new RunLog(paths.logs, "sync"),
+          limits,
         );
-        sync = new GitHubSync(github, config, new RunLog(paths.logs, "sync"));
         const routes = new Map<string, ProviderRoute>();
         for (const [each, settings] of Object.entries(config.providers))
           routes.set(each, {
@@ -147,15 +160,12 @@ async function main(argv: string[]): Promise<number> {
           ? { tickMs: Number(process.env.FACTORY_TICK_MS) }
           : {}),
         limits: {
-          ...DEFAULT_LIMITS,
+          ...limits,
           ...(loaded
             ? {
                 concurrency: loaded.execution.concurrency,
                 maxRepairs: loaded.execution.repairs,
               }
-            : {}),
-          ...(process.env.FACTORY_BACKOFF_MS
-            ? { baseBackoffMs: Number(process.env.FACTORY_BACKOFF_MS) }
             : {}),
         },
       });
@@ -221,13 +231,13 @@ function knowledge(config: CoreConfig, paths: Paths): KnowledgeSettings {
     repository: config.repository,
     root: paths.root,
     checkout: config.checkout,
-    allowedSecretNames: config.policy.allowedSecretNames,
+    secrets: config.secrets,
   });
 }
 
 /** An Objective's state once it is terminal with nothing left to run, or why not. */
 function settledState(paths: Paths, issue: number): ObjectiveState | string {
-  const loaded = loadState(paths.objectives, issue);
+  const loaded = findState(paths.objectives, issue);
   if (!loaded) return `Factory has no Objective #${issue}`;
   if (loaded.kind === "unreadable")
     return `#${issue} has unreadable state (${loaded.error})`;
@@ -241,12 +251,45 @@ function settledState(paths: Paths, issue: number): ObjectiveState | string {
   return state;
 }
 
+/**
+ * The engine's limits, with shorter timings from the environment for
+ * tests: FACTORY_BACKOFF_MS (first backoff), FACTORY_WAIT_MS (transient
+ * budget), FACTORY_NOTE_MS (status note), FACTORY_REMIND_MS (gate
+ * reminder), FACTORY_DEADLINE_MS (a cap on step deadlines).
+ */
+function envLimits(): EngineLimits {
+  const env = (name: string): number | undefined => {
+    const value = Number(process.env[name]);
+    return process.env[name] && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  };
+  const set = <K extends keyof EngineLimits>(key: K, name: string) => {
+    const value = env(name);
+    return value === undefined ? {} : { [key]: value };
+  };
+  return {
+    ...DEFAULT_LIMITS,
+    ...set("baseBackoffMs", "FACTORY_BACKOFF_MS"),
+    ...set("maxWaitMs", "FACTORY_WAIT_MS"),
+    ...set("noteAfterMs", "FACTORY_NOTE_MS"),
+    ...set("remindAfterMs", "FACTORY_REMIND_MS"),
+    ...set("maxDeadlineMs", "FACTORY_DEADLINE_MS"),
+  };
+}
+
 async function status(paths: Paths, args: Args): Promise<number> {
   const only = args.positional[1] ? Number(args.positional[1]) : undefined;
   const rows: StatusRow[] = [];
-  for (const issue of listObjectives(paths.objectives)) {
+  for (const issue of listAllObjectives(paths.objectives)) {
     if (only !== undefined && issue !== only) continue;
-    const loaded = loadState(paths.objectives, issue);
+    let loaded: ReturnType<typeof findState>;
+    try {
+      loaded = findState(paths.objectives, issue);
+    } catch (error) {
+      process.stderr.write(`#${issue}: can't read its state now: ${error}\n`);
+      continue;
+    }
     if (!loaded) continue;
     if (loaded.kind === "unreadable") {
       rows.push({
@@ -275,17 +318,24 @@ async function status(paths: Paths, args: Args): Promise<number> {
         step,
         nextAt: retry.nextAt,
         lastError: retry.lastError,
+        since: retry.since,
+        ...(retry.wait?.kind === "gate" ? { gate: retry.wait.gate } : {}),
       })),
     });
   }
   const live = await serviceLive(paths);
+  const loop = live ? crashLoop(paths) : undefined;
   if (args.flags.json !== undefined) {
     process.stdout.write(
-      `${JSON.stringify({ service: live ? "running" : "stopped", objectives: rows }, null, 2)}\n`,
+      `${JSON.stringify({ service: live ? "running" : "stopped", ...(loop ? { crashLoop: loop } : {}), objectives: rows }, null, 2)}\n`,
     );
     return 0;
   }
   const lines = [`Service: ${live ? "running" : "stopped"}`];
+  if (loop)
+    lines.push(
+      `  Crash loop: the service restarted after ${loop.crashes} deaths in a row; interrupted steps ${Date.parse(loop.resumeAt) > Date.now() ? "resume" : "resumed"} at ${loop.resumeAt}.`,
+    );
   if (rows.length === 0) lines.push("No Objectives.");
   for (const row of rows) {
     lines.push(`#${row.issue}: ${row.status}`);
@@ -301,7 +351,9 @@ async function status(paths: Paths, args: Args): Promise<number> {
       );
     for (const wait of row.waiting)
       lines.push(
-        `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
+        wait.gate
+          ? `  Waiting on ${wait.gate} (${wait.step}, since ${wait.since})`
+          : `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
       );
   }
   process.stdout.write(`${lines.join("\n")}\n`);
@@ -416,11 +468,13 @@ async function request(
       process.stderr.write("factory: answer needs an answer\n");
       return 2;
     }
+    // `answer ISSUE switch NAME` names the provider, as `--text NAME` does.
+    const text = args.flags.text ?? args.positional[3];
     body = {
       kind: "answer",
       issue,
       answer,
-      ...(args.flags.text ? { text: args.flags.text } : {}),
+      ...(text ? { text } : {}),
     };
   } else body = { kind: command, issue };
   const by = process.env.USER ?? "operator";
@@ -449,6 +503,32 @@ async function request(
   }
   process.stdout.write("Sent; the service hasn't applied it yet.\n");
   return 0;
+}
+
+/**
+ * The running service's crash loop, from `service.json`: the deaths in a
+ * row before this start, and when it resumes interrupted steps. Shown
+ * until the run has lived 10 min past that time.
+ */
+function crashLoop(
+  paths: Paths,
+): { crashes: number; resumeAt: string } | undefined {
+  try {
+    const record = JSON.parse(
+      readFileSync(join(paths.root, "service.json"), "utf8"),
+    ) as { starts?: string[]; resumeAt?: string };
+    if (
+      !record.resumeAt ||
+      Date.now() > Date.parse(record.resumeAt) + 10 * 60 * 1000
+    )
+      return undefined;
+    return {
+      crashes: (record.starts?.length ?? 1) - 1,
+      resumeAt: record.resumeAt,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** The service holds its abstract socket while it lives. */

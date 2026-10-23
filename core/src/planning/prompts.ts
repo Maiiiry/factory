@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { objectiveSection } from "../objective.js";
+import { declaration, onlyEntry } from "../objective.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
+import type { ObjectiveBlock } from "../shown.js";
 import { REPOSITORY_DIRECTORY, type RepositoryView } from "./repository.js";
 import type { ReviewEvidence } from "./review.js";
 import {
@@ -142,24 +143,24 @@ function playbookAdvice(playbook: string): string {
 // ---------------------------------------------------------------------------
 // Per-round instructions
 
-/** The single entry of an Objective section, or undefined. */
-function sectionEntry(body: string, name: string): string | undefined {
-  const entries = (objectiveSection(body, name) ?? []).filter((line) =>
-    line.text.trim(),
-  );
-  return entries.length === 1 && !entries[0]!.fenced
-    ? entries[0]!.text.trim()
-    : undefined;
+/** The only entry of an Objective declaration section, or undefined. */
+function sectionEntry(
+  blocks: readonly ObjectiveBlock[],
+  name: string,
+): ObjectiveBlock | undefined {
+  const { entries } = declaration(blocks, name, name);
+  return entries && onlyEntry(entries);
 }
 
 /**
  * The Objective's exact package-manager pin. The Objective check refuses a
  * malformed section, so here anything else means no update.
  */
-export function packageManagerUpdate(body: string): string | undefined {
-  const pin = sectionEntry(body, "package manager update")?.match(
-    /^-\s+`([^`]+)`$/,
-  )?.[1];
+export function packageManagerUpdate(
+  blocks: readonly ObjectiveBlock[],
+): string | undefined {
+  const entry = sectionEntry(blocks, "package manager update");
+  const pin = entry?.kind === "item" ? entry.code : undefined;
   return pin &&
     /^(npm|pnpm)@(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(pin)
     ? pin
@@ -175,8 +176,11 @@ export function packageManagerInstructions(update?: string): string {
 }
 
 /** Compile the checkpoint into the existing brief, within the author's turn. */
-function qualityCheckpointInstructions(body: string): string {
-  if (sectionEntry(body, "quality checkpoint") !== "enabled") return "";
+function qualityCheckpointInstructions(
+  blocks: readonly ObjectiveBlock[],
+): string {
+  const entry = sectionEntry(blocks, "quality checkpoint");
+  if (entry?.kind !== "text" || entry.text !== "enabled") return "";
   return `\n\nQuality checkpoint guidance (enabled by the pinned Objective; no new acceptance or authority): For each new or never-started implementation Work Item, put a short artifact-specific quality checkpoint in its existing brief. Derive a few observable dimensions from the original human intent and this item's deliverable, without repeating source bodies. Visual work may emphasize composition, craftsmanship and visible variety when requested; backend work needs its own relevant behavioral qualities rather than a visual rubric. Do not prescribe a style, library, extra feature or numerical quality threshold. Do not change retained attempted items or add QA, aggregate, grader or polish phases for this guidance.
 The brief tells its author to inspect the actual result against those dimensions and the original intent, identify the least convincing dimension, and decide whether a meaningful in-scope improvement is warranted. If warranted, improve within owned paths and inspect the changed result again; report unowned needs through the ordinary discovery path. Hand off when the intent is convincingly fulfilled and remaining choices are minor preferences or outside scope. Include a concise observable summary of the decision, improvements and remaining tradeoffs in the ordinary final response; do not expose private reasoning. Preserve required commands, independent validation and review. No mandatory iteration count, model-facing time target, new acceptance fact, tool or permission is introduced.`;
 }
@@ -200,7 +204,7 @@ function findingItemIds(
  * answered.
  */
 export function renderPlanningInstructions(
-  body: string,
+  blocks: readonly ObjectiveBlock[],
   corrections: readonly (Finding & { itemIds?: readonly string[] })[] = [],
   /** The planner answers with only its changes to the current plan. */
   revising = false,
@@ -213,7 +217,7 @@ export function renderPlanningInstructions(
       detail: finding.message,
     };
   });
-  return `\n\n${packageManagerInstructions(packageManagerUpdate(body))}${qualityCheckpointInstructions(body)}${entries.length ? `\n\n${revising ? "Revise the current plan once to fix these findings, answering with only the changes." : "Revise the complete graph once to fix these findings."} Each has a source field: review (the independent plan reviewer), check (a deterministic Factory refusal), diagnosis (an analysis of the last failure) or operator (the operator's answer to your decisionRequired question or to the plan reviewer's operator question, which is authority to act as answered).${revising && corrections.some((entry) => entry.source === "operator") ? " The current plan holds the choice it made when each question was asked: change it only where an operator answer differs from that choice or is not yet reflected, so an answer that confirms it needs no item changes; set decisionRequired again only for a choice no answer settles." : ""} Do not expand scope or invent authority:\n${JSON.stringify(entries)}` : ""}`;
+  return `\n\n${packageManagerInstructions(packageManagerUpdate(blocks))}${qualityCheckpointInstructions(blocks)}${entries.length ? `\n\n${revising ? "Revise the current plan once to fix these findings, answering with only the changes." : "Revise the complete graph once to fix these findings."} Each has a source field: review (the independent plan reviewer), check (a deterministic Factory refusal), diagnosis (an analysis of the last failure) or operator (the operator's answer to your decisionRequired question or to the plan reviewer's operator question, which is authority to act as answered).${revising && corrections.some((entry) => entry.source === "operator") ? " The current plan holds the choice it made when each question was asked: change it only where an operator answer differs from that choice or is not yet reflected, so an answer that confirms it needs no item changes; set decisionRequired again only for a choice no answer settles." : ""} Do not expand scope or invent authority:\n${JSON.stringify(entries)}` : ""}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -27,13 +27,13 @@ import { isScalar, parseDocument, visit } from "yaml";
 import type { SandboxConfig } from "./config.js";
 import { hold, type Outcome } from "./engine.js";
 import { knowledgeSettings } from "./knowledge/settings.js";
-import { githubEmptyField, markdownLines } from "./markdown.js";
 import {
   hydrateTree,
   type LfsFile,
   rewrittenMedia,
   type SelectedMember,
 } from "./media.js";
+import { declaration, onlyEntry } from "./objective.js";
 import { installNetworkRefusal } from "./package-network.js";
 import { forceRemove, openParent, within } from "./paths.js";
 import {
@@ -54,6 +54,7 @@ import {
   selectorsFor,
 } from "./review/artifacts.js";
 import { runSandboxed } from "./sandbox.js";
+import type { ObjectiveBlock } from "./shown.js";
 import { errorMessage, headAndTail } from "./text.js";
 import { privateStagingPath } from "./work/collect.js";
 import {
@@ -77,8 +78,8 @@ export interface ValidateInput {
   /** One Work Item's commands, or, absent, the plan's final commands. */
   item?: WorkItem;
   plan: Plan;
-  /** The Objective body as planned: its Package manager update and Workspace package additions. */
-  body: string;
+  /** The Objective as planned (shown.ts): its Package manager update and Workspace package additions. */
+  blocks: readonly ObjectiveBlock[];
   /** The commit a later item started from, when not the base: its new scripts stay fixed too. */
   predecessor?: string;
   sandbox: SandboxConfig;
@@ -204,8 +205,8 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
     item
       ? {
           sourceDeclared: sourceDeclared([item]),
-          workspacePackageAdditions: workspaceAdditions(input.body).additions,
-          packageManagerUpdate: packageManagerUpdate(input.body),
+          workspacePackageAdditions: workspaceAdditions(input.blocks).additions,
+          packageManagerUpdate: packageManagerUpdate(input.blocks),
           predecessor: input.predecessor,
         }
       : {
@@ -213,8 +214,8 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
             ...sourceDeclared(plan.items),
             ...plan.finalCommands,
           ],
-          workspacePackageAdditions: workspaceAdditions(input.body).additions,
-          packageManagerUpdate: packageManagerUpdate(input.body),
+          workspacePackageAdditions: workspaceAdditions(input.blocks).additions,
+          packageManagerUpdate: packageManagerUpdate(input.blocks),
           requirePackageManagerUpdate: true,
         },
   );
@@ -1296,62 +1297,37 @@ async function checkWorkspaceChange(
 // ---------------------------------------------------------------------------
 // Objective declarations
 
-/** The lines of the one level-two or level-three section named `name`, or a problem. */
-function declaration(
-  body: string,
-  name: string,
-  label: string,
-): { lines?: ReturnType<typeof markdownLines>; problem?: string } {
-  const lines = markdownLines(body);
-  const matches = lines.flatMap((line, index) =>
-    line.heading?.text.toLowerCase() === name ? [index] : [],
-  );
-  if (!matches.length) return {};
-  const start = matches[0]!;
-  const level = lines[start]!.heading!.level;
-  // Same levels as the template sections: the issue form renders `###`.
-  if (matches.length !== 1 || ![2, 3].includes(level))
-    return { problem: `Use one level-two or level-three ${label} section.` };
-  const section: ReturnType<typeof markdownLines> = [];
-  for (const line of lines.slice(start + 1)) {
-    if (line.heading && line.heading.level <= level) break;
-    section.push(line);
-  }
-  return { lines: section };
-}
-
 /** The Objective's Workspace package additions: exact package directories it admits. */
-function workspaceAdditions(body: string): {
+function workspaceAdditions(blocks: readonly ObjectiveBlock[]): {
   additions: string[];
   problem?: string;
 } {
   const found = declaration(
-    body,
+    blocks,
     "workspace package additions",
     "Workspace package additions",
   );
-  if (!found.lines) return { additions: [], problem: found.problem };
+  if (!found.entries) return { additions: [], problem: found.problem };
   const additions: string[] = [];
   let noResponse = false;
-  for (const line of found.lines) {
-    if (!line.text.trim()) continue;
-    if (githubEmptyField(line)) {
+  for (const entry of found.entries) {
+    if (entry.kind === "empty") {
       noResponse = true;
       continue;
     }
-    const match = !line.fenced && line.text.match(/^\s*-\s+`([^`]+)`\s*$/);
-    if (!match || !exactPackageDirectory(match[1]!))
+    const directory = entry.kind === "item" ? entry.code : undefined;
+    if (directory === undefined || !exactPackageDirectory(directory))
       return {
         additions,
         problem:
           "Workspace package additions require exact backticked package directories, one per bullet, such as - `packages/new-lib`.",
       };
-    if (additions.includes(match[1]!))
+    if (additions.includes(directory))
       return {
         additions,
-        problem: `Duplicate Workspace package additions entry \`${match[1]}\`; list each directory once.`,
+        problem: `Duplicate Workspace package additions entry \`${directory}\`; list each directory once.`,
       };
-    additions.push(match[1]!);
+    additions.push(directory);
   }
   if (!additions.length && !noResponse)
     return {
@@ -1364,49 +1340,45 @@ function workspaceAdditions(body: string): {
 
 /**
  * The problems in the Objective's optional declarations: Package manager
- * update, Quality checkpoint and Workspace package additions. The check step
- * runs this once; validation and planning then trust what it accepted.
+ * update, Quality checkpoint, Workspace package additions and Adaptive
+ * workflow. The check step runs this once; validation and planning then
+ * trust what it accepted.
  */
-export function declarationProblems(body: string): string[] {
+export function declarationProblems(
+  blocks: readonly ObjectiveBlock[],
+): string[] {
   const problems: string[] = [];
   const update = declaration(
-    body,
+    blocks,
     "package manager update",
     "Package manager update",
   );
   if (update.problem) problems.push(update.problem);
-  else if (update.lines) {
-    const entries = update.lines.filter((line) => line.text.trim());
-    const empty = entries.length === 1 && githubEmptyField(entries[0]!);
-    const pin =
-      entries.length === 1 && !entries[0]!.fenced
-        ? entries[0]!.text.match(/^\s*-\s+`([^`]+)`\s*$/)?.[1]
-        : undefined;
-    if (!empty && !exactPin(pin))
+  else if (update.entries) {
+    const only = onlyEntry(update.entries);
+    const pin = only?.kind === "item" ? only.code : undefined;
+    if (only?.kind !== "empty" && !exactPin(pin))
       problems.push(
         "Package manager update requires exactly one backticked stable npm@X.Y.Z or pnpm@X.Y.Z pin, such as - `pnpm@9.15.0`.",
       );
   }
   const checkpoint = declaration(
-    body,
+    blocks,
     "quality checkpoint",
     "Quality checkpoint",
   );
   if (checkpoint.problem) problems.push(checkpoint.problem);
-  else if (checkpoint.lines) {
-    const entries = checkpoint.lines.filter((line) => line.text.trim());
-    const selection =
-      entries.length === 1 && !entries[0]!.fenced
-        ? entries[0]!.text.trim()
-        : undefined;
+  else if (checkpoint.entries) {
+    const only = onlyEntry(checkpoint.entries);
+    const selection = only?.kind === "text" ? only.text : undefined;
     if (selection !== "enabled" && selection !== "disabled")
       problems.push(
         "Quality checkpoint requires exactly enabled or disabled as its only line.",
       );
   }
-  const workspace = workspaceAdditions(body).problem;
+  const workspace = workspaceAdditions(blocks).problem;
   if (workspace) problems.push(workspace);
-  const adaptive = adaptiveWorkflow(body);
+  const adaptive = adaptiveWorkflow(blocks);
   if (adaptive.problem) problems.push(adaptive.problem);
   else if (adaptive.enabled && !knowledgeSettings()?.planningContext)
     problems.push(
@@ -1416,20 +1388,16 @@ export function declarationProblems(body: string): string[] {
 }
 
 /** The Objective's Adaptive workflow section: on only when it reads `enabled`. */
-export function adaptiveWorkflow(body: string): {
+export function adaptiveWorkflow(blocks: readonly ObjectiveBlock[]): {
   enabled: boolean;
   problem?: string;
 } {
-  const found = declaration(body, "adaptive workflow", "Adaptive workflow");
-  if (!found.lines)
+  const found = declaration(blocks, "adaptive workflow", "Adaptive workflow");
+  if (!found.entries)
     return { enabled: false, ...(found.problem && { problem: found.problem }) };
-  const entries = found.lines.filter((line) => line.text.trim());
-  if (entries.length === 1 && githubEmptyField(entries[0]!))
-    return { enabled: false };
-  const selection =
-    entries.length === 1 && !entries[0]!.fenced
-      ? entries[0]!.text.trim()
-      : undefined;
+  const only = onlyEntry(found.entries);
+  if (only?.kind === "empty") return { enabled: false };
+  const selection = only?.kind === "text" ? only.text : undefined;
   if (selection !== "enabled" && selection !== "disabled")
     return {
       enabled: false,

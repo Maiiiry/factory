@@ -1,3 +1,4 @@
+import type { ObjectiveBlock } from "../shown.js";
 /**
  * Provider selection. Each configured provider gets its own planner,
  * worker and workflow; an Objective runs on the provider it froze when it
@@ -7,15 +8,11 @@
 
 import { isDeepStrictEqual } from "node:util";
 import type { CoreConfig } from "../config.js";
-import { hold, type Step, type Workflow } from "../engine.js";
+import { hold, type Step, switchTargets, type Workflow } from "../engine.js";
 import type { Plan } from "../planning/types.js";
 import { type ObjectiveState, TERMINAL } from "../state.js";
 import type { Worker } from "../work/worker.js";
-import {
-  ClaudePlanner,
-  type ClaudePlannerOptions,
-  DEFAULT_CLAUDE_MODELS,
-} from "./claude.js";
+import { ClaudePlanner, DEFAULT_CLAUDE_MODELS } from "./claude.js";
 import { ClaudeWorker } from "./claude-worker.js";
 import { CodexPlanner, DEFAULT_CODEX_MODELS } from "./codex.js";
 import { CodexWorker } from "./codex-worker.js";
@@ -30,28 +27,18 @@ import { HedgedPlanner, type Planner } from "./planner.js";
 
 /** The provider's planner, hedged against stalled calls. */
 export function providerPlanner(provider: ProviderConfig): Planner {
-  const models = provider.models ?? {};
   switch (provider.planner) {
     case "claude":
       return new HedgedPlanner(
-        new ClaudePlanner({
-          ...DEFAULT_CLAUDE_MODELS,
-          ...models,
-        } as ClaudePlannerOptions),
+        new ClaudePlanner({ ...DEFAULT_CLAUDE_MODELS, ...provider.models }),
       );
     case "copilot":
       return new HedgedPlanner(
-        new CopilotPlanner({
-          ...DEFAULT_COPILOT_MODELS,
-          ...models,
-        } as typeof DEFAULT_COPILOT_MODELS),
+        new CopilotPlanner({ ...DEFAULT_COPILOT_MODELS, ...provider.models }),
       );
     default:
       return new HedgedPlanner(
-        new CodexPlanner({
-          ...DEFAULT_CODEX_MODELS,
-          ...models,
-        } as typeof DEFAULT_CODEX_MODELS),
+        new CodexPlanner({ ...DEFAULT_CODEX_MODELS, ...provider.models }),
       );
   }
 }
@@ -60,16 +47,16 @@ export function providerPlanner(provider: ProviderConfig): Planner {
 export function providerWorker(
   provider: ProviderConfig,
   config: CoreConfig,
-): (plan: Plan, body: string) => Worker {
+): (plan: Plan, blocks: readonly ObjectiveBlock[]) => Worker {
   const worker = provider.worker;
   const allowedSecretNames = config.policy.allowedSecretNames;
-  return (plan, body) => {
+  return (plan, blocks) => {
     switch (worker.kind) {
       case "claude":
         return new ClaudeWorker({
           sandbox: config.sandbox,
           plan,
-          body,
+          blocks,
           repository: config.repository,
           config: worker.settings,
           allowedSecretNames,
@@ -88,6 +75,7 @@ export function providerWorker(
           sandbox: config.sandbox,
           network: worker.network,
           allowedSecretNames,
+          secrets: config.secrets,
         });
     }
   };
@@ -123,21 +111,26 @@ export function providerWorkflow(
       ? route.workflow
       : undefined;
   };
+  // `switch NAME` freezes these settings, so the new route matches them.
+  const providers = Object.fromEntries(
+    [...routes].map(([name, route]) => [name, frozenSettings(route.settings)]),
+  );
   return {
     steps(state) {
       // Cancel cleanup is the same on every provider.
       if (state.status === "cancelled") return fallback.steps(state);
       if (TERMINAL.includes(state.status)) return [];
       const workflow = frozen(state);
-      return workflow ? workflow.steps(state) : [unavailable(state, routes)];
+      return workflow ? workflow.steps(state) : [unavailable(state, providers)];
     },
     status: (state) => (frozen(state) ?? fallback).status(state),
+    providers,
   };
 }
 
 function unavailable(
   state: ObjectiveState,
-  routes: ReadonlyMap<string, ProviderRoute>,
+  providers: Readonly<Record<string, ProviderConfig>>,
 ): Step {
   return {
     key: "provider",
@@ -149,12 +142,27 @@ function unavailable(
           "This Objective has no frozen provider: it was admitted by a Factory build that didn't record one. Cancel it and queue it again.",
           ["cancel"],
         );
-      const what = routes.has(provider.name)
+      const configured = provider.name in providers;
+      const what = configured
         ? `whose settings changed since then. It needs them as they were: ${JSON.stringify(provider.settings)}. Restore them`
         : "which the configuration no longer names. Restore it with the settings it had";
-      return hold(
-        `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry; or cancel.`,
-      );
+      // `switch` moves the Objective now, without restoring anything: onto
+      // another configured provider, or onto this one's new settings. The
+      // engine accepts exactly these (switchTargets).
+      const others = switchTargets(provider, providers);
+      const named = others
+        .map((n) =>
+          n === provider.name ? `\`${n}\` (its new settings)` : `\`${n}\``,
+        )
+        .join(", ");
+      return others.length
+        ? hold(
+            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry. Or ${others.length === 1 ? `answer \`switch\` to run it on provider ${named}` : `answer \`switch NAME\` to run it on one of these providers: ${named}`}; or cancel.`,
+            ["switch", "retry", "cancel"],
+          )
+        : hold(
+            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry; or cancel.`,
+          );
     },
   };
 }

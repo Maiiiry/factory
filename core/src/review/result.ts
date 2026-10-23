@@ -17,7 +17,13 @@
 import { lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { type CandidateRecord, candidateReceipts } from "../media.js";
+import { blobSizes, type CatFile, readBlobs } from "../git.js";
+import {
+  type CandidateRecord,
+  candidateReceipts,
+  type InputRecord,
+  inputReceipts,
+} from "../media.js";
 import { validPath } from "../objective.js";
 import { coverageCriterion, isRecord } from "../planning/graph.js";
 import { TREE_READ_GUIDANCE } from "../planning/prompts.js";
@@ -139,6 +145,8 @@ export interface ResultReviewInput {
   notes?: string;
   /** The item's captured candidate sets and the operator's selection. */
   candidates?: readonly CandidateRecord[];
+  /** The read-only inputs the item's worker got. */
+  inputs?: readonly InputRecord[];
   /**
    * What the validate step captured (its passed result's artifacts): text
    * rows, and images the reviewer sees. Captures of another tree are ignored.
@@ -178,9 +186,11 @@ export async function reviewResult(
       root,
     );
     const receipts = await candidateRows(root, input.candidates);
+    const given = await inputRows(root, input.inputs);
     const evidence = [
       ...sourceRows(input.sources),
       ...controllerRows(input, changes),
+      ...given,
       ...receipts,
       ...captured.rows,
       ...rows,
@@ -195,6 +205,7 @@ export async function reviewResult(
           evidence,
           captured.rows.length > 0,
           receipts.length > 0,
+          given.length > 0,
           previousInvalid,
         ),
         schema: resultReviewSchema(evidence),
@@ -608,8 +619,12 @@ export async function materialize(
         ...entry,
         from: base,
       }));
+  const catFile: CatFile = (args, stdin) =>
+    hostGit(checkout, args, { input: stdin, signal });
   const objects = raw.flatMap((entry) => [entry.oldObject, entry.newObject]);
-  const sizes = await objectSizes(checkout, objects, signal);
+  const sizes = await blobSizes(catFile, [
+    ...new Set(objects.filter((oid) => !NO_OBJECT.test(oid))),
+  ]);
   // base/: the base copy of each changed regular file, within the export bounds.
   const atBase = raw.filter(
     (entry) =>
@@ -623,10 +638,9 @@ export async function materialize(
     total += sizes.get(entry.oldObject)!;
     return total <= BASE_TOTAL_BYTES;
   });
-  const bodies = await blobs(
-    checkout,
+  const bodies = await readBlobs(
+    catFile,
     kept.map((entry) => entry.oldObject),
-    signal,
   );
   for (const [index, entry] of kept.entries()) {
     const path = resolve(root, "base", entry.path);
@@ -796,6 +810,19 @@ export async function candidateRows(
   return (await candidateReceipts(root, candidates)).map((receipt) => ({
     origin: "controller",
     path: receiptPath(receipt.item),
+    content: receipt.content,
+    complete: true,
+  }));
+}
+
+/** The controller input receipt of each item whose worker got inputs; see inputReceipts. */
+export async function inputRows(
+  root: string,
+  inputs: readonly InputRecord[] = [],
+): Promise<ResultEvidence[]> {
+  return (await inputReceipts(root, inputs)).map((receipt) => ({
+    origin: "controller",
+    path: `Controller input receipt: ${receipt.item}`,
     content: receipt.content,
     complete: true,
   }));
@@ -976,51 +1003,6 @@ async function mergedChanges(
   });
 }
 
-/** Blob sizes by object id, from one `cat-file --batch-check`. */
-async function objectSizes(
-  checkout: string,
-  objects: readonly string[],
-  signal: AbortSignal,
-): Promise<Map<string, number>> {
-  const wanted = [...new Set(objects.filter((oid) => !NO_OBJECT.test(oid)))];
-  const sizes = new Map<string, number>();
-  if (!wanted.length) return sizes;
-  const output = await hostGit(checkout, ["cat-file", "--batch-check"], {
-    input: wanted.map((oid) => `${oid}\n`).join(""),
-    signal,
-  });
-  for (const line of output.toString("utf8").split("\n")) {
-    const [oid, type, size] = line.split(" ");
-    if (oid && type === "blob") sizes.set(oid, Number(size));
-  }
-  return sizes;
-}
-
-/** The exact bytes of these blobs, in order, from one `cat-file --batch`. */
-async function blobs(
-  checkout: string,
-  objects: readonly string[],
-  signal: AbortSignal,
-): Promise<Buffer[]> {
-  if (!objects.length) return [];
-  const output = await hostGit(checkout, ["cat-file", "--batch"], {
-    input: objects.map((oid) => `${oid}\n`).join(""),
-    signal,
-  });
-  let offset = 0;
-  return objects.map((oid) => {
-    const newline = output.indexOf(10, offset);
-    const header = output.subarray(offset, newline).toString("utf8");
-    const [named, type, size] = header.split(" ");
-    if (named !== oid || type !== "blob")
-      throw new Error(`git cat-file returned "${header}" for ${oid}`);
-    const bytes = Number(size);
-    const body = output.subarray(newline + 1, newline + 1 + bytes);
-    offset = newline + 1 + bytes + 1;
-    return body;
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Prompt
 
@@ -1053,6 +1035,9 @@ export const REVIEW_GUIDANCE = {
 export const CANDIDATE_GUIDANCE =
   "Candidate media sets: alternatives exist so the operator can choose one. Factory delivers, validates, reviews, publishes and merges only the selected set; unselected sets stay in Factory's private staging and are never committed or validated, by design. Judge a criterion about the alternatives (how many were offered, that each was complete, how they differ) from the Controller candidate receipt: it lists every captured set with each member's role, destination, media type, size and sha256, the capture checks every set passed, which roles' bytes differ across sets, and the operator's selection; where a member has a reviewCopy, media-sets/ holds Factory's digest-checked copy of its bytes for read-only comparison. The operator viewed every set before choosing, so the selection is the human judgment of the alternatives' appearance; never ask the operator to confirm it again. Judge the delivered bytes (format, content, tests) from the selected set in candidate/ and the validation that passed on this tree. A criterion worded about each candidate or every alternative is judged for the delivered selection plus the receipt's facts about the alternatives: never ask for, and never refuse or hold for missing, validation, tests or review of an unselected set.";
 
+export const INPUT_GUIDANCE =
+  "Worker inputs: the Controller input receipt lists every file Factory gave the worker read-only (Objective source assets, including private local files and GitHub attachments, and dependencies' selected media), each with the sha256 and size Factory recorded when it fetched it. Where an input has a reviewCopy, inputs/ holds Factory's digest-checked copy of those exact bytes: judge a criterion about using, quoting or matching an input against that copy and the receipt. Never ask the operator to supply or confirm an input's bytes when the receipt has them.";
+
 /**
  * The result-review prompt: product logic kept verbatim from the old
  * reviewer, trimmed to what the core supplies: no receipts, bindings or
@@ -1066,6 +1051,7 @@ function renderResultReview(
   evidence: readonly ResultEvidence[],
   artifacts: boolean,
   candidates: boolean,
+  inputs: boolean,
   previousInvalid?: string,
 ): string {
   const itemCriteria = input.item.acceptance.length;
@@ -1088,6 +1074,7 @@ function renderResultReview(
     REVIEW_GUIDANCE.evidenceRoot,
     ...(artifacts ? [REVIEW_ARTIFACT_GUIDANCE] : []),
     ...(candidates ? [CANDIDATE_GUIDANCE] : []),
+    ...(inputs ? [INPUT_GUIDANCE] : []),
   ].join("\n");
   return reviewPrompt(
     instructions,

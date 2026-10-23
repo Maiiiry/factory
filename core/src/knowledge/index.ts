@@ -6,6 +6,7 @@
  */
 import { TransientError } from "../github.js";
 import { type BaseFiles, planningSources } from "../planning/facts.js";
+import type { ShownObjective } from "../shown.js";
 import type { ObjectiveState } from "../state.js";
 import { errorMessage } from "../text.js";
 import { adaptiveWorkflow } from "../validate.js";
@@ -32,19 +33,22 @@ import { type Database, openStore, withStore } from "./store.js";
  */
 export async function planningKnowledge(input: {
   state: ObjectiveState;
-  body: string;
+  /** The Objective as shown. */
+  shown: ShownObjective;
+  /** The Objective is a Factory-created split child. */
+  child: boolean;
   files: BaseFiles;
   /** The target's curated playbook at the base; empty when there is none. */
   playbook: string;
 }): Promise<string> {
   const settings = knowledgeSettings();
   if (!settings) return input.playbook;
-  const context = adaptiveWorkflow(input.body).enabled
+  const context = adaptiveWorkflow(input.shown.blocks).enabled
     ? settings.planningContext
     : undefined;
   // Git reads fail as TransientError, which the planning step retries.
   const sources = context?.memory
-    ? (await planningSources(input.body, input.files)).sources
+    ? (await planningSources(input.shown, input.files, input.child)).sources
     : [];
   const issue = input.state.issue;
   const run = runOf(input.state);
@@ -62,7 +66,7 @@ export async function planningKnowledge(input: {
         parts.push(
           await memorySection(db, {
             objective: issue,
-            body: input.body,
+            body: input.shown.body,
             context,
             supplied: sources.map((s) => `${s.path}#${s.heading ?? ""}`),
             digest: (path) => pathDigest(input.files, path),
@@ -87,9 +91,13 @@ export async function planningKnowledge(input: {
  * that a new admission of the same issue replaces.
  */
 export const knowledgeObserver = {
-  async observe(state: ObjectiveState, settled: boolean): Promise<void> {
+  async observe(
+    state: ObjectiveState,
+    settled: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
     const settings = knowledgeSettings();
-    if (settings) await observeObjective(settings, state, settled);
+    if (settings) await observeObjective(settings, state, settled, { signal });
   },
   release(state: ObjectiveState): void {
     const settings = knowledgeSettings();

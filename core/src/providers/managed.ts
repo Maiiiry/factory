@@ -49,6 +49,7 @@ import { create, extract, list } from "tar";
 import { crashPoint } from "../crash.js";
 import { hold } from "../engine.js";
 import { validPath } from "../objective.js";
+import { ContainedError, copyContained } from "../paths.js";
 import { errorMessage } from "../text.js";
 import type {
   Worker,
@@ -206,16 +207,32 @@ async function pack(
     // A tracked file the worker deleted is listed but absent.
     (path) => lstatSync(join(worktree, path), { throwIfNoEntry: false }),
   );
-  for (const path of paths)
-    if (!lstatSync(join(worktree, path)).isFile())
-      throw new PlannerError(
-        "hold",
-        `Managed workers carry regular files only, and ${path} is a link or other special file. Run this Work Item on a local worker provider, or cancel.`,
-      );
-  await create(
-    { cwd: worktree, file: archive, portable: true, noMtime: true },
-    paths,
-  );
+  // Each file is copied out through a descriptor opened without following
+  // a link on any part of its path, so a directory the worker replaced
+  // with a link can't put a host file in the archive; tar reads the copy.
+  const copies = `${archive}.files`;
+  try {
+    for (const path of paths) {
+      const copy = join(copies, path);
+      mkdirSync(dirname(copy), { recursive: true, mode: 0o700 });
+      try {
+        await copyContained(worktree, path, copy, Number.MAX_SAFE_INTEGER);
+      } catch (error) {
+        if (!(error instanceof ContainedError)) throw error;
+        throw new PlannerError(
+          "hold",
+          `Managed workers carry regular files only, reached without links, and ${path} isn't one (${error.message}). Run this Work Item on a local worker provider, or cancel.`,
+        );
+      }
+      chmodSync(copy, lstatSync(join(worktree, path)).mode & 0o777);
+    }
+    await create(
+      { cwd: copies, file: archive, portable: true, noMtime: true },
+      paths,
+    );
+  } finally {
+    rmSync(copies, { recursive: true, force: true });
+  }
   const bytes = readFileSync(archive);
   return {
     archive,
@@ -321,6 +338,10 @@ function statusFailure(
   status: number | undefined,
   what: string,
   key: string,
+  /** The response's Retry-After header, for a 429. */
+  retryAfter?: string | null,
+  /** The worker kind, named in a usage limit's wait. */
+  provider?: string,
 ): PlannerError {
   if (status === 401 || status === 403)
     return new PlannerError(
@@ -332,10 +353,31 @@ function statusFailure(
       "hold",
       `${what} refused the request (${status}); check the managed worker settings, then answer retry`,
     );
+  if (status === 429) {
+    // A rate limit that names its reset waits until then (CORE.md#Waits);
+    // without one it is an unknown transient cause and backs off.
+    const at = retryAt(retryAfter);
+    return new PlannerError(
+      "retry",
+      `${what} rate limit (429)`,
+      undefined,
+      at ? { kind: "reset", at, ...(provider ? { provider } : {}) } : undefined,
+    );
+  }
   return new PlannerError(
     "retry",
     `${what} failed${status ? ` (${status})` : ""}`,
   );
+}
+
+/** A Retry-After header (seconds or an HTTP date) as an ISO time. */
+function retryAt(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  const at = Number.isFinite(seconds)
+    ? Date.now() + seconds * 1000
+    : Date.parse(header);
+  return Number.isFinite(at) ? new Date(at).toISOString() : undefined;
 }
 
 /** A classified failure as the worker's outcome; anything else is retried. */
@@ -346,6 +388,7 @@ function outcome(error: unknown, signal: AbortSignal): WorkerResult {
         kind: "retry",
         reason: error.message,
         ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+        ...(error.wait && { wait: error.wait }),
       };
     return hold(error.message);
   }
@@ -641,6 +684,8 @@ export class OpenAIManagedWorker extends ManagedWorker {
         response.status,
         `OpenAI Agents API ${method} ${path}`,
         this.config.apiKeyEnv,
+        response.headers.get("retry-after"),
+        "openai-agents",
       );
     return response;
   }
@@ -895,6 +940,8 @@ export class ClaudeManagedWorker extends ManagedWorker {
               error.status,
               `Claude Managed Agents ${what}`,
               this.config.credentialEnv,
+              error.headers?.get("retry-after"),
+              "claude-managed-agents",
             )
           : new PlannerError(
               "retry",

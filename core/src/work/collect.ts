@@ -79,9 +79,8 @@ export interface CollectInput {
   /** The worker's last message, carried by an empty-result finding. */
   finalResponse: string;
   /**
-   * The tree a repair refused, when resubmitting it unchanged is empty.
-   * Omit it when the correction may be environmental, so the same tree is
-   * validated again.
+   * The tree of the result a repair refused: submitting that same tree
+   * again is no change.
    */
   refusedTree?: string;
   signal: AbortSignal;

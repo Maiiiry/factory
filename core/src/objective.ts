@@ -1,9 +1,15 @@
-import { githubEmptyField, markdownLines } from "./markdown.js";
+import {
+  type ObjectiveBlock,
+  type ShownOptions,
+  shownBlocks,
+} from "./shown.js";
 
 /**
  * The Objective checks. They run once when an Objective is first taken from
- * the queue, and planning uses the same functions. Each problem says how to
- * fix it.
+ * the queue, and planning uses the same functions. They read the shown
+ * structure (shown.ts): sections are GitHub's heading elements, bullets its
+ * list items, commands and paths its code elements. Each problem says how
+ * to fix it.
  */
 export interface SourceRef {
   path: string;
@@ -12,8 +18,18 @@ export interface SourceRef {
 
 export interface ParsedObjective {
   goal: string;
-  acceptance: string[];
+  /**
+   * Each Acceptance criterion: its shown text (code as backticked spans,
+   * emphasis and strikethrough with their markers) and, for a list item
+   * that is exactly one code element, its command.
+   */
+  acceptance: Criterion[];
   sources: SourceRef[];
+}
+
+export interface Criterion {
+  text: string;
+  command?: string;
 }
 
 const KNOWN = [
@@ -37,57 +53,69 @@ const RETIRED: Record<string, string> = {
 
 interface Section {
   name: string;
-  lines: { text: string; fenced: boolean }[];
+  blocks: ObjectiveBlock[];
 }
 
 /** Level-2 and level-3 sections. A heading that repeats its section's name continues it (issue forms do this). */
-function sections(body: string): Section[] {
+function sections(blocks: readonly ObjectiveBlock[]): Section[] {
   const result: Section[] = [];
-  for (const line of markdownLines(body)) {
-    const heading = line.heading;
-    if (heading && (heading.level === 2 || heading.level === 3)) {
-      const text = heading.text.toLowerCase();
+  for (const block of blocks) {
+    if (block.kind === "heading" && (block.level === 2 || block.level === 3)) {
+      const text = block.text.toLowerCase();
       const name = ALIASES[text] ?? text;
       const last = result[result.length - 1];
-      if (last && last.name === name && last.lines.every((l) => !l.text.trim()))
-        continue;
-      result.push({ name, lines: [] });
+      if (last && last.name === name && last.blocks.length === 0) continue;
+      result.push({ name, blocks: [] });
       continue;
     }
-    result[result.length - 1]?.lines.push(line);
+    result[result.length - 1]?.blocks.push(block);
   }
   return result;
 }
 
-/** The lines of the body's first section with this lower-case name. */
-export function objectiveSection(
-  body: string,
-  name: string,
-): Section["lines"] | undefined {
-  return sections(body).find((section) => section.name === name)?.lines;
+/** A block's shown text; a blank form field has none. */
+function blockText(block: ObjectiveBlock): string {
+  if (block.kind === "empty") return "";
+  if (block.kind === "item") return `- ${block.text}`;
+  return block.text;
 }
 
-function bullets(section: Section | undefined): string[] {
-  if (!section) return [];
-  const items: string[] = [];
-  for (const line of section.lines) {
-    const text = line.text.trim();
-    if (!text || githubEmptyField(line)) continue;
-    const bullet = text.match(/^(?:[-*]|\d+[.)])\s+(.+)$/);
-    if (bullet) items.push(bullet[1]!);
-    else if (items.length) items[items.length - 1] += ` ${text}`;
-    else items.push(text);
-  }
-  return items;
+/**
+ * A section's entries: each list item and each other shown block (a
+ * paragraph, quote, table or code block) on its own. A paragraph never
+ * joins an item: GitHub shows them apart.
+ */
+function bullets(
+  section: Section | undefined,
+): { text: string; code?: string; item: boolean }[] {
+  return (section?.blocks ?? []).flatMap((block) => {
+    if (block.kind === "empty" || block.kind === "heading") return [];
+    const text = block.text.replace(/\s+/g, " ").trim();
+    if (!text) return [];
+    const item = block.kind === "item";
+    return [
+      block.kind !== "code" && block.code !== undefined
+        ? { text, code: block.code, item }
+        : { text, item },
+    ];
+  });
 }
 
-/** Check the body's structure. Returns the parsed Objective and every problem found. */
-export function parseObjective(body: string): {
+/** Parse GitHub's rendering of an issue body (`body_html`) as an Objective. */
+export function parseShownObjective(
+  html: string,
+  options: ShownOptions,
+): { objective: ParsedObjective; problems: string[] } {
+  return checkObjective(shownBlocks(html, options));
+}
+
+/** Check the shown structure. Returns the parsed Objective and every problem found. */
+export function checkObjective(blocks: readonly ObjectiveBlock[]): {
   objective: ParsedObjective;
   problems: string[];
 } {
   const problems: string[] = [];
-  const all = sections(body);
+  const all = sections(blocks);
   const seen = new Set<string>();
   for (const section of all) {
     const retired = RETIRED[section.name];
@@ -102,23 +130,19 @@ export function parseObjective(body: string): {
     }
   }
   const find = (name: string) => all.find((s) => s.name === name);
-  const goal = (find("goal")?.lines ?? [])
-    .filter((l) => !githubEmptyField(l))
-    .map((l) => l.text)
-    .join("\n")
-    .trim();
+  const goal = (find("goal")?.blocks ?? []).map(blockText).join("\n").trim();
   if (!goal) problems.push("Add a Goal section with one paragraph.");
-  const acceptance = bullets(find("acceptance"));
-  if (acceptance.length === 0)
+  const criteria = bullets(find("acceptance"));
+  if (criteria.length === 0)
     problems.push(
       "Add an Acceptance section with at least one observable outcome bullet.",
     );
   const sources: SourceRef[] = [];
-  for (const line of bullets(find("sources"))) {
-    const value = line.match(/^`([^`]+)`$/)?.[1] ?? line;
+  for (const entry of bullets(find("sources"))) {
+    const value = entry.code ?? entry.text;
     if (/\s/.test(value.split("#")[0]!) || value.includes("`")) {
       problems.push(
-        `Sources entry ${JSON.stringify(line)} isn't a path; write "- path" or "- path#Exact Heading", one file per bullet, and put prose under Context.`,
+        `Sources entry ${JSON.stringify(entry.text)} isn't a path; write "- path" or "- path#Exact Heading", one file per bullet, and put prose under Context.`,
       );
       continue;
     }
@@ -127,13 +151,64 @@ export function parseObjective(body: string): {
     const heading = split < 0 ? undefined : value.slice(split + 1).trim();
     if (!validPath(path) || heading === "") {
       problems.push(
-        `Sources entry ${JSON.stringify(line)} isn't a valid repository path.`,
+        `Sources entry ${JSON.stringify(entry.text)} isn't a valid repository path.`,
       );
       continue;
     }
     sources.push(heading ? { path, heading } : { path });
   }
-  return { objective: { goal, acceptance, sources }, problems };
+  return {
+    objective: {
+      goal,
+      // A command is a list item only: a paragraph or quote is prose.
+      acceptance: criteria.map(({ text, code, item }) =>
+        item && code?.trim() ? { text, command: code } : { text },
+      ),
+      sources,
+    },
+    problems,
+  };
+}
+
+/**
+ * The entries of the one level-two or level-three section named `name`
+ * (lower case), up to the next heading of its level or above, or a problem.
+ * Undefined entries: no such section.
+ */
+export function declaration(
+  blocks: readonly ObjectiveBlock[],
+  name: string,
+  label: string,
+): { entries?: ObjectiveBlock[]; problem?: string } {
+  const matches = blocks.flatMap((block, index) =>
+    block.kind === "heading" && block.text.toLowerCase() === name
+      ? [index]
+      : [],
+  );
+  if (!matches.length) return {};
+  const start = matches[0]!;
+  const level = (blocks[start] as { level: number }).level;
+  // Same levels as the template sections: the issue form renders `###`.
+  if (matches.length !== 1 || ![2, 3].includes(level))
+    return { problem: `Use one level-two or level-three ${label} section.` };
+  const entries: ObjectiveBlock[] = [];
+  for (const block of blocks.slice(start + 1)) {
+    if (block.kind === "heading" && block.level <= level) break;
+    entries.push(block);
+  }
+  return { entries };
+}
+
+/** A declaration's only entry, when it has exactly one. */
+export function onlyEntry(
+  entries: readonly ObjectiveBlock[],
+): ObjectiveBlock | undefined {
+  return entries.length === 1 ? entries[0] : undefined;
+}
+
+/** The shown text of the whole Objective, code as backticked spans. */
+export function objectiveText(blocks: readonly ObjectiveBlock[]): string {
+  return blocks.map(blockText).join("\n");
 }
 
 /** A repository-relative path with no empty, `.` or `..` part. */

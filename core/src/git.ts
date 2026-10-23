@@ -120,27 +120,65 @@ export function pinnedGitExit(
   });
 }
 
+/** Runs one `git cat-file` with `input` on standard input; its output. */
+export type CatFile = (args: string[], input: string) => Promise<Buffer>;
+
 /**
- * The bodies `git cat-file --batch` printed for `count` requested objects,
- * each with its header line (`<oid> <type> <size>`).
+ * The exact bytes of these blobs, in order, from one `cat-file --batch`.
+ * Each header must be `<oid> blob <size>`: a missing object, or one that is
+ * not a blob, throws instead of misreading every object after it.
  */
-export function batchObjects(
-  output: Buffer,
-  count: number,
-): { header: string; body: Buffer }[] {
-  const objects: { header: string; body: Buffer }[] = [];
+export async function readBlobs(
+  catFile: CatFile,
+  oids: readonly string[],
+): Promise<Buffer[]> {
+  if (!oids.length) return [];
+  const output = await catFile(
+    ["cat-file", "--batch"],
+    oids.map((oid) => `${oid}\n`).join(""),
+  );
   let offset = 0;
-  for (let index = 0; index < count; index++) {
+  return oids.map((oid) => {
     const newline = output.indexOf(10, offset);
-    const header = output.subarray(offset, newline).toString("utf8");
-    const size = Number(header.split(" ")[2]);
-    objects.push({
-      header,
-      body: output.subarray(newline + 1, newline + 1 + size),
-    });
-    offset = newline + 1 + size + 1;
+    const header = output
+      .subarray(offset, newline < 0 ? undefined : newline)
+      .toString("utf8");
+    const [named, type, size] = header.split(" ");
+    const bytes = Number(size);
+    const end = newline + 1 + bytes;
+    if (
+      newline < 0 ||
+      named !== oid ||
+      type !== "blob" ||
+      !Number.isSafeInteger(bytes) ||
+      end > output.length
+    )
+      throw new Error(`git cat-file returned "${header}" for ${oid}`);
+    offset = end + 1;
+    return output.subarray(newline + 1, end);
+  });
+}
+
+/**
+ * The sizes of these objects that are blobs, by object id, from one
+ * `cat-file --batch-check`; a missing object or a non-blob has no entry.
+ */
+export async function blobSizes(
+  catFile: CatFile,
+  oids: readonly string[],
+): Promise<Map<string, number>> {
+  const sizes = new Map<string, number>();
+  if (!oids.length) return sizes;
+  const output = await catFile(
+    ["cat-file", "--batch-check"],
+    oids.map((oid) => `${oid}\n`).join(""),
+  );
+  for (const line of output.toString("utf8").split("\n")) {
+    const [oid, type, size] = line.split(" ");
+    if (oid && type === "blob" && Number.isSafeInteger(Number(size)))
+      sizes.set(oid, Number(size));
   }
-  return objects;
+  return sizes;
 }
 
 /** The lowercase hex SHA-256 of `bytes`. */
@@ -214,4 +252,226 @@ export async function defaultHead(
       `git fetch in ${checkout}: ${errorMessage(error)}`,
     );
   }
+}
+
+/**
+ * The shortest whole secret value a push is refused for. Redaction
+ * (config.ts MIN_SECRET_LENGTH) goes lower: hiding a short value from a
+ * comment is harmless, but refusing every file that contains one isn't.
+ */
+const MIN_REFUSED_SECRET = 8;
+
+/** The shortest piece of a multi-line secret a push is refused for. */
+const MIN_REFUSED_PIECE = 16;
+
+/** A PEM armor line, the same in every key. */
+const PEM_ARMOR = /^-----(?:BEGIN|END) [A-Z0-9 ]+-----$/;
+
+/**
+ * Whether a piece of a multi-line secret looks like key material: mixed
+ * case and digits (base64), or long hex, with high entropy. JSON keys,
+ * well-known URLs and other lowercase words don't qualify.
+ */
+function keyMaterial(piece: string): boolean {
+  if (piece.length < MIN_REFUSED_PIECE || PEM_ARMOR.test(piece)) return false;
+  const mixed = /[a-z]/.test(piece) && /[A-Z]/.test(piece) && /\d/.test(piece);
+  if (!mixed && !/^[0-9a-fA-F]{32,}$/.test(piece)) return false;
+  const counts = new Map<string, number>();
+  for (const c of piece) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let bits = 0;
+  for (const n of counts.values())
+    bits -= (n / piece.length) * Math.log2(n / piece.length);
+  return bits >= 3.5;
+}
+
+/**
+ * The byte strings a push is refused for, as written and base64: each
+ * whole secret value, and the pieces of a multi-line one (a PEM key, a
+ * service-account JSON) that are key material, so a fixture holding PEM
+ * armor or a common JSON line isn't refused.
+ */
+function secretNeedles(secrets: readonly string[]): {
+  exact: Buffer[];
+  encoded: Buffer[];
+} {
+  const values = new Set<string>();
+  for (const secret of secrets) {
+    if (secret.length >= MIN_REFUSED_SECRET) values.add(secret);
+    if (!/[\r\n]/.test(secret)) continue;
+    for (const line of secret.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (keyMaterial(trimmed)) values.add(trimmed);
+      for (const token of trimmed.split(/[\s"',:;{}[\]=]+/))
+        if (keyMaterial(token)) values.add(token);
+    }
+  }
+  const exact: Buffer[] = [];
+  const encoded = new Set<string>();
+  for (const value of values) {
+    const bytes = Buffer.from(value);
+    exact.push(bytes);
+    // At each byte alignment: only the characters the value alone decides.
+    for (const shift of [0, 1, 2]) {
+      const text = Buffer.concat([Buffer.alloc(shift), bytes]).toString(
+        "base64",
+      );
+      const whole = Math.floor((shift + bytes.length) / 3) * 4;
+      const core = text.slice([0, 2, 3][shift], whole);
+      if (core.length < 8) continue;
+      encoded.add(core);
+      encoded.add(core.replace(/\+/g, "-").replace(/\//g, "_"));
+    }
+  }
+  return { exact, encoded: [...encoded].map((text) => Buffer.from(text)) };
+}
+
+/** Finds any needle in a stream of chunks, keeping only a needle's length of tail. */
+class StreamSearch {
+  private tail: Buffer = Buffer.alloc(0);
+  private readonly keep: number;
+  found = false;
+  constructor(private readonly needles: readonly Buffer[]) {
+    this.keep = Math.max(0, ...needles.map((needle) => needle.length - 1));
+  }
+  feed(chunk: Buffer): void {
+    if (this.found || !this.needles.length) return;
+    const text = Buffer.concat([this.tail, chunk]);
+    this.found = this.needles.some((needle) => text.includes(needle));
+    this.tail = text.subarray(Math.max(0, text.length - this.keep));
+  }
+}
+
+/**
+ * A search of one stream of bytes for the values of `secrets`
+ * (config.secrets, secretNeedles): as written, or
+ * base64 (standard or URL-safe, at any alignment, line breaks ignored).
+ * Memory stays bounded by the longest needle, whatever the stream's size.
+ */
+export function secretSearch(secrets: readonly string[]): () => {
+  feed(chunk: Buffer): void;
+  readonly found: boolean;
+} {
+  const { exact, encoded } = secretNeedles(secrets);
+  return () => {
+    const raw = new StreamSearch(exact);
+    const flat = new StreamSearch(encoded);
+    return {
+      feed(chunk: Buffer) {
+        raw.feed(chunk);
+        flat.feed(
+          Buffer.from(
+            chunk.toString("latin1").replace(/[\r\n]/g, ""),
+            "latin1",
+          ),
+        );
+      },
+      get found() {
+        return raw.found || flat.found;
+      },
+    };
+  };
+}
+
+/**
+ * The paths whose content `commit` adds or changes against `base` that
+ * hold a value of `secrets` (secretSearch). Blobs stream through one
+ * `cat-file --batch`. Throws when Git fails.
+ */
+export async function pathsHoldingSecrets(
+  directory: string,
+  base: string,
+  commit: string,
+  secrets: readonly string[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (!secrets.length) return [];
+  const diff = await pinnedGitExit(
+    directory,
+    [
+      "diff-tree",
+      "-r",
+      "-z",
+      "--no-renames",
+      "--no-commit-id",
+      "--diff-filter=ACMT",
+      base,
+      commit,
+    ],
+    signal ? { signal } : {},
+  );
+  if (diff.code !== 0)
+    throw new Error(`git diff-tree ${base} ${commit}: ${diff.stderr}`);
+  const fields = diff.stdout.toString("utf8").split("\0");
+  const paths = new Map<string, string[]>();
+  for (let at = 0; at + 1 < fields.length; at += 2) {
+    const [, mode, , oid] = fields[at]!.split(" ");
+    if (!oid || mode === "160000") continue;
+    paths.set(oid, [...(paths.get(oid) ?? []), fields[at + 1]!]);
+  }
+  const oids = [...paths.keys()];
+  if (!oids.length) return [];
+  const search = secretSearch(secrets);
+  const holding: string[] = [];
+  await new Promise<void>((done, failed) => {
+    const child = spawn("git", ["-C", directory, "cat-file", "--batch"], {
+      env: gitEnvironment(),
+      stdio: ["pipe", "pipe", "ignore"],
+      ...(signal ? { signal } : {}),
+    });
+    let index = 0;
+    let pending: Buffer = Buffer.alloc(0);
+    let remaining = -1; // -1: reading a header; 0: the newline after the content.
+    let blob = search();
+    let broken: Error | undefined;
+    child.stdout.on("data", (chunk: Buffer) => {
+      let buffer: Buffer = pending.length
+        ? Buffer.concat([pending, chunk])
+        : chunk;
+      pending = Buffer.alloc(0);
+      while (buffer.length && !broken) {
+        if (remaining < 0) {
+          const newline = buffer.indexOf(10);
+          if (newline < 0) {
+            pending = buffer;
+            return;
+          }
+          const header = buffer.subarray(0, newline).toString("utf8");
+          const [named, type, size] = header.split(" ");
+          if (named !== oids[index] || type !== "blob" || !size) {
+            broken = new Error(`git cat-file returned "${header}"`);
+            child.kill();
+            return;
+          }
+          remaining = Number(size);
+          blob = search();
+          buffer = buffer.subarray(newline + 1);
+          continue;
+        }
+        if (remaining > 0) {
+          const part = buffer.subarray(0, remaining);
+          blob.feed(part);
+          remaining -= part.length;
+          buffer = buffer.subarray(part.length);
+          continue;
+        }
+        // The newline that ends the content.
+        buffer = buffer.subarray(1);
+        if (blob.found) holding.push(...paths.get(oids[index]!)!);
+        index += 1;
+        remaining = -1;
+      }
+    });
+    child.on("error", failed);
+    child.on("close", (code) => {
+      if (broken) failed(broken);
+      else if (code !== 0 || index !== oids.length)
+        failed(new Error(`git cat-file --batch exited ${code}`));
+      else done();
+    });
+    child.stdin.on("error", () => {
+      // git may exit before reading stdin; its exit code reports the failure.
+    });
+    child.stdin.end(oids.map((oid) => `${oid}\n`).join(""));
+  });
+  return holding.sort();
 }

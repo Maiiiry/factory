@@ -14,31 +14,41 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome } from "./engine.js";
-import { defaultHead, type GitExit, operatorGit } from "./git.js";
+import {
+  defaultHead,
+  operatorGit,
+  pathsHoldingSecrets,
+  pinnedGitExit,
+  sha256,
+} from "./git.js";
 import {
   type AsyncMerge,
   type CheckRun,
   type GitHub,
   GitHubError,
+  githubOutcome,
   type PullRequest,
   type Stack,
   TransientError,
   Unreadable,
 } from "./github.js";
 import { redact } from "./log.js";
-import { lfsPushIfPointers } from "./media.js";
+import { lfsObjectsHoldingSecrets, lfsPushIfPointers } from "./media.js";
 import { BaseFiles, workflowCheckNames } from "./planning/facts.js";
 import type { WorkItem } from "./planning/types.js";
 import { errorMessage } from "./text.js";
-import { GitRefusal, hostGit, hostGitExit, originProblem } from "./worktree.js";
+import { FACTORY_EMAIL } from "./work/collect.js";
+import { GitRefusal, hostGit, isAncestor, originProblem } from "./worktree.js";
 
 const MINUTE = 60_000;
 /** How long GitHub may not yet show what Factory just did. */
 const GITHUB_LAG_MS = 2 * MINUTE;
-/** How long a newly pushed head may show no checks before Factory asks. */
-const CHECK_SETTLE_MS = 20 * MINUTE;
-/** Checks pending with the same set this long become a question. */
-const ESCALATE_AFTER_MS = 24 * 60 * MINUTE;
+/**
+ * How long a newly pushed head may show no run or status of a check it
+ * needs before Factory asks: a check that never registers, or a workflow
+ * that didn't trigger, needs a person (CORE.md#Waits).
+ */
+const CHECK_SETTLE_MS = 15 * MINUTE;
 const CI_POLL_MS = 20_000;
 /** How long a fetched default-branch head serves renamed-check lookups. */
 const DEFAULT_HEAD_REUSE_MS = 10 * MINUTE;
@@ -85,6 +95,15 @@ export interface Repair {
  *   the new PR's number reaches the later steps.
  */
 export const REPUBLISH = "republish";
+
+/**
+ * The answer that replaces a Factory branch holding commits Factory did not
+ * make with the current result: the publish step passes `reset: true`.
+ */
+export const RESET_BRANCH = "reset";
+
+/** Commits beyond the default branch checked for Factory's ownership; more is not Factory's. */
+const MAX_OWNED_COMMITS = 250;
 
 /**
  * GitHub has no commits between the default branch and the result: the
@@ -144,6 +163,12 @@ export interface PublishInput {
   };
   /** The operator answered REPUBLISH to this step's question. */
   republish?: boolean;
+  /** The operator answered RESET_BRANCH: replace the branch whoever made it. */
+  reset?: boolean;
+  /** The values no pushed blob may hold (config.secrets). */
+  secrets: readonly string[];
+  /** The digest of a secret finding the operator let through (`publish`). */
+  allowSecret?: string;
   /**
    * The PR's base: omitted (the default branch) for a regular item or the
    * bottom layer of a native stack; the predecessor layer's branch
@@ -179,6 +204,11 @@ export type PublishResult =
       merged: boolean;
     }
   | Empty
+  /**
+   * A blob the push would add holds a secret value; nothing was pushed.
+   * `digest` names this finding on this commit, for the operator's answer.
+   */
+  | { kind: "secret"; finding: string; digest: string }
   | Retry
   | Repair
   | Hold;
@@ -193,8 +223,14 @@ export type PublishResult =
  * no object is a `repair`. The PR is found by its head branch; only when
  * there is none is one opened, so a lost create is found by the next run.
  *
+ * Before a push, a blob the result adds or changes that holds a value of
+ * `secrets` stops it: `secret`, unless `allowSecret` is that finding's
+ * digest.
+ *
  * Outcomes for the publish step: `published` → done; `empty` and `repair`
- * → the item's delivery repair with the finding; `retry` and `hold` as
+ * → the item's delivery repair with the finding; `secret` → a hold whose
+ * `repair` answer sends the finding to the worker and whose `publish`
+ * answer lets exactly that finding through; `retry` and `hold` as
  * they are.
  */
 export function publish(
@@ -206,10 +242,11 @@ export function publish(
     const branch = itemBranch(input.issue, input.item.id);
     const origin = await originHold(context);
     if (origin) return origin;
-    const { expected: baseBranch, bases } = await acceptedBases(
-      context,
-      input.baseBranch,
-    );
+    const {
+      expected: baseBranch,
+      defaultBranch,
+      bases,
+    } = await acceptedBases(context, input.baseBranch);
     const current = new Set([input.commit]);
     const earlier = new Set(
       input.pushedHeads.filter((h) => h !== input.commit),
@@ -239,11 +276,46 @@ export function publish(
     // The branch's head once pushed: the commit, or GitHub's update of it.
     let delivered = remote ?? input.commit;
     if (!remote || !(await updates(context, remote, current, bases))) {
-      if (remote && !(await updates(context, remote, earlier, bases)))
+      // A branch whose every commit Factory made (a head of an earlier run,
+      // before a replan or a re-queue) is Factory's own: the push below
+      // resets it, with a lease on exactly that head. Anyone else's commit
+      // on it is never overwritten without the operator's answer.
+      if (
+        remote &&
+        !input.reset &&
+        !(await updates(context, remote, earlier, bases)) &&
+        !(await factoryMade(context, remote, defaultBranch, bases))
+      )
         return hold(
-          `Remote branch ${branch} holds a commit Factory did not push (${remote}; Factory pushed ${[...known].join(", ")}). Inspect it; delete or restore the branch and answer retry, or cancel.`,
-          ["cancel", "retry"],
+          `Remote branch ${branch} holds commits Factory did not make (head ${remote}; Factory pushed ${[...known].join(", ")}). Move them off the branch and answer retry; answer ${RESET_BRANCH} to replace the branch with Factory's result, dropping them from it; or cancel.`,
+          ["retry", RESET_BRANCH, "cancel"],
         );
+      // Nothing Factory pushes carries a secret value it knows (config.secrets).
+      const leaked = [
+        ...(await pathsHoldingSecrets(
+          context.checkout,
+          input.base,
+          input.commit,
+          input.secrets,
+          signal,
+        )),
+        ...(await lfsObjectsHoldingSecrets(
+          context.checkout,
+          input.base,
+          input.commit,
+          input.secrets,
+          signal,
+        )),
+      ];
+      if (leaked.length) {
+        const finding = `The result writes the value of a secret Factory redacts (a policy.allowedSecretNames variable or a managed provider's credential), as written or base64-encoded, into ${leaked.map((path) => JSON.stringify(path)).join(", ")}. Remove it from those files and never write a secret's value into the repository.`;
+        const digest = sha256(Buffer.from(`${input.commit}\n${finding}`)).slice(
+          0,
+          16,
+        );
+        if (input.allowSecret !== digest)
+          return { kind: "secret", finding, digest };
+      }
       // Only before a push: a branch that holds the result already has its objects.
       const media = await lfsPushIfPointers({
         checkout: context.checkout,
@@ -294,22 +366,20 @@ export function publish(
         signal,
       );
     } catch (error) {
-      // The branch adds nothing to the default branch: an empty change.
-      if (
-        error instanceof GitHubError &&
-        error.status === 422 &&
-        /No commits between/i.test(error.message)
-      )
+      if (!(error instanceof GitHubError && error.status === 422))
+        throw needing(error, "Pull requests: write");
+      // GitHub's compare status decides, not its error text: a result
+      // identical to or behind the base adds nothing, an empty change.
+      const status = await github.compare(baseBranch, input.commit, signal);
+      if (status === "identical" || status === "behind")
         return {
           kind: "empty",
-          finding: `The result ${input.commit} adds no commits to ${baseBranch} (GitHub: ${error.message.slice(0, 300)}). The Work Item's change is empty or already on ${baseBranch}: make the change the Work Item asks for.`,
+          finding: `The result ${input.commit} adds no commits to ${baseBranch} (GitHub compares it as ${status}). The Work Item's change is empty or already on ${baseBranch}: make the change the Work Item asks for.`,
         };
       // A PR for the branch exists already (a create whose answer was lost).
-      if (error instanceof GitHubError && error.status === 422)
-        return retry(
-          `GitHub refused a second PR for ${branch}: ${error.message}`,
-        );
-      throw needing(error, "Pull requests: write");
+      return retry(
+        `GitHub refused a second PR for ${branch}: ${error.message}`,
+      );
     }
     crashPoint("deliver:pr-create:after");
     return {
@@ -319,6 +389,93 @@ export function publish(
       merged: false,
     };
   });
+}
+
+/**
+ * Whether Factory made every commit `remote` has beyond the default branch:
+ * each is committed as FACTORY_EMAIL (Factory commits with a clean Git
+ * environment; an amend, rebase or cherry-pick by anyone else changes the
+ * committer), or is GitHub's update-branch merge (updateMerge) whose first
+ * parent is one of those commits and whose other is on one of the item's
+ * accepted `bases` (a stack layer's predecessor branch too), as updates()
+ * accepts. The whole range is read; a range too long to read is not
+ * Factory's.
+ */
+async function factoryMade(
+  context: DeliveryContext,
+  remote: string,
+  defaultBranch: string,
+  bases: readonly string[],
+): Promise<boolean> {
+  const { total, commits } = await context.github.commitsBeyond(
+    defaultBranch,
+    remote,
+    MAX_OWNED_COMMITS,
+    context.signal,
+  );
+  if (total > commits.length) return false;
+  const range = new Set(commits.map((commit) => commit.sha));
+  for (const commit of commits)
+    if (
+      commit.committerEmail !== FACTORY_EMAIL &&
+      !(
+        range.has(commit.parents[0] ?? "") &&
+        (await updateMerge(context, commit, bases))
+      )
+    )
+      return false;
+  return true;
+}
+
+/**
+ * Delete Factory's branch once its PR merged (a native stack's layers once
+ * the whole unit merged) or cancel closed it. Only a branch whose every
+ * commit beyond the default branch is Factory's (factoryMade) goes, by a
+ * push with a lease on the head read, so a commit pushed meanwhile keeps
+ * it. A branch already gone (GitHub's auto-delete, or a run before a
+ * crash) is done. Returns why a branch was kept; a refused delete never
+ * blocks the step. A failure to reach origin throws, for a retry.
+ * `baseBranch` is a stack layer's predecessor branch, as for publish.
+ */
+export async function deleteFactoryBranch(
+  context: DeliveryContext,
+  branch: string,
+  point: string,
+  baseBranch?: string,
+): Promise<string | undefined> {
+  const remote = await remoteHead(context, branch);
+  if (!remote) return undefined;
+  const { defaultBranch, bases } = await acceptedBases(context, baseBranch);
+  if (!(await factoryMade(context, remote, defaultBranch, bases)))
+    return `${branch} holds commits Factory did not make`;
+  crashPoint(`${point}:before`);
+  try {
+    await remoteGit(context, [
+      "push",
+      "--porcelain",
+      `--force-with-lease=refs/heads/${branch}:${remote}`,
+      "origin",
+      `:refs/heads/${branch}`,
+    ]);
+  } catch (error) {
+    if (context.signal.aborted) throw error;
+    const refused = pushRefusal(
+      (error as { stdout?: unknown }).stdout?.toString() ?? "",
+    );
+    if (!refused)
+      throw new TransientError(
+        `git push --delete ${branch}: ${message(error)}`,
+      );
+    if (!(await remoteHead(context, branch))) return undefined;
+    return `the remote refused deleting ${branch} (${refused})`;
+  }
+  crashPoint(`${point}:after`);
+  return undefined;
+}
+
+/** The hidden marker in the body of every PR Factory opens. */
+function pullMarker(issue: number, item: string): string {
+  return `<!-- factory:${issue}:pr:${item} -->`;
 }
 
 /** Push with a lease on `remote`; undefined once the branch holds `commit`. */
@@ -494,6 +651,7 @@ async function pullRequestBody(
     );
   parts.push(
     `Candidate commit: ${code(input.commit)}\n\nCandidate tree: ${code(input.tree)}`,
+    pullMarker(input.issue, input.item.id),
   );
   return parts.join("\n\n");
 }
@@ -534,8 +692,10 @@ export type CiResult =
  * (#1637). Each plan-named check must pass by name. A PR BEHIND its base
  * under strict protection is updated by GitHub and observed again. A PR
  * made a draft, closed without merging, with only cancelled checks nothing
- * re-ran, with the same checks pending for a day, or with no checks at all,
- * is a question (#1640).
+ * re-ran, with a needed check that never registered, or with no checks at
+ * all, is a question (#1640). Checks queued or running are a transient
+ * wait; an environment approval or a required review is a human gate the
+ * engine waits on without a deadline (CORE.md#Waits).
  */
 export function observeCi(
   context: DeliveryContext,
@@ -652,20 +812,20 @@ async function judge(
       finding: `PR #${pr} conflicts with its base branch; rebase the change`,
       conflict: {},
     };
-  // GitHub can report a PR CLEAN before a required check registers on its
-  // head. A required check with no run and no status yet is pending (#626).
+  // A required check with no run and no status yet is pending, whatever
+  // GitHub's readiness says: CLEAN can come before it registers (#626), and
+  // a missing one makes the PR BLOCKED. Missing required checks are judged
+  // before any gate, so one that never registers reaches the hold below
+  // instead of reading as a wait for a review.
   const reported = new Set<string>(
     [
       ...runs.map((run) => run.name),
       ...statuses.map((status) => status.context),
     ].filter((name): name is string => typeof name === "string" && !!name),
   );
-  const unreported =
-    readiness === "ready"
-      ? (await github.requiredChecks(baseBranch, signal)).filter(
-          (name) => !reported.has(name),
-        )
-      : [];
+  const unreported = (await github.requiredChecks(baseBranch, signal)).filter(
+    (name) => !reported.has(name),
+  );
   const pending = [
     ...new Set([
       ...runs
@@ -702,36 +862,44 @@ async function judge(
       unreported,
     );
     if (renamed) return renamed;
-    // A check held for an approval or a runner, a status nobody completes,
-    // or a plan-named check that never runs or settles without success,
-    // never settles on its own: after a day with the same pending set, ask.
-    // A time GitHub doesn't show counts from when this wait began retrying.
-    const times = [
-      ...runs
-        .filter((run) => run.status !== "completed")
-        .map((run) => run.started_at),
-      ...runs
-        .filter((run) => run.status === "completed" && named.includes(run.name))
-        .map((run) => run.completed_at),
-      ...statuses
-        .filter((status) => status.state === "pending")
-        .map((status) => status.updated_at),
-      ...(unreported.length || absent.length
-        ? [await github.pushTime(pull.head.ref, head, signal)]
-        : []),
-    ].map((time) => (typeof time === "string" ? Date.parse(time) : Number.NaN));
-    const began = Date.parse(context.retryingSince ?? "");
-    // NaN only before the first retry is recorded: the next poll decides.
-    const since = Math.max(
-      ...(times.length ? times : [began]).map((time) =>
-        Number.isFinite(time) ? time : began,
-      ),
-    );
-    if (Date.now() - since >= ESCALATE_AFTER_MS)
-      return hold(
-        `Checks on PR #${pr} have been pending since ${new Date(since).toISOString()}: ${pending.join(", ") || named.join(", ") || "unnamed"}. Complete or re-run them, or merge the PR by hand, then answer retry; or cancel.`,
-      );
-    return { kind: "retry", reason: waiting, afterMs: CI_POLL_MS };
+    // A required or plan-named check with no run or status a while after
+    // the push never registered: a person must trigger or fix it.
+    const missing = [...new Set([...unreported, ...absent])];
+    if (missing.length) {
+      const pushedAt = await github.pushTime(pull.head.ref, head, signal);
+      const from = Number.isFinite(Date.parse(pushedAt ?? ""))
+        ? Date.parse(pushedAt!)
+        : Date.parse(context.retryingSince ?? "");
+      if (Number.isFinite(from) && Date.now() - from >= CHECK_SETTLE_MS)
+        return hold(
+          `Check ${bounded(
+            missing.map((name) => JSON.stringify(name)),
+            ", ",
+          )} has no run or status on PR #${pr}'s head ${head} ${CHECK_SETTLE_MS / MINUTE} minutes after ${pushedAt ? `its push at ${pushedAt}` : "Factory began waiting"}, though ${absent.length ? "the plan" : "branch protection"} requires it. Trigger or fix the workflow that reports it, then answer retry; or cancel.`,
+        );
+    }
+    // Jobs held for an environment's approval, or a review the branch
+    // requires once every required check is there: people outside Factory
+    // decide, so there is no deadline.
+    const approvals = runs
+      .filter((run) => run.status === "waiting")
+      .map((run) => run.name);
+    const gate = approvals.length
+      ? `an environment approval for ${bounded(approvals, ", ")} on PR #${pr}`
+      : readiness === "waiting" &&
+          !pending.length &&
+          !named.length &&
+          ["REVIEW_REQUIRED", "CHANGES_REQUESTED"].includes(
+            state.reviewDecision ?? "",
+          )
+        ? `a required review on PR #${pr}`
+        : undefined;
+    return {
+      kind: "retry",
+      reason: gate ? `Waiting on ${gate}` : waiting,
+      afterMs: CI_POLL_MS,
+      ...(gate ? { wait: { kind: "gate", gate } } : {}),
+    };
   }
   const unregistered = await unregisteredChecks(
     context,
@@ -948,8 +1116,10 @@ async function unregisteredChecks(
   const pr = pull.number;
   const pushedAt = await github.pushTime(pull.head.ref, head, signal);
   let actions: "running" | "failed" | "completed" | "none" | undefined;
+  let approval = false;
   if (others) {
     const workflows = await github.workflowRuns(head, signal);
+    approval = Boolean(workflows?.some((run) => run?.status === "waiting"));
     actions = !workflows
       ? undefined
       : workflows.some((run) => run?.status !== "completed")
@@ -970,13 +1140,22 @@ async function unregisteredChecks(
       `Actions workflow runs on PR #${pr}'s head ${head} ended without jobs or success (a startup failure, or awaiting approval). Fix or approve them, then answer retry; or merge the PR by hand, then answer retry; or cancel.`,
     );
   const question = others
-    ? `No Actions checks registered on PR #${pr}'s head ${head}, and GitHub does not show ${actions === "running" ? "its runs finishing" : "when it was pushed or its Actions runs"}. Inspect its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`
+    ? `No Actions checks registered on PR #${pr}'s head ${head}, and GitHub does not show when it was pushed or its Actions runs. Inspect its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`
     : `No checks registered on PR #${pr}'s head ${head}: does a path filter or a push-only workflow skip it? Add or fix its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`;
   const pushed = Date.parse(pushedAt ?? "");
-  // A run held for a concurrency group or a runner: wait, for a day at most.
+  // A run held for a concurrency group or a runner is a transient wait; one
+  // held for an environment's approval waits on that person.
   if (actions === "running")
-    return Date.now() - pushed >= ESCALATE_AFTER_MS
-      ? hold(question)
+    return approval
+      ? {
+          kind: "retry",
+          reason: `Waiting on an environment approval for Actions workflow runs on PR #${pr}`,
+          afterMs: CI_POLL_MS,
+          wait: {
+            kind: "gate",
+            gate: `an environment approval for Actions workflow runs on PR #${pr}`,
+          },
+        }
       : {
           kind: "retry",
           reason: `Awaiting Actions workflow runs on PR #${pr} to start their jobs`,
@@ -1062,9 +1241,9 @@ async function deliveredHead(
 }
 
 /**
- * Whether `sha` is one of `heads`, or GitHub's update-branch of one: a
- * merge committed by web-flow whose first parent is the earlier head and
- * whose second is on one of the base branches, followed back a few updates.
+ * Whether `sha` is one of `heads`, or GitHub's update-branch of one
+ * (updateMerge) whose first parent is the earlier head, followed back a
+ * few updates.
  */
 async function updates(
   context: DeliveryContext,
@@ -1076,31 +1255,78 @@ async function updates(
     if (heads.has(sha)) return true;
     if (!heads.size || !/^[a-f0-9]{40}$/.test(sha)) return false;
     const commit = await context.github.commit(sha, context.signal);
-    const [first, merged] = commit.parents;
-    if (
-      commit.sha !== sha ||
-      commit.parents.length !== 2 ||
-      commit.committer !== "web-flow" ||
-      !first ||
-      !merged
-    )
+    if (commit.sha !== sha || !(await updateMerge(context, commit, bases)))
       return false;
-    let onBase = false;
-    for (const base of bases) {
-      const compared = await context.github.compare(
-        merged,
-        base,
-        context.signal,
-      );
-      if (compared === "identical" || compared === "ahead") {
-        onBase = true;
-        break;
-      }
-    }
-    if (!onBase) return false;
-    sha = first;
+    sha = commit.parents[0]!;
   }
   return false;
+}
+
+/**
+ * Whether `commit` is GitHub's update-branch merge and nothing more: two
+ * parents, committed by web-flow, the second on one of `bases`, and its
+ * tree exactly what `git merge-tree` makes of the two parents. Anyone can
+ * commit as web-flow (GitHub attributes noreply@github.com to it); only
+ * the tree check shows the merge adds nothing of its own. The commit is
+ * fetched from origin when the checkout lacks it.
+ */
+async function updateMerge(
+  context: DeliveryContext,
+  commit: { sha: string; parents: string[]; committer?: string },
+  bases: readonly string[],
+): Promise<boolean> {
+  const [first, merged] = commit.parents;
+  if (
+    commit.parents.length !== 2 ||
+    commit.committer !== "web-flow" ||
+    !first ||
+    !merged ||
+    !/^[a-f0-9]{40}$/.test(commit.sha)
+  )
+    return false;
+  let onBase = false;
+  for (const base of bases) {
+    const compared = await context.github.compare(merged, base, context.signal);
+    if (compared === "identical" || compared === "ahead") {
+      onBase = true;
+      break;
+    }
+  }
+  if (!onBase) return false;
+  const git = (args: string[]) =>
+    pinnedGitExit(context.checkout, args, { signal: context.signal });
+  if ((await git(["cat-file", "-e", `${commit.sha}^{commit}`])).code !== 0)
+    try {
+      await remoteGit(context, [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "origin",
+        commit.sha,
+      ]);
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw new TransientError(`git fetch ${commit.sha}: ${message(error)}`);
+    }
+  const local = await git([
+    "rev-parse",
+    `${commit.sha}^1`,
+    `${commit.sha}^2`,
+    `${commit.sha}^{tree}`,
+  ]);
+  const [one, two, tree] = local.stdout.toString("utf8").trim().split("\n");
+  if (local.code !== 0 || one !== first || two !== merged || !tree)
+    throw new TransientError(
+      `git can't read the parents and tree of ${commit.sha}: ${local.stderr}`,
+    );
+  const made = await git(["merge-tree", "--write-tree", first, merged]);
+  // 1: the parents conflict, so no merge GitHub made can be this one.
+  if (made.code === 1) return false;
+  if (made.code !== 0)
+    throw new TransientError(
+      `git merge-tree ${first} ${merged}: ${made.stderr}`,
+    );
+  return made.stdout.toString("utf8").split("\n")[0] === tree;
 }
 
 // ── Merge ───────────────────────────────────────────────────────────────
@@ -1240,7 +1466,7 @@ async function integrate(
   mergeSha: string,
 ): Promise<Extract<MergeResult, { kind: "merged" }> | Retry | Hold> {
   const tip = await defaultHead(context.checkout, context.signal);
-  if (!(await ancestor(context, mergeSha, tip)))
+  if (!(await isAncestor(context.checkout, mergeSha, tip, context.signal)))
     return lagging(
       context,
       `The default branch does not show the merge of PR #${pr} (${mergeSha}) yet`,
@@ -1250,39 +1476,13 @@ async function integrate(
   if (
     !integrated ||
     integrated === mergeSha ||
-    (await ancestor(context, integrated, mergeSha))
+    (await isAncestor(context.checkout, integrated, mergeSha, context.signal))
   )
     return { kind: "merged", mergeSha, integratedSha: mergeSha };
-  if (await ancestor(context, mergeSha, integrated))
+  if (await isAncestor(context.checkout, mergeSha, integrated, context.signal))
     return { kind: "merged", mergeSha, integratedSha: integrated };
   return hold(
     `The merge of PR #${pr} (${mergeSha}) and Factory's integrated head ${integrated} have diverged. Inspect the default branch, then answer retry; or cancel.`,
-  );
-}
-
-/** `git merge-base --is-ancestor`: exit 1 is no, anything else but 0 is an error. */
-async function ancestor(
-  context: DeliveryContext,
-  older: string,
-  newer: string,
-): Promise<boolean> {
-  let result: GitExit;
-  try {
-    result = await hostGitExit(
-      context.checkout,
-      ["merge-base", "--is-ancestor", older, newer],
-      { signal: context.signal, timeoutMs: MINUTE },
-    );
-  } catch (error) {
-    if (context.signal.aborted || error instanceof GitRefusal) throw error;
-    throw new TransientError(
-      `git merge-base --is-ancestor ${older} ${newer}: ${message(error)}`,
-    );
-  }
-  if (result.code === 0) return true;
-  if (result.code === 1) return false;
-  throw new TransientError(
-    `git merge-base --is-ancestor ${older} ${newer} ${result.code === null ? `ended by ${result.signal}` : `exited ${result.code}`}: ${result.stderr}`,
   );
 }
 
@@ -1421,7 +1621,7 @@ async function acceptUnit(
     if (judged.kind !== "ready") return pin(judged, layer);
     const sha = await github.mergeCommitOf(layer.pr, signal);
     if (!sha) missing.push(`PR #${layer.pr} names no merge commit`);
-    else if (!(await ancestor(context, sha, tip)))
+    else if (!(await isAncestor(context.checkout, sha, tip, context.signal)))
       missing.push(
         `PR #${layer.pr}'s merge ${sha} is not on the default branch (${tip})`,
       );
@@ -1438,7 +1638,8 @@ async function acceptUnit(
     );
   let latest = shas[0]!;
   for (const sha of shas.slice(1))
-    if (await ancestor(context, latest, sha)) latest = sha;
+    if (await isAncestor(context.checkout, latest, sha, context.signal))
+      latest = sha;
   const result = await integrate(context, top.pr, integrated, latest);
   if (result.kind !== "merged") return pin(result, top);
   return {
@@ -1861,11 +2062,10 @@ function needing(error: unknown, permission: string): unknown {
 }
 
 /**
- * GitHub's and git's transient failures become a retry. A rejected login
- * (401) is a hold naming `gh auth login`; GitHub's refusals (403, or a 404
- * the login can't see past) become a hold naming the permission the call
- * needs; its other answers (409, 422, GraphQL errors) may change, so they
- * retry. A GitRefusal, and anything else, escapes to the caller.
+ * GitHub's and git's failures as outcomes (github.ts githubOutcome): a
+ * rejected login or a refusal holds, naming the permission the call needs;
+ * anything else GitHub says may change, so it retries. A GitRefusal, and
+ * anything else, escapes to the caller.
  */
 async function guarded<T>(
   context: DeliveryContext,
@@ -1875,29 +2075,13 @@ async function guarded<T>(
     return await body();
   } catch (error) {
     if (context.signal.aborted || error instanceof GitRefusal) throw error;
-    if (error instanceof TransientError)
-      return {
-        kind: "retry",
-        reason: error.message,
-        ...(error.retryAfterMs !== undefined
-          ? { afterMs: error.retryAfterMs }
-          : {}),
-      };
-    const refused = error instanceof Refused ? error.error : error;
-    if (!(refused instanceof GitHubError)) throw error;
-    if (refused.status === 401)
-      return hold(
-        `GitHub rejected Factory's login on ${context.github.repository} (${refused.message.slice(0, 300)}). Log in again with \`gh auth login\` (or replace FACTORY_GITHUB_TOKEN), then answer retry; or cancel.`,
-      );
-    if (refused.status === 403 || refused.status === 404)
-      return hold(
-        `${refused.message.slice(0, 500)}. Give Factory's login ${error instanceof Refused ? error.permission : "read access to the repository, its pull requests and its checks (fine-grained token: Contents, Pull requests, Checks and Commit statuses: read)"} on ${context.github.repository}, then answer retry; or cancel.`,
-      );
-    return {
-      kind: "retry",
-      reason: refused.message,
-      afterMs: CI_POLL_MS,
-    };
+    const outcome = githubOutcome(
+      error instanceof Refused ? error.error : error,
+      context.github.repository,
+      error instanceof Refused ? error.permission : undefined,
+    );
+    if (!outcome) throw error;
+    return outcome as Retry | Hold;
   }
 }
 

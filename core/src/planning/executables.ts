@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import type { ObjectiveBlock } from "../shown.js";
 import { BaseFiles } from "./facts.js";
 import { packageManagerUpdate } from "./prompts.js";
 
@@ -255,14 +256,15 @@ async function hostVersion(
 export async function observeLocalExecutables(args: {
   checkout: string;
   base: string;
-  body: string;
+  /** The Objective's shown structure: its Package manager update. */
+  blocks: readonly ObjectiveBlock[];
   finalCommands: string[];
   signal?: AbortSignal;
 }): Promise<{ observations: LocalExecutables | null; problems: string[] }> {
-  const { checkout, base, body, finalCommands, signal } = args;
+  const { checkout, base, blocks, finalCommands, signal } = args;
   const problems: string[] = [];
 
-  const update = packageManagerUpdate(body);
+  const update = packageManagerUpdate(blocks);
   const baseline = (await new BaseFiles(checkout, base, signal).packageJson())
     .packageManager;
   if (update !== undefined) {

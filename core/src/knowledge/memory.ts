@@ -15,6 +15,7 @@ import { BaseFiles } from "../planning/facts.js";
 import type { Plan } from "../planning/types.js";
 import type { ObjectiveState } from "../state.js";
 import { TERMINAL } from "../state.js";
+import { mergeOf } from "../work/merged.js";
 import { admitted, type PlanningContext } from "./settings.js";
 import { type Database, sha256, transaction, withStore } from "./store.js";
 
@@ -120,16 +121,20 @@ export async function observeObjective(
   settings: { root: string; repository: string; checkout: string },
   state: ObjectiveState,
   settled: boolean,
-  busyMs?: number,
+  options: { busyMs?: number; signal?: AbortSignal } = {},
 ): Promise<number> {
-  const records = await withDigests(stateRecords(state), settings.checkout);
+  const records = await withDigests(
+    stateRecords(state),
+    settings.checkout,
+    options.signal,
+  );
   return withStore(
     settings.root,
     (db) =>
       settled
         ? releaseRun(db, settings.repository, state, records)
         : retain(db, records),
-    busyMs,
+    options.busyMs,
   );
 }
 
@@ -167,20 +172,23 @@ export function runOf(state: ObjectiveState): string {
 async function withDigests(
   records: MemoryRecord[],
   checkout: string,
+  signal?: AbortSignal,
 ): Promise<MemoryRecord[]> {
   const trees = new Map<string, BaseFiles>();
   for (const record of records) {
     if (!record.tree) continue;
     let files = trees.get(record.tree);
     if (!files) {
-      files = new BaseFiles(checkout, record.tree);
+      files = new BaseFiles(checkout, record.tree, signal);
       trees.set(record.tree, files);
     }
     for (const path of record.paths) {
       try {
         const digest = await pathDigest(files, path);
         if (digest) record.digests[path] = digest;
-      } catch {
+      } catch (error) {
+        // Past the deadline the observation fails and is tried again.
+        if (signal?.aborted) throw error;
         // The tree is gone (an unmerged branch was pruned): unverified.
         break;
       }
@@ -218,10 +226,7 @@ export async function pathDigest(
 /** The tree an item's paths are cited at: its last work result, else its merge. */
 function itemTree(state: ObjectiveState, item: string): string | undefined {
   const work = state.done[`item:${item}:work`] as { tree?: string } | undefined;
-  const merge = state.done[`item:${item}:merge`] as
-    | { mergeSha?: string }
-    | undefined;
-  return work?.tree ?? merge?.mergeSha;
+  return work?.tree ?? mergeOf(state, item)?.mergeSha;
 }
 
 function stateRecords(state: ObjectiveState): MemoryRecord[] {
@@ -364,7 +369,7 @@ function episodeRecord(
       id: item.id,
       title: item.title,
       ownedPaths: item.ownedPaths,
-      merged: Boolean(state.done[`item:${item.id}:merge`]),
+      merged: Boolean(mergeOf(state, item.id)),
       pr: published?.pr ?? null,
       repairs,
     };
@@ -472,18 +477,24 @@ export async function memorySection(
     : [];
   // Sources supplied to this call, and copies of a Source text already
   // kept (several Objectives pin the same text), are left out.
+  // A record about any admitted path is shown with only its admitted
+  // citations, but its staleness comes from every cited file's digest (a
+  // digest compare shows no content); a reference carries its Source's
+  // text, so it needs all of its paths admitted.
   const seen = new Set(query.supplied);
-  const eligible = matches.filter((record) => {
+  const eligible = matches.flatMap((record) => {
+    const paths = record.paths.filter((path) => admitted(path, selectors));
     if (
-      !record.paths.length ||
-      !record.paths.every((path) => admitted(path, selectors))
+      !paths.length ||
+      (record.source !== undefined && paths.length < record.paths.length)
     )
-      return false;
-    if (!record.source) return true;
+      return [];
+    const shown = { ...record, paths };
+    if (!record.source) return [shown];
     const copy = `${record.source}\0${sha256(record.body)}`;
-    if (seen.has(record.source) || seen.has(copy)) return false;
+    if (seen.has(record.source) || seen.has(copy)) return [];
     seen.add(copy);
-    return true;
+    return [shown];
   });
   const entries: string[] = [];
   let bytes = 0;
@@ -517,6 +528,15 @@ async function render(
   const changed: string[] = [];
   for (const [path, digest] of Object.entries(record.digests))
     if ((await query.digest(path)) !== digest) changed.push(path);
+  // Only shown paths are named; a changed file outside them is counted.
+  const named = changed.filter((path) => record.paths.includes(path));
+  const unnamed = changed.length - named.length;
+  const what = [
+    ...named,
+    ...(unnamed
+      ? [`${unnamed} cited file${unnamed === 1 ? "" : "s"} outside these paths`]
+      : []),
+  ];
   // Changed files make any record stale, a historical one too.
   const disposition = changed.length
     ? "stale"
@@ -530,7 +550,7 @@ async function render(
     ...(record.item ? [`Work Item ${record.item}`] : []),
     record.created.slice(0, 10),
   ].join(", ");
-  return `- [${record.kind}, ${record.authority}, ${disposition}${changed.length ? `: ${changed.join(", ")} changed since` : ""}] ${about}: ${record.summary}${record.paths.length ? `\n  Paths: ${record.paths.join(", ")}` : ""}\n  ${record.body.split("\n").join("\n  ")}`;
+  return `- [${record.kind}, ${record.authority}, ${disposition}${what.length ? `: ${what.join(", ")} changed since` : ""}] ${about}: ${record.summary}${record.paths.length ? `\n  Paths: ${record.paths.join(", ")}` : ""}\n  ${record.body.split("\n").join("\n  ")}`;
 }
 
 function stored(row: Record<string, unknown>): StoredRecord {

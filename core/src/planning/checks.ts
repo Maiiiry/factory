@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import { markdownLines } from "../markdown.js";
-import { namesPath } from "../objective.js";
+import { namesPath, objectiveText } from "../objective.js";
+import { localAssetPlace } from "../sandbox.js";
 import {
   type BaseFiles,
   ciOnlyKey,
@@ -52,9 +53,15 @@ export async function checkPlan(
   const shapes = workShapes(draft);
   await commandFindings(shapes, facts, files, found);
   await boundaryFindings(shapes, facts, files, found);
-  graphLint(draft, new Map(), facts.authorizedCommands, found);
+  graphLint(
+    draft,
+    new Map(),
+    facts.authorizedCommands,
+    facts.coverageObligations,
+    found,
+  );
   await citationFindings(shapes, facts.sources, files, found);
-  await mediaFindings(shapes, facts.body, files, found);
+  await mediaFindings(shapes, facts, files, found);
   gateFindings(draft, facts, found);
   return findings;
 }
@@ -270,6 +277,7 @@ function graphLint(
   /** In a split, each item's child Objective: children run as separate Objectives. */
   childOf: ReadonlyMap<string, string>,
   authorized: readonly string[],
+  obligations: readonly CoverageObligation[],
   found: Found,
 ): void {
   const byId = new Map(draft.items.map((item) => [item.id, item]));
@@ -332,14 +340,19 @@ function graphLint(
         `Work Item ${item.id} has no validation command, so its acceptance has no local executable evidence: select one of the authorized commands (${listCommands(authorized)}) that runs the tests it owns, or, if its proof needs an environment local validation lacks, ask through decisionRequired`,
         item.id,
       );
+  // An Objective command criterion is run by final validation.
+  const commands = new Set(
+    obligations.flatMap(({ source }) =>
+      source.path === "OBJECTIVE" && source.command ? [source.text] : [],
+    ),
+  );
   for (const entry of draft.coverage) {
     const kind = entry.proof?.kind;
     if (!kind) continue;
     const claim = coverageCriterion(entry).match(SAFETY_CLAIM)?.[0];
-    // A criterion that is exactly one backticked command is run by Factory.
     if (
       claim &&
-      !/^\s*`[^`]+`\s*$/.test(coverageCriterion(entry)) &&
+      !(entry.source.path === "OBJECTIVE" && commands.has(entry.source.text)) &&
       !/-command$/.test(kind) &&
       kind !== "final-controller"
     ) {
@@ -419,7 +432,13 @@ async function citationFindings(
     for (const citation of item.citations) {
       const pins = sources.filter((source) => source.path === citation.path);
       const heading = citation.heading ?? "";
-      if (citationChoices(pins).includes(heading)) continue;
+      // The same resolution the worker prompt uses, so check and build agree.
+      if (
+        heading === ""
+          ? citationChoices(pins).includes("")
+          : pins.some((pin) => sectionText(pin.content, heading) !== undefined)
+      )
+        continue;
       const problem = await repositoryCitation(citation, tracked, files, cited);
       if (problem === undefined) {
         if (
@@ -502,10 +521,11 @@ function recognizedObjectiveAttachment(value: string): boolean {
 /** Output roles, candidate counts, LFS roles and source assets. */
 async function mediaFindings(
   shapes: readonly WorkItem[],
-  body: string,
+  facts: PlanningFacts,
   files: BaseFiles,
   found: Found,
 ): Promise<void> {
+  const shown = objectiveText(facts.blocks);
   const tracked = new Set(await files.paths());
   for (const item of shapes) {
     const roles = item.expectedOutputRoles ?? [];
@@ -529,6 +549,16 @@ async function mediaFindings(
       );
     for (const asset of item.sourceAssets ?? []) {
       const kind = asset.kind ?? "repository";
+      if (kind === "local" && namesPath(shown, asset.path)) {
+        const place = localAssetPlace(asset.path, facts.localAssetRoots);
+        if ("refused" in place) {
+          found(
+            `Work Item ${item.id} cites local source asset ${asset.path}, which can't go to a worker: ${place.refused}. Use a file tracked at the base or a GitHub attachment URL instead; only the operator can allow a local file, by adding a directory that holds it to media.localAssetRoots`,
+            item.id,
+          );
+          continue;
+        }
+      }
       const available =
         kind === "repository"
           ? /^[A-Za-z0-9_./-]+$/.test(asset.path) &&
@@ -537,9 +567,9 @@ async function mediaFindings(
           : kind === "local"
             ? asset.visibility === "private" &&
               isAbsolute(asset.path) &&
-              namesPath(body, asset.path)
+              namesPath(shown, asset.path)
             : recognizedObjectiveAttachment(asset.path) &&
-              body.includes(asset.path);
+              shown.includes(asset.path);
       if (!available)
         found(
           `Work Item ${item.id} cites an unavailable or invalid source asset: ${asset.path}. Use a file tracked at the base, a private absolute local path or a GitHub attachment URL that the Objective names`,
@@ -648,9 +678,13 @@ async function splitFindings(
     }
     const childFacts: PlanningFacts = {
       ...facts,
-      coverageObligations: child.outcomes.map((text) => ({
-        source: { path: "OBJECTIVE", text },
-      })),
+      // An outcome keeps its parent criterion's command.
+      coverageObligations: child.outcomes.map(
+        (text) =>
+          facts.coverageObligations.find(
+            ({ source }) => source.path === "OBJECTIVE" && source.text === text,
+          ) ?? { source: { path: "OBJECTIVE", text } },
+      ),
     };
     for (const finding of await checkPlan(child.graph, childFacts, files))
       findings.push({ ...finding, message: `${label}: ${finding.message}` });

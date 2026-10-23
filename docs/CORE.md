@@ -40,7 +40,8 @@ Each rule has a test (see [Testing](#testing)).
 
 There is one process, `factory serve`, per installation, run by systemd. It is the only writer of state.
 
-- **Lock.** `serve` takes an `flock` on `service.lock`. The kernel releases the lock when the process dies, so there are no owner records, PID proofs or handoffs. A second `serve` exits at once with "already running".
+- **Lock.** `serve` binds a Linux abstract socket named for the installation. The kernel releases it when the process dies, so there are no owner records, PID proofs or handoffs. A second `serve` exits at once with "already running".
+- **The lock is per network namespace.** A host CLI asks whether the service runs by connecting to that socket, and abstract sockets belong to a network namespace. So the CLI can't see a service inside another one (a container, `pasta`, `unshare --net`): it says "isn't running", and its request file still applies, because files are shared. Run the CLI in the service's namespace to see it.
 - **CLI.** Commands that read (`status`, `log`) read the state files directly. Commands that change something (`answer`, `cancel`, `retry`, `queue`) write one request file to `requests/`. The service picks it up within a second and deletes it when the request is applied. If the service isn't running, the request waits there and the CLI says so.
 - **`factory run N`** queues one Objective and follows it to the end, with the old exit codes. The service does the work, so there is only one code path.
 - **One installation per repository.** Two machines serving one queue are not supported.
@@ -48,7 +49,7 @@ There is one process, `factory serve`, per installation, run by systemd. It is t
 
 ## State
 
-Each Objective has one JSON file: `objectives/<issue>.json` under the installation's state directory.
+Each Objective has one JSON file: `objectives/<issue>.json` under the installation's state directory. Once a finished Objective's cleanup, final sync and settled observation are done, the file moves to `objectives/finished/<issue>.json`. Startup never reads `finished/` (rule 6); a request, a re-queue or `status` reads a file there when it names the Objective, and a later save writes the active file again until it moves back.
 
 ```jsonc
 {
@@ -77,7 +78,7 @@ Each Objective has one JSON file: `objectives/<issue>.json` under the installati
 - **Trusted.** The state belongs to the installation's user, as do Factory's code and credentials. There are no digests, seals, witnesses or tamper checks.
 - **Small.** Large bodies (prompts, worker transcripts, review packets) go in the run log directory, never in state.
 - **Rebuildable.** `factory reset --objective N` rebuilds the state from GitHub: the plan comment, the Work Item branches and the PRs. It's how a corrupt file, an incompatible version or a new machine is recovered.
-- **One version.** If the file's version isn't the current one, the Objective holds with the answers `reset` and `cancel`. There are no migrations.
+- **One version.** If the file's version isn't the current one, or it doesn't parse, the Objective holds with the answers `reset` and `cancel`. The hold is posted on the issue and shown as "Needs you" like any other, and `/factory cancel` answers it. Nothing overwrites the file except that answer. There are no migrations. A read that fails for a moment (EMFILE, EIO) is tried again every tick, never taken as unreadable.
 
 ## Steps
 
@@ -102,61 +103,96 @@ check → plan → plan review → [hold: plan question?]
 
 Every step returns exactly one outcome:
 
-| Outcome                 | Meaning                                                          | What the core does                                                                       |
-| ----------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `done(data)`            | The step finished.                                               | Save the data and move on.                                                               |
-| `retry(reason, after?)` | Transient: network, 5xx, rate or usage limit, overload, timeout. | Back off (30 s doubling to 15 min, or the provider's reset time) and run the step again. |
-| `repair(finding)`       | The work is wrong: validation, review or CI failed.              | Run the item's work step again with the finding, until the repair budget is spent.       |
-| `hold(question)`        | Only a person can decide.                                        | Post the question on the issue, set Status to "Needs you", and wait.                     |
-| `fail(reason)`          | The item can't be done as planned.                               | Hold, with the answers `retry`, `replan` and `cancel`.                                   |
+| Outcome                 | Meaning                                                         | What the core does                                                                 |
+| ----------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `done(data)`            | The step finished.                                              | Save the data and move on.                                                         |
+| `retry(reason, after?)` | An error, or a wait classed by its cause (see [Waits](#waits)). | Back off (30 s doubling to 15 min, or the reset time) and run the step again.      |
+| `repair(finding)`       | The work is wrong: validation, review or CI failed.             | Run the item's work step again with the finding, until the repair budget is spent. |
+| `hold(question)`        | Only a person can decide.                                       | Post the question on the issue, set Status to "Needs you", and wait.               |
+| `fail(reason)`          | The item can't be done as planned.                              | Hold, with the answers `retry`, `replan` and `cancel`.                             |
 
-An exception that escapes a step counts as `retry`. After three in a row on the same step, it becomes a hold: the error, plus `retry` and `cancel`. A step can't crash the service, block another Objective, or leave an Objective without an answer that works.
+An exception that escapes a step counts as `retry`, and so do a missed deadline, an idle model and an invalid model answer: these are errors. After three in a row on the same step, it becomes a hold: the error, plus `retry` and `cancel`. A full disk holds at once. A step can't crash the service, block another Objective, or leave an Objective without an answer that works.
+
+### Interrupted steps
+
+A step the service's death cut off (a crash, an OOM kill, a reboot) is not that step's error. Each saved attempt names the service run that started it, and after a restart the step runs again at once, with no backoff and no error count, cleanup after cancel included. Crash-loop protection is the service's:
+
+- **Crash loop.** `service.json` keeps the starts of the current crash streak: a start continues it when the run before died, without a clean stop, within 10 min of resuming its steps. From the third start in a streak, interrupted steps resume after 30 s, doubling to 30 min; other steps run as usual. `factory status` shows the deaths in a row and the resume time. A clean stop ends the streak.
+- **A step that kills the service.** `service.json` also keeps the last three deaths: the steps running at each (the open attempts that run started), and whether that run finished any step (its heartbeat count, or an Objective's state saved with a step's outcome naming that run, so a death right after a step still counts). When one step, and only one, was running at all three, and steps finished in the runs between them, that step holds: "The service died 3 times in a row while step … ran", with `retry` and `cancel`. The evidence is then spent, so another hold needs three more deaths. Cleanup after cancel never holds; the crash loop's delay covers it.
+
+### Waits
+
+Any other retry is a wait. Waiting more than a few hours is never right, so a wait is classed by its cause, not by how long it has gone on:
+
+| Cause                            | Examples                                                                                                                                                                                                                | What the core does                                                                                                                                                                                                                                                                                           |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fatal until a person acts        | An expired or invalid gh or provider login; GitHub 401 or a 403 refusal; a missing repository or issue (404); a full disk; a required check with no run or status 15 min after the push; a workflow that didn't trigger | Hold at once, with a question naming the fix.                                                                                                                                                                                                                                                                |
+| A known reset time               | A GitHub rate limit; a provider usage limit that reports its reset                                                                                                                                                      | Wait until the reset when it is at most 3 h away. Further away or unknown (a weekly limit): hold with `wait` (keep waiting until it resets), `switch NAME` (run this Objective on another configured provider, which becomes its frozen provider; plain `switch` when there is only one other) and `cancel`. |
+| A human gate Factory doesn't own | An environment approval; a review the branch requires                                                                                                                                                                   | Wait with no deadline. Status shows "waiting on" the gate, and one reminder comment follows after 24 h.                                                                                                                                                                                                      |
+| An unknown transient cause       | The network down; 5xx or an outage at GitHub or the provider; 409, 410, 422 or a GraphQL error from GitHub; CI queued or running                                                                                        | Retry with backoff. After 1 h, post one status note on the issue (edited in place). After 3 h, hold with a question naming the cause and the last error: `wait` (another 3 h), `retry` and `cancel`.                                                                                                         |
+
+A problem on the host counts as fatal when it is certain (disk, login) and as transient otherwise. Times are wall-clock times saved in the state, so a restart doesn't reset a budget, and the question comes only after the step ran again and still had to wait.
+
+- **An open question pauses the clocks.** While a question is open, no other step starts, so no other step's wait counts. When the question closes, each waiting step's wait start and any granted `wait` move forward by the time it was due but blocked. A human gate's start stays: it never times out, and its one reminder is keyed to that start. No status note or gate reminder is posted while a question is open. A step that asks while another question is open records nothing: it runs again after the answer and asks then.
+
+- **One budget per class.** A step's wait start, first cause, backoff and any granted `wait` belong to one run of one class: a reset, a gate, or an unknown cause (errors count as unknown). When the class changes, they start again, so eight hours on a review never spend the transient budget. The error count covers one run of consecutive errors; any other outcome resets it.
+- **Only a real rate limit is a reset.** A 429, or a 403 rate limit, waits for its reset. A 5xx is an unknown transient even when it carries rate-limit headers; its `retry-after` only sets the backoff. A reset at or before now (a skewed clock) still waits at least the normal backoff.
+- **Required checks before gates.** A required check with no run or status counts as pending whatever GitHub's readiness says, and it holds 15 min after the push. A review the branch requires is a gate only once every required check is there.
 
 ### Idempotence
 
 Every step is safe to run again. Before it does anything with an outside effect, it looks for that effect on GitHub:
 
-| Effect        | How the step finds it                                                                                     |
-| ------------- | --------------------------------------------------------------------------------------------------------- |
-| Branch        | Fixed name: `factory/<issue>/<item>`.                                                                     |
-| PR            | Open or merged PR whose head is that branch.                                                              |
-| Merge         | That PR's merged state.                                                                                   |
-| Comment       | A hidden marker, `<!-- factory:<issue>:<kind>:<id> -->`. An existing comment is edited, not posted again. |
-| Issue close   | The issue's state.                                                                                        |
-| Project field | Written every time; it is a display.                                                                      |
+| Effect        | How the step finds it                                                                                                                                                                                                                                                                                                                                        |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Branch        | Fixed name: `factory/<issue>/<item>`.                                                                                                                                                                                                                                                                                                                        |
+| PR            | Open or merged PR whose head is that branch.                                                                                                                                                                                                                                                                                                                 |
+| Merge         | That PR's merged state.                                                                                                                                                                                                                                                                                                                                      |
+| Comment       | A hidden marker, `<!-- factory:<issue>:<kind>:<id> -->`, in a comment by Factory's own login (anyone else's marked comment is ignored). An existing comment is edited, not posted again. A plan too large for one comment continues in numbered `plan-data` comments.                                                                                        |
+| Issue close   | The issue's state.                                                                                                                                                                                                                                                                                                                                           |
+| Branch delete | The branch's absence. After its PR merges (a native stack's layers once the whole unit merged), and on cancel, a branch is deleted only when Factory made every commit it has beyond the default branch (GitHub's update-branch merges from the item's base count, a stack layer's predecessor branch included), by a push with a lease on the head it read. |
+| Project field | Written every time; it is a display.                                                                                                                                                                                                                                                                                                                         |
 
 So an effect whose result was lost is never "unknown". The next run of the step finds it on GitHub and carries on.
 
-A model call has no outside effect. If the process dies mid-call, the call runs again. A worker's worktree is kept and reused, so a repeated work step continues from its files.
+A model call has no outside effect. If the process dies mid-call, the call runs again. A worker's worktree is kept and reused on the base the item kept, so a repeated work step continues from its files. A worktree from an attempt that never kept its base (it died before its outcome) is reset onto the base the rerun picks.
+
+A step's kept facts (`state.kept`) outlive repairs. A step forgets one by keeping `null`, and the engine then removes it, so a reader never sees `null`.
 
 ### Deadlines
 
-| Wait                   | Deadline (configurable)             | At the deadline               |
-| ---------------------- | ----------------------------------- | ----------------------------- |
-| GitHub request         | 60 s                                | retry                         |
-| Plan, plan review      | 45 min each, 15 min idle            | retry; hold after 3           |
-| Worker turn            | 2 h total, 15 min idle              | retry; hold after 3           |
-| One validation command | from configuration                  | repair                        |
-| Result or final review | 30 min, 15 min idle                 | retry; hold after 3           |
-| CI on a PR             | 60 min after the last check started | retry; hold after 3           |
-| Hold                   | none: it waits for a person         | a reminder comment after 24 h |
+| Wait                   | Deadline                                           | At the deadline               |
+| ---------------------- | -------------------------------------------------- | ----------------------------- |
+| GitHub request         | 60 s                                               | retry                         |
+| Plan, plan review      | 45 min each, 15 min idle                           | retry; hold after 3           |
+| Worker turn            | 2 h total, 15 min idle                             | retry; hold after 3           |
+| One validation command | from configuration                                 | repair                        |
+| Result or final review | 45 min, 15 min idle                                | retry; hold after 3           |
+| CI on a PR             | a needed check registers within 15 min of the push | hold                          |
+| CI queued or running   | 3 h of transient waiting (see [Waits](#waits))     | hold with `wait`              |
+| Hold                   | none: it waits for a person                        | a reminder comment after 24 h |
+
+Step deadlines are fixed in the code; the engine's limits take shorter test timings from the environment (`FACTORY_DEADLINE_MS`, `FACTORY_WAIT_MS`, `FACTORY_NOTE_MS`, `FACTORY_REMIND_MS`, `FACTORY_BACKOFF_MS`).
 
 ## Queue
 
 The GitHub Project is the source of truth for what is queued.
 
 - **Queued** means the item's Status field equals the configured "queued" option. **Order** comes from the Project's configured number field, then issue number.
-- **Read-only, and retried.** The service reads the Project every 30 s. If a read fails or comes back partial, it keeps the last good view and tries again. A read failure never fails a run.
-- **Status is a display.** The service sets Status as the run moves: Planning, Building, Needs you, Done, Failed, Cancelled. A failed write is logged and written again on the next transition.
-- **Operator controls:** set an item's Status to the queued option to queue it, move it out of the queued option to dequeue it if it hasn't started, and set the order number to reorder. There is no control card and no managed metadata field.
-- **Several at once.** Up to `queue.maxActiveObjectives` Objectives run at once (default 3). An Objective builds only when no earlier unfinished one owns an overlapping path, and planning never waits. Host-wide caps limit worker runs and validations (`execution.workers` and `execution.validations`, sized from the host).
+- **Read-only, and retried.** Every 30 s the service reads the Project's queued cards, filtered by GitHub (the items `query`, `<field>:"<queued option>"`, closed issues included), plus, from the issue side, the issues it already knows and the most recently updated open issues, since the Project's item list can lag. So a read costs one page per 100 queued cards, not per card ever added; past 1,000 queued cards the rest wait for a later read, and the log says how many. A known issue GitHub no longer has (deleted, transferred, converted) is dropped from later reads with a log line; the rest of the read stands. Any other failed or partial read keeps the last good view and tries again. A read failure never fails a run.
+- **Status is a display.** The service sets Status as the run moves, from the tick it admits the Objective: Queued (while it is checked and until it has a slot), Planning, Building, Needs you, Done, Failed, Cancelled. A failed write is logged and tried again after a backoff of its own, doubling to 10 min, so one Objective's bad card never spends the rate limit the others need. A finished Objective stays in memory, across restarts too, until its final Status and its replies are written.
+- **Edges, not levels.** Factory writes the queued option itself, so a card that reads queued means nothing alone. A finished Objective queues again only when its option was set after Factory's own last Status write for that run, by GitHub's clock: Factory saves when it wrote (`shownAt`) and when the card was queued for this run (`queuedAt`), and compares the option's `updatedAt`. An unfinished one dequeues on a change from queued to anything else, cleared or off the Project included, against the option Factory last saw on the card or wrote (`seen`, saved in state). A read that started before Factory's last write is skipped for that card. A stale card never re-admits a run that was cancelled, finished or already admitted.
+- **Never over the operator.** Factory reads the card before each Status write and writes only over what it last saw or wrote itself. Someone else's change is the operator's input: from queued, it dequeues an Objective that hasn't started; any other change stands until the Objective's status moves on. Factory saves the option it is about to write, so after a crash a card showing it still reads as Factory's own.
+- **Operator controls:** set an item's Status to the queued option to queue it (again, for a finished Objective: set it after its final Status shows), move it out of the queued option to dequeue it if it hasn't started, and set the order number to reorder. Dequeuing before planning starts withdraws the Objective: its state is removed, as if it was never admitted, so queuing it again checks it afresh. Order is read on every queue read until the Objective starts. There is no control card and no managed metadata field.
+- **Several at once.** Up to `queue.maxActiveObjectives` Objectives plan or build at once (default 3), in queue order. An Objective builds only when no Objective whose plan was accepted earlier, and that is unfinished, owns an overlapping path; planning never waits. A holding Objective, one whose every remaining step waits on a human gate, and one waiting on another's paths take no slot; a gated or holding Objective still owns its paths. Host-wide caps limit worker runs and validations (`execution.workers` and `execution.validations`, sized from the host).
+- **Again.** Queuing a finished Objective again stops its old run (its steps, saves and GitHub jobs) once its cleanup is done, and starts a new one. The new run first reopens the issue if it is closed (the earlier run closed it, or the Project's "Auto-close issue" workflow closed it again); if GitHub refuses, it holds with `retry` and `cancel`. Just before that reopen, and only then, Factory touches the Project's built-in single-select "Status" field (not its own queue field): if the card's Status reads "Done", Factory moves it to "In Progress", else "Todo", else the first option not named "Done", because that workflow closes an issue whose Status reads Done. The check that follows reads the issue again: if something closed it again anyway, it holds with a question naming who closed it, with `retry` and `cancel`, and never plans on a closed issue. A closed issue that never ran isn't queued. The new run then closes the old run's open PRs and removes its worktrees, as `replan` does after a plan was accepted. Factory resets a Work Item branch only when it made every commit the branch has beyond the default branch: each is committed as Factory (Factory commits with a clean Git environment as `factory@users.noreply.github.com`; an amend, rebase or cherry-pick by anyone else changes the committer), or is GitHub's update-branch merge from the default branch or the item's base (a stack layer's predecessor branch). Otherwise it holds with `retry` (after moving the commits off), `reset` (replace the branch anyway) and `cancel`.
 - **No approval step.** A clean, reviewed plan runs straight away. Factory asks only when review finds a decision for the operator.
 
 ## Check at queue time
 
-When the service first sees a queued Objective, it runs the Objective checks: template sections, pinned Sources that resolve at the default branch, no duplicate headings, and declarations that parse. Planning uses the same function.
+When the service first sees a queued Objective, it runs the Objective checks at once, whether or not a slot is free: template sections, pinned Sources that resolve at the default branch, no duplicate headings, and declarations that parse. Planning uses the same function. A checked Objective then waits for a slot.
 
-A failed check is a hold. It names each problem and how to fix it, and Status goes to "Needs you". Editing the issue and setting Status back to the queued option checks it again.
+A failed check is a hold. It names each problem and how to fix it, and Status goes to "Needs you". Edit the issue and answer `recheck` to check it again.
 
 ## Holds and answers
 
@@ -172,18 +208,20 @@ A hold is a question with named answers:
 ```
 
 - It is posted as one issue comment with a marker, and it lists the answers.
-- **Answering:** a comment `/factory <answer> [text]` from a user with write access to the repository, or `factory answer <issue> <answer> [--text ...]`. The service checks for comments every 30 s while it is holding. If someone without write access answers, that's ignored and logged.
+- **Answering:** a comment `/factory <answer> [text]` from a user with write access to the repository, or `factory answer <issue> <answer> [--text ...]`. The service checks for comments every 30 s while it is holding. If someone without write access answers (or the user doesn't exist), that's ignored and logged. A comment whose author's access GitHub can't report now waits in a list of up to 20 per Objective and is checked again with backoff; the comments after it go on.
 - **In an agent host.** The director skill shows each open hold with the host's question tool (Claude Code's AskUserQuestion, or its Codex equivalent): the question, each answer with the recommended one first, and a one-line consequence for each. That gives the operator an app notification. The chosen answer runs `factory answer`. `factory status --json` lists open holds in this shape so the skill needs no parsing.
 - An answer that doesn't match the open hold gets a reply naming the valid answers. Nothing else changes.
 - `cancel` is valid at every hold and at any time.
-- **Repair diagnosis.** When diagnosing a refused result needs a decision, the work step holds with `answer <decision>` (a correction for the worker), `retry` (diagnose again) and `cancel`. While the refused result is kept, still exists on the item's base and (for media) its selection stands, it also offers `revalidate`: the result was correct and Factory's check was at fault. The work step then finishes with that same result, without the worker or collection, and the selection, validation, review and delivery run again. It isn't counted as a repair, and a rerun after a crash does the same.
+- **Provider model.** A model the provider's login can't serve holds with `switch NAME` and `cancel`. Copilot checks its model list before it opens a session, so this hold costs no request, and it also offers `retry`: the retry reads the list again before any session, so it bills nothing and succeeds once an admin enables the model. A session that served another model offers no `retry`, because each one bills a request. The operator sets the model and restarts the service, then answers `switch` with the same provider's name, which re-freezes its changed settings, or with another configured provider's name.
+- **Provider unavailable.** An Objective whose frozen provider is no longer configured, or whose settings changed, holds with `switch NAME` (recommended; plain `switch` when there is one target) when there is a target, `retry` (after restoring the provider and restarting) and `cancel`. The targets are the ones the engine accepts (engine.ts switchTargets): every other configured provider, and this one when it is still configured with changed settings, which `switch` re-freezes.
+- **Repair diagnosis.** When diagnosing a refused result needs a decision, the work step holds with `answer <decision>` (a correction for the worker), `retry` (diagnose again) and `cancel`. While the refused result is kept, still exists on the item's base and (for media) its selection stands, it also offers `revalidate`: the result was correct and Factory's check was at fault. The work step then finishes with that same result, without the worker or collection, and the selection, validation, review and delivery run again. It isn't counted as a repair, and a rerun after a crash does the same. Only a repair that refuses the result itself (validate, review, CI, merge, a secret the result writes) records it as refused, so the next result must differ. A select or publish media repair (new candidates, a selection that couldn't be written, missing LFS objects) records nothing: its correct fix may leave the tracked tree unchanged.
 
 ## Cancel
 
 `/factory cancel` or `factory cancel <issue>`:
 
 1. Abort the Objective's running steps. This kills the process groups the service started for those steps; it tracks them in memory, and they die with the service anyway.
-2. Close open Factory PRs with a comment, and set Status to Cancelled.
+2. Close every open Factory PR of the Objective (each branch under `factory/<issue>/`, whatever plan made it) with a comment, delete those branches Factory made (see [Idempotence](#idempotence)), close the issue as not planned, and set Status to Cancelled.
 3. Mark the state cancelled.
 
 Cancel reads only the Objective's state file and its open PRs, so its cost doesn't depend on history. It can't be refused. If closing a PR fails, the close is retried in the background; it never blocks the cancel.
@@ -215,6 +253,11 @@ Rules for modules:
 - A module returns step outcomes. It never writes state directly, takes a lock, starts a background loop, or keeps its own archive.
 - A module keeps its data in `modules.<name>` of the state file, or in the run log.
 - A module validates its input once, where the input enters, and doesn't re-verify it later.
+
+Review and knowledge see what the worker saw:
+
+- **Review inputs.** Result review and final review get a controller input receipt for each item: every read-only input its worker got (source assets and bound selections) with kind, path, visibility, media type, size and sha256, and Factory's digest-checked copy under `inputs/` in the evidence root, within the candidate copy bounds.
+- **Repository memory** shows a record that cites any path inside the planning selectors, with only its admitted paths; its staleness still comes from every cited file's digest, and a changed file outside the selectors is counted, not named. A reference record carries its Source's text, so it needs every path admitted. An episode counts a native stack's lower layer as merged when the stack merged.
 - Provider APIs stay inside their adapter.
 
 ## Security
@@ -223,8 +266,18 @@ These carry over unchanged:
 
 - Credentials stay with the service. Workers never see them.
 - Workers run in the OS sandbox with the configured network policy.
-- Secrets are named by reference.
+- Secrets are named by reference. The configuration derives the secret values once: those named in `policy.allowedSecretNames` and each managed provider's credential (`apiKeyEnv`, `credentialEnv`, from the environment or a service credential). Everything Factory writes to GitHub, Dream input and the Codex worker's reported commands and errors are redacted of them. Only the named ones reach a worker's environment.
 - Deploys stay in the target's own GitHub Actions, behind environment approvals.
+
+Added after the 2026-10-23 security review:
+
+- **Issue bodies.** Factory reads an Objective from GitHub's rendering of the issue (`body_html`, read with the body, full+json), never from its Markdown; nothing GitHub doesn't show reaches a model or a check. shown.ts parses it once with a real HTML parser (hast-util-from-html) and gives two views of the shown tree. **Structure** (`blocks`) comes from the elements: sections are GitHub's headings (`h1`–`h6`, text content, a `<br>` read as a space), bullets are its `li` elements, Goal and other prose are paragraph text, and backticked commands, paths and pins are `code` elements. Every check reads it: Goal, Acceptance (a list item that is exactly one code element is a final command, carried on its coverage obligation as `source.command`; a paragraph, quote, struck or bold code span or math is never one), Sources, and the Package manager update, Quality checkpoint, Workspace package additions and Adaptive workflow declarations (objective.ts checkObjective, validate.ts declarationProblems); so does command authority from the Objective (its shown lines and inline code elements). Shown text is text with its emphasis markers: strong is written `__text__`, emphasis `_text_` and struck text `~~text~~`, so an unbackticked path reads as written (`src/_internal.ts`, `pkg/__init__.py`, `src/__tests__/a.ts`, `docs/A&B.md`; a `**` or `*` in a path comes back as `__` or `_`, so backtick it), a heading anchor keeps its markers (Sources heading matching treats `*` and `_` as one marker, so `#Step *y*` finds `Step *y*` or `Step _y_`), and a struck criterion stays visibly struck. A writer's inline math is text (`$…$`), never code. A paragraph line that reads ``- `cmd` `` is never a bullet. A blank issue-form field (`<p><em>No response</em></p>`) is an empty entry. **The planner text** (`body`) is the same tree as GFM Markdown (hast-util-to-mdast, mdast-util-to-markdown, default escapes): prose for a model, never parsed. Both keep text, headings, lists and task lists, tables, code blocks and links as their text plus href; an image or video is `[image: <file name>]`, a diagram other than mermaid `[<type> diagram]`. An approver sees only a diagram's drawing, so mermaid and math sources stay as code only when the author can write; a non-writer's mermaid diagram is `[mermaid diagram]`and each math block`[math]`. Every other attribute (alt, title, data-*), every comment, invisible characters and whatever GitHub's sanitizer removed are gone. Footnotes stay as GitHub's rendered section. Factory's own split-child marker is read from the raw body by its exact pattern, as structure, never as text. A non-empty body without `body_html` is a transient error and retries; the raw body never stands in. Edit detection (planning and build) and the author approval compare one digest of the structure and the planner text (shownDigest), stable between reads. When the issue's author has no write access, the check holds once: approve or cancel; the question names the digest and says diagram and math sources aren't planner input. The approval is kept against that digest, so any later edit asks again. Until then nothing in the body counts. Queue consent stays the Project field.
+- **Write access** (`/factory` answers, issue authors) is asked of GitHub again after 10 minutes.
+- **GitHub attachments** are fetched with the service's token sent only to the attachment URL. Redirects may go to github.com, `*.githubusercontent.com` and GitHub's own S3 buckets for user, repository and release files, by exact bucket name; any other host is refused. The size bound and the digest apply wherever the bytes come from.
+- **Local source assets** come only from directories listed in `media.localAssetRoots` (empty by default: off), by real path, and never from anything the sandbox seals: HOME as a whole, logins, Factory's config and state, runtime sockets or shared temporary directories. The plan check and the copy both check.
+- **Pushed content.** Before publish pushes, every blob the result adds or changes, and every LFS object it uploads, is searched for the secret values, as written and base64: each whole value of 8 or more characters, and the pieces of a multi-line secret that are key material (16 or more characters, high entropy, never PEM armor or lowercase JSON keys and URLs). Redaction still hides values from 4 characters. A match pushes nothing and holds with `repair`, `publish` and `cancel`. `publish` lets exactly that finding on that commit through: its digest is kept when the hold is raised and the answer is checked against that, never against the question's text, which quotes worker-chosen paths.
+- **Workers.** A Claude worker never loads project or local settings (their hooks would run on the host). A Codex worker's shell gets proxy URLs without credentials (a URL without a scheme is read as http://, and one that doesn't parse is left out), or none when it has no network. A managed worker's archive is read without following links.
+- **Factory's branches.** A web-flow merge counts as Factory's only when its first parent is Factory's head, its second is on the PR's base, and its tree is what `git merge-tree` makes of the two.
 
 A same-user process is trusted, as decided for the archive: it can already change Factory's code and credentials.
 

@@ -5,6 +5,11 @@
  * admitted (selection.ts). Checked once here, when configuration loads.
  */
 
+import type { ClaudePlannerOptions } from "./claude.js";
+import type { ClaudeWorkerConfig } from "./claude-worker.js";
+import type { CodexEffort } from "./codex.js";
+import { PLANNER_PHASES, type PlannerModels } from "./planner.js";
+
 export const PLANNERS = ["codex", "claude", "copilot"] as const;
 export type PlannerKind = (typeof PLANNERS)[number];
 
@@ -20,8 +25,8 @@ export type WorkerKind = (typeof WORKERS)[number];
 /** A worker's settings: `kind` plus the adapter's own fields, checked here. */
 export type WorkerConfig =
   | { kind: "codex"; network: "off" | "host" }
-  /** Claude worker settings (model, effort, maxTurns, tools, allowedTools, permissionMode). */
-  | { kind: "claude"; settings: Record<string, unknown> }
+  /** The Claude worker settings given; the adapter's defaults fill the rest. */
+  | { kind: "claude"; settings: Partial<ClaudeWorkerConfig> }
   | {
       kind: "copilot";
       model: string;
@@ -58,12 +63,39 @@ export type WorkerConfig =
       itemBudgetCents?: number;
     };
 
-export interface ProviderConfig {
-  planner: PlannerKind;
-  /** Planner and reviewer model choices; each adapter has defaults. */
-  models?: Record<string, unknown>;
-  worker: WorkerConfig;
-}
+/** A planner with the model choices given; each adapter has defaults. */
+export type ProviderConfig = { worker: WorkerConfig } & (
+  | { planner: "claude"; models?: Partial<ClaudePlannerOptions> }
+  | { planner: "codex"; models?: Partial<PlannerModels<CodexEffort>> }
+  | { planner: "copilot"; models?: Partial<PlannerModels> }
+);
+
+export const CLAUDE_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export const CODEX_EFFORTS = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+] as const satisfies readonly CodexEffort[];
+/** The Claude worker's tools: the SDK's file tools and Factory's Validate. */
+export const CLAUDE_TOOLS = [
+  "Read",
+  "Edit",
+  "Write",
+  "Glob",
+  "Grep",
+  "Validate",
+] as const;
 
 export const COPILOT_TOOLS = [
   "view",
@@ -148,21 +180,105 @@ function providerConfig(
     problems.push(`${path}.planner must be one of ${PLANNERS.join(", ")}`);
     return undefined;
   }
+  const before = problems.length;
   const models =
     provider.models === undefined
       ? undefined
-      : object(provider.models, `${path}.models`, problems);
+      : modelsConfig(
+          provider.models,
+          planner as PlannerKind,
+          `${path}.models`,
+          problems,
+        );
   const worker = workerConfig(
     provider.worker ?? { kind: planner },
     `${path}.worker`,
     problems,
   );
-  if (!worker) return undefined;
+  if (!worker || problems.length !== before) return undefined;
   return {
-    planner: planner as PlannerKind,
+    planner,
     ...(models ? { models } : {}),
     worker,
+  } as ProviderConfig;
+}
+
+/**
+ * Planner and reviewer model choices, with the keys and efforts of the
+ * planner's kind: a choice names both model and effort.
+ */
+function modelsConfig(
+  value: unknown,
+  planner: PlannerKind,
+  path: string,
+  problems: string[],
+): Fields | undefined {
+  const models = object(value, path, problems);
+  if (!models) return undefined;
+  const efforts: readonly string[] | undefined =
+    planner === "claude"
+      ? CLAUDE_EFFORTS
+      : planner === "codex"
+        ? CODEX_EFFORTS
+        : undefined;
+  const effort = (entry: unknown, at: string) => {
+    if (
+      efforts
+        ? efforts.includes(entry as string)
+        : typeof entry === "string" && entry.trim()
+    )
+      return;
+    problems.push(
+      `${at} must be ${efforts ? `one of ${efforts.join(", ")}` : "a non-empty string"}`,
+    );
   };
+  known(
+    models,
+    [
+      "planner",
+      "reviewer",
+      "reviewEffort",
+      ...(planner === "claude" ? ["maxOutputTokens"] : []),
+    ],
+    path,
+    problems,
+  );
+  for (const role of ["planner", "reviewer"]) {
+    if (models[role] === undefined) continue;
+    const at = `${path}.${role}`;
+    const choice = object(models[role], at, problems);
+    if (!choice) continue;
+    known(
+      choice,
+      ["model", "effort", ...(planner === "codex" ? ["serviceTier"] : [])],
+      at,
+      problems,
+    );
+    if (typeof choice.model !== "string" || !choice.model.trim())
+      problems.push(`${at}.model must be a non-empty string`);
+    effort(choice.effort, `${at}.effort`);
+    if (
+      choice.serviceTier !== undefined &&
+      choice.serviceTier !== "standard" &&
+      choice.serviceTier !== "fast"
+    )
+      problems.push(`${at}.serviceTier must be one of standard, fast`);
+  }
+  if (models.reviewEffort !== undefined) {
+    const at = `${path}.reviewEffort`;
+    const phases = object(models.reviewEffort, at, problems);
+    for (const [phase, entry] of Object.entries(phases ?? {}))
+      if (PLANNER_PHASES.includes(phase as never))
+        effort(entry, `${at}.${phase}`);
+      else problems.push(`${at}.${phase} is not a setting`);
+  }
+  const tokens = models.maxOutputTokens;
+  if (
+    tokens !== undefined &&
+    !(Number.isSafeInteger(tokens) && (tokens as number) > 0)
+  )
+    problems.push(`${path}.maxOutputTokens must be a positive whole number`);
+  return models;
 }
 
 function workerConfig(
@@ -207,6 +323,24 @@ function workerConfig(
     problems.push(`${path}.${name} must be a whole number from 1 to ${most}`);
     return fallback;
   };
+  const names = <T extends string>(
+    name: string,
+    values: readonly T[],
+    empty: boolean,
+  ): T[] => {
+    const entry = worker[name];
+    if (
+      Array.isArray(entry) &&
+      (empty || entry.length > 0) &&
+      entry.every((item) => values.includes(item as T)) &&
+      new Set(entry).size === entry.length
+    )
+      return entry as T[];
+    problems.push(
+      `${path}.${name} must be distinct names from ${values.join(", ")}`,
+    );
+    return [];
+  };
   // A hosted run ends before the work step's 2-hour deadline.
   const seconds = () => whole("timeoutSeconds", 3600, MAX_HOSTED_SECONDS);
   const runs = () => whole("maxRuns", 3, 100);
@@ -224,7 +358,59 @@ function workerConfig(
       };
       break;
     case "claude": {
-      const { kind: _kind, ...settings } = worker;
+      known(
+        worker,
+        [
+          "kind",
+          "model",
+          "effort",
+          "permissionMode",
+          "settingSources",
+          "tools",
+          "allowedTools",
+          "maxTurns",
+        ],
+        path,
+        problems,
+      );
+      const settings: Partial<ClaudeWorkerConfig> = {};
+      if (worker.model !== undefined) settings.model = string("model");
+      if (worker.effort !== undefined)
+        settings.effort = oneOf("effort", CLAUDE_EFFORTS);
+      if (worker.permissionMode !== undefined)
+        settings.permissionMode = oneOf("permissionMode", [
+          "acceptEdits",
+          "dontAsk",
+        ] as const);
+      if (worker.settingSources !== undefined) {
+        // Project and local settings are files in the worktree, which the
+        // repository or the worker writes; the CLI runs their hooks on the
+        // host, outside the sandbox.
+        const sources = worker.settingSources;
+        if (
+          Array.isArray(sources) &&
+          sources.some((source) => source === "project" || source === "local")
+        )
+          problems.push(
+            `${path}.settingSources may name only "user": project and local settings come from the worktree, and their hooks would run outside the sandbox`,
+          );
+        else
+          settings.settingSources = names(
+            "settingSources",
+            ["user"] as const,
+            true,
+          );
+      }
+      if (worker.tools !== undefined)
+        settings.tools = names("tools", CLAUDE_TOOLS, false);
+      if (worker.allowedTools !== undefined) {
+        settings.allowedTools = names("allowedTools", CLAUDE_TOOLS, true);
+        const offered: readonly string[] = settings.tools ?? CLAUDE_TOOLS;
+        if (settings.allowedTools.some((tool) => !offered.includes(tool)))
+          problems.push(`${path}.allowedTools must be a subset of tools`);
+      }
+      if (worker.maxTurns !== undefined)
+        settings.maxTurns = whole("maxTurns", 1, Number.MAX_SAFE_INTEGER);
       config = { kind: "claude", settings };
       break;
     }

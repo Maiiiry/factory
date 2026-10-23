@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -43,28 +44,46 @@ export interface Hold {
 
 export interface Answer {
   holdId: string;
+  /** The question this answers, as it was asked. */
+  question?: string;
   answer: string;
   text?: string;
   by: string;
   at: string;
 }
 
+/**
+ * Why a retry waits (CORE.md#Waits). Absent: an unknown transient cause,
+ * such as the network, a GitHub or provider outage, or CI still running.
+ */
+export type Wait =
+  /** A limit that resets at `at` (unknown when absent), from `provider` when a model provider set it. */
+  | { kind: "reset"; at?: string; provider?: string }
+  /** A person outside Factory: an environment approval, a required review. */
+  | { kind: "gate"; gate: string };
+
 export interface Retry {
-  /** Consecutive escaped errors, missed deadlines and interrupted attempts. */
+  /** Consecutive escaped errors and missed deadlines; any other outcome resets it. */
   count: number;
-  /** Retries of any kind in this run of retries; sets the backoff. */
+  /** Retries in this run of one wait class (`Wait`, or an unknown cause); sets the backoff. */
   attempts: number;
-  /** When this run of retries began. */
+  /** When this run of one wait class began (wall clock, so a restart doesn't reset it). */
   since: string;
   nextAt: string;
   lastError: string;
+  /** The reason this run of retries began with. */
+  cause?: string;
+  /** The latest wait's class; absent for errors and unknown transient causes. */
+  wait?: Wait;
+  /** The operator answered `wait`: no question until then. */
+  grantedUntil?: string;
 }
 
 /** The provider an Objective was admitted with, kept for its whole run. */
 export interface FrozenProvider {
   name: string;
-  /** Why: the configured default, or `serve --provider`. */
-  selectedBy: "defaultProvider" | "--provider";
+  /** Why: the configured default, `serve --provider`, or the operator's `switch` answer to a usage limit. */
+  selectedBy: "defaultProvider" | "--provider" | "switch";
   /** The provider's planner, models and worker as they were at admission. */
   settings: ProviderConfig;
 }
@@ -87,8 +106,13 @@ export interface ObjectiveState {
   repairs: Record<string, { count: number; findings: string[] }>;
   /** Steps that finished, with their saved results. */
   done: Record<string, unknown>;
-  /** Steps started and not yet finished. One found after a restart was interrupted. */
-  attempts: Record<string, { startedAt: string }>;
+  /**
+   * Steps started and not yet finished, with the service run that started
+   * each. One found after a restart was interrupted, and runs again.
+   */
+  attempts: Record<string, { startedAt: string; run?: string }>;
+  /** The service run that last finished a step of this Objective, saved with the step's outcome. */
+  finishedRun?: string;
   /** The latest applied requests and their results, so a request is never applied twice. */
   appliedRequests: { id: string; message: string }[];
   /** Per-capability data. Modules own their key. */
@@ -145,26 +169,82 @@ export function saveState(dir: string, state: ObjectiveState): void {
   }
   crashPoint("state:before-rename");
   renameSync(temporary, path);
+  syncDirectory(dir);
+  crashPoint("state:saved");
+}
+
+/** Remove the Objective's state: it was dequeued before it started. */
+export function removeState(dir: string, issue: number): void {
+  rmSync(statePath(dir, issue), { force: true });
+  syncDirectory(dir);
+}
+
+/**
+ * Settled Objectives' files, under the state directory: the service never
+ * reads them at startup (rule 6: cost follows active work, never history);
+ * findState reads one when a request, a re-queue or status names it.
+ */
+const FINISHED = "finished";
+
+/**
+ * Move a settled Objective's file into finished/, once its cleanup, its
+ * final sync and its settled observation are done. A later save (a request
+ * to the finished Objective) writes the active file again, and it moves
+ * again. Nothing to move is not an error.
+ */
+export function finishState(dir: string, issue: number): void {
+  const finished = join(dir, FINISHED);
+  mkdirSync(finished, { recursive: true });
+  try {
+    renameSync(statePath(dir, issue), statePath(finished, issue));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  syncDirectory(finished);
+  syncDirectory(dir);
+}
+
+/** The Objective's active state, else its finished one; null when it has neither. */
+export function findState(dir: string, issue: number): Loaded | null {
+  return loadState(dir, issue) ?? loadState(join(dir, FINISHED), issue);
+}
+
+/** Every issue with an active or a finished state file. */
+export function listAllObjectives(dir: string): number[] {
+  return [
+    ...new Set([
+      ...listObjectives(dir),
+      ...listObjectives(join(dir, FINISHED)),
+    ]),
+  ].sort((a, b) => a - b);
+}
+
+function syncDirectory(dir: string): void {
   const dirFd = openSync(dir, "r");
   try {
     fsyncSync(dirFd);
   } finally {
     closeSync(dirFd);
   }
-  crashPoint("state:saved");
 }
 
 export type Loaded =
   | { kind: "ok"; state: ObjectiveState }
   | { kind: "unreadable"; issue: number; error: string };
 
+/**
+ * The Objective's state; null when it has none. Only a file that doesn't
+ * parse, or has another version, is unreadable; a read that fails (EMFILE,
+ * EIO) throws, and the caller tries again later.
+ */
 export function loadState(dir: string, issue: number): Loaded | null {
   let text: string;
   try {
     text = readFileSync(statePath(dir, issue), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return { kind: "unreadable", issue, error: String(error) };
+    throw error;
   }
   try {
     const state = JSON.parse(text) as ObjectiveState;

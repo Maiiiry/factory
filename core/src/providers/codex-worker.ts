@@ -60,6 +60,8 @@ export interface CodexWorkerOptions {
   network?: "host" | "off";
   /** Operator variables the worker's shell may see, by name. */
   allowedSecretNames?: readonly string[];
+  /** Values its reported commands and errors are redacted of (config.secrets). */
+  secrets?: readonly string[];
   /** Turns Codex child agents off, for a prompt that says they are. */
   childAgents?: "disabled";
   idleMs?: number;
@@ -79,6 +81,7 @@ function outcome(error: PlannerError): WorkerResult {
       kind: "retry",
       reason: error.message,
       ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+      ...(error.wait && { wait: error.wait }),
     };
   // `fail` is a turn larger than the context window: the operator decides.
   return hold(`${error.message}. Narrow the Work Item, then answer retry.`);
@@ -91,6 +94,47 @@ interface WorkerHome {
   /** Where the launcher records that group. */
   pidFile: string;
   env: Record<string, string>;
+}
+
+/** The proxy variables Codex keeps for itself (codex.ts ENVIRONMENT). */
+const PROXY = /^(?:HTTPS?|NO|ALL)_PROXY$/i;
+
+/**
+ * What the worker's shell sees of the proxy variables Codex keeps to reach
+ * its API: nothing when the shell has no network; with network, each URL
+ * (one without a scheme read as http://) without its user name and
+ * password (a URL that doesn't parse is left out), so the shell never
+ * holds a proxy credential.
+ */
+function proxyPolicy(source: NodeJS.ProcessEnv, network: boolean): string {
+  const set: string[] = [];
+  const exclude: string[] = [];
+  for (const [name, value] of Object.entries(source)) {
+    if (!PROXY.test(name) || value === undefined) continue;
+    if (!network) {
+      exclude.push(name);
+      continue;
+    }
+    if (/^no_proxy$/i.test(name)) continue;
+    let url: URL;
+    try {
+      // curl, pip and npm read a proxy without a scheme as http://.
+      url = new URL(
+        /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `http://${value}`,
+      );
+    } catch {
+      exclude.push(name);
+      continue;
+    }
+    if (!url.username && !url.password) continue;
+    url.username = "";
+    url.password = "";
+    set.push(`${JSON.stringify(name)} = ${JSON.stringify(url.href)}`);
+  }
+  return `
+[shell_environment_policy]
+inherit = "all"
+${exclude.length ? `exclude = ${JSON.stringify(exclude)}\n` : ""}${set.length ? `\n[shell_environment_policy.set]\n${set.join("\n")}\n` : ""}`;
 }
 
 /**
@@ -152,7 +196,7 @@ ${grants.join("\n")}
 
 [permissions.factory.network]
 enabled = ${network}
-`;
+${proxyPolicy(source, network)}`;
     },
     finish: ({ root, home, env }) => {
       // Package caches stay in the private HOME, never in the worktree.
@@ -249,9 +293,7 @@ export class CodexWorker implements Worker {
       );
     }
     const keep = this.options.allowedSecretNames ?? [];
-    const secrets = keep
-      .map((name) => process.env[name])
-      .filter((value): value is string => Boolean(value));
+    const secrets = this.options.secrets ?? [];
     let home: WorkerHome;
     try {
       home = workerHome(input.worktree, this.options.network === "host", keep);
@@ -372,7 +414,8 @@ export class CodexWorker implements Worker {
     } catch (error) {
       if (error instanceof PlannerError) return outcome(error);
       const idle = watchdog.expired;
-      if (idle) return { kind: "retry", reason: idle.message };
+      // An idle model is an error: three in a row hold.
+      if (idle) return { kind: "retry", reason: idle.message, afterMs: -1 };
       // Cancelled or past the step deadline: the engine decides.
       if (input.signal.aborted) throw input.signal.reason ?? error;
       // A failed codex process: its stderr is in the message.

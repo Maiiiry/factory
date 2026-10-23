@@ -1,5 +1,6 @@
 import type { SourceRef } from "../objective.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
+import type { ObjectiveBlock } from "../shown.js";
 
 /**
  * Plan data as the core stores it: plain JSON in the state file. The
@@ -94,6 +95,8 @@ export interface CoverageObligation {
     heading?: string;
     text?: string;
     lines?: [number, number];
+    /** An Objective criterion's command: an Acceptance list item that is exactly one code element. */
+    command?: string;
   };
   statement?: string;
 }
@@ -254,6 +257,11 @@ export interface PinnedSource extends Citation {
   content: string;
   /** Set only on the operator-written Objective body. */
   operatorAuthored?: true;
+  /**
+   * The Objective's shown lines and inline code elements (shown.ts): its
+   * command authority reads these, never its Markdown text.
+   */
+  shown?: { lines: string[]; spans: string[] };
   /** AGENTS.md or README.md read as context: never a source of obligations. */
   context?: true;
 }
@@ -261,7 +269,10 @@ export interface PinnedSource extends Citation {
 /** Everything the planner is given, computed once from the base. */
 export interface PlanningFacts {
   objective: number;
+  /** The planner text (shown.ts). */
   body: string;
+  /** The Objective's shown structure: every check reads this. */
+  blocks: readonly ObjectiveBlock[];
   base: string;
   sources: PinnedSource[];
   /** Commands a Work Item may run: test and check first, CI-only and network ones left out. */
@@ -276,4 +287,6 @@ export interface PlanningFacts {
   coverageObligations: CoverageObligation[];
   /** The approved playbook text; empty when there is none. */
   playbook: string;
+  /** The operator's media.localAssetRoots: the only places a local source asset may come from. */
+  localAssetRoots: readonly string[];
 }

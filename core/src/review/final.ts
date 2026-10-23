@@ -12,8 +12,7 @@
  * operator. Provider failures escape as `PlannerError`.
  */
 import { rm } from "node:fs/promises";
-import type { CandidateRecord } from "../media.js";
-import { parseObjective } from "../objective.js";
+import type { CandidateRecord, InputRecord } from "../media.js";
 import { coverageCriterion } from "../planning/graph.js";
 import { DESIGN_CHECKLIST } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
@@ -31,6 +30,8 @@ import {
   decisionRows,
   decodeResultReview,
   evidenceRoot,
+  INPUT_GUIDANCE,
+  inputRows,
   invalidReason,
   judge,
   materialize,
@@ -64,8 +65,12 @@ export async function reviewObjective(input: {
    */
   artifacts?: readonly ReviewArtifactGroup[];
   sources: readonly PinnedSource[];
+  /** The Objective's Acceptance criteria, in order (objective.ts). */
+  acceptance: readonly string[];
   /** Each merged item's captured candidate sets and the operator's selection. */
   candidates?: readonly CandidateRecord[];
+  /** Each merged item's read-only worker inputs. */
+  inputs?: readonly InputRecord[];
   /** A private directory for the evidence root. */
   dir: string;
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
@@ -74,10 +79,7 @@ export async function reviewObjective(input: {
   log(event: Record<string, unknown>): void;
 }): Promise<ResultReview> {
   const tree = input.validation.tree;
-  const criteria = finalCriteria(
-    input.plan,
-    objectiveAcceptance(input.sources),
-  );
+  const criteria = finalCriteria(input.plan, input.acceptance);
   const decided = (criterion: string) =>
     input.decisions?.find(
       (entry) => entry.criterion === criterion && entry.tree === tree,
@@ -93,6 +95,7 @@ export async function reviewObjective(input: {
       root,
     );
     const receipts = await candidateRows(root, input.candidates);
+    const given = await inputRows(root, input.inputs);
     const evidence: ResultEvidence[] = [
       ...sourceRows(input.sources),
       ...input.plan.items.map(
@@ -106,6 +109,7 @@ export async function reviewObjective(input: {
       ...decisionRows(input.plan),
       changeIndexRow(input.base, input.commit, tree, changes, input.merges),
       validationRow(input.validation),
+      ...given,
       ...receipts,
       ...captured.rows,
       ...rows,
@@ -119,6 +123,7 @@ export async function reviewObjective(input: {
             FINAL_INSTRUCTIONS,
             ...(captured.rows.length ? [REVIEW_ARTIFACT_GUIDANCE] : []),
             ...(receipts.length ? [CANDIDATE_GUIDANCE] : []),
+            ...(given.length ? [INPUT_GUIDANCE] : []),
           ].join("\n"),
           criteria,
           evidence,
@@ -151,14 +156,6 @@ export async function reviewObjective(input: {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}
-
-/** The operator-written Objective body's Acceptance criteria, in order. */
-function objectiveAcceptance(sources: readonly PinnedSource[]): string[] {
-  const body = sources.find(
-    (source) => source.path === "OBJECTIVE" && !source.heading,
-  );
-  return body ? parseObjective(body.content).objective.acceptance : [];
 }
 
 /**

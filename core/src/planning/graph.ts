@@ -1,4 +1,3 @@
-import { normalizedCommand } from "./facts.js";
 import type {
   AcceptanceCoverage,
   CoverageObligation,
@@ -957,35 +956,10 @@ function environmentFindings(
 }
 
 /**
- * The command an Acceptance bullet consists of: exactly one backticked
- * command, or a plain line, that has command authority of its own. Any other
- * bullet is a semantic obligation for review to judge.
- */
-function commandObligation(
-  text: string,
-  isCommand: (command: string, backticked: boolean) => boolean,
-): string | undefined {
-  const quoted = text.trim().match(/^`([^`]+)`$/)?.[1];
-  const candidate = quoted ?? text.trim();
-  return isCommand(candidate, quoted !== undefined)
-    ? normalizedCommand(candidate)
-    : undefined;
-}
-
-/** The Objective's final commands: Acceptance bullets that are exactly one backticked command. */
-function obligationCommands(obligations: readonly CoverageObligation[]) {
-  return obligations.flatMap((obligation) => {
-    if (obligation.source.path !== "OBJECTIVE") return [];
-    const command = obligation.source.text?.match(/^`([^`]+)`$/)?.[1];
-    return command?.trim() ? [command] : [];
-  });
-}
-
-/**
  * Coverage against the pinned sources: every Objective obligation covered
- * once, every source span real and disjoint, and a command criterion proved
- * by exactly that command. Obligations are keyed by text (Objective) or by
- * path and lines (source exit items).
+ * once and every source span real and disjoint. Obligations are keyed by
+ * text (Objective) or by path and lines (source exit items). An Objective
+ * command (`source.command`) is run by final validation.
  */
 function checkCoverageSources(
   draft: Draft,
@@ -998,45 +972,6 @@ function checkCoverageSources(
   const coverage = draft.coverage.filter(
     (entry) => isRecord(entry) && isRecord(entry.source),
   );
-  const items = Array.isArray(draft.items) ? draft.items : [];
-  const finals = obligationCommands(obligations).map(normalizedCommand);
-  const finalSet = new Set(finals);
-  const isCommand = (command: string, backticked: boolean) =>
-    backticked && finalSet.has(normalizedCommand(command));
-  const checks = (draft.requiredPreIntegrationChecks ?? []).map(
-    (gate) => gate.checkName,
-  );
-  const spanText = (source: CoverageObligation["source"]) =>
-    source.lines
-      ? (() => {
-          const text = pinnedSourceText(sources, source.path, source.heading);
-          return text === undefined
-            ? undefined
-            : sourceLines(text, source.lines);
-        })()
-      : source.text;
-  for (const { itemId, proof, source } of coverage) {
-    const text = spanText(source);
-    if (text === undefined || !isRecord(proof)) continue;
-    const command = commandObligation(text, isCommand);
-    if (
-      command === undefined ||
-      finals.includes(command) ||
-      checks.includes(command) ||
-      ("checkName" in proof && proof.checkName === command)
-    )
-      continue;
-    const owner = items.find((item) => item.id === itemId);
-    const selected =
-      "validationIndex" in proof
-        ? owner?.validation[proof.validationIndex]?.command
-        : undefined;
-    if (selected === undefined || normalizedCommand(selected) !== command)
-      found(
-        `Objective obligation \`${command}\` is a command, so its proof must be a result-command or integrated-command whose validationIndex selects exactly \`${command}\` on its owning item; it is proved by ${proof.kind} on ${itemId}`,
-        itemId,
-      );
-  }
   const required = new Map<string, number>();
   for (const obligation of obligations)
     if (obligation.source.path === "OBJECTIVE")

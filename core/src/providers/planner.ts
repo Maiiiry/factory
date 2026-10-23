@@ -5,14 +5,17 @@
  */
 import { accessSync, constants, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import type { Wait } from "../state.js";
 
-export type PlannerPhase =
-  | "plan"
-  | "graph-review"
-  | "result-review"
-  | "objective-review"
-  | "diagnosis"
-  | "dream";
+export const PLANNER_PHASES = [
+  "plan",
+  "graph-review",
+  "result-review",
+  "objective-review",
+  "diagnosis",
+  "dream",
+] as const;
+export type PlannerPhase = (typeof PLANNER_PHASES)[number];
 
 export interface PlannerCall {
   role: "planner" | "reviewer";
@@ -53,8 +56,12 @@ export class PlannerError extends Error {
   constructor(
     readonly outcome: "retry" | "hold" | "fail",
     reason: string,
-    /** For `retry`: when the provider said to come back. */
+    /** For `retry`: when to come back; -1 makes it an error (an idle model), which holds after three. */
     readonly afterMs?: number,
+    /** For `retry`: a usage limit and its reset (CORE.md#Waits). */
+    readonly wait?: Wait,
+    /** For `hold`: its answers, when not `retry` and `cancel`. */
+    readonly answers?: string[],
   ) {
     super(reason);
   }

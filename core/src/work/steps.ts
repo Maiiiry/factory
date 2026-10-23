@@ -1,8 +1,10 @@
-import { lstat } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { crashPoint } from "../crash.js";
 import {
   ACCEPT,
   type DeliveryContext,
+  deleteFactoryBranch,
   itemBranch,
   merge,
   mergeUnit,
@@ -10,14 +12,18 @@ import {
   type PullInput,
   publish,
   REPUBLISH,
+  RESET_BRANCH,
   type Repair,
 } from "../delivery.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead } from "../git.js";
+import { GitHubError } from "../github.js";
 import {
   type CandidateSet,
   captureAssets,
   destinationFinding,
+  type InputRecord,
+  type MediaInput,
   type MediaOutcome,
   materializeSelection,
   mediaDirectory,
@@ -31,6 +37,7 @@ import {
   validationMembers,
   verifyOriginMedia,
 } from "../media.js";
+import { checkObjective, objectiveText } from "../objective.js";
 import { forceRemove } from "../paths.js";
 import {
   BaseFiles,
@@ -48,11 +55,13 @@ import {
 } from "../planning/schedule.js";
 import {
   guarded,
-  normalizedBody,
+  type ObjectiveInputs,
   type PlanningDeps,
+  REOPENED,
 } from "../planning/steps.js";
 import type { Plan, WorkItem } from "../planning/types.js";
 import { type DeliveryUnit, unitOf, units } from "../planning/units.js";
+import { moveStatusOffDone } from "../queue.js";
 import { correction, type RepairFinding } from "../repair.js";
 import type { ReviewArtifact } from "../review/artifacts.js";
 import { reviewObjective } from "../review/final.js";
@@ -62,6 +71,7 @@ import {
   receiptPath,
   reviewResult,
 } from "../review/result.js";
+import { type ObjectiveBlock, readShown, shownDigest } from "../shown.js";
 import type { ObjectiveState } from "../state.js";
 import { validateTree } from "../validate.js";
 import {
@@ -69,10 +79,12 @@ import {
   GitRefusal,
   hostGit,
   hostGitExit,
+  isAncestor,
   removeWorktree,
   worktreePath,
 } from "../worktree.js";
 import { collect, type HandoffNote } from "./collect.js";
+import { type MergeResult, mergeOf } from "./merged.js";
 import { prepareWorkPrompt, type RepairContext } from "./prompt.js";
 import type { Worker, WorkerSpend } from "./worker.js";
 
@@ -81,7 +93,7 @@ const MINUTE = 60_000;
 /** What execution needs from the installation, beyond planning. */
 export interface BuildDeps extends PlanningDeps {
   /** The worker for an Objective's plan. */
-  worker(plan: Plan, body: string): Worker;
+  worker(plan: Plan, blocks: readonly ObjectiveBlock[]): Worker;
 }
 
 /*
@@ -165,14 +177,6 @@ interface PublishResult {
   pr: number;
   head: string;
   merged: boolean;
-}
-
-interface MergeResult {
-  mergeSha: string;
-  integratedSha: string;
-  at: string;
-  /** A native stack's top: every layer's item, merged at `mergeSha`. */
-  items?: string[];
 }
 
 /**
@@ -286,19 +290,6 @@ export function built(state: ObjectiveState): boolean {
   // A split delivers through its children, which aren't created yet.
   if (!plan || plan.split) return false;
   return plan.items.every((item) => mergeOf(state, item.id));
-}
-
-/**
- * The merge that delivered `id`: its own merge step's, or, for a lower
- * native-stack layer, the stack's merge recorded on the unit's top.
- */
-function mergeOf(state: ObjectiveState, id: string): MergeResult | undefined {
-  const own = state.done[stepKey(id, "merge")] as MergeResult | undefined;
-  if (own) return own;
-  for (const [key, value] of Object.entries(state.done))
-    if (key.endsWith(":merge") && (value as MergeResult).items?.includes(id))
-      return value as MergeResult;
-  return undefined;
 }
 
 /** The item's unit and layer when it is in a native stack of more than one item. */
@@ -417,7 +408,7 @@ function itemStep(item: WorkItem, phase: Phase, deps: BuildDeps): Step {
     run: (context) =>
       context.answer?.answer === "replan"
         ? Promise.resolve(replanOutcome(context.state))
-        : guardedItem(() => run(item, context, deps)),
+        : guardedItem(deps, () => run(item, context, deps)),
   };
 }
 
@@ -432,7 +423,8 @@ async function workStep(
   const { state, signal } = context;
   const { config } = deps;
   const plan = state.done.plan as Plan;
-  const body = objectiveBody(state);
+  const { shown } = objectiveInputs(state);
+  const body = shown.body;
   const workDir = deps.workDir(state.issue);
   const worktree = worktreePath(workDir, state.issue, item.id);
   const media = mediaDirectory(workDir, item.id);
@@ -455,21 +447,31 @@ async function workStep(
   };
   const keptBase = kept<string>(state, item.id, "base");
   let base = keptBase ?? (await start());
-  await addWorktree(config.checkout, worktree, base, signal);
-  if (kept(state, item.id, "rebase")) {
+  const added = await addWorktree(config.checkout, worktree, base, signal);
+  if (added === "kept" && keptBase === undefined) {
+    // A worktree from an attempt that never kept its base (interrupted
+    // before its outcome) sits on that attempt's base, which the default
+    // branch may have left since: start over on this one.
+    await rebaseWorktree(
+      config.checkout,
+      worktree,
+      base,
+      base,
+      undefined,
+      signal,
+    );
+  } else if (kept(state, item.id, "rebase")) {
     // A conflict or failed delivery: move onto the current start and replay
-    // the refused change, so the worker can resolve it there. An attempt
-    // that never kept its base (stopped when the layer below was repaired)
-    // left files on an unknown base: start over on the current one.
+    // the kept change, so the worker can resolve it there.
     const head = await start();
-    const refused = kept<string>(state, item.id, "refusedCommit");
-    if (head !== base || keptBase === undefined) {
+    const replay = kept<string>(state, item.id, "replay");
+    if (head !== base) {
       await rebaseWorktree(
         config.checkout,
         worktree,
         base,
         head,
-        refused,
+        replay,
         signal,
       );
       base = head;
@@ -524,6 +526,8 @@ async function workStep(
         ...keepBase,
         [finishedKey]: null,
         [keptKey(item.id, "finding")]: null,
+        [keptKey(item.id, "refused")]: null,
+        [keptKey(item.id, "replay")]: null,
       },
     };
   }
@@ -544,7 +548,8 @@ async function workStep(
       plan,
       item,
       base,
-      body,
+      body: objectiveText(shown.blocks),
+      localAssetRoots: config.media.localAssetRoots,
       selection: selection(state),
       ...(own ? { kept: own.selection } : {}),
       githubToken: () => deps.github.serviceToken(),
@@ -552,13 +557,15 @@ async function workStep(
     });
     if (inputs.kind !== "done")
       return mediaOutcome(item, inputs, context, deps, keepAll);
+    // Review gets the same inputs (InputRecord): the last ones resolved.
+    keepAll = { ...keepAll, [keptKey(item.id, "inputs")]: inputs.value };
 
     const files = new BaseFiles(config.checkout, base, signal);
     const scripts = await fixedScripts(
-      finalCommands(body, config.finalValidation.requiredCommands),
+      finalCommands(shown.blocks, config.finalValidation.requiredCommands),
       files,
     );
-    const pin = packageManagerUpdate(body);
+    const pin = packageManagerUpdate(shown.blocks);
     const prepared = await prepareWorkPrompt({
       checkout: config.checkout,
       worktree,
@@ -591,7 +598,7 @@ async function workStep(
       );
 
     const spent = kept<WorkerSpend>(state, item.id, "spend");
-    const { spend, ...result } = await deps.worker(plan, body).run({
+    const { spend, ...result } = await deps.worker(plan, shown.blocks).run({
       worktree,
       prompt: prepared.prompt,
       item,
@@ -670,9 +677,7 @@ async function workStep(
     item,
     sandbox: config.sandbox,
     finalResponse: finished.finalResponse,
-    ...(kept<string>(state, item.id, "refusedTree")
-      ? { refusedTree: kept<string>(state, item.id, "refusedTree")! }
-      : {}),
+    refusedTree: kept<Refused>(state, item.id, "refused")?.tree,
     signal,
   });
   switch (collected.kind) {
@@ -708,6 +713,8 @@ async function workStep(
           ...keepAll,
           [finishedKey]: null,
           [keptKey(item.id, "finding")]: null,
+          [keptKey(item.id, "refused")]: null,
+          [keptKey(item.id, "replay")]: null,
         },
       };
     }
@@ -788,8 +795,8 @@ function withKeep(outcome: Outcome, keep: Record<string, unknown>): Outcome {
 }
 
 /**
- * Move a kept worktree from `from` to `to` and replay the refused change on
- * it. Conflicts stay in the files for the worker to resolve.
+ * Move a kept worktree from `from` to `to` and replay the kept change
+ * (`replay`) on it. Conflicts stay in the files for the worker to resolve.
  */
 async function rebaseWorktree(
   checkout: string,
@@ -865,7 +872,9 @@ async function repairContext(
     checkout: deps.config.checkout,
     base,
     commit:
-      kept<string>(state, item.id, "refusedCommit") ?? previous?.commit ?? base,
+      kept<Refused>(state, item.id, "refused")?.commit ??
+      previous?.commit ??
+      base,
     sources,
     prior: applied,
     ...(answer ? { operatorAnswer: answer } : {}),
@@ -910,10 +919,42 @@ async function repairContext(
 }
 
 /**
+ * The result a repair refused: its commit (the diagnosis's evidence), its
+ * tree (collection reads the same tree on the same base as no change) and
+ * its notes (for `revalidate`).
+ */
+interface Refused {
+  commit: string;
+  tree: string;
+  notes: HandoffNote[];
+}
+
+/**
+ * The change a rebase replays: the commit of the item's last work result,
+ * kept on every repair that clears it, whether or not the repair refuses
+ * that result. Separate from the refused fact, whose tree collection reads
+ * as "no change".
+ */
+function replayFact(id: string, work: WorkResult): Record<string, string> {
+  return { [keptKey(id, "replay")]: work.commit };
+}
+
+/** The one writer of the refused fact, from the refused work result. */
+function refusedFact(id: string, work: WorkResult): Record<string, Refused> {
+  return {
+    [keptKey(id, "refused")]: {
+      commit: work.commit,
+      tree: work.tree,
+      notes: work.notes,
+    },
+  };
+}
+
+/**
  * The kept refused result as a work result, when it can be checked again
  * unchanged: its commit still exists with the refused tree, on `base`, and
- * an item with media still has the selection to write on it again. Notes
- * come back when they were kept with that commit; sets from the selection.
+ * an item with media still has the selection to write on it again; sets
+ * come from the selection.
  */
 async function refusedResult(
   state: ObjectiveState,
@@ -922,38 +963,21 @@ async function refusedResult(
   base: string,
   signal: AbortSignal,
 ): Promise<WorkResult | undefined> {
-  const commit = kept<string>(state, item.id, "refusedCommit");
-  const tree = kept<string>(state, item.id, "refusedTree");
-  if (!commit || !tree) return undefined;
+  const refused = kept<Refused>(state, item.id, "refused");
+  if (!refused) return undefined;
   const own = kept<KeptSelection>(state, item.id, "selection");
   if (needsSelection(item) && !own) return undefined;
   const shown = await hostGitExit(
     checkout,
-    ["show", "--no-patch", "--format=%P %T", `${commit}^{commit}`],
+    ["show", "--no-patch", "--format=%P %T", `${refused.commit}^{commit}`],
     { signal },
   );
   if (
     shown.code !== 0 ||
-    shown.stdout.toString("utf8").trim() !== `${base} ${tree}`
+    shown.stdout.toString("utf8").trim() !== `${base} ${refused.tree}`
   )
     return undefined;
-  const notes = kept<{ commit: string; notes: HandoffNote[] }>(
-    state,
-    item.id,
-    "refusedNotes",
-  );
-  return {
-    base,
-    commit,
-    tree,
-    notes: notes?.commit === commit ? notes.notes : [],
-    sets: own?.sets ?? [],
-  };
-}
-
-/** The refused result's notes, kept with its commit for `revalidate`. */
-function refusedNotes(work: WorkResult) {
-  return { commit: work.commit, notes: work.notes };
+  return { base, ...refused, sets: own?.sets ?? [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -978,7 +1002,7 @@ async function validateStep(
     commit: candidate(state, item.id),
     item,
     plan,
-    body: objectiveBody(state),
+    blocks: objectiveInputs(state).shown.blocks,
     ...(work.base !== plan.base ? { predecessor: work.base } : {}),
     reviewArtifacts: {
       configured: config.reviewArtifacts,
@@ -1023,10 +1047,6 @@ async function validateStep(
         result.detail,
         {
           ...failure(item, result.output),
-          // The worker's own tree: collection compares the next result to it.
-          [keptKey(item.id, "refusedTree")]: work.tree,
-          [keptKey(item.id, "refusedCommit")]: work.commit,
-          [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
         },
         context,
         deps,
@@ -1151,6 +1171,7 @@ async function reviewStep(
     ...(chosen
       ? { candidates: [{ item, sets: work.sets, selection: chosen }] }
       : {}),
+    inputs: workerInputs(state, [item.id]),
     ...(validated.artifacts ? { artifacts: validated.artifacts } : {}),
     decisions,
     signal,
@@ -1169,14 +1190,19 @@ async function reviewStep(
           tree: review.tree,
           refused: review.kind === "refused" ? review.refused : [],
         } satisfies RepairFinding,
-        [keptKey(item.id, "refusedTree")]: work.tree,
-        [keptKey(item.id, "refusedCommit")]: work.commit,
-        [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       },
       context,
       deps,
     ),
   );
+}
+
+/** The read-only inputs each item's worker last got, for review. */
+function workerInputs(state: ObjectiveState, ids: string[]): InputRecord[] {
+  return ids.map((id) => ({
+    item: id,
+    inputs: kept<MediaInput[]>(state, id, "inputs") ?? [],
+  }));
 }
 
 /** Pass is done, refused repairs, needs-human asks (saving the criteria it asks about under `pendingKey`). */
@@ -1278,9 +1304,35 @@ async function publishStep(
         ...(flaky ? { flaky: { command: flaky.command, exitCode: null } } : {}),
       },
       ...(republish ? { republish: true } : {}),
+      ...(context.answer?.answer === RESET_BRANCH ? { reset: true } : {}),
       ...(branch ? { baseBranch: branch } : {}),
+      secrets: deps.config.secrets,
+      // The operator's `publish` counts only for the finding it answered:
+      // the digest kept when the hold was raised, never the hold's text,
+      // which quotes worker-chosen paths.
+      ...(context.answer?.answer === "publish"
+        ? { allowSecret: kept<string>(state, item.id, "secret") }
+        : {}),
     },
   );
+  if (result.kind === "secret")
+    return context.answer?.answer === "repair"
+      ? repairOutcome(
+          item,
+          "publish",
+          result.finding,
+          failure(item, result.finding),
+          context,
+          deps,
+          true,
+        )
+      : {
+          ...hold(
+            `${result.finding}\n\nPublication stopped; nothing was pushed (finding \`${result.digest}\`). Answer repair to have the worker remove the value; publish if the matched text isn't a secret, which lets exactly this finding on this commit through once; or cancel. Rotate the secret if the worker may have written it anywhere else.`,
+            ["repair", "publish", "cancel"],
+          ),
+          keep: { [keptKey(item.id, "secret")]: result.digest },
+        };
   // An empty change, or a pointer whose LFS object is missing: a fault in
   // the result itself, not a conflict, so no rebase.
   if (result.kind === "empty" || result.kind === "repair")
@@ -1378,6 +1430,7 @@ async function mergeStep(
   );
   switch (result.kind) {
     case "merged": {
+      await deleteBranches(context, deps, [item]);
       const done: MergeResult = {
         mergeSha: result.mergeSha,
         integratedSha: result.integratedSha,
@@ -1391,6 +1444,29 @@ async function mergeStep(
       return republishOutcome(item, result.reason);
     default:
       return result;
+  }
+}
+
+/** Delete the merged items' branches (deleteFactoryBranch); a kept one is logged. */
+async function deleteBranches(
+  context: StepContext,
+  deps: BuildDeps,
+  items: readonly WorkItem[],
+): Promise<void> {
+  const where = {
+    github: deps.github,
+    checkout: deps.config.checkout,
+    signal: context.signal,
+  };
+  for (const item of items) {
+    const branch = itemBranch(context.state.issue, item.id);
+    const kept = await deleteFactoryBranch(
+      where,
+      branch,
+      "deliver:branch-delete",
+      baseBranch(context.state, deps, item),
+    );
+    if (kept) context.log({ event: "branch-kept", branch, reason: kept });
   }
 }
 
@@ -1421,6 +1497,9 @@ async function mergeStack(
     unit.items.find((entry) => entry.id === id) ?? top;
   switch (result.kind) {
     case "merged": {
+      // Lower layers' branches are the upper PRs' bases: they go only
+      // once the whole unit merged.
+      await deleteBranches(context, deps, unit.items);
       const done: MergeResult = {
         mergeSha: result.mergeSha,
         integratedSha: result.integratedSha,
@@ -1453,7 +1532,6 @@ function deliveryRepair(
   repair: Repair,
   phase: Phase,
 ): Outcome {
-  const work = context.state.done[stepKey(item.id, "work")] as WorkResult;
   return repairOutcome(
     item,
     phase,
@@ -1465,9 +1543,6 @@ function deliveryRepair(
       ...(repair.conflict?.onto
         ? { [keptKey(item.id, "onto")]: repair.conflict.onto }
         : {}),
-      [keptKey(item.id, "refusedCommit")]: work.commit,
-      [keptKey(item.id, "refusedTree")]: work.tree,
-      [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       [keptKey(item.id, "rebase")]: true,
     },
     context,
@@ -1509,6 +1584,17 @@ function republishOutcome(item: WorkItem, reason: string): Outcome {
  * unless the repair is about the media: it comes from the select step (the
  * operator's `repair`, or the selected set couldn't be written), or the
  * finding names a selected destination or cites the candidate receipt.
+ *
+ * Every cleared work result (the item's and each layer's above) keeps its
+ * commit as the replay source, so a rebase never drops the change.
+ *
+ * `refusesResult`: the repair refuses the item's own work result tree
+ * (validate, review, CI, merge, a secret it writes), so the worker must
+ * change it and the item's refused fact is recorded. A select or publish
+ * media repair (new candidates, a selection that couldn't be written, LFS
+ * objects) may rightly end on the same tracked tree, so it records no
+ * refused fact, and a correct fix is never "no change". The layers above
+ * are moved, not refused: they never get a refused fact.
  */
 function repairOutcome(
   item: WorkItem,
@@ -1517,6 +1603,7 @@ function repairOutcome(
   keep: Record<string, unknown>,
   context: StepContext,
   deps: BuildDeps,
+  refusesResult = from !== "select" && from !== "publish",
 ): Outcome {
   const { state } = context;
   const place = stackLayer(state.done.plan as Plan, deps, item.id);
@@ -1542,8 +1629,13 @@ function repairOutcome(
         finding,
         keep[keptKey(item.id, "finding")] as RepairFinding | undefined,
       ));
+  // The result being cleared, when there is one: a repair from `work`
+  // itself keeps the facts of the result before it.
+  const result = state.done[stepKey(item.id, "work")] as WorkResult | undefined;
   const moved: Record<string, unknown> = {
     [keptKey(item.id, "selection")]: media ? null : (own ?? null),
+    ...(result ? replayFact(item.id, result) : {}),
+    ...(result && refusesResult ? refusedFact(item.id, result) : {}),
   };
   for (const layer of above) {
     const layerSelection = standing(layer);
@@ -1555,9 +1647,9 @@ function repairOutcome(
     moved[keptKey(layer.id, "finished")] = null;
     moved[keptKey(layer.id, "onto")] = null;
     if (work) {
-      moved[keptKey(layer.id, "refusedCommit")] = work.commit;
       Object.assign(
         moved,
+        replayFact(layer.id, work),
         conflictFinding(
           layer,
           `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
@@ -1622,11 +1714,21 @@ function replanOutcome(state: ObjectiveState): Outcome {
         ...items.flatMap((item) => PHASES.map((p) => stepKey(item.id, p))),
       ]),
     ],
-    keep: Object.fromEntries(
-      Object.keys(state.kept ?? {}).map((key) => [key, null]),
-    ),
+    keep: {
+      ...Object.fromEntries(
+        Object.keys(state.kept ?? {}).map((key) => [key, null]),
+      ),
+      [RERUN]: true,
+    },
   };
 }
+
+/**
+ * Set when an Objective runs again: after a `replan` once the plan was
+ * accepted, or when a finished Objective is queued again. The earlier
+ * run's open PRs and work files go before the new run checks the issue.
+ */
+export const RERUN = "rerun";
 
 // ---------------------------------------------------------------------------
 // aggregates and not-yet-ported kinds
@@ -1677,7 +1779,7 @@ export function finalStep(deps: BuildDeps): Step {
     resource: "cpu",
     deadlineMs: 60 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
         const { config } = deps;
         const plan = state.done.plan as Plan;
@@ -1688,12 +1790,9 @@ export function finalStep(deps: BuildDeps): Step {
             | MergeResult
             | undefined;
           if (!merged?.mergeSha) continue;
-          const on = await hostGitExit(
-            config.checkout,
-            ["merge-base", "--is-ancestor", merged.mergeSha, head],
-            { signal },
-          );
-          if (on.code !== 0)
+          if (
+            !(await isAncestor(config.checkout, merged.mergeSha, head, signal))
+          )
             return hold(
               `Work Item ${item.id}'s merge \`${merged.mergeSha.slice(0, 12)}\` is not on the default branch (${head.slice(0, 12)}); someone may have reverted or force-pushed it. Restore it and answer \`retry\`, or \`replan\`.`,
               ["retry", "replan", "cancel"],
@@ -1707,7 +1806,7 @@ export function finalStep(deps: BuildDeps): Step {
           directory: join(workDir, "final"),
           commit: head,
           plan,
-          body: objectiveBody(state),
+          blocks: objectiveInputs(state).shown.blocks,
           reviewArtifacts: {
             configured: config.reviewArtifacts,
             planned: plan.reviewArtifacts,
@@ -1760,7 +1859,7 @@ export function finalReviewStep(deps: BuildDeps): Step {
     key: "final-review",
     deadlineMs: 45 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
         if (context.answer?.answer === "replan") return replanOutcome(state);
         // A fix on the default branch: validate the new head before reviewing again.
@@ -1823,7 +1922,11 @@ export function finalReviewStep(deps: BuildDeps): Step {
               ? [{ item, sets: work.sets, selection: chosen }]
               : [];
           }),
+          inputs: workerInputs(state, mergedIds),
           sources: await pinnedSources(state, deps, signal),
+          acceptance: checkObjective(
+            objectiveInputs(state).shown.blocks,
+          ).objective.acceptance.map((criterion) => criterion.text),
           dir: join(deps.workDir(state.issue), "final-review"),
           ...(decisions ? { decisions } : {}),
           signal,
@@ -1851,20 +1954,22 @@ async function objectiveEdited(
   deps: BuildDeps,
 ): Promise<Outcome | undefined> {
   const { state, signal } = context;
-  const issue = await deps.github.issue(state.issue, signal);
-  const body = normalizedBody(issue.body);
-  const accepted = normalizedBody(
-    ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
-      objectiveBody(state),
+  const issue = await deps.github.renderedIssue(state.issue, signal);
+  const planned = objectiveInputs(state);
+  const digest = shownDigest(
+    readShown(issue.body_html, { sources: planned.writer === true }),
   );
+  const accepted =
+    ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
+    shownDigest(planned.shown);
   if (context.answer?.answer === "continue")
-    return body === accepted
+    return digest === accepted
       ? undefined
       : {
           kind: "retry",
           reason: "Continuing with the edited Objective.",
           afterMs: 0,
-          keep: { "objective:accepted": body },
+          keep: { "objective:accepted": digest },
         };
   if (issue.state !== "open")
     return hold(
@@ -1872,7 +1977,7 @@ async function objectiveEdited(
       ["continue", "cancel"],
       "cancel",
     );
-  if (body !== accepted)
+  if (digest !== accepted)
     return hold(
       `Objective #${state.issue} was edited after its plan was accepted. \`continue\` keeps building this plan; \`replan\` plans again from the new text.`,
       ["continue", "replan", "cancel"],
@@ -1881,15 +1986,15 @@ async function objectiveEdited(
   return undefined;
 }
 
-/** The Objective body as planning read it. */
-function objectiveBody(state: ObjectiveState): string {
-  let latest = (state.done.check as { body: string }).body;
+/** The Objective as planning read it. */
+function objectiveInputs(state: ObjectiveState): ObjectiveInputs {
+  let latest = state.done.check as ObjectiveInputs;
   for (const [key, value] of Object.entries(state.done))
     if (
       /^plan:\d+:1$/.test(key) &&
-      (value as { inputs?: { body: string } }).inputs
+      (value as { inputs?: ObjectiveInputs }).inputs
     )
-      latest = (value as { inputs: { body: string } }).inputs.body;
+      latest = (value as { inputs: ObjectiveInputs }).inputs;
   return latest;
 }
 
@@ -1909,16 +2014,21 @@ async function pinnedSources(
   signal: AbortSignal,
 ) {
   const plan = state.done.plan as Plan;
+  const objective = objectiveInputs(state);
   const { sources } = await planningSources(
-    objectiveBody(state),
+    objective.shown,
     new BaseFiles(deps.config.checkout, plan.base, signal),
+    objective.child === true,
   );
   return sources;
 }
 
 /** Item steps map Git refusals to a hold; everything else goes through planning's mapping. */
-async function guardedItem(work: () => Promise<Outcome>): Promise<Outcome> {
-  return guarded(async () => {
+async function guardedItem(
+  deps: BuildDeps,
+  work: () => Promise<Outcome>,
+): Promise<Outcome> {
+  return guarded(deps.config.repository, async () => {
     try {
       return await work();
     } catch (error) {
@@ -1937,9 +2047,9 @@ export function reportStep(deps: BuildDeps): Step {
     key: "report",
     deadlineMs: 10 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
-        const { config, github } = deps;
+        const { github } = deps;
         if (context.answer?.answer === "replan") return replanOutcome(state);
         const marker = `<!-- factory:${state.issue}:report -->`;
         // Once the report is posted, the issue close that follows is Factory's
@@ -1968,91 +2078,197 @@ export function reportStep(deps: BuildDeps): Step {
           0,
         );
         const body = `${marker}\n**Factory finished this Objective.**\n\n${lines.join("\n")}\n\nFinal validation and final review passed on \`${final.commit.slice(0, 12)}\` (${final.commands.map((c) => `\`${c}\``).join(", ")}).${repairs ? ` ${repairs} repair${repairs === 1 ? "" : "s"} along the way.` : ""}${final.media ? `\n\n${final.media}` : ""}`;
-        if (!reported) await github.postComment(state.issue, body, signal);
-        const issue = await github.issue(state.issue, signal);
-        if (issue.state === "open")
-          await github.rest(
-            "PATCH",
-            `/repos/${config.repository}/issues/${state.issue}`,
-            { state: "closed", state_reason: "completed" },
-            signal,
-          );
-        await removeWorkFiles(state, deps, signal);
+        if (!reported) {
+          crashPoint("report:comment:before");
+          await github.postComment(state.issue, body, signal);
+          crashPoint("report:comment:after");
+        }
+        await github.closeIssue(
+          state.issue,
+          "completed",
+          "report:close",
+          signal,
+        );
+        await removeWorkFiles(state.issue, deps, signal);
         return { kind: "done" };
       }),
   };
 }
 
-/** After cancel: close Factory's open PRs and remove the work files. It retries; it never asks. */
+/** After cancel: close Factory's open PRs, delete its branches and remove the work files. It retries; it never asks. */
 export function cancelCleanupStep(deps: BuildDeps): Step {
   return {
     key: "cancel:cleanup",
     deadlineMs: 10 * MINUTE,
-    run: async ({ state, signal }) => {
-      const plan = state.done.plan as Plan | undefined;
-      const { config, github } = deps;
-      for (const item of plan?.items ?? []) {
-        const branch = `${config.repository.split("/")[0]}:${itemBranch(state.issue, item.id)}`;
-        const pulls = await github.rest<{ number: number }[]>(
-          "GET",
-          `/repos/${config.repository}/pulls?head=${encodeURIComponent(branch)}&state=open`,
-          undefined,
-          signal,
+    run: async ({ state, signal, log }) => {
+      await closeFactoryPulls(
+        deps,
+        state.issue,
+        "cancelled",
+        `Factory cancelled Objective #${state.issue}; closing this PR.`,
+        signal,
+      );
+      // Cancel ends the Objective, so its branches go once their PRs are
+      // closed (a stack's upper PRs first); a re-run reuses them instead.
+      for (const branch of await deps.github.branches(
+        `factory/${state.issue}/`,
+        signal,
+      )) {
+        const kept = await deleteFactoryBranch(
+          { github: deps.github, checkout: deps.config.checkout, signal },
+          branch,
+          "cancel:branch-delete",
         );
-        for (const pull of pulls) {
-          const marker = `<!-- factory:${state.issue}:pr-cancelled:${item.id} -->`;
-          if (
-            !(await github.findComment(pull.number, marker, undefined, signal))
-          )
-            await github.postComment(
-              pull.number,
-              `${marker}\nFactory cancelled Objective #${state.issue}; closing this PR.`,
-              signal,
-            );
-          await github.rest(
-            "PATCH",
-            `/repos/${config.repository}/pulls/${pull.number}`,
-            { state: "closed" },
-            signal,
-          );
-        }
+        if (kept) log({ event: "branch-kept", branch, reason: kept });
       }
       // The Objective's issue closes as not planned, so the queue and the
       // issue agree; the operator can reopen and queue it again.
-      const issue = await github.issue(state.issue, signal);
-      if (issue.state === "open")
-        await github.rest(
-          "PATCH",
-          `/repos/${config.repository}/issues/${state.issue}`,
-          { state: "closed", state_reason: "not_planned" },
-          signal,
-        );
-      await removeWorkFiles(state, deps, signal);
+      await deps.github.closeIssue(
+        state.issue,
+        "not_planned",
+        "cancel:close",
+        signal,
+      );
+      await removeWorkFiles(state.issue, deps, signal);
       return { kind: "done" };
     },
   };
 }
 
-/** The Objective's worktrees, selection refs, captured media, review artifacts and final media scratch. */
+/**
+ * Before a new run of the Objective checks the issue again: reopen the
+ * issue if it is closed (a finished Objective queued again; the earlier
+ * run, or the Project's "Auto-close issue" workflow, closed it), close the
+ * earlier run's open PRs and remove its worktrees, so the new plan starts
+ * clean. Before reopening, the card's built-in Status moves off Done, so
+ * that workflow doesn't close it again; the check after sees whether the
+ * issue stayed open. It asks only when GitHub refuses the reopen.
+ */
+export function rerunCleanupStep(deps: BuildDeps): Step {
+  return {
+    key: "rerun:cleanup",
+    deadlineMs: 10 * MINUTE,
+    run: (context) =>
+      guardedItem(deps, async () => {
+        const { state, signal } = context;
+        const closed =
+          (await deps.github.issue(state.issue, signal)).state !== "open";
+        try {
+          // The Project's "Auto-close issue" workflow closes an issue whose
+          // built-in Status reads Done, so it moves off Done first.
+          if (closed) {
+            const moved = await moveStatusOffDone(
+              deps.github,
+              deps.config,
+              state.issue,
+              "rerun:status",
+              signal,
+            );
+            if (moved) context.log({ event: "status-off-done", option: moved });
+          }
+          await deps.github.reopenIssue(state.issue, "rerun:reopen", signal);
+        } catch (error) {
+          if (
+            error instanceof GitHubError &&
+            (error.status === 403 || error.status === 422)
+          )
+            return hold(
+              `Issue #${state.issue} was queued again, but it is closed and GitHub refused to reopen it (${error.message.slice(0, 300)}). Reopen it yourself, then answer retry; or cancel. If the Project's "Auto-close issue" workflow closes it again, set the item's Status off Done first.`,
+            );
+          throw error;
+        }
+        await closeFactoryPulls(
+          deps,
+          state.issue,
+          "replanned",
+          `Factory is running Objective #${state.issue} again from a new plan; closing this PR from the earlier one.`,
+          signal,
+        );
+        await removeWorkFiles(state.issue, deps, signal);
+        // The check that follows sees whether it stayed open.
+        return {
+          kind: "done",
+          keep: { [RERUN]: null, ...(closed ? { [REOPENED]: true } : {}) },
+        };
+      }),
+  };
+}
+
+/**
+ * Close every open PR of the Objective: every branch under
+ * `factory/<issue>/`, whatever plan made it, so PRs of an earlier plan
+ * close too. Each gets one marked comment first.
+ */
+async function closeFactoryPulls(
+  deps: BuildDeps,
+  issue: number,
+  kind: string,
+  text: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const { config, github } = deps;
+  const point = kind === "cancelled" ? "cancel" : "rerun";
+  for (const branch of await github.branches(`factory/${issue}/`, signal)) {
+    const pulls = await github.rest<{ number: number }[]>(
+      "GET",
+      `/repos/${config.repository}/pulls?head=${encodeURIComponent(`${github.owner}:${branch}`)}&state=open`,
+      undefined,
+      signal,
+    );
+    for (const pull of pulls) {
+      const marker = `<!-- factory:${issue}:pr-${kind}:${branch.slice(`factory/${issue}/`.length)} -->`;
+      await github.upsertComment(
+        pull.number,
+        marker,
+        `${marker}\n${text}`,
+        `${point}:pr-comment`,
+        signal,
+      );
+      crashPoint(`${point}:pr-close:before`);
+      await github.rest(
+        "PATCH",
+        `/repos/${config.repository}/pulls/${pull.number}`,
+        { state: "closed" },
+        signal,
+      );
+      crashPoint(`${point}:pr-close:after`);
+    }
+  }
+}
+
+/**
+ * Every worktree and selection ref of the Objective, whatever plan made
+ * them, then its whole work directory: captured media, review artifacts,
+ * final media and review scratch, and the planning tree.
+ */
 async function removeWorkFiles(
-  state: ObjectiveState,
+  issue: number,
   deps: BuildDeps,
   signal: AbortSignal,
 ): Promise<void> {
-  const plan = state.done.plan as Plan | undefined;
-  const workDir = deps.workDir(state.issue);
-  for (const item of plan?.items ?? []) {
-    await removeWorktree(
-      deps.config.checkout,
-      worktreePath(workDir, state.issue, item.id),
-      signal,
-    );
-    await hostGit(
-      deps.config.checkout,
-      ["update-ref", "-d", selectionRef(state.issue, item.id)],
-      { signal },
-    );
+  const { checkout } = deps.config;
+  const workDir = deps.workDir(issue);
+  const root = dirname(worktreePath(workDir, issue, "item"));
+  let names: string[] = [];
+  try {
+    names = await readdir(root);
+  } catch {
+    // No worktrees.
   }
-  for (const files of ["assets", "artifacts", "final-media"])
-    await forceRemove(join(workDir, files));
+  for (const name of names)
+    if (!name.endsWith(".shell") && !name.endsWith(".validation"))
+      await removeWorktree(checkout, join(root, name), signal);
+  const refs = (
+    await hostGit(
+      checkout,
+      ["for-each-ref", "--format=%(refname)", `refs/factory/${issue}/`],
+      { signal },
+    )
+  )
+    .toString("utf8")
+    .split("\n")
+    .filter(Boolean);
+  for (const ref of refs)
+    await hostGit(checkout, ["update-ref", "-d", ref], { signal });
+  await forceRemove(workDir);
 }

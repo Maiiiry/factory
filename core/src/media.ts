@@ -36,16 +36,19 @@ import {
   lstatSync,
 } from "node:fs";
 import { chmod, copyFile, mkdir, open, rm, unlink } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebStream } from "node:stream/web";
 import { hold } from "./engine.js";
 import {
-  batchObjects,
+  blobSizes,
+  type CatFile,
   LFS_POINTER_MAX_BYTES,
   lfsPointer,
   operatorGit,
+  readBlobs,
+  secretSearch,
   sha256,
 } from "./git.js";
 import { namesPath, validPath } from "./objective.js";
@@ -58,6 +61,7 @@ import {
 } from "./paths.js";
 import { isRecord, ownsPath } from "./planning/graph.js";
 import type { Plan, SourceAssetBinding, WorkItem } from "./planning/types.js";
+import { localAssetPlace } from "./sandbox.js";
 import { errorMessage } from "./text.js";
 import {
   FACTORY_EMAIL,
@@ -222,8 +226,10 @@ export interface InputsRequest {
   item: WorkItem;
   /** The commit the item's worktree starts from: repository sources are read there. */
   base: string;
-  /** The Objective body: a local source must be a path it names (namesPath). */
+  /** The Objective's shown text (objectiveText): a local source must be a path it names (namesPath). */
   body: string;
+  /** The operator's media.localAssetRoots: a local source must lie under one. */
+  localAssetRoots: readonly string[];
   /** Each dependency's select result, when it has one. */
   selection(itemId: string): Selection | undefined;
   /** The item's own selection kept across a repair that isn't about the media; its members are staged read-only. */
@@ -239,7 +245,8 @@ export interface InputsRequest {
  * a GitHub attachment), the selected members its dependencies bound to
  * it, and its own kept selection's members on a repair. Each is copied
  * fresh into `<directory>/inputs/` with its digest; pass the list to
- * prepareWorkPrompt as `mediaInputs`, which stages them.
+ * prepareWorkPrompt as `mediaInputs`, which stages them, and keep it for
+ * result and final review (inputReceipts).
  *
  * Step: call before prepareWorkPrompt on every attempt. done → pass on;
  * retry → retry; hold → hold. Its holds carry `retry` (run the work step
@@ -260,7 +267,12 @@ export async function resolveInputs(
       kind === "repository"
         ? await repositorySource(request, binding.path, file)
         : kind === "local"
-          ? await localSource(request.body, binding.path, file)
+          ? await localSource(
+              request.body,
+              binding.path,
+              request.localAssetRoots,
+              file,
+            )
           : await attachmentSource(request, binding.path, file);
     if (copied.kind !== "done") return copied;
     inputs.push({
@@ -366,12 +378,14 @@ async function repositorySource(
 
 /**
  * A private file the Objective names, checked again here as a whole path
- * token since this copies it to the worker. It is read without following
- * any link on its absolute path.
+ * token and against the operator's local asset roots (localAssetPlace),
+ * since this copies it to the worker. It is read from its root without
+ * following any link below it.
  */
 async function localSource(
   body: string,
   path: string,
+  roots: readonly string[],
   file: string,
 ): Promise<Copied> {
   if (!namesPath(body, path))
@@ -379,15 +393,19 @@ async function localSource(
       `Local source asset ${path} is not a path the Objective names, so Factory won't give it to the worker. Name the exact path in the Objective and answer replan, or cancel.`,
       ["replan", "cancel"],
     );
+  const place = localAssetPlace(path, roots);
+  if ("refused" in place)
+    return hold(
+      `Local source asset ${path} can't go to the worker: ${place.refused}. Put the file under a directory media.localAssetRoots names and answer retry; or replan or cancel.`,
+      ["retry", "replan", "cancel"],
+    );
   await mkdir(join(file, ".."), { recursive: true, mode: 0o700 });
   try {
-    if (!isAbsolute(path))
-      throw new ContainedError(`${path} is not an absolute path`);
     return {
       kind: "done",
       value: await copyContained(
-        "/",
-        path.slice(1),
+        place.root,
+        place.relative,
         file,
         Number.MAX_SAFE_INTEGER,
       ),
@@ -401,9 +419,27 @@ async function localSource(
   }
 }
 
-/** Hosts an attachment may redirect to. */
+/**
+ * Hosts an attachment may redirect to: GitHub, its content domain, and the
+ * S3 buckets GitHub serves user, repository and release files from, by
+ * exact name (bucket names are global, so no pattern on amazonaws.com).
+ */
+const ATTACHMENT_BUCKETS = new Set(
+  [
+    "github-production-user-asset-6210df",
+    "github-production-repository-file-5c1aeb",
+    "github-production-repository-image-32fea6",
+    "github-production-release-asset-2e65be",
+    "github-production-upload-manifest-file-7fdce7",
+    "github-cloud",
+  ].map((bucket) => `${bucket}.s3.amazonaws.com`),
+);
 function attachmentHost(host: string): boolean {
-  return host === "github.com" || host.endsWith(".githubusercontent.com");
+  return (
+    host === "github.com" ||
+    host.endsWith(".githubusercontent.com") ||
+    ATTACHMENT_BUCKETS.has(host)
+  );
 }
 
 /** A download that passed MAX_ATTACHMENT_BYTES. */
@@ -1465,30 +1501,23 @@ async function pointerBlobs(
   blobs: readonly { oid: string; path: string }[],
   signal: AbortSignal,
 ): Promise<{ oid: string; size: number; path: string }[]> {
-  if (!blobs.length) return [];
-  const sizes = (
-    await hostGit(checkout, ["cat-file", "--batch-check"], {
-      input: `${blobs.map((b) => b.oid).join("\n")}\n`,
-      signal,
-    })
-  )
-    .toString("utf8")
-    .split("\n");
-  const small = blobs.filter((_, index) => {
-    const [, type, size] = (sizes[index] ?? "").split(" ");
-    return type === "blob" && Number(size) <= LFS_POINTER_MAX_BYTES;
-  });
-  if (!small.length) return [];
-  const bodies = batchObjects(
-    await hostGit(checkout, ["cat-file", "--batch"], {
-      input: `${small.map((b) => b.oid).join("\n")}\n`,
-      signal,
-    }),
-    small.length,
+  const catFile: CatFile = (args, input) =>
+    hostGit(checkout, args, { input, signal });
+  const sizes = await blobSizes(
+    catFile,
+    blobs.map((b) => b.oid),
+  );
+  const small = blobs.filter(
+    (b) =>
+      (sizes.get(b.oid) ?? Number.POSITIVE_INFINITY) <= LFS_POINTER_MAX_BYTES,
+  );
+  const bodies = await readBlobs(
+    catFile,
+    small.map((b) => b.oid),
   );
   const pointers: { oid: string; size: number; path: string }[] = [];
   small.forEach((blob, index) => {
-    const found = lfsPointer(bodies[index]!.body);
+    const found = lfsPointer(bodies[index]!);
     if (found) pointers.push({ ...found, path: blob.path });
   });
   return pointers;
@@ -1539,6 +1568,38 @@ export async function lfsPushIfPointers(input: {
     oids: [...new Set(pointers.map((found) => found.oid))],
   });
   return pushed ?? { kind: "done", value: { pushed: true } };
+}
+
+/**
+ * The paths of the LFS pointers `commit` adds against `base` whose object
+ * in the local store holds a value of `secrets` (git.ts secretSearch).
+ * An object only origin has isn't uploaded, so it isn't read. Publish
+ * calls this before it pushes, with pathsHoldingSecrets for the blobs.
+ */
+export async function lfsObjectsHoldingSecrets(
+  checkout: string,
+  base: string,
+  commit: string,
+  secrets: readonly string[],
+  signal: AbortSignal,
+): Promise<string[]> {
+  if (!secrets.length) return [];
+  const search = secretSearch(secrets);
+  const holding: string[] = [];
+  for (const pointer of await addedPointers(checkout, base, commit, signal)) {
+    const stored = await lfsObject(checkout, pointer.oid, signal);
+    if (!stored) continue;
+    const object = search();
+    for await (const chunk of createReadStream(
+      join(stored.root, stored.relative),
+      { signal },
+    )) {
+      object.feed(chunk as Buffer);
+      if (object.found) break;
+    }
+    if (object.found) holding.push(pointer.path);
+  }
+  return holding;
 }
 
 /**
@@ -1847,18 +1908,8 @@ export async function candidateReceipts(
       const members = [];
       for (const member of set.members) {
         const relative = `media-sets/${safeName(item.id)}/${set.id.toLowerCase()}/${basename(member.file)}`;
-        let copied = false;
-        if (member.bytes <= Math.min(REVIEW_MEMBER_BYTES, budget)) {
-          const target = join(root, relative);
-          await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
-          const held = await copyFile(member.file, target)
-            .then(() => digestFile(target))
-            .catch(() => undefined);
-          copied =
-            held?.sha256 === member.sha256 && held.bytes === member.bytes;
-          if (copied) budget -= member.bytes;
-          else await rm(target, { force: true });
-        }
+        const copied = await reviewCopy(root, relative, member, budget);
+        if (copied) budget -= member.bytes;
         members.push({
           role: member.role,
           destination: member.destination,
@@ -1918,6 +1969,76 @@ export async function candidateReceipts(
           "Only the selected set is written at its destinations, then validated (its members hydrated in the fresh validation checkout and checked against their sha256 and size before the validation commands ran), reviewed, published and merged. Unselected sets stay in Factory's private staging: they are never committed, validated or delivered.",
         reviewCopies:
           "reviewCopy is the evidence-root path of Factory's private copy of the member, checked against its sha256; null when the member exceeds the review copy bounds.",
+      }),
+    });
+  }
+  return receipts;
+}
+
+/**
+ * Factory's private copy of `file` at `relative` under `root`, when it is
+ * within the review bounds and still has its recorded digest.
+ */
+async function reviewCopy(
+  root: string,
+  relative: string,
+  file: { file: string; sha256: string; bytes: number },
+  budget: number,
+): Promise<boolean> {
+  if (file.bytes > Math.min(REVIEW_MEMBER_BYTES, budget)) return false;
+  const target = join(root, relative);
+  await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
+  const held = await copyFile(file.file, target)
+    .then(() => digestFile(target))
+    .catch(() => undefined);
+  if (held?.sha256 === file.sha256 && held.bytes === file.bytes) return true;
+  await rm(target, { force: true });
+  return false;
+}
+
+/** The read-only inputs one item's worker got (resolveInputs), for review. */
+export interface InputRecord {
+  item: string;
+  inputs: readonly MediaInput[];
+}
+
+/**
+ * The controller input receipt for result and final review: per item, each
+ * file its worker got as read-only input (a source asset's kind, path and
+ * visibility, or the dependency selection it came from), with media type,
+ * size and sha256. Factory's copy within the review bounds goes to
+ * `inputs/<item>/` under `root`, checked against its digest, so the
+ * reviewer judges the same bytes the worker read.
+ */
+export async function inputReceipts(
+  root: string,
+  records: readonly InputRecord[],
+): Promise<{ item: string; content: string }[]> {
+  let budget = REVIEW_CANDIDATE_BYTES;
+  const receipts = [];
+  for (const { item, inputs } of records) {
+    if (!inputs.length) continue;
+    const described = [];
+    for (const [index, { file, ...input }] of inputs.entries()) {
+      const relative = `inputs/${safeName(item)}/${index}-${safeName(input.destination ?? input.path ?? input.role)}`;
+      const copied = await reviewCopy(
+        root,
+        relative,
+        { file, ...input },
+        budget,
+      );
+      if (copied) budget -= input.bytes;
+      described.push({ ...input, reviewCopy: copied ? relative : null });
+    }
+    receipts.push({
+      item,
+      content: JSON.stringify({
+        record:
+          "Factory controller input receipt: the exact files Factory gave this Work Item's worker as read-only inputs (Objective source assets, and dependencies' selected media bound to it), with the digests Factory recorded when it fetched or copied them. Built by Factory, not written by the worker.",
+        workItem: item,
+        inputs: described,
+        reviewCopies:
+          "reviewCopy is the evidence-root path of Factory's copy of the input, checked against its sha256; null when it exceeds the review copy bounds or no longer matches.",
       }),
     });
   }

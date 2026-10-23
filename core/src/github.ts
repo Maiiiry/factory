@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { crashPoint } from "./crash.js";
+import { hold, type Outcome } from "./engine.js";
 import { redact } from "./log.js";
 import { errorMessage } from "./text.js";
 
@@ -11,6 +13,11 @@ export class TransientError extends Error {
     message: string,
     /** When GitHub said to come back, if it did. */
     readonly retryAfterMs?: number,
+    /**
+     * A rate limit (429, or a 403 rate limit): `retryAfterMs` is when it
+     * resets. Otherwise it is only a backoff hint (a 5xx's retry-after).
+     */
+    readonly limited = false,
   ) {
     super(message);
   }
@@ -37,6 +44,59 @@ export class GitHubError extends Error {
 
 const TIMEOUT_MS = 60_000;
 
+/**
+ * A GitHub failure as a step outcome (CORE.md#Waits): only what a person
+ * must fix holds, at once: a rejected login (401), a refusal (403; rate
+ * limits are TransientErrors) naming the `permission` the call needs, and
+ * a missing repository or issue (404, `missing`). A rate limit waits for
+ * its reset. Everything else (5xx, timeouts, 409, 410, 422, GraphQL
+ * errors) may change, so it retries as an unknown transient wait; a 5xx's
+ * retry-after only sets its backoff. Undefined for an error that isn't
+ * GitHub's.
+ */
+export function githubOutcome(
+  error: unknown,
+  repository: string,
+  permission = "read access to the repository, its issues, pull requests and checks",
+  missing?: string,
+): Outcome | undefined {
+  if (error instanceof TransientError)
+    return {
+      kind: "retry",
+      reason: error.message,
+      ...(error.retryAfterMs === undefined
+        ? {}
+        : error.limited
+          ? {
+              wait: {
+                kind: "reset",
+                at: new Date(Date.now() + error.retryAfterMs).toISOString(),
+              },
+            }
+          : { afterMs: error.retryAfterMs }),
+    };
+  if (!(error instanceof GitHubError)) return undefined;
+  const detail = error.message.slice(0, 500);
+  if (error.status === 401)
+    return hold(
+      `GitHub rejected Factory's login on ${repository} (${detail}). Log in again with \`gh auth login\` (or replace FACTORY_GITHUB_TOKEN), then answer retry; or cancel.`,
+    );
+  if (error.status === 403 || (error.status === 404 && !missing))
+    return hold(
+      `${detail}. Give Factory's login ${permission} on ${repository}, then answer retry; or cancel.`,
+    );
+  if (error.status === 404)
+    return hold(`${missing} (${detail}).`, ["retry", "cancel"], "cancel");
+  return { kind: "retry", reason: error.message };
+}
+
+export interface GraphQLError {
+  type?: string;
+  message: string;
+  /** Where in the data it applies: field names and aliases, then indexes. */
+  path?: (string | number)[];
+}
+
 export interface IssueComment {
   id: number;
   body: string;
@@ -53,6 +113,7 @@ export interface PullRequest {
   draft?: boolean;
   head: { ref: string; sha: string };
   base: { ref: string; sha: string };
+  body?: string | null;
   html_url?: string;
 }
 
@@ -104,9 +165,14 @@ export interface AsyncMerge {
  * in the service; workers never see it. Every request has a deadline, and
  * every failure is either a TransientError (retry) or a GitHubError.
  */
+/** How long a write-access answer counts (canWrite). */
+const WRITER_TTL_MS = 10 * 60_000;
+
 export class GitHub {
   private token: string | undefined;
   private secrets: readonly string[] = [];
+  private self: string | undefined;
+  private readonly writers = new Map<string, { ok: boolean; at: number }>();
 
   constructor(
     readonly repository: string,
@@ -114,12 +180,12 @@ export class GitHub {
   ) {}
 
   /**
-   * Redact these secret values (policy.allowedSecretNames) from every text
-   * Factory writes to GitHub: comments, PR bodies, titles. One choke point,
-   * so no hold, report or log excerpt can carry a value a worker saw.
+   * Redact these secret values (config.secrets) from every text Factory
+   * writes to GitHub: comments, PR bodies, titles. One choke point, so no
+   * hold, report or log excerpt can carry a value a worker saw.
    */
   redacting(secrets: readonly string[]): this {
-    this.secrets = secrets.filter((secret) => secret.length >= 4);
+    this.secrets = secrets;
     return this;
   }
 
@@ -166,13 +232,48 @@ export class GitHub {
   async issue(
     issue: number,
     signal?: AbortSignal,
-  ): Promise<{ title: string; body: string | null; state: string }> {
+  ): Promise<{
+    title: string;
+    body: string | null;
+    state: string;
+    /** The issue's author; null for a deleted account. */
+    user: { login: string } | null;
+    /** Who closed it last, and why: set on a closed issue. */
+    closed_by?: { login: string } | null;
+    state_reason?: string | null;
+  }> {
     return this.rest(
       "GET",
       `/repos/${this.repository}/issues/${issue}`,
       undefined,
       signal,
     );
+  }
+
+  /**
+   * The issue with GitHub's own rendering of its body (`body_html`, from the
+   * same read, so the two always match): planning reads only what it shows.
+   * A non-empty body without one is Unreadable (transient, so the step
+   * retries); the raw body never stands in for it.
+   */
+  async renderedIssue(
+    issue: number,
+    signal?: AbortSignal,
+  ): Promise<Awaited<ReturnType<GitHub["issue"]>> & { body_html: string }> {
+    const response = await this.send(
+      "GET",
+      `/repos/${this.repository}/issues/${issue}`,
+      undefined,
+      signal,
+      { accept: "application/vnd.github.full+json" },
+    );
+    const found = (await response.json()) as Awaited<
+      ReturnType<GitHub["issue"]>
+    > & { body_html?: unknown };
+    if (typeof found.body_html === "string")
+      return { ...found, body_html: found.body_html };
+    if (!found.body) return { ...found, body_html: "" };
+    throw new Unreadable(`GitHub sent issue #${issue} without body_html`);
   }
 
   async postComment(
@@ -195,9 +296,115 @@ export class GitHub {
     since?: string,
     signal?: AbortSignal,
   ): Promise<number | undefined> {
-    return (await this.comments(issue, since, signal)).find((c) =>
-      c.body.startsWith(marker),
-    )?.id;
+    return (await this.markedComment(issue, marker, since, signal))?.id;
+  }
+
+  /**
+   * The issue comment Factory marked with `marker`, if it exists. Markers
+   * are predictable, so only a comment by Factory's own login counts:
+   * anyone else's comment that carries one is ignored.
+   */
+  async markedComment(
+    issue: number,
+    marker: string,
+    since?: string,
+    signal?: AbortSignal,
+  ): Promise<IssueComment | undefined> {
+    const self = await this.login(signal);
+    return (await this.comments(issue, since, signal)).find(
+      (c) =>
+        c.body.startsWith(marker) &&
+        c.user !== null &&
+        sameLogin(c.user.login, self),
+    );
+  }
+
+  /** The login Factory acts as, read once per process. */
+  async login(signal?: AbortSignal): Promise<string> {
+    if (this.self) return this.self;
+    const user = await this.rest<{ login?: unknown }>(
+      "GET",
+      "/user",
+      undefined,
+      signal,
+    );
+    if (typeof user.login !== "string" || !user.login)
+      throw new TransientError("GitHub GET /user: no login");
+    this.self = user.login;
+    return this.self;
+  }
+
+  /**
+   * Post the marked comment, or edit the one already there: found first,
+   * so a post whose answer was lost is never repeated. `point` names the
+   * crash points before and after the write.
+   */
+  async upsertComment(
+    issue: number,
+    marker: string,
+    body: string,
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const existing = await this.markedComment(issue, marker, undefined, signal);
+    if (existing?.body === body) return;
+    crashPoint(`${point}:before`);
+    if (existing)
+      await this.rest(
+        "PATCH",
+        `/repos/${this.repository}/issues/comments/${existing.id}`,
+        { body },
+        signal,
+      );
+    else await this.postComment(issue, body, signal);
+    crashPoint(`${point}:after`);
+  }
+
+  /** Close an issue with a reason, unless it is closed already. */
+  async closeIssue(
+    issue: number,
+    reason: "completed" | "not_planned",
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if ((await this.issue(issue, signal)).state !== "open") return;
+    crashPoint(`${point}:before`);
+    await this.rest(
+      "PATCH",
+      `/repos/${this.repository}/issues/${issue}`,
+      { state: "closed", state_reason: reason },
+      signal,
+    );
+    crashPoint(`${point}:after`);
+  }
+
+  /** Reopen a closed issue, unless it is open already. */
+  async reopenIssue(
+    issue: number,
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if ((await this.issue(issue, signal)).state === "open") return;
+    crashPoint(`${point}:before`);
+    await this.rest(
+      "PATCH",
+      `/repos/${this.repository}/issues/${issue}`,
+      { state: "open" },
+      signal,
+    );
+    crashPoint(`${point}:after`);
+  }
+
+  /** Branch names under `prefix` (such as `factory/12/`) on the repository. */
+  async branches(prefix: string, signal?: AbortSignal): Promise<string[]> {
+    const refs = await this.pages<{ ref?: unknown }>(
+      `/repos/${this.repository}/git/matching-refs/heads/${prefix.split("/").map(encodeURIComponent).join("/")}`,
+      signal,
+    );
+    return refs
+      .map((ref) => (typeof ref.ref === "string" ? ref.ref : ""))
+      .filter((ref) => ref.startsWith(`refs/heads/${prefix}`))
+      .map((ref) => ref.slice("refs/heads/".length));
   }
 
   async graphql<T>(
@@ -205,6 +412,21 @@ export class GitHub {
     variables: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
+    return (await this.graphqlPartial<T>(query, variables, signal, () => false))
+      .data;
+  }
+
+  /**
+   * A GraphQL read that may come back partial: errors that `accept` takes
+   * (such as one missing issue among many) are returned with the data;
+   * any other error throws as `graphql` does.
+   */
+  async graphqlPartial<T>(
+    query: string,
+    variables: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    accept: (error: GraphQLError) => boolean,
+  ): Promise<{ data: T; errors: GraphQLError[] }> {
     const response = await this.send(
       "POST",
       "/graphql",
@@ -213,16 +435,24 @@ export class GitHub {
     );
     const result = (await response.json()) as {
       data?: T;
-      errors?: { type?: string; message: string }[];
+      errors?: GraphQLError[];
     };
-    if (result.errors?.length) {
-      const message = result.errors.map((e) => e.message).join("; ");
-      if (result.errors.some((e) => e.type === "RATE_LIMITED"))
-        throw new TransientError(`GitHub GraphQL: ${message}`);
+    const errors = result.errors ?? [];
+    const refused = errors.filter((e) => !accept(e));
+    if (refused.length) {
+      const message = refused.map((e) => e.message).join("; ");
+      if (refused.some((e) => e.type === "RATE_LIMITED")) {
+        const reset = Number(response.headers.get("x-ratelimit-reset"));
+        throw new TransientError(
+          `GitHub GraphQL: ${message}`,
+          reset > 0 ? Math.max(0, reset * 1000 - Date.now()) : undefined,
+          true,
+        );
+      }
       throw new GitHubError(`GitHub GraphQL: ${message}`, 200);
     }
     if (!result.data) throw new TransientError("GitHub GraphQL: no data");
-    return result.data;
+    return { data: result.data, errors };
   }
 
   /** Every item of a paginated list of 100 per page, up to `maxPages` pages. */
@@ -293,6 +523,32 @@ export class GitHub {
   async canPush(signal?: AbortSignal): Promise<boolean | undefined> {
     const push = (await this.about(signal)).permissions?.push;
     return typeof push === "boolean" ? push : undefined;
+  }
+
+  /**
+   * Whether `login` may write to the repository (admin, maintain or write);
+   * throws when GitHub can't say now. An answer is kept for 10 minutes, so
+   * revoked access stops counting within that, without a restart.
+   */
+  async canWrite(login: string, signal?: AbortSignal): Promise<boolean> {
+    const known = this.writers.get(login);
+    if (known && Date.now() - known.at < WRITER_TTL_MS) return known.ok;
+    let permission: string;
+    try {
+      ({ permission } = await this.rest<{ permission: string }>(
+        "GET",
+        this.repo(`collaborators/${encodeURIComponent(login)}/permission`),
+        undefined,
+        signal,
+      ));
+    } catch (error) {
+      // No such user: a definite no. Anything else may pass.
+      if (!(error instanceof GitHubError && error.status === 404)) throw error;
+      permission = "none";
+    }
+    const ok = ["admin", "maintain", "write"].includes(permission);
+    this.writers.set(login, { ok, at: Date.now() });
+    return ok;
   }
 
   /** Every PR, open or closed, whose head is `branch` of this repository. */
@@ -418,7 +674,11 @@ export class GitHub {
   async commit(
     sha: string,
     signal?: AbortSignal,
-  ): Promise<{ sha: string; parents: string[]; committer?: string }> {
+  ): Promise<{
+    sha: string;
+    parents: string[];
+    committer?: string;
+  }> {
     const commit = await this.rest<{
       sha?: string;
       parents?: { sha?: unknown }[];
@@ -448,6 +708,67 @@ export class GitHub {
       signal,
     );
     return typeof result.status === "string" ? result.status : undefined;
+  }
+
+  /**
+   * The commits on `head` that `base` doesn't have, up to `max` of them,
+   * with GitHub's count of all of them: each with its parents, its
+   * committer's email, and its committer's login when GitHub knows it.
+   */
+  async commitsBeyond(
+    base: string,
+    head: string,
+    max: number,
+    signal?: AbortSignal,
+  ): Promise<{
+    total: number;
+    commits: {
+      sha: string;
+      parents: string[];
+      committerEmail?: string;
+      committer?: string;
+    }[];
+  }> {
+    const ref = (name: string) =>
+      name.split("/").map(encodeURIComponent).join("/");
+    let total = 0;
+    const commits: Awaited<ReturnType<GitHub["commitsBeyond"]>>["commits"] = [];
+    for (let page = 1; commits.length < max; page++) {
+      const result = await this.rest<{
+        total_commits?: unknown;
+        commits?: {
+          sha?: unknown;
+          parents?: { sha?: unknown }[];
+          committer?: { login?: unknown } | null;
+          commit?: { committer?: { email?: unknown } | null } | null;
+        }[];
+      }>(
+        "GET",
+        this.repo(
+          `compare/${ref(base)}...${ref(head)}?per_page=100&page=${page}`,
+        ),
+        undefined,
+        signal,
+      );
+      if (typeof result.total_commits !== "number" || !result.commits)
+        throw new TransientError(
+          `GitHub compare ${base}...${head}: no commits`,
+        );
+      total = result.total_commits;
+      for (const commit of result.commits) {
+        const email = commit.commit?.committer?.email;
+        commits.push({
+          sha: String(commit.sha),
+          parents: (commit.parents ?? []).map((parent) => String(parent?.sha)),
+          ...(typeof email === "string" ? { committerEmail: email } : {}),
+          ...(typeof commit.committer?.login === "string"
+            ? { committer: commit.committer.login }
+            : {}),
+        });
+      }
+      if (result.commits.length < 100 || commits.length >= total) break;
+    }
+    return { total, commits: commits.slice(0, max) };
   }
 
   /** The latest check run of each check suite on the commit. */
@@ -614,6 +935,7 @@ export class GitHub {
     headRefName: string;
     baseRefName: string;
     mergeStateStatus: string;
+    reviewDecision?: string | null;
   }> {
     const data = await this.graphql<{
       repository?: {
@@ -622,13 +944,14 @@ export class GitHub {
           headRefName: string;
           baseRefName: string;
           mergeStateStatus: string;
+          reviewDecision?: string | null;
         } | null;
       } | null;
     }>(
       `query($owner: String!, $name: String!, $number: Int!) {
         repository(owner: $owner, name: $name) {
           pullRequest(number: $number) {
-            headRefOid headRefName baseRefName mergeStateStatus
+            headRefOid headRefName baseRefName mergeStateStatus reviewDecision
           }
         }
       }`,
@@ -779,7 +1102,7 @@ export class GitHub {
           /rate limit/i.test(text)));
     // A 401 that a fresh token didn't fix is a login problem, not a hiccup.
     if (response.status === 401) throw new GitHubError(detail, 401, answer);
-    if (limited || response.status >= 500)
+    if (limited)
       throw new TransientError(
         detail,
         retryAfter > 0
@@ -787,6 +1110,14 @@ export class GitHub {
           : reset > 0
             ? Math.max(0, reset * 1000 - Date.now())
             : undefined,
+        true,
+      );
+    // A 5xx is an outage, not a limit: GitHub sends x-ratelimit-* headers on
+    // every answer, so only its retry-after counts, and only as a backoff.
+    if (response.status >= 500)
+      throw new TransientError(
+        detail,
+        retryAfter > 0 ? retryAfter * 1000 : undefined,
       );
     throw new GitHubError(detail, response.status, answer);
   }
@@ -810,16 +1141,26 @@ export class GitHub {
       );
       this.token = stdout.trim();
     } catch (error) {
-      throw new TransientError(
-        `GitHub login unavailable (run \`gh auth login\`): ${errorMessage(error)}`,
-      );
+      const message = `GitHub login unavailable (run \`gh auth login\`): ${errorMessage(error)}`;
+      // gh ran and said no, or isn't installed: a person must log in. A
+      // timeout may pass.
+      if ((error as { killed?: boolean }).killed)
+        throw new TransientError(message);
+      throw new GitHubError(message, 401);
     }
     if (!this.token)
-      throw new TransientError(
+      throw new GitHubError(
         "GitHub login unavailable (run `gh auth login`)",
+        401,
       );
     return this.token;
   }
+}
+
+/** One account, as a user (`name`) or as its app's bot (`name[bot]`). */
+function sameLogin(a: string, b: string): boolean {
+  const plain = (login: string) => login.toLowerCase().replace(/\[bot\]$/, "");
+  return plain(a) === plain(b);
 }
 
 /** A stack as GitHub returns it; a shape Factory can't read is Unreadable. */
