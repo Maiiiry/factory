@@ -62,6 +62,13 @@ type Hold = Extract<Outcome, { kind: "hold" }>;
 export interface Repair {
   kind: "repair";
   finding: string;
+  /**
+   * The change doesn't sit on its base: it conflicts with it, or a stack
+   * layer doesn't contain the layer below. The repair is mechanical: move
+   * the change onto the current base (`onto`, when Factory knows the head)
+   * and let the worker resolve what conflicts, with no diagnosis.
+   */
+  conflict?: { onto?: string };
 }
 
 /**
@@ -645,6 +652,7 @@ async function judge(
     return {
       kind: "repair",
       finding: `PR #${pr} conflicts with its base branch; rebase the change`,
+      conflict: {},
     };
   // GitHub can report a PR CLEAN before a required check registers on its
   // head. A required check with no run and no status yet is pending (#626).
@@ -1527,6 +1535,7 @@ async function mergeUnitOnce(
           {
             kind: "repair",
             finding: `PR #${pull.number} (${branch}) at ${layer.head} does not contain the head ${below.head} of the layer below it (PR #${below.pull.number}, ${below.pull.head.ref}): it was built on an older head of that layer. Rebuild the change on the current ${below.pull.head.ref}.`,
+            conflict: { onto: below.head },
           },
           layer.input,
         );

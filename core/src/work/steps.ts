@@ -9,6 +9,7 @@ import {
   type PullInput,
   publish,
   REPUBLISH,
+  type Repair,
 } from "../delivery.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead } from "../git.js";
@@ -24,6 +25,7 @@ import {
   resolveInputs,
   type Selection,
   selectionQuestion,
+  selectionRef,
   selectionSummary,
   validationMembers,
   verifyOriginMedia,
@@ -176,8 +178,19 @@ export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
   const done = (id: string, phase: Phase) =>
     Boolean(state.done[stepKey(id, phase)]);
   const settled = (id: string) => Boolean(mergeOf(state, id));
+  // Started: any step done or running, a kept base (the first work attempt
+  // keeps it, and repairs keep it), a waiting retry or an open question.
+  // Settled items drop out below.
   const started = new Set(
-    [...Object.keys(state.done), ...Object.keys(state.attempts)]
+    [
+      ...Object.keys(state.done),
+      ...Object.keys(state.attempts),
+      ...Object.keys(state.retries),
+      ...Object.entries(state.kept ?? {})
+        .filter(([key, value]) => key.endsWith(":base") && value != null)
+        .map(([key]) => key),
+      ...(state.hold ? [state.hold.step] : []),
+    ]
       .filter((key) => key.startsWith("item:"))
       .map((key) => key.split(":")[1]),
   );
@@ -391,23 +404,32 @@ async function workStep(
   const media = mediaDirectory(workDir, item.id);
   // An item builds on the default branch as it is when it starts, which
   // holds every merged dependency; a native-stack layer above the bottom
-  // builds on the head published for the layer below it. It keeps that
-  // base across repairs.
+  // builds on the layer below's current delivered head: the head a merge
+  // check named (`onto`), else its CI's (GitHub may have updated the
+  // branch), else its published one. It keeps that base across repairs.
   const below = stackBelow(plan, deps, item);
   const start = async () => {
-    const head = await defaultHead(config.checkout, signal);
-    return below
-      ? (state.done[stepKey(below.id, "publish")] as PublishResult).head
-      : head;
+    if (!below) return defaultHead(config.checkout, signal);
+    const delivered = (phase: Phase) =>
+      (state.done[stepKey(below.id, phase)] as { head: string } | undefined)
+        ?.head;
+    return (
+      kept<string>(state, item.id, "onto") ??
+      delivered("ci") ??
+      delivered("publish")!
+    );
   };
-  let base = kept<string>(state, item.id, "base") ?? (await start());
+  const keptBase = kept<string>(state, item.id, "base");
+  let base = keptBase ?? (await start());
   await addWorktree(config.checkout, worktree, base, signal);
   if (kept(state, item.id, "rebase")) {
     // A conflict or failed delivery: move onto the current start and replay
-    // the refused change, so the worker can resolve it there.
+    // the refused change, so the worker can resolve it there. An attempt
+    // that never kept its base (stopped when the layer below was repaired)
+    // left files on an unknown base: start over on the current one.
     const head = await start();
     const refused = kept<string>(state, item.id, "refusedCommit");
-    if (head !== base) {
+    if (head !== base || keptBase === undefined) {
       await rebaseWorktree(
         config.checkout,
         worktree,
@@ -422,6 +444,7 @@ async function workStep(
   const keepBase = {
     [keptKey(item.id, "base")]: base,
     [keptKey(item.id, "rebase")]: false,
+    [keptKey(item.id, "onto")]: null,
   };
   const finishedKey = keptKey(item.id, "finished");
   let finished = kept<Finished>(state, item.id, "finished");
@@ -450,6 +473,7 @@ async function workStep(
       plan,
       item,
       base,
+      body,
       selection: selection(state),
       githubToken: () => deps.github.serviceToken(),
       signal,
@@ -502,7 +526,9 @@ async function workStep(
     };
   }
 
-  // Capture before collection, which deletes the media manifest.
+  // Capture before collection, which deletes the media manifest, and keep
+  // the captured sets before anything destructive: the step runs again at
+  // once and collects with them.
   if (!finished.sets) {
     const captured = await captureAssets({
       checkout: config.checkout,
@@ -516,9 +542,21 @@ async function workStep(
         ...keepAll,
         [finishedKey]: finished,
       });
-    finished = { ...finished, sets: captured.value };
+    if (captured.value.length)
+      return {
+        kind: "retry",
+        reason: "Candidate media sets captured; collecting the result",
+        afterMs: 0,
+        keep: {
+          ...keepAll,
+          [finishedKey]: { ...finished, sets: captured.value },
+        },
+      };
+    finished = { ...finished, sets: [] };
   }
   const sets = finished.sets ?? [];
+  // The kept copies replace the worker's staging.
+  if (sets.length) await forceRemove(join(worktree, ".factory-media"));
   const keepFinished = { ...keepAll, [finishedKey]: finished };
 
   const collected = await collect({
@@ -563,7 +601,11 @@ async function workStep(
       return {
         kind: "done",
         result: done,
-        keep: { ...keepAll, [finishedKey]: null },
+        keep: {
+          ...keepAll,
+          [finishedKey]: null,
+          [keptKey(item.id, "finding")]: null,
+        },
       };
     }
     case "repair":
@@ -687,6 +729,14 @@ async function repairContext(
   const { state, signal } = context;
   const history = state.repairs?.[stepKey(item.id, "work")];
   const finding = kept<RepairFinding>(state, item.id, "finding");
+  // A conflict needs no diagnosis: the change was moved onto `base`.
+  if (finding?.kind === "conflict")
+    return {
+      context: {
+        finding: `${finding.detail} Factory moved the previous result onto ${base} and replayed its change; resolve every conflict the replay left (conflict markers, unmerged or missing changes) within the owned paths, keeping both the new base's changes and this item's change.`,
+      },
+      keep: {},
+    };
   if (!history?.count || !finding) return undefined;
   const saved = kept<{ repair: number; context: RepairContext }>(
     state,
@@ -811,7 +861,8 @@ async function validateStep(
         result.detail,
         {
           ...failure(item, result.output),
-          [keptKey(item.id, "refusedTree")]: result.tree,
+          // The worker's own tree: collection compares the next result to it.
+          [keptKey(item.id, "refusedTree")]: work.tree,
           [keptKey(item.id, "refusedCommit")]: work.commit,
         },
         context,
@@ -869,6 +920,7 @@ async function selectStep(
     item,
     commit: work.commit,
     set: read.set,
+    ref: selectionRef(state.issue, item.id),
     signal,
   });
   if (made.kind !== "done") return mediaOutcome(item, made, context, deps);
@@ -939,7 +991,7 @@ async function reviewStep(
           tree: review.tree,
           refused: review.kind === "refused" ? review.refused : [],
         } satisfies RepairFinding,
-        [keptKey(item.id, "refusedTree")]: review.tree,
+        [keptKey(item.id, "refusedTree")]: work.tree,
         [keptKey(item.id, "refusedCommit")]: work.commit,
       },
       context,
@@ -1119,7 +1171,7 @@ async function ciStep(
         result: { head: result.head, merged: result.merged },
       };
     case "repair":
-      return deliveryRepair(item, context, deps, result.finding, "ci");
+      return deliveryRepair(item, context, deps, result, "ci");
     case "republish":
       return republishOutcome(item, result.reason);
     default:
@@ -1155,7 +1207,7 @@ async function mergeStep(
       return { kind: "done", result: done };
     }
     case "repair":
-      return deliveryRepair(item, context, deps, result.finding, "merge");
+      return deliveryRepair(item, context, deps, result, "merge");
     case "republish":
       return republishOutcome(item, result.reason);
     default:
@@ -1199,13 +1251,7 @@ async function mergeStack(
       return { kind: "done", result: done };
     }
     case "repair":
-      return deliveryRepair(
-        layer(result.item),
-        context,
-        deps,
-        result.finding,
-        "merge",
-      );
+      return deliveryRepair(layer(result.item), context, deps, result, "merge");
     case "republish":
       return republishOutcome(layer(result.item), result.reason);
     default: {
@@ -1215,21 +1261,31 @@ async function mergeStack(
   }
 }
 
-/** Failed CI or a conflict: the worker repairs, and the same PR gets the new head. */
+/**
+ * Failed CI or a conflict: the worker repairs on the current base, and the
+ * same PR gets the new head. A conflict is mechanical: the change moves onto
+ * the base GitHub named (or the current start) and the worker resolves what
+ * the replay left, with no diagnosis.
+ */
 function deliveryRepair(
   item: WorkItem,
   context: StepContext,
   deps: BuildDeps,
-  finding: string,
+  repair: Repair,
   phase: Phase,
 ): Outcome {
   const work = context.state.done[stepKey(item.id, "work")] as WorkResult;
   return repairOutcome(
     item,
     phase,
-    finding,
+    repair.finding,
     {
-      ...failure(item, finding),
+      ...(repair.conflict
+        ? conflictFinding(item, repair.finding)
+        : failure(item, repair.finding)),
+      ...(repair.conflict?.onto
+        ? { [keptKey(item.id, "onto")]: repair.conflict.onto }
+        : {}),
       [keptKey(item.id, "refusedCommit")]: work.commit,
       [keptKey(item.id, "refusedTree")]: work.tree,
       [keptKey(item.id, "rebase")]: true,
@@ -1237,6 +1293,19 @@ function deliveryRepair(
     context,
     deps,
   );
+}
+
+/** The kept finding of a conflict: a mechanical repair (see repairContext). */
+function conflictFinding(
+  item: WorkItem,
+  detail: string,
+): Record<string, unknown> {
+  return {
+    [keptKey(item.id, "finding")]: {
+      kind: "conflict",
+      detail,
+    } satisfies RepairFinding,
+  };
 }
 
 function republishOutcome(item: WorkItem, reason: string): Outcome {
@@ -1274,7 +1343,17 @@ function repairOutcome(
       | undefined;
     moved[keptKey(layer.id, "rebase")] = true;
     moved[keptKey(layer.id, "finished")] = null;
-    if (work) moved[keptKey(layer.id, "refusedCommit")] = work.commit;
+    moved[keptKey(layer.id, "onto")] = null;
+    if (work) {
+      moved[keptKey(layer.id, "refusedCommit")] = work.commit;
+      Object.assign(
+        moved,
+        conflictFinding(
+          layer,
+          `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
+        ),
+      );
+    }
   }
   return {
     kind: "repair",
@@ -1293,11 +1372,18 @@ function repairOutcome(
  * work is on the default branch, so the new plan starts from it.
  */
 function replanOutcome(state: ObjectiveState): Outcome {
+  // Every item step, done or running: the engine stops the running ones.
+  const items = (state.done.plan as Plan | undefined)?.items ?? [];
   return {
     kind: "repair",
     finding: "The operator asked to replan.",
     target: "check",
-    clear: Object.keys(state.done),
+    clear: [
+      ...new Set([
+        ...Object.keys(state.done),
+        ...items.flatMap((item) => PHASES.map((p) => stepKey(item.id, p))),
+      ]),
+    ],
     keep: Object.fromEntries(
       Object.keys(state.kept ?? {}).map((key) => [key, null]),
     ),
@@ -1706,7 +1792,7 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
   };
 }
 
-/** The Objective's worktrees, captured media, review artifacts and final media scratch. */
+/** The Objective's worktrees, selection refs, captured media, review artifacts and final media scratch. */
 async function removeWorkFiles(
   state: ObjectiveState,
   deps: BuildDeps,
@@ -1714,12 +1800,18 @@ async function removeWorkFiles(
 ): Promise<void> {
   const plan = state.done.plan as Plan | undefined;
   const workDir = deps.workDir(state.issue);
-  for (const item of plan?.items ?? [])
+  for (const item of plan?.items ?? []) {
     await removeWorktree(
       deps.config.checkout,
       worktreePath(workDir, state.issue, item.id),
       signal,
     );
+    await hostGit(
+      deps.config.checkout,
+      ["update-ref", "-d", selectionRef(state.issue, item.id)],
+      { signal },
+    );
+  }
   for (const files of ["assets", "artifacts", "final-media"])
     await forceRemove(join(workDir, files));
 }

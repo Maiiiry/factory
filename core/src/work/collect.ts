@@ -18,7 +18,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { SandboxConfig } from "../config.js";
 import { hold } from "../engine.js";
 import type { GitExit } from "../git.js";
@@ -162,11 +162,9 @@ async function collectResult(collected: CollectInput): Promise<Collection> {
       throw new WorkFinding(
         "Handoff manifest must be untracked private staging",
       );
-    const stopped = await scanStaging(
-      input,
-      ".factory-handoff.json",
-      await readFile(handoffPath),
-    );
+    const stopped = await scanStaging(input, [
+      { name: ".factory-handoff.json", bytes: await readFile(handoffPath) },
+    ]);
     if (stopped) throw new CollectionStop(stopped);
   }
   const discoveryPath = join(worktree, ".factory-discovery.json");
@@ -927,20 +925,24 @@ async function scanFile(
 }
 
 /**
- * Private staging Factory keeps (handoff notes, the media manifest) crosses
- * the same secret boundary as the result before it is retained. Scans the
- * exact `bytes` Factory read from staging file `name`, not the worker's
- * file again. Undefined when clean; otherwise the secret hold (`repair` →
- * repair to work, `retry` → collect again, `cancel`), or a retry when the
- * scanner can't run or a hold when FACTORY_SECRETLINT_CONFIG is unusable.
- * collect and media's captureAssets both call it.
+ * Private staging Factory keeps (handoff notes, the media manifest, captured
+ * media members) crosses the same secret boundary as the result before it
+ * is retained. Scans the exact bytes Factory kept: `bytes` read from staging
+ * file `name`, or the file Factory copied them to (`path`), not the worker's
+ * file again. Undefined when clean; otherwise one secret hold naming every
+ * finding (`repair` → repair to work, `retry` → collect again, `cancel`), or
+ * a retry when the scanner can't run or a hold when
+ * FACTORY_SECRETLINT_CONFIG is unusable. collect and media's captureAssets
+ * both call it.
  */
 export async function scanStaging(
   input: Pick<CollectInput, "checkout" | "worktree" | "signal"> & {
     rules?: string;
   },
-  name: string,
-  bytes: Buffer,
+  entries: readonly ({ name: string } & (
+    | { bytes: Buffer }
+    | { path: string }
+  ))[],
 ): Promise<Exclude<Collection, { kind: "collected" | "repair" }> | undefined> {
   const scanRoot = await mkdtemp(join(dirname(input.worktree), "secret-scan-"));
   try {
@@ -949,10 +951,19 @@ export async function scanStaging(
         input.rules ?? (await scannerRules(input.checkout, input.worktree)),
       signal: input.signal,
     };
-    const source = join(scanRoot, name);
-    await writeFile(source, bytes, { mode: 0o600, flag: "wx" });
-    const finding = await scanFile(scanner, name, source, scanRoot);
-    return finding ? secretHold([finding]) : undefined;
+    const findings: SecretFinding[] = [];
+    for (const [index, entry] of entries.entries()) {
+      let source: string;
+      if ("path" in entry) source = entry.path;
+      else {
+        source = join(scanRoot, String(index), basename(entry.name));
+        await mkdir(dirname(source), { mode: 0o700 });
+        await writeFile(source, entry.bytes, { mode: 0o600, flag: "wx" });
+      }
+      const finding = await scanFile(scanner, entry.name, source, scanRoot);
+      if (finding) findings.push(finding);
+    }
+    return findings.length ? secretHold(findings) : undefined;
   } catch (error) {
     if (error instanceof CollectionStop && error.outcome.kind !== "repair")
       return error.outcome;

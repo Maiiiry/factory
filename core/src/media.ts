@@ -34,7 +34,7 @@ import {
   createWriteStream,
   lstatSync,
 } from "node:fs";
-import { chmod, copyFile, mkdir, rm, unlink } from "node:fs/promises";
+import { chmod, copyFile, mkdir, open, rm, unlink } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -47,7 +47,7 @@ import {
   operatorGit,
   sha256,
 } from "./git.js";
-import { validPath } from "./objective.js";
+import { namesPath, validPath } from "./objective.js";
 import {
   ContainedError,
   copyContained,
@@ -81,6 +81,8 @@ const MAX_MEMBER_BYTES = 2 * 1024 * MIB;
 /** All members one capture keeps, so a worker can't fill the work directory. */
 const MAX_CAPTURE_BYTES = 8 * 1024 * MIB;
 const MAX_MANIFEST_BYTES = 1 * MIB;
+/** GitHub refuses a pushed file larger than this outside LFS. */
+const GITHUB_FILE_BYTES = 100 * MIB;
 
 /** A media answer: a step maps each kind onto its own outcome. */
 export type MediaOutcome<T> =
@@ -193,6 +195,11 @@ export function mediaDirectory(workDir: string, itemId: string): string {
   return join(workDir, "assets", itemId);
 }
 
+/** The ref that pins an item's selection commit; report and cancel cleanup delete it. */
+export function selectionRef(issue: number, itemId: string): string {
+  return `refs/factory/${issue}/${itemId}/select`;
+}
+
 /** Whether the item produces candidate sets, so it has a select step between work and validate. */
 export function needsSelection(item: WorkItem): boolean {
   return Boolean(item.expectedOutputRoles?.length);
@@ -211,6 +218,8 @@ export interface InputsRequest {
   item: WorkItem;
   /** The commit the item's worktree starts from: repository sources are read there. */
   base: string;
+  /** The Objective body: a local source must be a path it names (namesPath). */
+  body: string;
   /** Each dependency's select result, when it has one. */
   selection(itemId: string): Selection | undefined;
   /** The service's GitHub token, for attachments; the worker never sees it. */
@@ -244,7 +253,7 @@ export async function resolveInputs(
       kind === "repository"
         ? await repositorySource(request, binding.path, file)
         : kind === "local"
-          ? await localSource(binding.path, file)
+          ? await localSource(request.body, binding.path, file)
           : await attachmentSource(request, binding.path, file);
     if (copied.kind !== "done") return copied;
     inputs.push({
@@ -324,7 +333,13 @@ async function repositorySource(
   }
   let stored = await lfsObject(checkout, lfs.oid, signal);
   if (!stored) {
-    const fetched = await lfsFetch(request, base, path);
+    const fetched = await lfsFetch({
+      checkout,
+      repository: request.repository,
+      commit: base,
+      paths: [path],
+      signal,
+    });
     if (fetched) return fetched;
     stored = await lfsObject(checkout, lfs.oid, signal);
   }
@@ -336,52 +351,21 @@ async function repositorySource(
   return copyChecked(stored, file, lfs);
 }
 
-/** `git lfs fetch` of one path at `commit` into the checkout's store. */
-async function lfsFetch(
-  request: Pick<InputsRequest, "checkout" | "repository" | "signal">,
-  commit: string,
-  path: string,
-): Promise<MediaOutcome<never> | undefined> {
-  const problem = await originProblem(
-    request.checkout,
-    request.repository,
-    request.signal,
-  );
-  if (problem)
-    return hold(
-      `${problem}. Factory fetches LFS objects from origin's default route. Fix origin, then answer retry; or cancel.`,
-    );
-  try {
-    await operatorGit(
-      request.checkout,
-      [
-        "-c",
-        "protocol.file.allow=never",
-        ...LFS,
-        "lfs",
-        "fetch",
-        "origin",
-        commit,
-        "--include",
-        path,
-      ],
-      { signal: request.signal, timeoutMs: 30 * MINUTE },
-    );
-  } catch (error) {
-    request.signal.throwIfAborted();
-    return {
-      kind: "retry",
-      reason: `git lfs fetch of ${path}: ${errorMessage(error)}`,
-    };
-  }
-  return undefined;
-}
-
 /**
- * A private file the Objective names; planning checked the binding. It is
- * read without following any link on its absolute path.
+ * A private file the Objective names, checked again here as a whole path
+ * token since this copies it to the worker. It is read without following
+ * any link on its absolute path.
  */
-async function localSource(path: string, file: string): Promise<Copied> {
+async function localSource(
+  body: string,
+  path: string,
+  file: string,
+): Promise<Copied> {
+  if (!namesPath(body, path))
+    return hold(
+      `Local source asset ${path} is not a path the Objective names, so Factory won't give it to the worker. Name the exact path in the Objective and answer replan, or cancel.`,
+      ["replan", "cancel"],
+    );
   await mkdir(join(file, ".."), { recursive: true, mode: 0o700 });
   try {
     if (!isAbsolute(path))
@@ -548,15 +532,18 @@ function safeName(path: string): string {
  * and distinct content; then copies each member from `.factory-media/`,
  * reached without links, to `<directory>/candidates/<set>/<role>-<name>`
  * with its sha256 and size (at most MAX_MEMBER_BYTES each and
- * MAX_CAPTURE_BYTES in all), and removes `.factory-media`.
+ * MAX_CAPTURE_BYTES in all), and secret-scans the copies, since they are
+ * committed once selected. It changes nothing in the worktree, so it can
+ * run again until its result is kept.
  *
  * Step: call right after the worker finishes and BEFORE collect (collect
  * deletes the manifest). Items without expectedOutputRoles get done [].
- * done → keep `value` for the work result (`sets`); repair → repair to
- * work with the finding; retry → retry (the secret scanner couldn't run);
- * hold → hold. The hold is collect's secret hold, with `repair` (repair to
- * work), `retry` (run the work step's collection again) and `cancel`:
- * route it as the step routes collect's. After collect, call
+ * done → keep `value` for the work result (`sets`) before anything
+ * destructive, then remove `.factory-media` and collect; repair → repair
+ * to work with the finding; retry → retry (the secret scanner couldn't
+ * run); hold → hold. The hold is collect's secret hold, with `repair`
+ * (repair to work), `retry` (run the work step's collection again) and
+ * `cancel`: route it as the step routes collect's. After collect, call
  * destinationFinding.
  */
 export async function captureAssets(input: {
@@ -577,7 +564,9 @@ export async function captureAssets(input: {
       ".factory-assets.json",
       MAX_MANIFEST_BYTES,
     );
-    const stopped = await scanStaging(input, ".factory-assets.json", manifest);
+    const stopped = await scanStaging(input, [
+      { name: ".factory-assets.json", bytes: manifest },
+    ]);
     if (stopped) return stopped;
     const sets = readManifest(manifest, item);
     const captured: CandidateSet[] = [];
@@ -628,7 +617,18 @@ export async function captureAssets(input: {
       throw new Finding(
         "Two candidate sets have the same content; each set must differ",
       );
-    await forceRemove(join(worktree, ".factory-media"));
+    // The exact bytes kept cross the secret boundary, whatever the declared
+    // format; only content Git itself would call binary is left out.
+    const texts = [];
+    for (const [index, set] of captured.entries())
+      for (const [at, member] of set.members.entries())
+        if (await textContent(member.file))
+          texts.push({
+            name: sets[index]!.members[at]!.path,
+            path: member.file,
+          });
+    const secret = await scanStaging(input, texts);
+    if (secret) return secret;
     return { kind: "done", value: captured };
   } catch (error) {
     if (error instanceof Finding || error instanceof ContainedError) {
@@ -964,6 +964,8 @@ export async function materializeSelection(input: {
   /** The work step's commit. */
   commit: string;
   set: CandidateSet;
+  /** The ref that keeps the selection commit from Git's pruning (selectionRef). */
+  ref: string;
   signal: AbortSignal;
 }): Promise<MediaOutcome<{ commit: string; tree: string }>> {
   const { checkout, directory, item, set, signal } = input;
@@ -993,6 +995,25 @@ export async function materializeSelection(input: {
       (m) =>
         item.requiredLfsRoles?.includes(m.role) && !filtered.has(m.destination),
     );
+    // GitHub refuses a push with a plain blob over its file limit; only LFS
+    // can carry such a member.
+    const oversize = set.members.filter(
+      (m) => !filtered.has(m.destination) && m.bytes > GITHUB_FILE_BYTES,
+    );
+    if (oversize.length) {
+      const listed = oversize
+        .map((m) => `${m.destination} (${m.role}, ${m.bytes} bytes)`)
+        .join(", ");
+      return ownsPath(".gitattributes", item.ownedPaths)
+        ? {
+            kind: "repair",
+            finding: `Candidate set ${set.id} has members over GitHub's ${GITHUB_FILE_BYTES}-byte file limit that .gitattributes doesn't route through Git LFS: ${listed}. Add a filter=lfs rule that covers them, or make them smaller.`,
+          }
+        : hold(
+            `Candidate set ${set.id} has members over GitHub's ${GITHUB_FILE_BYTES}-byte file limit that the repository's .gitattributes doesn't route through Git LFS: ${listed}. Work Item ${item.id} doesn't own .gitattributes. Answer repair to have the worker make smaller candidates, replan to give an item that rule, or cancel.`,
+            ["repair", "replan", "cancel"],
+          );
+    }
     if (uncovered.length) {
       const paths = uncovered.map((m) => m.destination).join(", ");
       return ownsPath(".gitattributes", item.ownedPaths)
@@ -1062,6 +1083,8 @@ export async function materializeSelection(input: {
     const tree = (await git(["rev-parse", "HEAD^{tree}"]))
       .toString("utf8")
       .trim();
+    // The worktree goes below; the ref keeps the commit until cleanup.
+    await hostGit(checkout, ["update-ref", input.ref, commit], { signal });
     return { kind: "done", value: { commit, tree } };
   } finally {
     await removeWorktree(checkout, directory, signal);
@@ -1380,7 +1403,8 @@ async function addedPointers(
  * `git lfs push origin <commit>` skips what origin's remote-tracking refs
  * already reach (a republish after the branch was pushed). Content-
  * addressed and idempotent, so it repeats safely on every publish attempt.
- * A pointer whose object Factory doesn't have is the result's fault.
+ * A pointer whose object neither Factory nor origin has is the result's
+ * fault.
  *
  * Delivery: `publish` (delivery.ts) calls it just before it pushes the
  * branch, with the item's base commit as `base`; steps don't call it. It
@@ -1402,10 +1426,22 @@ export async function lfsPushIfPointers(input: {
     input.signal,
   );
   if (!pointers.length) return { kind: "done", value: { pushed: false } };
-  const missing: string[] = [];
-  for (const found of pointers)
-    if (!(await lfsObject(input.checkout, found.oid, input.signal)))
-      missing.push(found.path);
+  const absent = async () => {
+    const paths: string[] = [];
+    for (const found of pointers)
+      if (!(await lfsObject(input.checkout, found.oid, input.signal)))
+        paths.push(found.path);
+    return paths;
+  };
+  let missing = await absent();
+  // Worktrees skip LFS smudge, so a moved or restored LFS file is a pointer
+  // whose object only origin has: fetch those, and refuse only what origin
+  // doesn't serve either.
+  if (missing.length) {
+    const fetched = await lfsFetch({ ...input, paths: missing });
+    if (fetched) return fetched;
+    missing = await absent();
+  }
   if (missing.length)
     return {
       kind: "repair",
@@ -1416,6 +1452,54 @@ export async function lfsPushIfPointers(input: {
     oids: [...new Set(pointers.map((found) => found.oid))],
   });
   return pushed ?? { kind: "done", value: { pushed: true } };
+}
+
+/**
+ * `git lfs fetch origin <commit>` of the LFS objects behind `paths` into
+ * the local store (or `storage`), with the operator's credentials, after
+ * the origin check. A fetch that fails while origin answers leaves the
+ * objects missing for the caller to judge; an unreachable origin is the
+ * network's, a retry.
+ */
+async function lfsFetch(input: {
+  checkout: string;
+  repository: string;
+  commit: string;
+  paths: readonly string[];
+  storage?: string;
+  signal: AbortSignal;
+}): Promise<MediaOutcome<never> | undefined> {
+  const { checkout, signal } = input;
+  const problem = await originProblem(checkout, input.repository, signal);
+  if (problem)
+    return hold(
+      `${problem}. Factory fetches LFS objects from origin's default route. Fix origin, then answer retry; or cancel.`,
+    );
+  const plain = input.paths.every((path) => !/[,*?[\]\\!]/.test(path));
+  const fetched = await operatorGit(
+    checkout,
+    [
+      "-c",
+      "protocol.file.allow=never",
+      ...(input.storage ? ["-c", `lfs.storage=${input.storage}`] : []),
+      ...LFS,
+      "lfs",
+      "fetch",
+      "origin",
+      input.commit,
+      ...(plain ? ["--include", input.paths.join(",")] : []),
+    ],
+    { signal, timeoutMs: 30 * MINUTE },
+  ).then(
+    () => undefined,
+    (error: unknown) => errorMessage(error),
+  );
+  if (fetched !== undefined && !(await reachable(checkout, signal)))
+    return {
+      kind: "retry",
+      reason: `Fetching LFS objects from origin: ${fetched}`,
+    };
+  return undefined;
 }
 
 /**
@@ -1510,41 +1594,18 @@ export async function verifyOriginMedia(input: {
   }
   const missing: SelectedMember[] = [];
   if (lfs.length) {
-    const problem = await originProblem(checkout, input.repository, signal);
-    if (problem)
-      return hold(`${problem}. Fix origin, then answer retry; or cancel.`);
     await forceRemove(input.scratch);
     await mkdir(input.scratch, { recursive: true, mode: 0o700 });
     try {
-      const plain = lfs.every((m) => !/[,*?[\]\\!]/.test(m.destination));
-      const fetched = await operatorGit(
+      const fetched = await lfsFetch({
         checkout,
-        [
-          "-c",
-          "protocol.file.allow=never",
-          "-c",
-          `lfs.storage=${input.scratch}`,
-          ...LFS,
-          "lfs",
-          "fetch",
-          "origin",
-          commit,
-          ...(plain
-            ? ["--include", lfs.map((m) => m.destination).join(",")]
-            : []),
-        ],
-        { signal, timeoutMs: 30 * MINUTE },
-      ).then(
-        () => undefined,
-        (error: unknown) => errorMessage(error),
-      );
-      // A failed fetch of an origin Factory can't reach at all is the
-      // network's; one it can reach is missing objects, checked below.
-      if (fetched !== undefined && !(await reachable(checkout, signal)))
-        return {
-          kind: "retry",
-          reason: `Fetching LFS objects from origin: ${fetched}`,
-        };
+        repository: input.repository,
+        commit,
+        paths: lfs.map((m) => m.destination),
+        storage: input.scratch,
+        signal,
+      });
+      if (fetched) return fetched;
       for (const member of lfs) {
         const object = join(
           input.scratch,
@@ -1661,6 +1722,18 @@ async function lfsObject(
  * Copy a local LFS object to `file`, reached without links, and check it
  * against the pointer it stands for.
  */
+/** Git's test for text: no NUL byte in the first 8000 bytes. */
+async function textContent(file: string): Promise<boolean> {
+  const handle = await open(file, "r");
+  try {
+    const head = Buffer.alloc(8000);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    return !head.subarray(0, bytesRead).includes(0);
+  } finally {
+    await handle.close();
+  }
+}
+
 async function copyChecked(
   from: { root: string; relative: string },
   file: string,

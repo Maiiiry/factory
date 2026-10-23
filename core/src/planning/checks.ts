@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { markdownLines } from "../markdown.js";
+import { namesPath } from "../objective.js";
 import {
   type BaseFiles,
   ciOnlyKey,
@@ -536,7 +537,7 @@ async function mediaFindings(
           : kind === "local"
             ? asset.visibility === "private" &&
               isAbsolute(asset.path) &&
-              body.includes(asset.path)
+              namesPath(body, asset.path)
             : recognizedObjectiveAttachment(asset.path) &&
               body.includes(asset.path);
       if (!available)

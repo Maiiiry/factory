@@ -6,6 +6,7 @@ import { defaultHead } from "../git.js";
 import { type GitHub, GitHubError, TransientError } from "../github.js";
 import { parseObjective } from "../objective.js";
 import { type Planner, PlannerError } from "../providers/planner.js";
+import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import type { ObjectiveState } from "../state.js";
 import { declarationProblems } from "../validate.js";
 import { checkPlan } from "./checks.js";
@@ -103,6 +104,12 @@ export interface ObjectiveInputs {
   body: string;
   base: string;
   title: string;
+  /**
+   * The installation's review artifact selectors when the generation began:
+   * its rounds, the controller guarantee list their answers index, and the
+   * accepted plan all use these, whatever the configuration says later.
+   */
+  reviewArtifacts: ReviewArtifactSelector[];
 }
 
 interface PlanRound {
@@ -313,7 +320,7 @@ function planRoundStep(
         const revising = Boolean(previous?.answer);
         const wire = {
           child: childIdentity(inputs.body),
-          reviewArtifacts: config.reviewArtifacts.length > 0,
+          reviewArtifacts: inputs.reviewArtifacts.length > 0,
         };
         const cited = revising
           ? await citedSections(previous!.draft, fixes, facts, files)
@@ -345,7 +352,7 @@ function planRoundStep(
           workers: WORKERS,
           citedSections: cited,
           localExecutables: local.observations,
-          reviewArtifacts: config.reviewArtifacts,
+          reviewArtifacts: inputs.reviewArtifacts,
         });
         const answer = await deps.planner.answer({
           role: "planner",
@@ -464,9 +471,9 @@ function reviewStep(
             config.finalValidation.requiredCommands,
           ),
           controllerCapabilities: controllerGuarantees(
-            config.reviewArtifacts.length > 0,
+            inputs.reviewArtifacts.length > 0,
           ),
-          reviewArtifacts: config.reviewArtifacts,
+          reviewArtifacts: inputs.reviewArtifacts,
           repository,
           workers: WORKERS,
           ...(scope
@@ -743,8 +750,8 @@ function acceptStep(g: number, n: number, deps: PlanningDeps): Step {
             deps.config.finalValidation.requiredCommands,
           ),
           decisions: decisions(state),
-          ...(deps.config.reviewArtifacts.length
-            ? { reviewArtifacts: deps.config.reviewArtifacts }
+          ...(inputs.reviewArtifacts.length
+            ? { reviewArtifacts: inputs.reviewArtifacts }
             : {}),
         };
         await postPlan(deps, state.issue, plan, signal);
@@ -824,6 +831,7 @@ export async function readObjective(
     body,
     base: await defaultHead(config.checkout, signal),
     title: found.title,
+    reviewArtifacts: config.reviewArtifacts,
   };
   const { problems } = parseObjective(body);
   // The optional declarations (Package manager update, Quality checkpoint,
