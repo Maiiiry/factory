@@ -479,18 +479,31 @@ export async function memorySection(
     : [];
   // Sources supplied to this call, and copies of a Source text already
   // kept (several Objectives pin the same text), are left out.
+  // A record about any admitted path is shown with only its admitted
+  // citations; a reference carries its Source's text, so it needs all of
+  // its paths admitted.
   const seen = new Set(query.supplied);
-  const eligible = matches.filter((record) => {
+  const eligible = matches.flatMap((record) => {
+    const paths = record.paths.filter((path) => admitted(path, selectors));
     if (
-      !record.paths.length ||
-      !record.paths.every((path) => admitted(path, selectors))
+      !paths.length ||
+      (record.source !== undefined && paths.length < record.paths.length)
     )
-      return false;
-    if (!record.source) return true;
+      return [];
+    const shown = {
+      ...record,
+      paths,
+      digests: Object.fromEntries(
+        Object.entries(record.digests).filter(([path]) =>
+          admitted(path, selectors),
+        ),
+      ),
+    };
+    if (!record.source) return [shown];
     const copy = `${record.source}\0${sha256(record.body)}`;
-    if (seen.has(record.source) || seen.has(copy)) return false;
+    if (seen.has(record.source) || seen.has(copy)) return [];
     seen.add(copy);
-    return true;
+    return [shown];
   });
   const entries: string[] = [];
   let bytes = 0;
