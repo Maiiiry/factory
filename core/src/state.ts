@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { crashPoint } from "./crash.js";
+import type { ProviderConfig } from "./providers/config.js";
 
 const STATE_VERSION = 1;
 
@@ -59,10 +60,21 @@ export interface Retry {
   lastError: string;
 }
 
+/** The provider an Objective was admitted with, kept for its whole run. */
+export interface FrozenProvider {
+  name: string;
+  /** Why: the configured default, or `serve --provider`. */
+  selectedBy: "defaultProvider" | "--provider";
+  /** The provider's planner, models and worker as they were at admission. */
+  settings: ProviderConfig;
+}
+
 export interface ObjectiveState {
   version: number;
   issue: number;
   status: ObjectiveStatus;
+  /** Frozen at admission; absent only for a record that never ran. */
+  provider?: FrozenProvider;
   /** The status to return to when a hold is answered. */
   resumeStatus?: ObjectiveStatus;
   hold: Hold | null;
@@ -84,11 +96,16 @@ export interface ObjectiveState {
   updatedAt: string;
 }
 
-export function newObjective(issue: number, now: Date): ObjectiveState {
+export function newObjective(
+  issue: number,
+  now: Date,
+  provider?: FrozenProvider,
+): ObjectiveState {
   return {
     version: STATE_VERSION,
     issue,
     status: "checking",
+    ...(provider ? { provider } : {}),
     hold: null,
     answers: {},
     retries: {},
