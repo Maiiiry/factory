@@ -42,10 +42,12 @@ import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebStream } from "node:stream/web";
 import { hold } from "./engine.js";
 import {
-  batchObjects,
+  blobSizes,
+  type CatFile,
   LFS_POINTER_MAX_BYTES,
   lfsPointer,
   operatorGit,
+  readBlobs,
   sha256,
 } from "./git.js";
 import { namesPath, validPath } from "./objective.js";
@@ -1465,30 +1467,23 @@ async function pointerBlobs(
   blobs: readonly { oid: string; path: string }[],
   signal: AbortSignal,
 ): Promise<{ oid: string; size: number; path: string }[]> {
-  if (!blobs.length) return [];
-  const sizes = (
-    await hostGit(checkout, ["cat-file", "--batch-check"], {
-      input: `${blobs.map((b) => b.oid).join("\n")}\n`,
-      signal,
-    })
-  )
-    .toString("utf8")
-    .split("\n");
-  const small = blobs.filter((_, index) => {
-    const [, type, size] = (sizes[index] ?? "").split(" ");
-    return type === "blob" && Number(size) <= LFS_POINTER_MAX_BYTES;
-  });
-  if (!small.length) return [];
-  const bodies = batchObjects(
-    await hostGit(checkout, ["cat-file", "--batch"], {
-      input: `${small.map((b) => b.oid).join("\n")}\n`,
-      signal,
-    }),
-    small.length,
+  const catFile: CatFile = (args, input) =>
+    hostGit(checkout, args, { input, signal });
+  const sizes = await blobSizes(
+    catFile,
+    blobs.map((b) => b.oid),
+  );
+  const small = blobs.filter(
+    (b) =>
+      (sizes.get(b.oid) ?? Number.POSITIVE_INFINITY) <= LFS_POINTER_MAX_BYTES,
+  );
+  const bodies = await readBlobs(
+    catFile,
+    small.map((b) => b.oid),
   );
   const pointers: { oid: string; size: number; path: string }[] = [];
   small.forEach((blob, index) => {
-    const found = lfsPointer(bodies[index]!.body);
+    const found = lfsPointer(bodies[index]!);
     if (found) pointers.push({ ...found, path: blob.path });
   });
   return pointers;

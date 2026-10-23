@@ -17,6 +17,7 @@
 import { lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { blobSizes, type CatFile, readBlobs } from "../git.js";
 import { type CandidateRecord, candidateReceipts } from "../media.js";
 import { validPath } from "../objective.js";
 import { coverageCriterion, isRecord } from "../planning/graph.js";
@@ -608,8 +609,12 @@ export async function materialize(
         ...entry,
         from: base,
       }));
+  const catFile: CatFile = (args, stdin) =>
+    hostGit(checkout, args, { input: stdin, signal });
   const objects = raw.flatMap((entry) => [entry.oldObject, entry.newObject]);
-  const sizes = await objectSizes(checkout, objects, signal);
+  const sizes = await blobSizes(catFile, [
+    ...new Set(objects.filter((oid) => !NO_OBJECT.test(oid))),
+  ]);
   // base/: the base copy of each changed regular file, within the export bounds.
   const atBase = raw.filter(
     (entry) =>
@@ -623,10 +628,9 @@ export async function materialize(
     total += sizes.get(entry.oldObject)!;
     return total <= BASE_TOTAL_BYTES;
   });
-  const bodies = await blobs(
-    checkout,
+  const bodies = await readBlobs(
+    catFile,
     kept.map((entry) => entry.oldObject),
-    signal,
   );
   for (const [index, entry] of kept.entries()) {
     const path = resolve(root, "base", entry.path);
@@ -973,51 +977,6 @@ async function mergedChanges(
   return [...first].flatMap(([path, from]) => {
     const entry = combined.get(path);
     return entry ? [{ ...entry, from }] : [];
-  });
-}
-
-/** Blob sizes by object id, from one `cat-file --batch-check`. */
-async function objectSizes(
-  checkout: string,
-  objects: readonly string[],
-  signal: AbortSignal,
-): Promise<Map<string, number>> {
-  const wanted = [...new Set(objects.filter((oid) => !NO_OBJECT.test(oid)))];
-  const sizes = new Map<string, number>();
-  if (!wanted.length) return sizes;
-  const output = await hostGit(checkout, ["cat-file", "--batch-check"], {
-    input: wanted.map((oid) => `${oid}\n`).join(""),
-    signal,
-  });
-  for (const line of output.toString("utf8").split("\n")) {
-    const [oid, type, size] = line.split(" ");
-    if (oid && type === "blob") sizes.set(oid, Number(size));
-  }
-  return sizes;
-}
-
-/** The exact bytes of these blobs, in order, from one `cat-file --batch`. */
-async function blobs(
-  checkout: string,
-  objects: readonly string[],
-  signal: AbortSignal,
-): Promise<Buffer[]> {
-  if (!objects.length) return [];
-  const output = await hostGit(checkout, ["cat-file", "--batch"], {
-    input: objects.map((oid) => `${oid}\n`).join(""),
-    signal,
-  });
-  let offset = 0;
-  return objects.map((oid) => {
-    const newline = output.indexOf(10, offset);
-    const header = output.subarray(offset, newline).toString("utf8");
-    const [named, type, size] = header.split(" ");
-    if (named !== oid || type !== "blob")
-      throw new Error(`git cat-file returned "${header}" for ${oid}`);
-    const bytes = Number(size);
-    const body = output.subarray(newline + 1, newline + 1 + bytes);
-    offset = newline + 1 + bytes + 1;
-    return body;
   });
 }
 

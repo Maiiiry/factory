@@ -120,27 +120,65 @@ export function pinnedGitExit(
   });
 }
 
+/** Runs one `git cat-file` with `input` on standard input; its output. */
+export type CatFile = (args: string[], input: string) => Promise<Buffer>;
+
 /**
- * The bodies `git cat-file --batch` printed for `count` requested objects,
- * each with its header line (`<oid> <type> <size>`).
+ * The exact bytes of these blobs, in order, from one `cat-file --batch`.
+ * Each header must be `<oid> blob <size>`: a missing object, or one that is
+ * not a blob, throws instead of misreading every object after it.
  */
-export function batchObjects(
-  output: Buffer,
-  count: number,
-): { header: string; body: Buffer }[] {
-  const objects: { header: string; body: Buffer }[] = [];
+export async function readBlobs(
+  catFile: CatFile,
+  oids: readonly string[],
+): Promise<Buffer[]> {
+  if (!oids.length) return [];
+  const output = await catFile(
+    ["cat-file", "--batch"],
+    oids.map((oid) => `${oid}\n`).join(""),
+  );
   let offset = 0;
-  for (let index = 0; index < count; index++) {
+  return oids.map((oid) => {
     const newline = output.indexOf(10, offset);
-    const header = output.subarray(offset, newline).toString("utf8");
-    const size = Number(header.split(" ")[2]);
-    objects.push({
-      header,
-      body: output.subarray(newline + 1, newline + 1 + size),
-    });
-    offset = newline + 1 + size + 1;
+    const header = output
+      .subarray(offset, newline < 0 ? undefined : newline)
+      .toString("utf8");
+    const [named, type, size] = header.split(" ");
+    const bytes = Number(size);
+    const end = newline + 1 + bytes;
+    if (
+      newline < 0 ||
+      named !== oid ||
+      type !== "blob" ||
+      !Number.isSafeInteger(bytes) ||
+      end > output.length
+    )
+      throw new Error(`git cat-file returned "${header}" for ${oid}`);
+    offset = end + 1;
+    return output.subarray(newline + 1, end);
+  });
+}
+
+/**
+ * The sizes of these objects that are blobs, by object id, from one
+ * `cat-file --batch-check`; a missing object or a non-blob has no entry.
+ */
+export async function blobSizes(
+  catFile: CatFile,
+  oids: readonly string[],
+): Promise<Map<string, number>> {
+  const sizes = new Map<string, number>();
+  if (!oids.length) return sizes;
+  const output = await catFile(
+    ["cat-file", "--batch-check"],
+    oids.map((oid) => `${oid}\n`).join(""),
+  );
+  for (const line of output.toString("utf8").split("\n")) {
+    const [oid, type, size] = line.split(" ");
+    if (oid && type === "blob" && Number.isSafeInteger(Number(size)))
+      sizes.set(oid, Number(size));
   }
-  return objects;
+  return sizes;
 }
 
 /** The lowercase hex SHA-256 of `bytes`. */

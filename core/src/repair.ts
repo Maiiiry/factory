@@ -10,7 +10,7 @@
  * engine keeps the repair budget.
  */
 
-import { batchObjects } from "./git.js";
+import { readBlobs } from "./git.js";
 import { validPath } from "./objective.js";
 import { isRecord, ownsPath } from "./planning/graph.js";
 import type { PinnedSource, Plan, WorkItem } from "./planning/types.js";
@@ -530,7 +530,8 @@ async function candidateFiles(
     files.push({ path: file.path, content: "", complete: true, oid: file.oid });
   }
   const bodies = await readBlobs(
-    input,
+    (args, stdin) =>
+      hostGit(input.checkout, args, { input: stdin, signal: input.signal }),
     chosen.map((file) => file.oid),
   );
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -547,19 +548,6 @@ async function candidateFiles(
       };
     }
   });
-}
-
-/** The exact bytes of these blobs, in order, from one `cat-file --batch`. */
-async function readBlobs(
-  input: CorrectionInput,
-  objects: readonly string[],
-): Promise<Buffer[]> {
-  if (!objects.length) return [];
-  const output = await hostGit(input.checkout, ["cat-file", "--batch"], {
-    input: objects.map((oid) => `${oid}\n`).join(""),
-    signal: input.signal,
-  });
-  return batchObjects(output, objects.length).map((object) => object.body);
 }
 
 function renderDiagnosis(

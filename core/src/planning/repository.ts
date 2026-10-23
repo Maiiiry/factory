@@ -1,6 +1,6 @@
 import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, posix, resolve, sep } from "node:path";
-import { batchObjects, pinnedGitExit } from "../git.js";
+import { pinnedGitExit, readBlobs } from "../git.js";
 import { markdownLines } from "../markdown.js";
 
 /**
@@ -122,24 +122,20 @@ async function treeEntries(
 }
 
 /** The exact bytes of these base-tree blobs, in order. */
-async function readBlobs(
+async function baseBlobs(
   checkout: string,
   files: readonly TreeEntry[],
   signal?: AbortSignal,
 ): Promise<Buffer[]> {
-  if (!files.length) return [];
-  const output = await git(
-    checkout,
-    ["cat-file", "--batch"],
-    files.map((entry) => `${entry.sha}\n`).join(""),
-    signal,
+  const bodies = await readBlobs(
+    (args, input) => git(checkout, args, input, signal),
+    files.map((entry) => entry.sha),
   );
-  const objects = batchObjects(output, files.length);
   return files.map((entry, index) => {
-    const { header, body } = objects[index]!;
-    if (header !== `${entry.sha} blob ${entry.size}`)
+    const body = bodies[index]!;
+    if (body.length !== entry.size)
       throw new Error(
-        `git cat-file returned "${header}" for ${entry.path}; expected ${entry.sha} blob ${entry.size}`,
+        `git cat-file returned ${body.length} bytes for ${entry.path}; expected ${entry.size}`,
       );
     return body;
   });
@@ -185,7 +181,7 @@ async function markdownOutline(
     (entry) => entry.size > OUTLINE_MIN_FILE_BYTES && /\.md$/i.test(entry.path),
   );
   if (!large.length) return "";
-  const files = (await readBlobs(checkout, large, signal)).map((body, at) => {
+  const files = (await baseBlobs(checkout, large, signal)).map((body, at) => {
     const headings = markdownLines(body.toString("utf8")).flatMap(
       ({ heading }, index) =>
         heading?.text
@@ -244,7 +240,7 @@ export async function exportTree(
   const files = (await treeEntries(checkout, base, signal)).filter(
     (entry) => entry.exported,
   );
-  const bodies = await readBlobs(checkout, files, signal);
+  const bodies = await baseBlobs(checkout, files, signal);
   const staging = `${root}.partial`;
   await rm(staging, { recursive: true, force: true });
   await mkdir(staging, { recursive: true, mode: 0o700 });
@@ -432,7 +428,7 @@ async function renderConventions(
       entry.size <= MAX_SOURCE_BYTES,
   );
   const bodies = (
-    await readBlobs(checkout, [...sources, ...manifests], signal)
+    await baseBlobs(checkout, [...sources, ...manifests], signal)
   ).map((body) => body.toString("utf8"));
   const modules = new Map<string, Module>();
   for (const [index, entry] of sources.entries())
