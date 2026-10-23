@@ -1336,6 +1336,7 @@ export async function planningFacts(
       child: inputs.child === true,
       files,
       playbook: (await files.text(config.planning.playbook)) ?? "",
+      ...(inputs.recipe ? { recipe: inputs.recipe.recipe } : {}),
     }),
     ...(files.signal ? { signal: files.signal } : {}),
   });
