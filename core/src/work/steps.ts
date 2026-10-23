@@ -57,9 +57,11 @@ import {
   guarded,
   type ObjectiveInputs,
   type PlanningDeps,
+  REOPENED,
 } from "../planning/steps.js";
 import type { Plan, WorkItem } from "../planning/types.js";
 import { type DeliveryUnit, unitOf, units } from "../planning/units.js";
+import { moveStatusOffDone } from "../queue.js";
 import { correction, type RepairFinding } from "../repair.js";
 import type { ReviewArtifact } from "../review/artifacts.js";
 import { reviewObjective } from "../review/final.js";
@@ -2138,7 +2140,9 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
  * issue if it is closed (a finished Objective queued again; the earlier
  * run, or the Project's "Auto-close issue" workflow, closed it), close the
  * earlier run's open PRs and remove its worktrees, so the new plan starts
- * clean. It asks only when GitHub refuses the reopen.
+ * clean. Before reopening, the card's built-in Status moves off Done, so
+ * that workflow doesn't close it again; the check after sees whether the
+ * issue stayed open. It asks only when GitHub refuses the reopen.
  */
 export function rerunCleanupStep(deps: BuildDeps): Step {
   return {
@@ -2147,7 +2151,21 @@ export function rerunCleanupStep(deps: BuildDeps): Step {
     run: (context) =>
       guardedItem(deps, async () => {
         const { state, signal } = context;
+        const closed =
+          (await deps.github.issue(state.issue, signal)).state !== "open";
         try {
+          // The Project's "Auto-close issue" workflow closes an issue whose
+          // built-in Status reads Done, so it moves off Done first.
+          if (closed) {
+            const moved = await moveStatusOffDone(
+              deps.github,
+              deps.config,
+              state.issue,
+              "rerun:status",
+              signal,
+            );
+            if (moved) context.log({ event: "status-off-done", option: moved });
+          }
           await deps.github.reopenIssue(state.issue, "rerun:reopen", signal);
         } catch (error) {
           if (
@@ -2167,7 +2185,11 @@ export function rerunCleanupStep(deps: BuildDeps): Step {
           signal,
         );
         await removeWorkFiles(state.issue, deps, signal);
-        return { kind: "done", keep: { [RERUN]: null } };
+        // The check that follows sees whether it stayed open.
+        return {
+          kind: "done",
+          keep: { [RERUN]: null, ...(closed ? { [REOPENED]: true } : {}) },
+        };
       }),
   };
 }

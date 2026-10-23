@@ -881,14 +881,25 @@ export async function readObjective(
   const { state, signal } = context;
   const issue = state.issue;
   const found = await deps.github.renderedIssue(issue, signal);
-  if (found.state !== "open")
+  if (found.state !== "open") {
+    const by = found.closed_by?.login ? `@${found.closed_by.login}` : "someone";
+    const reason = found.state_reason ? ` as ${found.state_reason}` : "";
+    // Closed again after the re-run reopened it: something on GitHub
+    // closes it, and reopening it alone won't hold.
+    if (state.kept?.[REOPENED])
+      return {
+        hold: hold(
+          `Factory reopened issue #${issue} to run it again, but ${by} closed it again${reason}, so Factory won't plan on it. A Project workflow (such as "Auto-close issue", while the item's built-in Status reads Done) or other automation does this: stop it, reopen the issue, then answer retry; or cancel.`,
+        ),
+      };
     return {
       hold: hold(
-        `Issue #${issue} is closed. Reopen it and answer \`${again}\`, or cancel. If the Project's "Auto-close issue" workflow closes it again, set the item's Status off Done first.`,
+        `Issue #${issue} is closed (${by} closed it${reason}). Reopen it and answer \`${again}\`, or cancel. If the Project's "Auto-close issue" workflow closes it again, set the item's Status off Done first.`,
         [again, "cancel"],
         "cancel",
       ),
     };
+  }
   // Planning reads what GitHub shows; Factory's own marker is structure.
   const author = found.user?.login;
   const writer = !!author && (await deps.github.canWrite(author, signal));
@@ -927,6 +938,8 @@ export async function readObjective(
 
 /** Where the operator's approval of a non-writer's Objective is kept. */
 const AUTHOR_APPROVAL = "objective:author-approval";
+/** Set by a re-run that reopened the issue; the check that follows clears it. */
+export const REOPENED = "rerun:reopened";
 
 /**
  * An issue a non-writer wrote is planned only once a writer approves its

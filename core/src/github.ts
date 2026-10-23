@@ -238,6 +238,9 @@ export class GitHub {
     state: string;
     /** The issue's author; null for a deleted account. */
     user: { login: string } | null;
+    /** Who closed it last, and why: set on a closed issue. */
+    closed_by?: { login: string } | null;
+    state_reason?: string | null;
   }> {
     return this.rest(
       "GET",

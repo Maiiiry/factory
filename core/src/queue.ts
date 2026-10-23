@@ -1,4 +1,5 @@
 import type { CoreConfig } from "./config.js";
+import { crashPoint } from "./crash.js";
 import type { GitHub, GraphQLError } from "./github.js";
 
 /** One Objective card on the Project. */
@@ -391,4 +392,106 @@ export class QueueDisplay {
     };
     return this.field;
   }
+}
+
+/** The Project's built-in status field and the option its "Auto-close issue" workflow closes on. */
+const BUILT_IN_STATUS = "Status";
+const DONE = "Done";
+/** Options to move a card off Done to, in order of preference; else the first option not named Done. */
+const OFF_DONE = ["In Progress", "Todo"];
+
+const BUILT_IN = `
+query($owner: String!, $name: String!, $issue: Int!, $project: ID!, $field: String!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $issue) {
+      projectItems(first: 50) {
+        nodes {
+          id
+          isArchived
+          project { id }
+          value: fieldValueByName(name: $field) {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+        }
+      }
+    }
+  }
+  node(id: $project) {
+    ... on ProjectV2 {
+      field(name: $field) {
+        ... on ProjectV2SingleSelectField { id options { id name } }
+      }
+    }
+  }
+}`;
+
+/**
+ * Before a re-queue reopens a closed issue: if the issue's card has the
+ * Project's built-in single-select "Status" field (not Factory's own
+ * field) set to "Done", move it off Done, so the Project's "Auto-close
+ * issue" workflow doesn't close the issue again. Idempotent: a card
+ * already off Done, or without the field, is left alone. Returns the
+ * option it set, if any.
+ */
+export async function moveStatusOffDone(
+  github: GitHub,
+  config: CoreConfig,
+  issue: number,
+  point: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  if (config.queue.field === BUILT_IN_STATUS) return undefined;
+  const data = await github.graphql<{
+    repository: {
+      issue: {
+        projectItems: {
+          nodes: ({
+            id: string;
+            isArchived: boolean;
+            project: { id: string };
+            value: { name?: string } | null;
+          } | null)[];
+        };
+      } | null;
+    } | null;
+    node: {
+      field?: { id?: string; options?: { id: string; name: string }[] } | null;
+    } | null;
+  }>(
+    BUILT_IN,
+    {
+      owner: github.owner,
+      name: github.name,
+      issue,
+      project: config.queue.projectId,
+      field: BUILT_IN_STATUS,
+    },
+    signal,
+  );
+  const item = data.repository?.issue?.projectItems.nodes.find(
+    (n) => n?.project.id === config.queue.projectId && !n.isArchived,
+  );
+  const field = data.node?.field;
+  if (!item || item.value?.name !== DONE || !field?.id || !field.options)
+    return undefined;
+  const options = field.options.filter((o) => o.name !== DONE);
+  const target =
+    OFF_DONE.map((name) => options.find((o) => o.name === name)).find(
+      (o) => o !== undefined,
+    ) ?? options[0];
+  if (!target) return undefined;
+  crashPoint(`${point}:before`);
+  await github.graphql(
+    SET,
+    {
+      project: config.queue.projectId,
+      item: item.id,
+      field: field.id,
+      option: target.id,
+      name: BUILT_IN_STATUS,
+    },
+    signal,
+  );
+  crashPoint(`${point}:after`);
+  return target.name;
 }

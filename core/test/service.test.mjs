@@ -276,7 +276,8 @@ test("unreadable state holds with cancel, and cancel works", async () => {
 // applied once and no stray files.
 // Crash points around GitHub effects: the hold, reply, note and reminder
 // comments, the Status write, the plan, report and cancel comments, the
-// issue close, the PR close and the branch delete. CI has no GitHub, so
+// issue close, the PR close, the branch delete, and a re-queue's move of
+// the built-in Status off Done and its reopen. CI has no GitHub, so
 // the drill covers them.
 const GITHUB_CRASH_POINTS = [
   "serve:admitted",
@@ -310,6 +311,8 @@ const GITHUB_CRASH_POINTS = [
   "rerun:pr-comment:after",
   "rerun:pr-close:before",
   "rerun:pr-close:after",
+  "rerun:status:before",
+  "rerun:status:after",
   "rerun:reopen:before",
   "rerun:reopen:after",
   "serve:withdrawn",

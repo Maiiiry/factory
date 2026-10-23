@@ -9,6 +9,7 @@ import {
   guarded,
   type PlanningDeps,
   planningStep,
+  REOPENED,
   readObjective,
 } from "./planning/steps.js";
 import type { ObjectiveState, ObjectiveStatus } from "./state.js";
@@ -76,7 +77,7 @@ function checkStep(deps: PlanningDeps): Step {
         const read = await readObjective(deps, "recheck", context);
         return "hold" in read
           ? read.hold
-          : { kind: "done", result: read.inputs };
+          : { kind: "done", result: read.inputs, keep: { [REOPENED]: null } };
       }),
   };
 }
