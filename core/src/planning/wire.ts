@@ -525,12 +525,9 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
     // Discovery observes: it owns no proof.
     ...(adaptive ? { discovery: [] } : {}),
   };
+  // Discovery is in allModes only behind the adaptive gate (adaptiveGraph).
   const modes = Object.fromEntries(
-    Object.entries(allModes).filter(
-      // Discovery is offered only behind the adaptive gate (adaptiveGraph).
-      ([kind]) =>
-        executable(kind as ItemKind) || (adaptive && kind === "discovery"),
-    ),
+    Object.entries(allModes).filter(([kind]) => executable(kind as ItemKind)),
   );
   const offeredForms = new Set(Object.values(modes).flat());
   // A plan may split the Objective into child Objectives, unless it is itself
@@ -658,9 +655,22 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
           },
           completeness: { type: "string", enum: ["complete"] },
           allowance: strict({
-            maxEntries: { type: "integer", minimum: 1 },
-            maxBytes: { type: "integer", minimum: 1 },
-            maxAttempts: { type: "integer", minimum: 1 },
+            // The controller's ceiling (planning.discoveryLimits); graph.ts checks it too.
+            maxEntries: {
+              type: "integer",
+              minimum: 1,
+              maximum: facts.discoveryLimits.maxEntries,
+            },
+            maxBytes: {
+              type: "integer",
+              minimum: 1,
+              maximum: facts.discoveryLimits.maxBytes,
+            },
+            maxAttempts: {
+              type: "integer",
+              minimum: 1,
+              maximum: facts.discoveryLimits.maxAttempts,
+            },
           }),
         });
         item.required!.push("discovery");

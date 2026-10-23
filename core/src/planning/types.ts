@@ -33,6 +33,20 @@ export interface DiscoverySpecification {
   allowance: { maxEntries: number; maxBytes: number; maxAttempts: number };
 }
 
+/** The controller's ceiling on a discovery allowance (config.ts planning.discoveryLimits). */
+export interface DiscoveryLimits {
+  maxEntries: number;
+  maxBytes: number;
+  maxAttempts: number;
+}
+
+/** The ceiling when the configuration sets none. */
+export const DISCOVERY_LIMITS: DiscoveryLimits = {
+  maxEntries: 5000,
+  maxBytes: 64 * 1024 * 1024,
+  maxAttempts: 3,
+};
+
 /** Every kind a saved plan may hold; graph.ts knows each shape. */
 export type ItemKind = "work" | "qa" | "aggregate" | "discovery";
 
@@ -40,12 +54,14 @@ export type ItemKind = "work" | "qa" | "aggregate" | "discovery";
  * The kinds this build executes (work/steps.ts), and so the only kinds the
  * planner is offered: the wire, the planner prompt and the review rubric
  * read this list. A kind joins it when its executor lands; a saved plan
- * with any other kind holds at that item.
+ * with any other kind holds at that item. Discovery is offered only behind
+ * Adaptive workflow with `planning.adaptiveGraph` on as well (wire.ts).
  */
 export const EXECUTABLE_KINDS: readonly ItemKind[] = [
   "work",
   "qa",
   "aggregate",
+  "discovery",
 ];
 
 /** Whether this build executes, and the planner is offered, `kind`. */
@@ -311,4 +327,6 @@ export interface PlanningFacts {
   playbook: string;
   /** The operator's media.localAssetRoots: the only places a local source asset may come from. */
   localAssetRoots: readonly string[];
+  /** The ceiling on every discovery allowance the plan declares. */
+  discoveryLimits: DiscoveryLimits;
 }
