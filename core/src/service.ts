@@ -93,6 +93,14 @@ export interface ServeOptions {
    * requests only, and says so in its log and in `status`.
    */
   unconfigured?: string;
+  /** Stops the service like SIGTERM: a host serving in its own process (library.ts serveFactory). */
+  signal?: AbortSignal;
+  /**
+   * The longest a stop waits for its drain (`factory serve`: the process
+   * exits right after, which ends what is still in flight). Absent, it
+   * waits until the drain ends (library.ts serveFactory).
+   */
+  drainMs?: number;
 }
 
 /**
@@ -1027,44 +1035,81 @@ export async function serve(options: ServeOptions): Promise<number> {
   const stop = (): void => {
     stopping = true;
   };
+  // A stray rejection must not end the service: log it and keep serving.
+  const stray = (reason: unknown): void =>
+    log.write(0, { event: "unhandled-rejection", error: String(reason) });
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
-  // A stray rejection must not end the service: log it and keep serving.
-  process.on("unhandledRejection", (reason) =>
-    log.write(0, { event: "unhandled-rejection", error: String(reason) }),
-  );
-  const housekeeping = (): void => {
-    try {
-      rotateLogs(paths.logs, runId);
-      sweepResults(paths.requests);
-    } catch (error) {
-      log.write(0, { event: "housekeeping-failed", error: String(error) });
+  process.on("unhandledRejection", stray);
+  if (options.signal?.aborted) stop();
+  options.signal?.addEventListener("abort", stop, { once: true });
+  try {
+    const housekeeping = (): void => {
+      try {
+        rotateLogs(paths.logs, runId);
+        sweepResults(paths.requests);
+      } catch (error) {
+        log.write(0, { event: "housekeeping-failed", error: String(error) });
+      }
+    };
+    housekeeping();
+    let lastHousekeeping = Date.now();
+    while (!stopping) {
+      try {
+        tick();
+      } catch (error) {
+        // A bug in the loop itself: log it and keep serving.
+        log.write(0, { event: "loop-error", error: String(error) });
+      }
+      if (Date.now() - lastHousekeeping > RESULT_TTL_MS) {
+        housekeeping();
+        lastHousekeeping = Date.now();
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, options.tickMs ?? 1000),
+      );
     }
-  };
-  housekeeping();
-  let lastHousekeeping = Date.now();
-  while (!stopping) {
-    try {
-      tick();
-    } catch (error) {
-      // A bug in the loop itself: log it and keep serving.
-      log.write(0, { event: "loop-error", error: String(error) });
-    }
-    if (Date.now() - lastHousekeeping > RESULT_TTL_MS) {
-      housekeeping();
-      lastHousekeeping = Date.now();
-    }
-    await new Promise((resolve) => setTimeout(resolve, options.tickMs ?? 1000));
+    // Nothing of this run writes after its end, or after the lock is
+    // released: every step stops (never saving again) and every
+    // observation and sync job is aborted, and each has ended.
+    const settledAtStop = new Map(
+      [...runners].map(([issue, runner]) => [issue, runner.settled]),
+    );
+    const drained = Promise.allSettled([
+      ...[...runners.values()].map((runner) => runner.stop()),
+      observing.drain(),
+      options.sync?.drain(),
+    ]).then(() => true);
+    const { drainMs } = options;
+    let timer: NodeJS.Timeout | undefined;
+    const ended =
+      drainMs === undefined
+        ? await drained
+        : await Promise.race([
+            drained,
+            new Promise<false>((resolve) => {
+              timer = setTimeout(() => resolve(false), drainMs);
+            }),
+          ]);
+    clearTimeout(timer);
+    // Stopped runners never save again; what still runs ends with the
+    // process, which exits right after.
+    if (!ended) log.write(0, { event: "stop-drain-timeout", afterMs: drainMs });
+    options.sync?.flushTransport();
+    // An Objective still unfinished is handed off to the next run.
+    log.end((issue) =>
+      settledAtStop.get(issue) === false ? "handed-off" : "stopped",
+    );
+    // A clean stop (an upgrade, a reboot) ends any crash streak.
+    heartbeat(true);
+    lock.close();
+    return 0;
+  } finally {
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
+    process.off("unhandledRejection", stray);
+    options.signal?.removeEventListener("abort", stop);
   }
-  options.sync?.flushTransport();
-  // An Objective still unfinished is handed off to the next run.
-  log.end((issue) =>
-    runners.get(issue)?.settled === false ? "handed-off" : "stopped",
-  );
-  // A clean stop (an upgrade, a reboot) ends any crash streak.
-  heartbeat(true);
-  lock.close();
-  return 0;
 }
 
 /**

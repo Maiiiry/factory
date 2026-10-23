@@ -9,9 +9,11 @@ import {
   openSync,
   readFileSync,
   readSync,
+  realpathSync,
   rmSync,
 } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ANALYSIS_FIELDS,
   type AnalysisField,
@@ -30,31 +32,28 @@ import {
   sendExport,
   writeExport,
 } from "./capture-export.js";
-import { type CoreConfig, configPath, loadConfig } from "./config.js";
+import { type CoreConfig, loadConfig } from "./config.js";
 import { diagnostics } from "./diagnostics.js";
 import { eventLine, redactDeep } from "./display.js";
-import {
-  DEFAULT_LIMITS,
-  type EngineLimits,
-  hostLimits,
-  MAX_ANSWER_TEXT,
-  settled,
-} from "./engine.js";
+import { MAX_ANSWER_TEXT, settled } from "./engine.js";
 import { gitEnvironment } from "./git.js";
 import { GitHub } from "./github.js";
-import { finalShown, GitHubSync, requeued } from "./github-sync.js";
+import { finalShown, requeued } from "./github-sync.js";
 import {
-  applyDream,
+  ConfigurationError,
+  configOf,
+  followRun,
+  knowledge,
+  providerNamed,
+  Refusal,
+  serveInstallation,
+  serviceLive,
+} from "./host.js";
+import {
   type DreamCommand,
   dreamCommand,
   runDream,
 } from "./knowledge/dream.js";
-import { knowledgeObserver } from "./knowledge/index.js";
-import {
-  configureKnowledge,
-  type KnowledgeSettings,
-} from "./knowledge/settings.js";
-import { lockHeld } from "./lock.js";
 import {
   type LogEvent,
   logFiles,
@@ -65,7 +64,7 @@ import {
   runOfFile,
   untilInterrupted,
 } from "./log.js";
-import { installationPaths, type Paths } from "./paths.js";
+import { installationPaths, type Paths, validRepository } from "./paths.js";
 import { BaseFiles } from "./planning/facts.js";
 import {
   markdownBlocks,
@@ -79,29 +78,20 @@ import {
   ProposalRefused,
 } from "./proposals.js";
 import type { Planner } from "./providers/planner.js";
-import {
-  freezeConfig,
-  type ProviderRoute,
-  providerPlanner,
-  providerWorker,
-  providerWorkflow,
-} from "./providers/selection.js";
+import { providerPlanner } from "./providers/selection.js";
 import { readCards } from "./queue.js";
 import {
   type QueueMode,
-  type RefusalCode,
   type Request,
   type RequestResult,
   writeRequest,
 } from "./requests.js";
-import { rebuildStep, resettable } from "./reset.js";
 import {
   type Scorecard,
   ScorecardError,
   scorecard,
   scorecardText,
 } from "./scorecard.js";
-import { serve } from "./service.js";
 import {
   SERVICE_MODES,
   SETUP_FLAGS,
@@ -112,7 +102,6 @@ import {
   setup,
 } from "./setup.js";
 import {
-  type Frozen,
   findState,
   listAllObjectives,
   loadQueueControl,
@@ -583,19 +572,18 @@ message, and exit 1. Wrong usage exits 2. Times show in the host's zone, or
 in FACTORY_DISPLAY_TIMEZONE.
 `;
 
-class Refusal extends Error {
-  constructor(
-    readonly code: RefusalCode,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
 const usage = (message: string) => new Refusal("usage", message);
 
-/** Runs a command line `parse` has checked: its arguments are trusted here. */
-async function main(argv: string[]): Promise<number> {
+/** How long `factory serve` waits at a stop for steps and jobs to end. */
+const STOP_DRAIN_MS = 20_000;
+
+/**
+ * Run one command line in this process, as the `factory` binary does,
+ * and resolve with its exit code; a refusal throws Refusal. A host program
+ * runs commands that build its registered kinds (dream, propose) this way
+ * (library.ts).
+ */
+export async function main(argv: string[]): Promise<number> {
   const args = parse(argv);
   const command = args.positional[0];
   if (!command || command === "help") {
@@ -603,7 +591,7 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   const repository = args.flags.repo ?? process.env.FACTORY_REPOSITORY;
-  if (!repository || !/^[\w.-]+\/[\w.-]+$/.test(repository))
+  if (!repository || !validRepository(repository))
     throw usage("give --repo OWNER/NAME");
   const paths = installationPaths(repository);
   switch (command) {
@@ -739,96 +727,26 @@ async function serveCommand(
   paths: Paths,
   args: Args,
 ): Promise<number> {
-  const limits = envLimits();
-  let sync: GitHubSync | undefined;
-  let loaded: CoreConfig | undefined;
-  let workflow = objectiveWorkflow();
-  let frozen: Frozen | undefined;
-  let freeze: ((provider: string) => Frozen | undefined) | undefined;
-  let log: RunLog | undefined;
-  if (existsSync(configPath(repository))) {
-    let config: CoreConfig;
-    try {
-      config = loadConfig(repository);
-    } catch (error) {
-      // A restart can't fix it: the unit doesn't restart on this code.
-      process.stderr.write(`factory: ${errorMessage(error)}\n`);
-      return CONFIGURATION_EXIT;
-    }
-    loaded = config;
-    configureKnowledge(knowledge(config, paths));
-    const name = providerName(config, args);
-    frozen = {
-      ...freezeConfig(config, name)!,
-      provider: name,
-      selectedBy: args.flags.provider ? "--provider" : "defaultProvider",
-    };
-    const github = new GitHub(
-      config.repository,
-      process.env.FACTORY_GITHUB_API,
-    ).redacting(config.secrets);
-    // One log per service run: the sync's events go to the run's files too.
-    log = new RunLog(paths.logs, newRunId(), config.capture, config.secrets);
-    sync = new GitHubSync(github, config, log, limits);
-    const routes = new Map<string, ProviderRoute>();
-    for (const [each, settings] of Object.entries(config.providers))
-      routes.set(each, {
-        frozen: freezeConfig(config, each)!,
-        workflow: objectiveWorkflow({
-          config,
-          github,
-          planner: planner(config, each),
-          workDir: (issue) => join(paths.root, "work", String(issue)),
-          objectives: paths.objectives,
-          worker: providerWorker(settings, config),
-        }),
-      });
-    workflow = resettable(
-      providerWorkflow(routes, routes.get(name)!.workflow),
-      rebuildStep(github, config),
-    );
-    freeze = (each) => {
-      const route = routes.get(each);
-      return route
-        ? { ...route.frozen, provider: each, selectedBy: "--provider" }
-        : undefined;
-    };
+  try {
+    // The process exits once serve returns, ending what still runs: the
+    // stop waits for its drain only briefly (CORE.md#Process model).
+    return await serveInstallation(repository, paths, {
+      drainMs: STOP_DRAIN_MS,
+      ...(args.flags.provider !== undefined
+        ? { provider: args.flags.provider }
+        : {}),
+    });
+  } catch (error) {
+    if (!(error instanceof ConfigurationError)) throw error;
+    // A restart can't fix it: the unit doesn't restart on this code.
+    process.stderr.write(`factory: ${error.message}\n`);
+    return CONFIGURATION_EXIT;
   }
-  if (loaded)
-    hostLimits.configure(
-      hostCapacity(loaded.execution, loaded.queue.maxActiveObjectives),
-    );
-  return await serve({
-    paths,
-    workflow,
-    ...(loaded ? {} : { unconfigured: configPath(repository) }),
-    ...(loaded ? { maxActive: loaded.queue.maxActiveObjectives } : {}),
-    ...(sync ? { sync, reset: true } : {}),
-    ...(log ? { log } : {}),
-    ...(frozen ? { frozen } : {}),
-    ...(freeze ? { freeze } : {}),
-    ...(loaded?.queue.objectiveDeadlineSeconds
-      ? { deadlineSeconds: loaded.queue.objectiveDeadlineSeconds }
-      : {}),
-    ...(loaded ? { observer: knowledgeObserver, dream: applyDream } : {}),
-    ...(process.env.FACTORY_TICK_MS
-      ? { tickMs: Number(process.env.FACTORY_TICK_MS) }
-      : {}),
-    limits: {
-      ...limits,
-      ...(loaded ? { concurrency: loaded.execution.concurrency } : {}),
-    },
-  });
 }
 
 /** The provider `--provider` names, else defaultProvider; one the configuration lacks is refused. */
 function providerName(config: CoreConfig, args: Args): string {
-  const name = args.flags.provider ?? config.defaultProvider;
-  if (!config.providers[name])
-    throw usage(
-      `no provider ${JSON.stringify(name)}; the configuration names ${Object.keys(config.providers).join(", ")}`,
-    );
-  return name;
+  return providerNamed(config, args.flags.provider);
 }
 
 async function dream(
@@ -973,18 +891,6 @@ function planner(
   return providerPlanner(provider);
 }
 
-function knowledge(config: CoreConfig, paths: Paths): KnowledgeSettings {
-  return {
-    repository: config.repository,
-    root: paths.root,
-    checkout: config.checkout,
-    ...(config.planning.context
-      ? { planningContext: config.planning.context }
-      : {}),
-    secrets: config.secrets,
-  };
-}
-
 /** An Objective's state once it is terminal with nothing left to run, or why not. */
 function settledState(paths: Paths, issue: number): ObjectiveState | string {
   const loaded = findState(paths.objectives, issue);
@@ -1003,37 +909,6 @@ function settledState(paths: Paths, issue: number): ObjectiveState | string {
  * budget), FACTORY_NOTE_MS (status note), FACTORY_REMIND_MS (gate
  * reminder), FACTORY_DEADLINE_MS (a cap on step deadlines).
  */
-function envLimits(): EngineLimits {
-  const env = (name: string): number | undefined => {
-    const value = Number(process.env[name]);
-    return process.env[name] && Number.isFinite(value) && value >= 0
-      ? value
-      : undefined;
-  };
-  const set = <K extends keyof EngineLimits>(key: K, name: string) => {
-    const value = env(name);
-    return value === undefined ? {} : { [key]: value };
-  };
-  return {
-    ...DEFAULT_LIMITS,
-    ...set("baseBackoffMs", "FACTORY_BACKOFF_MS"),
-    ...set("maxWaitMs", "FACTORY_WAIT_MS"),
-    ...set("noteAfterMs", "FACTORY_NOTE_MS"),
-    ...set("remindAfterMs", "FACTORY_REMIND_MS"),
-    ...set("maxDeadlineMs", "FACTORY_DEADLINE_MS"),
-  };
-}
-
-/** The configuration, if this repository has one that loads. */
-function configOf(repository: string): CoreConfig | undefined {
-  if (!existsSync(configPath(repository))) return undefined;
-  try {
-    return loadConfig(repository);
-  } catch {
-    return undefined;
-  }
-}
-
 async function status(
   paths: Paths,
   repository: string,
@@ -1422,66 +1297,16 @@ async function runCommand(
   repository: string,
   args: Args,
 ): Promise<number> {
-  const issue = issueOf(args);
-  const config = configOf(repository);
   const { provider, deadline } = args.flags;
-  if (provider !== undefined && config) providerName(config, args);
-  const secrets = config?.secrets ?? [];
-  // Follow from here: only what happens from now on.
-  const { ends } = readLog(paths.logs, issue, 0);
-  const id = writeRequest(
-    paths.requests,
-    {
-      kind: "run",
-      issue,
-      ...(provider !== undefined ? { provider } : {}),
-      ...(deadline !== undefined
-        ? { deadline: deadlineOf(deadline, Date.now())! }
-        : {}),
-    },
-    process.env.USER ?? "operator",
-  );
-  const stoppedService = () => {
-    process.stdout.write(
-      `The service isn't running; the request applies when it starts. Start it (factory serve, or its systemd unit), then factory run ${issue} follows it.\n`,
-    );
-    return 2;
-  };
-  if (!(await serviceLive(paths))) return stoppedService();
-  process.stdout.write(
-    `Queued #${issue}; following it (Ctrl-C stops following, and it keeps running).\n`,
-  );
-  const resultFile = join(paths.requests, `${id}.result`);
-  let admitted = false;
-  const code = await untilInterrupted(async () => {
-    for (const event of readNew(paths.logs, issue, ends))
-      process.stdout.write(`${eventLine(redactDeep(event, secrets))}\n`);
-    const live = await serviceLive(paths);
-    if (!admitted && existsSync(resultFile)) {
-      const result = JSON.parse(
-        readFileSync(resultFile, "utf8"),
-      ) as RequestResult;
-      rmSync(resultFile, { force: true });
-      if (result.code) throw new Refusal(result.code, result.message);
-      admitted = true;
-    }
-    if (!live) return stoppedService();
-    // Before the admission, an earlier run's state is not this one's.
-    if (!admitted) return undefined;
-    const view = readStatus(paths, { only: issue, live, secrets });
-    const row = view.objectives[0];
-    if (!row) return undefined;
-    const ended = TERMINAL.includes(row.status as ObjectiveState["status"]);
-    if (!ended && row.status !== "unreadable" && !row.holds.length)
-      return undefined;
-    process.stdout.write(statusText(view, { list: false, all: false }));
-    return row.status === "done" ? 0 : ended ? 1 : 2;
+  const { code } = await followRun(paths, repository, {
+    issue: issueOf(args),
+    ...(provider !== undefined ? { provider } : {}),
+    ...(deadline !== undefined
+      ? { deadline: deadlineOf(deadline, Date.now())! }
+      : {}),
+    write: (text) => process.stdout.write(text),
   });
-  if (code !== undefined) return code;
-  process.stdout.write(
-    `Stopped following #${issue}; it keeps running: factory status ${issue}, or factory run ${issue} to follow it again.\n`,
-  );
-  return 130;
+  return code;
 }
 
 /** `factory queue list|pause|resume|drain`. */
@@ -1699,7 +1524,6 @@ async function recipe(repository: string, args: Args): Promise<number> {
 }
 
 /** The service holds its abstract socket while it lives. */
-const serviceLive = (paths: Paths) => lockHeld(paths.lockName);
 
 interface Args {
   positional: string[];
@@ -1793,18 +1617,29 @@ function misplaced(name: string, command: string | undefined): string {
   return `Unknown option --${name} for factory ${command ?? "(no command)"}; see factory help`;
 }
 
-main(process.argv.slice(2)).then(
-  (code) => process.exit(code),
-  (error: unknown) => {
-    if (error instanceof Refusal) {
-      process.stderr.write(
-        `${JSON.stringify({ kind: "lifecycle-refusal", code: error.code })}\nfactory: ${error.message}\n`,
-      );
-      process.exit(error.code === "usage" ? 2 : 1);
-    }
-    process.stderr.write(
-      `factory: ${error instanceof Error ? error.stack : String(error)}\n`,
+// The `factory` binary; imported by the library, it only exports main.
+const entry = (): boolean => {
+  try {
+    return (
+      realpathSync(process.argv[1] ?? "") === fileURLToPath(import.meta.url)
     );
-    process.exit(1);
-  },
-);
+  } catch {
+    return false;
+  }
+};
+if (entry())
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+      if (error instanceof Refusal) {
+        process.stderr.write(
+          `${JSON.stringify({ kind: "lifecycle-refusal", code: error.code })}\nfactory: ${error.message}\n`,
+        );
+        process.exit(error.code === "usage" ? 2 : 1);
+      }
+      process.stderr.write(
+        `factory: ${error instanceof Error ? error.stack : String(error)}\n`,
+      );
+      process.exit(1);
+    },
+  );
