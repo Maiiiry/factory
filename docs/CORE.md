@@ -150,11 +150,14 @@ Every step is safe to run again. Before it does anything with an outside effect,
 | Merge         | That PR's merged state.                                                                                                                                                                                                                                               |
 | Comment       | A hidden marker, `<!-- factory:<issue>:<kind>:<id> -->`, in a comment by Factory's own login (anyone else's marked comment is ignored). An existing comment is edited, not posted again. A plan too large for one comment continues in numbered `plan-data` comments. |
 | Issue close   | The issue's state.                                                                                                                                                                                                                                                    |
+| Branch delete | The branch's absence. After its PR merges (a native stack's layers once the whole unit merged), and on cancel, a branch is deleted only when Factory made every commit it has beyond the default branch, by a push with a lease on the head it read.                  |
 | Project field | Written every time; it is a display.                                                                                                                                                                                                                                  |
 
 So an effect whose result was lost is never "unknown". The next run of the step finds it on GitHub and carries on.
 
-A model call has no outside effect. If the process dies mid-call, the call runs again. A worker's worktree is kept and reused, so a repeated work step continues from its files.
+A model call has no outside effect. If the process dies mid-call, the call runs again. A worker's worktree is kept and reused on the base the item kept, so a repeated work step continues from its files. A worktree from an attempt that never kept its base (it died before its outcome) is reset onto the base the rerun picks.
+
+A step's kept facts (`state.kept`) outlive repairs. A step forgets one by keeping `null`, and the engine then removes it, so a reader never sees `null`.
 
 ### Deadlines
 
@@ -209,6 +212,7 @@ A hold is a question with named answers:
 - **In an agent host.** The director skill shows each open hold with the host's question tool (Claude Code's AskUserQuestion, or its Codex equivalent): the question, each answer with the recommended one first, and a one-line consequence for each. That gives the operator an app notification. The chosen answer runs `factory answer`. `factory status --json` lists open holds in this shape so the skill needs no parsing.
 - An answer that doesn't match the open hold gets a reply naming the valid answers. Nothing else changes.
 - `cancel` is valid at every hold and at any time.
+- **Provider model.** A model the provider's login can't serve holds with `switch NAME` and `cancel`, never `retry` (a retry can't succeed, and Copilot bills each one). Copilot checks its model list before it opens a session, so this hold costs no request. The operator sets the model and restarts the service, then answers `switch` with the same provider's name, which re-freezes its changed settings, or with another configured provider's name.
 - **Repair diagnosis.** When diagnosing a refused result needs a decision, the work step holds with `answer <decision>` (a correction for the worker), `retry` (diagnose again) and `cancel`. While the refused result is kept, still exists on the item's base and (for media) its selection stands, it also offers `revalidate`: the result was correct and Factory's check was at fault. The work step then finishes with that same result, without the worker or collection, and the selection, validation, review and delivery run again. It isn't counted as a repair, and a rerun after a crash does the same.
 
 ## Cancel
@@ -216,7 +220,7 @@ A hold is a question with named answers:
 `/factory cancel` or `factory cancel <issue>`:
 
 1. Abort the Objective's running steps. This kills the process groups the service started for those steps; it tracks them in memory, and they die with the service anyway.
-2. Close every open Factory PR of the Objective (each branch under `factory/<issue>/`, whatever plan made it) with a comment, close the issue as not planned, and set Status to Cancelled.
+2. Close every open Factory PR of the Objective (each branch under `factory/<issue>/`, whatever plan made it) with a comment, delete those branches Factory made (see [Idempotence](#idempotence)), close the issue as not planned, and set Status to Cancelled.
 3. Mark the state cancelled.
 
 Cancel reads only the Objective's state file and its open PRs, so its cost doesn't depend on history. It can't be refused. If closing a PR fails, the close is retried in the background; it never blocks the cancel.
@@ -248,6 +252,11 @@ Rules for modules:
 - A module returns step outcomes. It never writes state directly, takes a lock, starts a background loop, or keeps its own archive.
 - A module keeps its data in `modules.<name>` of the state file, or in the run log.
 - A module validates its input once, where the input enters, and doesn't re-verify it later.
+
+Review and knowledge see what the worker saw:
+
+- **Review inputs.** Result review and final review get a controller input receipt for each item: every read-only input its worker got (source assets and bound selections) with kind, path, visibility, media type, size and sha256, and Factory's digest-checked copy under `inputs/` in the evidence root, within the candidate copy bounds.
+- **Repository memory** shows a record that cites any path inside the planning selectors, with only its admitted paths. A reference record carries its Source's text, so it needs every path admitted. An episode counts a native stack's lower layer as merged when the stack merged.
 - Provider APIs stay inside their adapter.
 
 ## Security
@@ -263,6 +272,7 @@ Added after the 2026-10-23 security review:
 
 - **Issue bodies.** Planning reads only what GitHub shows: HTML comments outside code, link reference titles and invisible characters are dropped (markdown.ts visibleMarkdown). When the issue's author has no write access, the check holds once: approve or cancel. The approval is kept against the visible body's digest, so any later edit asks again. Until then nothing in the body counts. Queue consent stays the Project field.
 - **Write access** (`/factory` answers, issue authors) is asked of GitHub again after 10 minutes.
+- **GitHub attachments** are fetched with the service's token sent only to the attachment URL. Redirects may go to github.com, `*.githubusercontent.com` and GitHub's own S3 buckets for user, repository and release files, by exact bucket name; any other host is refused. The size bound and the digest apply wherever the bytes come from.
 - **Local source assets** come only from directories listed in `media.localAssetRoots` (empty by default: off), by real path, and never from anything the sandbox seals: HOME as a whole, logins, Factory's config and state, runtime sockets or shared temporary directories. The plan check and the copy both check.
 - **Pushed content.** Before publish pushes, every blob the result adds or changes, and every LFS object it uploads, is searched for the secret values, as written and base64. A match pushes nothing and holds with `repair` and `cancel`.
 - **Workers.** A Claude worker never loads project or local settings (their hooks would run on the host). A Codex worker's shell gets proxy URLs without credentials, or none when it has no network. A managed worker's archive is read without following links.
