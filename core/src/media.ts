@@ -132,9 +132,9 @@ export interface Selection {
   set: CandidateSet;
   /** Direct dependents that receive the set as read-only inputs. */
   bound: string[];
-  /** Who chose the set and when; absent on selections made before Factory recorded them. */
-  by?: string;
-  at?: string;
+  /** Who chose the set and when. */
+  by: string;
+  at: string;
 }
 
 /** A file a worker gets read-only under `.factory-inputs/assets`. */
@@ -1296,25 +1296,11 @@ export async function hydrateTree(input: {
     return hold(
       `The tree being validated holds ${files.length} Git LFS files, ${total} bytes in all; Factory restores at most ${MAX_CAPTURE_BYTES} bytes of LFS files for a validation run, so their commands can't see the real files. Make the repository's LFS files smaller in all on the default branch and answer retry, or cancel.`,
     );
-  const absent = async () => {
-    const missing: LfsFile[] = [];
-    for (const file of files)
-      if (!(await lfsObject(directory, file.sha256, signal)))
-        missing.push(file);
-    return missing;
-  };
-  let missing = await absent();
-  if (missing.length) {
-    const fetched = await lfsFetch({
-      checkout: directory,
-      repository: input.repository,
-      commit: input.commit,
-      paths: missing.map((file) => file.path),
-      signal,
-    });
-    if (fetched) return fetched;
-    missing = await absent();
-  }
+  const missing = await fetchMissing(
+    { ...input, checkout: directory },
+    files.map((file) => ({ ...file, oid: file.sha256 })),
+  );
+  if (!Array.isArray(missing)) return missing;
   if (missing.length)
     return hold(
       `Origin does not serve the Git LFS objects of ${missing
@@ -1538,32 +1524,50 @@ export async function lfsPushIfPointers(input: {
     input.signal,
   );
   if (!pointers.length) return { kind: "done", value: { pushed: false } };
-  const absent = async () => {
-    const paths: string[] = [];
-    for (const found of pointers)
-      if (!(await lfsObject(input.checkout, found.oid, input.signal)))
-        paths.push(found.path);
-    return paths;
-  };
-  let missing = await absent();
   // Worktrees skip LFS smudge, so a moved or restored LFS file is a pointer
   // whose object only origin has: fetch those, and refuse only what origin
   // doesn't serve either.
-  if (missing.length) {
-    const fetched = await lfsFetch({ ...input, paths: missing });
-    if (fetched) return fetched;
-    missing = await absent();
-  }
+  const missing = await fetchMissing(input, pointers);
+  if (!Array.isArray(missing)) return missing;
   if (missing.length)
     return {
       kind: "repair",
-      finding: `The result adds Git LFS pointers whose objects don't exist: ${missing.join(", ")}. Commit real files (Factory stores them in LFS) or leave those paths unchanged.`,
+      finding: `The result adds Git LFS pointers whose objects don't exist: ${missing.map((found) => found.path).join(", ")}. Commit real files (Factory stores them in LFS) or leave those paths unchanged.`,
     };
   const pushed = await lfsPush({
     ...input,
     oids: [...new Set(pointers.map((found) => found.oid))],
   });
   return pushed ?? { kind: "done", value: { pushed: true } };
+}
+
+/**
+ * The files whose LFS objects the local store lacks, after one fetch of
+ * them from origin at `commit`; or the fetch's hold or retry.
+ */
+async function fetchMissing<File extends { path: string; oid: string }>(
+  input: {
+    checkout: string;
+    repository: string;
+    commit: string;
+    signal: AbortSignal;
+  },
+  files: readonly File[],
+): Promise<File[] | Exclude<MediaOutcome<never>, { kind: "repair" }>> {
+  const absent = async () => {
+    const missing: File[] = [];
+    for (const file of files)
+      if (!(await lfsObject(input.checkout, file.oid, input.signal)))
+        missing.push(file);
+    return missing;
+  };
+  const missing = await absent();
+  if (!missing.length) return missing;
+  const fetched = await lfsFetch({
+    ...input,
+    paths: missing.map((file) => file.path),
+  });
+  return fetched ?? absent();
 }
 
 /**
@@ -1904,8 +1908,8 @@ export async function candidateReceipts(
         sets: described,
         selection: {
           set: selection.set.id,
-          by: selection.by ?? null,
-          at: selection.at ?? null,
+          by: selection.by,
+          at: selection.at,
           boundTo: selection.bound,
           selectionCommit: selection.commit,
           checksPassed: SELECTION_CHECKS,
@@ -1948,10 +1952,6 @@ async function lfsObject(
     : undefined;
 }
 
-/**
- * Copy a local LFS object to `file`, reached without links, and check it
- * against the pointer it stands for.
- */
 /** Git's test for text: no NUL byte in the first 8000 bytes. */
 async function textContent(file: string): Promise<boolean> {
   const handle = await open(file, "r");
@@ -1964,6 +1964,10 @@ async function textContent(file: string): Promise<boolean> {
   }
 }
 
+/**
+ * Copy a local LFS object to `file`, reached without links, and check it
+ * against the pointer it stands for.
+ */
 async function copyChecked(
   from: { root: string; relative: string },
   file: string,

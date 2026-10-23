@@ -139,7 +139,7 @@ export function controllerGuarantees(
 }
 
 /** What Factory itself guarantees; a final-controller proof names one by index. */
-export const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
+const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
   {
     id: "independent-result-review",
     statement:

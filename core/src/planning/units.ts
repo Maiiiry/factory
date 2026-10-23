@@ -7,23 +7,12 @@ import type { Plan, WorkItem } from "./types.js";
  * one item is an ordinary PR, so a plan with no chains delivers exactly like
  * regular delivery.
  *
- * Pure: no I/O, and a malformed plan is a problem, never a throw.
- *
- * How the steps use it (core/src/work/steps.ts, native-stack mode only):
- * - Compute `units(plan)` once per steps() call. `{ problem }` is a
- *   deterministic plan fault: hold with replan or cancel (a retry would see
- *   the same plan). Checked plans never produce it.
- * - `unitOf(result, id)` finds an item's unit; `layer` is its index in
- *   `unit.items`. Layer i>0 is runnable once `item:<items[i-1]>:publish` is
- *   done, and starts from that predecessor's published head.
- * - Only `unit.items.at(-1)` gets a merge step when `items.length > 1`; it
- *   merges the whole stack. Every item of the unit counts as merged once that
- *   step is done. `externalDependencies` must all be merged before the
- *   unit's bottom layer starts.
+ * Pure: no I/O, and a malformed plan is a problem, never a throw; checked
+ * plans never produce one. work/steps.ts runs the layers: a layer above the
+ * bottom starts from the delivered head of the layer below, and only the
+ * top layer has a merge step, which merges the whole stack.
  */
 export interface DeliveryUnit {
-  /** The bottom item's id. */
-  id: string;
   /** Bottom first; each item's only dependency is the one before it. */
   items: WorkItem[];
   /** Dependencies outside the unit, which must merge before it starts. */
@@ -103,7 +92,6 @@ export function units(
       items.push(byId.get(current) as WorkItem);
     const own = new Set(items.map((item) => item.id));
     result.push({
-      id: root.id,
       items,
       externalDependencies: [
         ...new Set(

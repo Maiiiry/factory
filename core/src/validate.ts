@@ -561,7 +561,7 @@ async function revParse(
 function mutationDetail(
   before: Buffer,
   after: Buffer,
-  hydrated: ReadonlySet<string> = new Set(),
+  hydrated: ReadonlySet<string>,
 ): string | undefined {
   const records = (listing: Buffer) => {
     const fields = listing.toString("utf8").split("\0");

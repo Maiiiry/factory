@@ -461,7 +461,7 @@ async function workStep(
   const finishedKey = keptKey(item.id, "finished");
   const selectionKey = keptKey(item.id, "selection");
   let finished = kept<Finished>(state, item.id, "finished");
-  let own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
+  let own = kept<KeptSelection>(state, item.id, "selection");
   let keepAll: Record<string, unknown> = keepBase;
   // The worker finished and collection asked: `repair` sends the result
   // back; any other answer collects it again.
@@ -898,7 +898,7 @@ async function refusedResult(
   const commit = kept<string>(state, item.id, "refusedCommit");
   const tree = kept<string>(state, item.id, "refusedTree");
   if (!commit || !tree) return undefined;
-  const own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
+  const own = kept<KeptSelection>(state, item.id, "selection");
   if (needsSelection(item) && !own) return undefined;
   const shown = await hostGitExit(
     checkout,
@@ -1035,9 +1035,9 @@ async function selectStep(
     mediaDirectory(workDir, item.id),
   );
   const answer = context.answer;
-  const own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
+  const own = kept<KeptSelection>(state, item.id, "selection");
   let read: ReturnType<typeof readSelection>;
-  let decided: { by?: string; at?: string };
+  let decided: { by: string; at: string };
   if (!answer && own && work.sets.some((s) => s.id === own.selection.set.id)) {
     read = {
       kind: "chosen",
@@ -1080,8 +1080,8 @@ async function selectStep(
     tree: made.value.tree,
     set: read.set,
     bound: read.bound,
-    ...(decided.by ? { by: decided.by } : {}),
-    ...(decided.at ? { at: decided.at } : {}),
+    by: decided.by,
+    at: decided.at,
   };
   return { kind: "done", result: done };
 }
@@ -1501,7 +1501,7 @@ function repairOutcome(
       | undefined;
     return chosen && work
       ? { selection: chosen, sets: work.sets }
-      : (kept<KeptSelection>(state, entry.id, "selection") ?? undefined);
+      : kept<KeptSelection>(state, entry.id, "selection");
   };
   // The work step forgets a selection whose copies are gone.
   const own =
@@ -1758,6 +1758,11 @@ export function finalReviewStep(deps: BuildDeps): Step {
               !!entry.merged?.mergeSha,
           )
           .sort((a, b) => a.merged.at.localeCompare(b.merged.at));
+        const decisions = criterionDecisions(
+          context,
+          final.tree,
+          (state.kept ?? {})["final:questions"] as string[] | undefined,
+        );
         // Every merged item in merge order; a native stack's layers share its merge.
         const mergedIds = merges.flatMap(
           (entry) => entry.merged.items ?? [entry.id],
@@ -1793,19 +1798,7 @@ export function finalReviewStep(deps: BuildDeps): Step {
           }),
           sources: await pinnedSources(state, deps, signal),
           dir: join(deps.workDir(state.issue), "final-review"),
-          ...(criterionDecisions(
-            context,
-            final.tree,
-            (state.kept ?? {})["final:questions"] as string[] | undefined,
-          )
-            ? {
-                decisions: criterionDecisions(
-                  context,
-                  final.tree,
-                  (state.kept ?? {})["final:questions"] as string[],
-                )!,
-              }
-            : {}),
+          ...(decisions ? { decisions } : {}),
           signal,
           log: context.log,
         });
@@ -1972,7 +1965,7 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
       const plan = state.done.plan as Plan | undefined;
       const { config, github } = deps;
       for (const item of plan?.items ?? []) {
-        const branch = `${config.repository.split("/")[0]}:factory/${state.issue}/${item.id}`;
+        const branch = `${config.repository.split("/")[0]}:${itemBranch(state.issue, item.id)}`;
         const pulls = await github.rest<{ number: number }[]>(
           "GET",
           `/repos/${config.repository}/pulls?head=${encodeURIComponent(branch)}&state=open`,

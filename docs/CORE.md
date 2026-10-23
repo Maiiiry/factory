@@ -86,8 +86,8 @@ The service loop:
 ```text
 every second:   apply request files
 every 30 s:     read the queue (on failure, keep the last good view)
-for the active Objective (one at a time in v1):
-    pick the next runnable steps (up to 2 Work Items at once)
+for each active Objective (up to queue.maxActiveObjectives):
+    pick the next runnable steps (up to execution.concurrency at once)
     run each step with its deadline → outcome → save state → log
 ```
 

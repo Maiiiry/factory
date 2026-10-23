@@ -50,7 +50,7 @@ import type { ResultEvidence } from "./result.js";
 // The old controller's bounds, kept: the review request carries at most
 // eight images and 64 MiB of captured bytes in all.
 const MAX_SELECTORS = 8;
-export const MAX_REVIEW_IMAGES = 8;
+const MAX_REVIEW_IMAGES = 8;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;

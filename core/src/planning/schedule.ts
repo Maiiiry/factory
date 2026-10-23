@@ -2,28 +2,15 @@ import { ownsPath } from "./graph.js";
 import type { Plan, WorkItem } from "./types.js";
 
 /**
- * Scheduling for the build steps: which runnable item goes first, which
- * fresh starts a shared resource excludes, and which peer handoff notes a
- * worker gets. Ported from the old scheduler (src/scheduler.ts) and the old
- * handoff note routing (src/objective-knowledge.ts).
+ * Scheduling for the build steps (work/steps.ts buildSteps): which runnable
+ * item goes first (`rank`; the engine starts steps in emitted order, so
+ * order is priority), which fresh starts a shared resource holds back
+ * (`resourceGate`, a wait with no question), and which peer handoff notes a
+ * worker gets (`peerNotes`, from accepted results only). Ported from the
+ * old scheduler (src/scheduler.ts) and the old handoff note routing
+ * (src/objective-knowledge.ts).
  *
  * Pure: no I/O and no throws. The steps own the state reads and pass a view.
- *
- * How the steps use it (core/src/work/steps.ts):
- * - Build the runnable items as today, then order them with
- *   `rank(plan, view, runnable)` and emit steps in that order. The engine
- *   starts steps in emitted order up to its limits, so order is priority.
- * - Make one `resourceGate(plan, inFlightIds)` per steps() call. For each
- *   ranked runnable item whose next step would be its first (work, or a
- *   qa/aggregate/discovery item's only step), call `gate.admit(item)`:
- *   `undefined` → emit the step; a `ResourceBlock` → emit nothing for that
- *   item this call (no hold: the holder is in flight, so it will finish or
- *   hold on its own, and the next steps() call admits the waiter). Items
- *   already in flight are always admitted and claim nothing new.
- * - When preparing a work prompt, pass
- *   `peerNotes(plan, notesByItem, item)` as `prepareWorkPrompt`'s
- *   `peerNotes`. `notesByItem` must hold only notes of items whose work
- *   result was accepted (validate and review done), keyed by item id.
  */
 
 /** The state facts scheduling reads, by item id. */
@@ -69,7 +56,7 @@ export function rank(
 }
 
 /** Remaining critical path per item, on one basis for the whole plan. */
-export function criticalPath(
+function criticalPath(
   plan: Pick<Plan, "items">,
   view: Pick<ScheduleView, "settled">,
 ): Map<string, number> {
@@ -114,7 +101,7 @@ export interface ResourceBlock {
  * also declares. Ownership overlap is not checked here: plan checks keep
  * items that can run at once from owning the same paths.
  */
-export function resourceBlocked(
+function resourceBlocked(
   plan: Pick<Plan, "items">,
   startedIds: Iterable<string>,
   item: WorkItem,

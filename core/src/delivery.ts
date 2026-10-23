@@ -1249,17 +1249,16 @@ async function integrate(
       `The default branch (at ${tip}) does not contain the merge of PR #${pr} (${mergeSha}). Inspect it, then answer retry; or cancel.`,
     );
   // Merges can be recorded out of order, so the integrated head never moves back.
-  const recorded = integrated;
   if (
-    !recorded ||
-    recorded === mergeSha ||
-    (await ancestor(context, recorded, mergeSha))
+    !integrated ||
+    integrated === mergeSha ||
+    (await ancestor(context, integrated, mergeSha))
   )
     return { kind: "merged", mergeSha, integratedSha: mergeSha };
-  if (await ancestor(context, mergeSha, recorded))
-    return { kind: "merged", mergeSha, integratedSha: recorded };
+  if (await ancestor(context, mergeSha, integrated))
+    return { kind: "merged", mergeSha, integratedSha: integrated };
   return hold(
-    `The merge of PR #${pr} (${mergeSha}) and Factory's integrated head ${recorded} have diverged. Inspect the default branch, then answer retry; or cancel.`,
+    `The merge of PR #${pr} (${mergeSha}) and Factory's integrated head ${integrated} have diverged. Inspect the default branch, then answer retry; or cancel.`,
   );
 }
 
@@ -1420,11 +1419,7 @@ async function acceptUnit(
       missing.push(`PR #${layer.pr} is not merged`);
       continue;
     }
-    const below = input[index - 1];
-    const judged = await judge(context, {
-      ...layer,
-      ...(below ? { baseBranch: itemBranch(layer.issue, below.item) } : {}),
-    });
+    const judged = await judgeLayer(context, input, index);
     if (judged.kind !== "ready") return pin(judged, layer);
     const sha = await github.mergeCommitOf(layer.pr, signal);
     if (!sha) missing.push(`PR #${layer.pr} names no merge commit`);
@@ -1628,11 +1623,7 @@ async function judgeLayers(
   const refused: LayerResult[] = [];
   let defaultBranch = "";
   for (const [index, layer] of input.entries()) {
-    const below = input[index - 1];
-    const judged = await judge(context, {
-      ...layer,
-      ...(below ? { baseBranch: itemBranch(layer.issue, below.item) } : {}),
-    });
+    const judged = await judgeLayer(context, input, index);
     if (judged.kind === "ready") {
       layers.push({ input: layer, head: judged.head, pull: judged.pull });
       defaultBranch = judged.defaultBranch;
@@ -1643,6 +1634,20 @@ async function judgeLayers(
     if (first) return first;
   }
   return { layers, defaultBranch };
+}
+
+/** Judge one layer against the branch below it; the bottom against the default branch. */
+function judgeLayer(
+  context: DeliveryContext,
+  input: PullInput[],
+  index: number,
+): Promise<Judged> {
+  const layer = input[index]!;
+  const below = input[index - 1];
+  return judge(context, {
+    ...layer,
+    ...(below ? { baseBranch: itemBranch(layer.issue, below.item) } : {}),
+  });
 }
 
 /**
