@@ -1,6 +1,7 @@
 import type { CoreConfig } from "./config.js";
 import { crashPoint } from "./crash.js";
 import type { GitHub, GraphQLError } from "./github.js";
+import { WORK_ITEM_LABEL } from "./tracking.js";
 
 /** One Objective card on the Project. */
 export interface QueueItem {
@@ -65,6 +66,7 @@ fragment Card on Issue {
   number
   state
   repository { nameWithOwner }
+  body
   projectItems(first: 20) {
     nodes {
       id
@@ -95,6 +97,15 @@ ${ISSUE_FIELDS}`;
 
 type Value = { name?: string; number?: number; updatedAt?: string } | null;
 
+/**
+ * A Work Item issue (tracking.ts) is never an Objective: the items query
+ * leaves its label out, and an issue read by number is one when its body
+ * starts with Factory's item marker, however many labels it has.
+ */
+const NOT_WORK_ITEM = ` -label:"${WORK_ITEM_LABEL}"`;
+const workItem = (body: string | undefined) =>
+  /^<!-- factory:\d+:item:/.test(body ?? "");
+
 interface ItemsPage {
   node: {
     items?: {
@@ -119,6 +130,7 @@ interface Card {
   number: number;
   state: string;
   repository: { nameWithOwner: string };
+  body?: string;
   projectItems: {
     nodes: ({
       id: string;
@@ -182,7 +194,7 @@ async function readItems(
       {
         project: config.queue.projectId,
         after,
-        query,
+        query: query + NOT_WORK_ITEM,
         field: config.queue.field,
         order: config.queue.orderField,
       },
@@ -309,6 +321,7 @@ export async function readQueue(
     );
   }
   function read(issue: Card): void {
+    if (workItem(issue.body)) return;
     const node = issue.projectItems.nodes.find(
       (n) => n?.project.id === config.queue.projectId && !n.isArchived,
     );
