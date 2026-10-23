@@ -49,6 +49,7 @@ import { create, extract, list } from "tar";
 import { crashPoint } from "../crash.js";
 import { hold } from "../engine.js";
 import { validPath } from "../objective.js";
+import { ContainedError, copyContained } from "../paths.js";
 import { errorMessage } from "../text.js";
 import type {
   Worker,
@@ -206,16 +207,32 @@ async function pack(
     // A tracked file the worker deleted is listed but absent.
     (path) => lstatSync(join(worktree, path), { throwIfNoEntry: false }),
   );
-  for (const path of paths)
-    if (!lstatSync(join(worktree, path)).isFile())
-      throw new PlannerError(
-        "hold",
-        `Managed workers carry regular files only, and ${path} is a link or other special file. Run this Work Item on a local worker provider, or cancel.`,
-      );
-  await create(
-    { cwd: worktree, file: archive, portable: true, noMtime: true },
-    paths,
-  );
+  // Each file is copied out through a descriptor opened without following
+  // a link on any part of its path, so a directory the worker replaced
+  // with a link can't put a host file in the archive; tar reads the copy.
+  const copies = `${archive}.files`;
+  try {
+    for (const path of paths) {
+      const copy = join(copies, path);
+      mkdirSync(dirname(copy), { recursive: true, mode: 0o700 });
+      try {
+        await copyContained(worktree, path, copy, Number.MAX_SAFE_INTEGER);
+      } catch (error) {
+        if (!(error instanceof ContainedError)) throw error;
+        throw new PlannerError(
+          "hold",
+          `Managed workers carry regular files only, reached without links, and ${path} isn't one (${error.message}). Run this Work Item on a local worker provider, or cancel.`,
+        );
+      }
+      chmodSync(copy, lstatSync(join(worktree, path)).mode & 0o777);
+    }
+    await create(
+      { cwd: copies, file: archive, portable: true, noMtime: true },
+      paths,
+    );
+  } finally {
+    rmSync(copies, { recursive: true, force: true });
+  }
   const bytes = readFileSync(archive);
   return {
     archive,
