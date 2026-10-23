@@ -253,3 +253,186 @@ export async function defaultHead(
     );
   }
 }
+
+/** The byte strings a secret value is found by: as written, and base64. */
+function secretNeedles(secrets: readonly string[]): {
+  exact: Buffer[];
+  encoded: Buffer[];
+} {
+  const values = new Set<string>();
+  for (const secret of secrets) {
+    values.add(secret);
+    // Line by line too, as redact (log.ts) does.
+    for (const line of secret.split(/\r?\n/))
+      if (line.length >= 4) values.add(line);
+  }
+  const exact: Buffer[] = [];
+  const encoded = new Set<string>();
+  for (const value of values) {
+    const bytes = Buffer.from(value);
+    exact.push(bytes);
+    // At each byte alignment: only the characters the value alone decides.
+    for (const shift of [0, 1, 2]) {
+      const text = Buffer.concat([Buffer.alloc(shift), bytes]).toString(
+        "base64",
+      );
+      const whole = Math.floor((shift + bytes.length) / 3) * 4;
+      const core = text.slice([0, 2, 3][shift], whole);
+      if (core.length < 8) continue;
+      encoded.add(core);
+      encoded.add(core.replace(/\+/g, "-").replace(/\//g, "_"));
+    }
+  }
+  return { exact, encoded: [...encoded].map((text) => Buffer.from(text)) };
+}
+
+/** Finds any needle in a stream of chunks, keeping only a needle's length of tail. */
+class StreamSearch {
+  private tail: Buffer = Buffer.alloc(0);
+  private readonly keep: number;
+  found = false;
+  constructor(private readonly needles: readonly Buffer[]) {
+    this.keep = Math.max(0, ...needles.map((needle) => needle.length - 1));
+  }
+  feed(chunk: Buffer): void {
+    if (this.found || !this.needles.length) return;
+    const text = Buffer.concat([this.tail, chunk]);
+    this.found = this.needles.some((needle) => text.includes(needle));
+    this.tail = text.subarray(Math.max(0, text.length - this.keep));
+  }
+}
+
+/**
+ * A search of one stream of bytes for the values of `secrets`
+ * (config.secrets): as written, line by line as redact (log.ts) does, or
+ * base64 (standard or URL-safe, at any alignment, line breaks ignored).
+ * Memory stays bounded by the longest needle, whatever the stream's size.
+ */
+export function secretSearch(secrets: readonly string[]): () => {
+  feed(chunk: Buffer): void;
+  readonly found: boolean;
+} {
+  const { exact, encoded } = secretNeedles(secrets);
+  return () => {
+    const raw = new StreamSearch(exact);
+    const flat = new StreamSearch(encoded);
+    return {
+      feed(chunk: Buffer) {
+        raw.feed(chunk);
+        flat.feed(
+          Buffer.from(
+            chunk.toString("latin1").replace(/[\r\n]/g, ""),
+            "latin1",
+          ),
+        );
+      },
+      get found() {
+        return raw.found || flat.found;
+      },
+    };
+  };
+}
+
+/**
+ * The paths whose content `commit` adds or changes against `base` that
+ * hold a value of `secrets` (secretSearch). Blobs stream through one
+ * `cat-file --batch`. Throws when Git fails.
+ */
+export async function pathsHoldingSecrets(
+  directory: string,
+  base: string,
+  commit: string,
+  secrets: readonly string[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (!secrets.length) return [];
+  const diff = await pinnedGitExit(
+    directory,
+    [
+      "diff-tree",
+      "-r",
+      "-z",
+      "--no-renames",
+      "--no-commit-id",
+      "--diff-filter=ACMT",
+      base,
+      commit,
+    ],
+    signal ? { signal } : {},
+  );
+  if (diff.code !== 0)
+    throw new Error(`git diff-tree ${base} ${commit}: ${diff.stderr}`);
+  const fields = diff.stdout.toString("utf8").split("\0");
+  const paths = new Map<string, string[]>();
+  for (let at = 0; at + 1 < fields.length; at += 2) {
+    const [, mode, , oid] = fields[at]!.split(" ");
+    if (!oid || mode === "160000") continue;
+    paths.set(oid, [...(paths.get(oid) ?? []), fields[at + 1]!]);
+  }
+  const oids = [...paths.keys()];
+  if (!oids.length) return [];
+  const search = secretSearch(secrets);
+  const holding: string[] = [];
+  await new Promise<void>((done, failed) => {
+    const child = spawn("git", ["-C", directory, "cat-file", "--batch"], {
+      env: gitEnvironment(),
+      stdio: ["pipe", "pipe", "ignore"],
+      ...(signal ? { signal } : {}),
+    });
+    let index = 0;
+    let pending: Buffer = Buffer.alloc(0);
+    let remaining = -1; // -1: reading a header; 0: the newline after the content.
+    let blob = search();
+    let broken: Error | undefined;
+    child.stdout.on("data", (chunk: Buffer) => {
+      let buffer: Buffer = pending.length
+        ? Buffer.concat([pending, chunk])
+        : chunk;
+      pending = Buffer.alloc(0);
+      while (buffer.length && !broken) {
+        if (remaining < 0) {
+          const newline = buffer.indexOf(10);
+          if (newline < 0) {
+            pending = buffer;
+            return;
+          }
+          const header = buffer.subarray(0, newline).toString("utf8");
+          const [named, type, size] = header.split(" ");
+          if (named !== oids[index] || type !== "blob" || !size) {
+            broken = new Error(`git cat-file returned "${header}"`);
+            child.kill();
+            return;
+          }
+          remaining = Number(size);
+          blob = search();
+          buffer = buffer.subarray(newline + 1);
+          continue;
+        }
+        if (remaining > 0) {
+          const part = buffer.subarray(0, remaining);
+          blob.feed(part);
+          remaining -= part.length;
+          buffer = buffer.subarray(part.length);
+          continue;
+        }
+        // The newline that ends the content.
+        buffer = buffer.subarray(1);
+        if (blob.found) holding.push(...paths.get(oids[index]!)!);
+        index += 1;
+        remaining = -1;
+      }
+    });
+    child.on("error", failed);
+    child.on("close", (code) => {
+      if (broken) failed(broken);
+      else if (code !== 0 || index !== oids.length)
+        failed(new Error(`git cat-file --batch exited ${code}`));
+      else done();
+    });
+    child.stdin.on("error", () => {
+      // git may exit before reading stdin; its exit code reports the failure.
+    });
+    child.stdin.end(oids.map((oid) => `${oid}\n`).join(""));
+  });
+  return holding.sort();
+}

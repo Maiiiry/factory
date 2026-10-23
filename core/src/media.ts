@@ -48,6 +48,7 @@ import {
   lfsPointer,
   operatorGit,
   readBlobs,
+  secretSearch,
   sha256,
 } from "./git.js";
 import { namesPath, validPath } from "./objective.js";
@@ -1548,6 +1549,38 @@ export async function lfsPushIfPointers(input: {
     oids: [...new Set(pointers.map((found) => found.oid))],
   });
   return pushed ?? { kind: "done", value: { pushed: true } };
+}
+
+/**
+ * The paths of the LFS pointers `commit` adds against `base` whose object
+ * in the local store holds a value of `secrets` (git.ts secretSearch).
+ * An object only origin has isn't uploaded, so it isn't read. Publish
+ * calls this before it pushes, with pathsHoldingSecrets for the blobs.
+ */
+export async function lfsObjectsHoldingSecrets(
+  checkout: string,
+  base: string,
+  commit: string,
+  secrets: readonly string[],
+  signal: AbortSignal,
+): Promise<string[]> {
+  if (!secrets.length) return [];
+  const search = secretSearch(secrets);
+  const holding: string[] = [];
+  for (const pointer of await addedPointers(checkout, base, commit, signal)) {
+    const stored = await lfsObject(checkout, pointer.oid, signal);
+    if (!stored) continue;
+    const object = search();
+    for await (const chunk of createReadStream(
+      join(stored.root, stored.relative),
+      { signal },
+    )) {
+      object.feed(chunk as Buffer);
+      if (object.found) break;
+    }
+    if (object.found) holding.push(pointer.path);
+  }
+  return holding;
 }
 
 /**

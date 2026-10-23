@@ -1285,8 +1285,23 @@ async function publishStep(
       ...(republish ? { republish: true } : {}),
       ...(context.answer?.answer === RESET_BRANCH ? { reset: true } : {}),
       ...(branch ? { baseBranch: branch } : {}),
+      secrets: deps.config.secrets,
     },
   );
+  if (result.kind === "secret")
+    return context.answer?.answer === "repair"
+      ? repairOutcome(
+          item,
+          "publish",
+          result.finding,
+          failure(item, result.finding),
+          context,
+          deps,
+        )
+      : hold(
+          `${result.finding}\n\nPublication stopped; nothing was pushed. Answer repair to have the worker remove the value, or cancel. Rotate the secret if the worker may have written it anywhere else.`,
+          ["repair", "cancel"],
+        );
   // An empty change, or a pointer whose LFS object is missing: a fault in
   // the result itself, not a conflict, so no rebase.
   if (result.kind === "empty" || result.kind === "repair")

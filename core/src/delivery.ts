@@ -14,7 +14,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome } from "./engine.js";
-import { defaultHead, operatorGit } from "./git.js";
+import { defaultHead, operatorGit, pathsHoldingSecrets } from "./git.js";
 import {
   type AsyncMerge,
   type CheckRun,
@@ -27,7 +27,7 @@ import {
   Unreadable,
 } from "./github.js";
 import { redact } from "./log.js";
-import { lfsPushIfPointers } from "./media.js";
+import { lfsObjectsHoldingSecrets, lfsPushIfPointers } from "./media.js";
 import { BaseFiles, workflowCheckNames } from "./planning/facts.js";
 import type { WorkItem } from "./planning/types.js";
 import { errorMessage } from "./text.js";
@@ -159,6 +159,8 @@ export interface PublishInput {
   republish?: boolean;
   /** The operator answered RESET_BRANCH: replace the branch whoever made it. */
   reset?: boolean;
+  /** The values no pushed blob may hold (config.secrets). */
+  secrets: readonly string[];
   /**
    * The PR's base: omitted (the default branch) for a regular item or the
    * bottom layer of a native stack; the predecessor layer's branch
@@ -194,6 +196,8 @@ export type PublishResult =
       merged: boolean;
     }
   | Empty
+  /** A blob the push would add holds a secret value; nothing was pushed. */
+  | { kind: "secret"; finding: string }
   | Retry
   | Repair
   | Hold;
@@ -208,8 +212,12 @@ export type PublishResult =
  * no object is a `repair`. The PR is found by its head branch; only when
  * there is none is one opened, so a lost create is found by the next run.
  *
+ * Before a push, a blob the result adds or changes that holds a value of
+ * `secrets` stops it: `secret`.
+ *
  * Outcomes for the publish step: `published` → done; `empty` and `repair`
- * → the item's delivery repair with the finding; `retry` and `hold` as
+ * → the item's delivery repair with the finding; `secret` → a hold whose
+ * `repair` answer sends the finding to the worker; `retry` and `hold` as
  * they are.
  */
 export function publish(
@@ -269,6 +277,28 @@ export function publish(
           `Remote branch ${branch} holds commits Factory did not make (head ${remote}; Factory pushed ${[...known].join(", ")}). Move them off the branch and answer retry; answer ${RESET_BRANCH} to replace the branch with Factory's result, dropping them from it; or cancel.`,
           ["retry", RESET_BRANCH, "cancel"],
         );
+      // Nothing Factory pushes carries a secret value it knows (config.secrets).
+      const leaked = [
+        ...(await pathsHoldingSecrets(
+          context.checkout,
+          input.base,
+          input.commit,
+          input.secrets,
+          signal,
+        )),
+        ...(await lfsObjectsHoldingSecrets(
+          context.checkout,
+          input.base,
+          input.commit,
+          input.secrets,
+          signal,
+        )),
+      ];
+      if (leaked.length)
+        return {
+          kind: "secret",
+          finding: `The result writes the value of a secret Factory redacts (a policy.allowedSecretNames variable or a managed provider's credential), as written or base64-encoded, into ${leaked.map((path) => JSON.stringify(path)).join(", ")}. Remove it from those files and never write a secret's value into the repository.`,
+        };
       // Only before a push: a branch that holds the result already has its objects.
       const media = await lfsPushIfPointers({
         checkout: context.checkout,
