@@ -455,6 +455,170 @@ export class QueueDisplay {
   }
 }
 
+const RUN_ISSUE = `
+query($owner: String!, $name: String!, $issue: Int!, $field: String!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issue(number: $issue) {
+      id
+      number
+      state
+      repository { nameWithOwner }
+      projectItems(first: 50) {
+        nodes {
+          id
+          isArchived
+          project { id }
+          option: fieldValueByName(name: $field) {
+            ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const ADD_ITEM = `
+mutation($project: ID!, $content: ID!) {
+  addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
+    item { id }
+  }
+}`;
+
+const UNARCHIVE = `
+mutation($project: ID!, $item: ID!) {
+  unarchiveProjectV2Item(input: { projectId: $project, itemId: $item }) {
+    item { id }
+  }
+}`;
+
+interface RunCard {
+  id: string;
+  isArchived: boolean;
+  project: { id: string };
+  option: Value;
+}
+
+/** Issue N of this repository and its cards on the queue's Project; undefined when it has none here. */
+async function runIssue(
+  github: GitHub,
+  config: CoreConfig,
+  issue: number,
+  signal?: AbortSignal,
+): Promise<{ id: string; open: boolean; cards: RunCard[] } | undefined> {
+  const { data } = await github.graphqlPartial<{
+    repository: {
+      nameWithOwner: string;
+      issue: {
+        id: string;
+        number: number;
+        state: string;
+        repository: { nameWithOwner: string };
+        projectItems: { nodes: (RunCard | null)[] };
+      } | null;
+    } | null;
+  }>(
+    RUN_ISSUE,
+    {
+      owner: github.owner,
+      name: github.name,
+      issue,
+      field: config.queue.field,
+    },
+    signal,
+    (error) => error.type === "NOT_FOUND" && error.path?.[1] === "issue",
+  );
+  if (!data.repository)
+    throw new Error(`Repository ${config.repository} not found`);
+  github.sameRepository(data.repository.nameWithOwner);
+  const found = data.repository.issue;
+  // A pull request, or an issue transferred away, is no Objective here.
+  if (
+    found?.number !== issue ||
+    found.repository.nameWithOwner.toLowerCase() !==
+      config.repository.toLowerCase()
+  )
+    return undefined;
+  return {
+    id: found.id,
+    open: found.state === "OPEN",
+    cards: found.projectItems.nodes.filter(
+      (node): node is RunCard => node?.project.id === config.queue.projectId,
+    ),
+  };
+}
+
+/**
+ * `factory run N`: set issue N's card to the queued option, adding the
+ * issue to the Project (or unarchiving its card) first when it has no
+ * card there, so the next queue read admits it by the normal edges. A
+ * closed issue is queued only when `closed` allows it (a finished
+ * Objective runs again; its new run reopens the issue). The operator's
+ * latest action wins: a card someone moved to another option after the
+ * request was written (`since.at`) and after Factory's own last write
+ * (`since.shownAt`) is `dequeued`, and left alone. Idempotent otherwise:
+ * the Project returns an existing item, and the option is set again.
+ */
+export async function queueIssue(
+  github: GitHub,
+  config: CoreConfig,
+  display: QueueDisplay,
+  issue: number,
+  closed: boolean,
+  since: { at: string; shownAt?: string | undefined },
+  signal?: AbortSignal,
+): Promise<"queued" | "no_such_issue" | "issue_closed" | "dequeued"> {
+  const found = await runIssue(github, config, issue, signal);
+  if (!found) return "no_such_issue";
+  if (!found.open && !closed) return "issue_closed";
+  const project = config.queue.projectId;
+  const card = found.cards.find((node) => !node.isArchived);
+  const changedAt = Date.parse(card?.option?.updatedAt ?? "");
+  if (
+    card?.option?.name &&
+    card.option.name !== config.queue.options.queued &&
+    changedAt > Date.parse(since.at) &&
+    !(changedAt <= Date.parse(since.shownAt ?? ""))
+  )
+    return "dequeued";
+  let itemId = card?.id;
+  if (!itemId && found.cards[0]) {
+    itemId = found.cards[0].id;
+    await github.graphql(UNARCHIVE, { project, item: itemId }, signal);
+  }
+  if (!itemId) {
+    const added = await github.graphql<{
+      addProjectV2ItemById: { item: { id: string } | null } | null;
+    }>(ADD_ITEM, { project, content: found.id }, signal);
+    itemId = added.addProjectV2ItemById?.item?.id;
+    if (!itemId) throw new Error(`The Project didn't add #${issue}`);
+  }
+  crashPoint("run:queue:before");
+  await display.set(itemId, config.queue.options.queued, signal);
+  crashPoint("run:queue:after");
+  return "queued";
+}
+
+/**
+ * A cancel of a `factory run N` that wasn't admitted yet: a card that
+ * still reads queued moves to the cancelled option, so no queue read
+ * admits it. Idempotent.
+ */
+export async function unqueueIssue(
+  github: GitHub,
+  config: CoreConfig,
+  display: QueueDisplay,
+  issue: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const found = await runIssue(github, config, issue, signal);
+  const card = found?.cards.find((node) => !node.isArchived);
+  if (card?.option?.name !== config.queue.options.queued) return;
+  crashPoint("run:unqueue:before");
+  await display.set(card.id, config.queue.options.cancelled, signal);
+  crashPoint("run:unqueue:after");
+}
+
 const FIELDS = `
 query($project: ID!, $field: String!, $order: String!) {
   node(id: $project) {

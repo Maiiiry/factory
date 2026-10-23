@@ -36,6 +36,7 @@ import {
   isCancel,
   pendingRequests,
   type RequestResult,
+  type RunRequest,
   refused,
   removeRequest,
   type StoredRequest,
@@ -73,6 +74,8 @@ export interface ServeOptions {
   sync?: GitHubSync;
   /** The configuration each newly admitted Objective freezes. */
   frozen?: Frozen;
+  /** The configuration an Objective admitted for `factory run --provider NAME` freezes; undefined for a provider it lacks. */
+  freeze?: (provider: string) => Frozen | undefined;
   /** Each newly admitted Objective's deadline, from its admission (`queue.objectiveDeadlineSeconds`). */
   deadlineSeconds?: number;
   /** Reads Objectives as they move; never changes them (knowledge records memory here). */
@@ -195,6 +198,37 @@ export async function serve(options: ServeOptions): Promise<number> {
   const waitingOnPaths = new Map<number, number>();
   /** `factory queue pause|drain|resume`, saved so it survives restarts. */
   let queue = loadQueueControl(paths.root);
+  /**
+   * `factory run N` requests waiting for their Objective's admission, by
+   * issue: the newest one's provider and deadline admit it. Their files
+   * stay until then, so a restart reads them again.
+   */
+  const runs = new Map<number, StoredRequest & { request: RunRequest }>();
+  /**
+   * The one place a waiting `run` ends: whenever its request gets any
+   * result (refused, ok, dequeued, cancelled, admitted), its entry goes,
+   * and the sync stops watching its card. A newer request for the issue
+   * keeps its own entry.
+   */
+  const endRun = (issue: number, id: string): void => {
+    if (runs.get(issue)?.id !== id) return;
+    runs.delete(issue);
+    options.sync?.ranOut(issue);
+  };
+  /** Answer a request that stayed pending, and remove it. */
+  const answer = (
+    stored: StoredRequest & { request: RunRequest },
+    result: RequestResult,
+  ): void => {
+    endRun(stored.request.issue, stored.id);
+    writeResult(paths.requests, stored.id, result);
+    removeRequest(join(paths.requests, `${stored.id}.json`));
+    log.write(stored.request.issue, {
+      event: "request",
+      request: stored.request,
+      ...result,
+    });
+  };
   const open = (state: ObjectiveState): ObjectiveRunner => {
     const runner = new ObjectiveRunner(
       state,
@@ -380,8 +414,11 @@ export async function serve(options: ServeOptions): Promise<number> {
         });
         continue;
       }
-      // A reset that is rebuilding: answered when the rebuild lands.
+      // A reset that is rebuilding, or a run waiting for its admission:
+      // answered when that lands.
       if (!result) continue;
+      if (stored.request.kind === "run")
+        endRun(stored.request.issue, stored.id);
       writeResult(paths.requests, stored.id, result);
       crashPoint("requests:applied");
       removeRequest(file);
@@ -405,6 +442,17 @@ export async function serve(options: ServeOptions): Promise<number> {
         ...(result.code ? { code: result.code, error: result.message } : {}),
       });
       return result;
+    }
+    if (request.kind === "run") return startRun({ ...stored, request });
+    // A cancel drops a `factory run` waiting for its admission, and takes
+    // its card out of the queue: the operator's latest action wins.
+    const waiting = isCancel(request) ? runs.get(request.issue) : undefined;
+    if (waiting) {
+      answer(waiting, refused("superseded", "A cancel replaced this run."));
+      options.sync?.unqueue(request.issue);
+      const known = find(request.issue);
+      if (!known || TERMINAL.includes(known.state.status))
+        return { message: "ok" };
     }
     if (request.kind === "queue") {
       queue = { mode: request.mode, by: stored.by, at: stored.at };
@@ -503,6 +551,69 @@ export async function serve(options: ServeOptions): Promise<number> {
       ...result,
     });
     return result;
+  };
+
+  /**
+   * `factory run N`: an Objective already running answers at once (no
+   * second admission); otherwise its card is queued and the request waits
+   * for the normal queue admission, which takes its provider and deadline.
+   */
+  const startRun = (
+    stored: StoredRequest & { request: RunRequest },
+  ): RequestResult | undefined => {
+    const { issue, provider } = stored.request;
+    if (unreadable.has(issue))
+      return refused(
+        "state_unreadable",
+        `#${issue} has unreadable state. Answers: factory reset ${issue}, or cancel.`,
+      );
+    const known = find(issue);
+    if (known && !TERMINAL.includes(known.state.status))
+      return { message: "ok" };
+    const current = runs.get(issue);
+    if (current && current.id > stored.id)
+      return refused(
+        "superseded",
+        `A later factory run ${issue} replaced this one.`,
+      );
+    const { deadline } = stored.request;
+    if (deadline !== undefined && Date.parse(deadline) <= Date.now())
+      return refused(
+        "deadline_passed",
+        `This run's deadline (${deadline}) passed before #${issue} was admitted; run factory run ${issue} again with a new --deadline.`,
+      );
+    if (queue.mode !== "running")
+      return refused(
+        "queue_not_running",
+        `The queue is ${queue.mode}, so #${issue} isn't admitted; run factory queue resume, then factory run ${issue} again.`,
+      );
+    const sync = options.sync;
+    if (!sync)
+      return refused(
+        "no_configuration",
+        "The service runs without configuration, so it has no queue to run an Objective from.",
+      );
+    if (provider !== undefined && !options.freeze?.(provider))
+      return refused(
+        "unknown_provider",
+        `The service's configuration has no provider ${JSON.stringify(provider)}; restart the service after adding it, or leave out --provider.`,
+      );
+    if (!current || current.id < stored.id) {
+      runs.set(issue, stored);
+      log.write(issue, {
+        event: "request",
+        request: stored.request,
+        by: stored.by,
+      });
+    }
+    const shownAt = (known?.state.modules.github as GitHubModule | undefined)
+      ?.shownAt;
+    // The card's outcome answers whichever request waits for it by then.
+    sync.queue(issue, Boolean(known), { at: stored.at, shownAt }, (result) => {
+      const waiting = runs.get(issue);
+      if (waiting) answer(waiting, result);
+    });
+    return undefined;
   };
 
   /**
@@ -762,8 +873,19 @@ export async function serve(options: ServeOptions): Promise<number> {
         void previous?.stop();
         options.sync?.forget(issue);
         const now = new Date();
-        const state = newObjective(issue, now, options.frozen);
-        const deadline = deadlineAt(now, options.deadlineSeconds);
+        // A `factory run` request waiting for this admission chooses the
+        // provider and the deadline.
+        const asked = runs.get(issue);
+        const frozen =
+          asked?.request.provider !== undefined
+            ? (options.freeze?.(asked.request.provider) ?? options.frozen)
+            : options.frozen;
+        const state = newObjective(issue, now, frozen);
+        const deadline = deadlineAt(
+          now,
+          options.deadlineSeconds,
+          asked?.request.deadline,
+        );
         if (deadline) state.deadline = deadline;
         state.modules.github = github;
         // The earlier run's PRs and worktrees go before the new run plans.
@@ -774,13 +896,14 @@ export async function serve(options: ServeOptions): Promise<number> {
         log.write(issue, {
           event: "admitted",
           again: Boolean(previous),
-          ...(options.frozen
-            ? {
-                provider: options.frozen.provider,
-                config: options.frozen.digest,
-              }
+          ...(frozen
+            ? { provider: frozen.provider, config: frozen.digest }
             : {}),
+          ...(asked ? { run: asked.id } : {}),
         });
+        // A crash before this answers it when the request is read again:
+        // the Objective is running by then.
+        if (asked) answer(asked, { message: "ok" });
       },
       withdraw: (issue: number) => {
         const runner = runners.get(issue);
