@@ -316,7 +316,9 @@ export function publish(
         if (input.allowSecret !== digest)
           return { kind: "secret", finding, digest };
       }
-      // Only before a push: a branch that holds the result already has its objects.
+      // Only before a push: a branch that holds the result already has its
+      // objects. The upload is by object id, so a rerun repeats it safely.
+      crashPoint("deliver:lfs-push:before");
       const media = await lfsPushIfPointers({
         checkout: context.checkout,
         repository: github.repository,
@@ -324,6 +326,7 @@ export function publish(
         commit: input.commit,
         signal,
       });
+      crashPoint("deliver:lfs-push:after");
       if (media.kind === "retry") return retry(media.reason);
       if (media.kind !== "done") return media;
       const pushed = await pushBranch(context, branch, input.commit, remote);
@@ -1181,17 +1184,25 @@ async function unregisteredChecks(
 // ── Branch update ───────────────────────────────────────────────────────
 
 /**
- * Bring a PR that is BEHIND its base under strict protection up to date:
+ * Bring a PR up to date with its base: one BEHIND its base under strict
+ * protection, or a stack layer that doesn't contain the layer below it.
  * GitHub merges the base into `head`, guarded by the expected head, while
  * the PR still targets one of `bases` (a stack layer's predecessor branch,
- * or the default branch). GitHub
- * makes the merge asynchronously, so this always ends in a retry; the next
- * observation accepts the new head by its shape (see deliveredHead).
+ * or the default branch). No worker runs. GitHub makes the merge
+ * asynchronously, so this ends in a retry; the next observation accepts
+ * the new head by its shape (see deliveredHead).
  */
 function updateBranch(
   context: DeliveryContext,
   input: { pr: number; head: string; bases: string[] },
-): Promise<Retry | Hold> {
+  /**
+   * What a refused update is when GitHub shows the unmoved head conflicting
+   * with its base: a stack layer's conflict with the layer below. Any other
+   * refusal, or none given, retries: the next observation reads the PR and
+   * its readiness again.
+   */
+  refused?: Repair,
+): Promise<Retry | Hold | Repair> {
   return guarded(context, async () => {
     const { github, signal } = context;
     const pull = await github.pull(input.pr, signal);
@@ -1209,6 +1220,16 @@ function updateBranch(
       // next observation reads the PR and its readiness again.
       if (!(error instanceof GitHubError && error.status === 422))
         throw needing(error, "Contents: write and Pull requests: write");
+      // A 422 also answers a repeat request while GitHub's first update is
+      // still pending: only a head GitHub shows conflicting is refused.
+      if (refused) {
+        const state = await github.mergeState(input.pr, signal);
+        if (
+          state.headRefOid === input.head &&
+          state.mergeStateStatus === "DIRTY"
+        )
+          return refused;
+      }
     }
     crashPoint("deliver:update-branch:after");
     return {
@@ -1499,6 +1520,12 @@ const STACK_MERGE_POLL_MS = 6_000;
 const STACK_POLL_INTERVAL_MS = 2_000;
 const STACK_PERMISSION =
   "Contents: write and Pull requests: write, with stacked pull requests enabled for the repository";
+/**
+ * How to deliver without native stacks. The service reads delivery.kind
+ * once at start and an Objective's plan was split by it, so a retry never
+ * changes it: the Objective runs again under the new setting.
+ */
+const WITHOUT_STACKS = `To deliver without native stacks instead, cancel, set the installation's delivery.kind to regular, restart the service and queue the Objective again`;
 
 /** A delivery result pinned to the layer (Work Item) it belongs to. */
 export type LayerResult = (Retry | Repair | Hold | Republish) & {
@@ -1533,7 +1560,9 @@ interface Layer {
  * the bottom against the default branch), so a failed check or conflict is
  * pinned to its own layer; merge commits must be allowed; the stack is found
  * by its bottom PR, or created and checked; each layer must contain the
- * head of the layer below it; then GitHub merges it through the top PR at
+ * head of the layer below it (GitHub merges that head into a layer that
+ * doesn't, as it updates a BEHIND bottom layer; only a conflict is the
+ * layer's repair); then GitHub merges it through the top PR at
  * Factory's top head. Every layer must then be merged at its own head with
  * one shared merge commit, on the default branch, on every path (fresh,
  * already merged, refused as merged, after a crash). Layers merged with
@@ -1552,8 +1581,8 @@ interface Layer {
  * - `merged` → `done` with `{ mergeSha, integratedSha }`; every item in
  *   `items` counts as merged at `mergeSha`.
  * - `repair` → the delivery repair of `item` (the layer that failed, or a
- *   layer that does not contain its predecessor's head), which also clears
- *   the layers above it.
+ *   layer GitHub can't update with its predecessor's head), which also
+ *   clears the layers above it.
  * - `republish` → the republish repair of `item`.
  * - `retry` and `hold` → returned as they are; `item` names the layer the
  *   wait or question is about (the top layer for the unit as a whole). A
@@ -1727,13 +1756,24 @@ async function mergeUnitOnce(
           ),
           layer.input,
         );
+      // The layer below moved (GitHub updated it with the default branch,
+      // or it was repaired): GitHub merges it into this layer the same way,
+      // with no worker. Only a refused update, a real conflict, is a repair.
       if (relation !== "identical" && relation !== "ahead")
         return pin(
-          {
-            kind: "repair",
-            finding: `PR #${pull.number} (${branch}) at ${layer.head} does not contain the head ${below.head} of the layer below it (PR #${below.pull.number}, ${below.pull.head.ref}): it was built on an older head of that layer. Rebuild the change on the current ${below.pull.head.ref}.`,
-            conflict: { onto: below.head },
-          },
+          await updateBranch(
+            context,
+            {
+              pr: pull.number,
+              head: layer.head,
+              bases: [below.pull.head.ref],
+            },
+            {
+              kind: "repair",
+              finding: `PR #${pull.number} (${branch}) at ${layer.head} does not contain the head ${below.head} of the layer below it (PR #${below.pull.number}, ${below.pull.head.ref}), and GitHub can't merge that head into it. Rebuild the change on the current ${below.pull.head.ref}.`,
+              conflict: { onto: below.head },
+            },
+          ),
           layer.input,
         );
     }
@@ -1874,7 +1914,7 @@ async function ensureStack(
     lagging(
       context,
       error.message,
-      `${error.message} (for ${expected}). GitHub's native stack API may have changed: inspect the stack, or set the installation's delivery to regular, then answer retry; or cancel.`,
+      `${error.message} (for ${expected}). GitHub's native stack API may have changed: inspect the stack, then answer retry; or cancel. ${WITHOUT_STACKS}.`,
     );
   let found: Stack[];
   try {
@@ -1884,7 +1924,7 @@ async function ensureStack(
     if (error instanceof GitHubError && error.status === 404)
       return objectiveWide(
         hold(
-          `GitHub shows no native stacks for ${github.repository} (${error.message.slice(0, 300)}). Enable stacked pull requests for the repository, or set the installation's delivery to regular, then answer retry; or cancel.`,
+          `GitHub shows no native stacks for ${github.repository} (${error.message.slice(0, 300)}). Enable stacked pull requests for the repository, then answer retry; or cancel. ${WITHOUT_STACKS}.`,
         ),
       );
     throw error;

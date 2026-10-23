@@ -1,4 +1,4 @@
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { crashPoint } from "../crash.js";
 import {
@@ -74,12 +74,15 @@ import type { ReviewArtifact } from "../review/artifacts.js";
 import { reviewObjective } from "../review/final.js";
 import {
   type CriterionDecision,
+  type DeliveryPosition,
+  type DependencyResult,
   type ResultReview,
   receiptPath,
   reviewResult,
 } from "../review/result.js";
 import { type ObjectiveBlock, readShown, shownDigest } from "../shown.js";
 import { type ObjectiveState, runOf, sinceRun } from "../state.js";
+import { headAndTail } from "../text.js";
 import { validateTree } from "../validate.js";
 import {
   addWorktree,
@@ -95,6 +98,9 @@ import { prepareWorkPrompt, type RepairContext } from "./prompt.js";
 import type { Worker, WorkerSpend } from "./worker.js";
 
 const MINUTE = 60_000;
+/** What a kept validation finding holds of a failed run's output. */
+const KEPT_OUTPUT_HEAD = 32_000;
+const KEPT_OUTPUT_TAIL = 96_000;
 
 /** What execution needs from the installation, beyond planning. */
 export interface BuildDeps extends PlanningDeps {
@@ -168,6 +174,8 @@ interface KeptSelection {
 /** A finished worker run, kept until its result is collected, so a collection question doesn't run the worker again. */
 interface Finished {
   finalResponse: string;
+  /** Factory's clean replay of the kept change, with no worker: its notes are that change's. */
+  replayed?: true;
   validated?: { tree: string; commands: string[] };
   /** Captured once; absent until then. */
   sets?: CandidateSet[];
@@ -498,6 +506,7 @@ async function workStep(
   const keptBase = kept<string>(state, item.id, "base");
   let base = keptBase ?? (await start());
   const added = await addWorktree(config.checkout, worktree, base, signal);
+  let replayed = false;
   if (added === "kept" && keptBase === undefined) {
     // A worktree from an attempt that never kept its base (interrupted
     // before its outcome) sits on that attempt's base, which the default
@@ -514,9 +523,9 @@ async function workStep(
     // A conflict or failed delivery: move onto the current start and replay
     // the kept change, so the worker can resolve it there.
     const head = await start();
-    const replay = kept<string>(state, item.id, "replay");
+    const replay = kept<Replay>(state, item.id, "replay")?.commit;
     if (head !== base) {
-      await rebaseWorktree(
+      replayed = await rebaseWorktree(
         config.checkout,
         worktree,
         base,
@@ -536,6 +545,20 @@ async function workStep(
   const selectionKey = keptKey(item.id, "selection");
   let finished = kept<Finished>(state, item.id, "finished");
   let own = kept<KeptSelection>(state, item.id, "selection");
+  // A conflict repair whose replay applied cleanly onto the change's own
+  // base is mechanical: the replayed change is the result, collected,
+  // validated and reviewed again with no worker run. A media item's
+  // worker runs, for its candidates.
+  if (
+    !finished &&
+    replayed &&
+    !needsSelection(item) &&
+    kept<RepairFinding>(state, item.id, "finding")?.kind === "conflict"
+  )
+    finished = {
+      finalResponse: `Factory replayed the previous result onto ${base} with no conflict.`,
+      replayed: true,
+    };
   let keepAll: Record<string, unknown> = keepBase;
   // The worker finished and collection asked: `repair` sends the result
   // back; any other answer collects it again.
@@ -752,7 +775,10 @@ async function workStep(
         base,
         commit: collected.commit,
         tree: collected.tree,
-        notes: collected.notes,
+        // A replay's collection has no handoff file: the notes are kept.
+        notes: finished.replayed
+          ? (kept<Replay>(state, item.id, "replay")?.notes ?? [])
+          : collected.notes,
         ...(finished.validated ? { validated: finished.validated } : {}),
         sets,
       };
@@ -818,12 +844,15 @@ function mediaOutcome(
   }
 }
 
-/** Handoff notes of every item whose result was accepted (validated and reviewed), by item. */
+/**
+ * Handoff notes of every item whose result was accepted (validated and
+ * reviewed), by item, each with that result's commit.
+ */
 function acceptedNotes(
   state: ObjectiveState,
   plan: Plan,
-): Map<string, HandoffNote[]> {
-  const notes = new Map<string, HandoffNote[]>();
+): Map<string, (HandoffNote & { commit: string })[]> {
+  const notes = new Map<string, (HandoffNote & { commit: string })[]>();
   for (const other of plan.items) {
     const work = state.done[stepKey(other.id, "work")] as
       | WorkResult
@@ -833,7 +862,13 @@ function acceptedNotes(
       state.done[stepKey(other.id, "validate")] &&
       state.done[stepKey(other.id, "review")]
     )
-      notes.set(other.id, work.notes);
+      notes.set(
+        other.id,
+        work.notes.map((note) => ({
+          ...note,
+          commit: candidate(state, other.id),
+        })),
+      );
   }
   return notes;
 }
@@ -846,30 +881,49 @@ function withKeep(outcome: Outcome, keep: Record<string, unknown>): Outcome {
 
 /**
  * Move a kept worktree from `from` to `to` and replay the kept change
- * (`replay`) on it. Conflicts stay in the files for the worker to resolve.
+ * (`replay`) on it: that commit's own change, from its parent. Conflicts
+ * stay in the files for the worker to resolve. True only when the change
+ * was built on `from` and applied whole with no conflict: the worktree
+ * then holds `to` plus exactly that change. A change on another base (an
+ * attempt stopped after its base moved) is replayed for the worker, never
+ * taken as it is.
  */
 async function rebaseWorktree(
   checkout: string,
   worktree: string,
   from: string,
   to: string,
-  refused: string | undefined,
+  replay: string | undefined,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<boolean> {
   await hostGit(worktree, ["checkout", "--detach", "--force", to], { signal });
   await hostGit(worktree, ["clean", "-ffdx", "--", "."], { signal });
-  if (!refused) return;
+  if (!replay) return false;
+  const parent = (
+    await hostGit(checkout, ["rev-parse", `${replay}^`], { signal })
+  )
+    .toString("utf8")
+    .trim();
   const diff = await hostGit(
     checkout,
-    ["diff", "--no-ext-diff", "--no-textconv", from, refused],
+    ["diff", "--binary", "--no-ext-diff", "--no-textconv", parent, replay],
     { signal },
   );
-  if (!diff.length) return;
-  // Applying may conflict; the worker resolves what remains.
-  await hostGitExit(worktree, ["apply", "--3way", "--whitespace=nowarn"], {
-    input: diff.toString("utf8"),
-    signal,
-  });
+  if (!diff.length) return false;
+  // Applying may conflict; the worker resolves what remains. The patch is
+  // passed as a file: its bytes need not be UTF-8.
+  const patch = `${worktree}.replay.patch`;
+  await writeFile(patch, diff, { mode: 0o600 });
+  try {
+    const applied = await hostGitExit(
+      worktree,
+      ["apply", "--3way", "--whitespace=nowarn", patch],
+      { signal },
+    );
+    return applied.code === 0 && parent === from;
+  } finally {
+    await rm(patch, { force: true });
+  }
 }
 
 /**
@@ -985,8 +1039,16 @@ interface Refused {
  * that result. Separate from the refused fact, whose tree collection reads
  * as "no change".
  */
-function replayFact(id: string, work: WorkResult): Record<string, string> {
-  return { [keptKey(id, "replay")]: work.commit };
+function replayFact(id: string, work: WorkResult): Record<string, Replay> {
+  return {
+    [keptKey(id, "replay")]: { commit: work.commit, notes: work.notes },
+  };
+}
+
+/** The change a rebase replays, with its notes for a replay without a worker. */
+interface Replay {
+  commit: string;
+  notes: HandoffNote[];
 }
 
 /** The one writer of the refused fact, from the refused work result. */
@@ -1091,12 +1153,27 @@ async function validateStep(
             [flakyKey]: { tree: result.tree, command: result.failed.command },
           },
         };
+      // State is saved on every step: it keeps a bounded finding. Output
+      // longer than that (up to the raised review-artifact stream bounds)
+      // is kept whole in a file for the operator; no model can read it.
+      let keptOutput = result.output;
+      if (result.output.length > KEPT_OUTPUT_HEAD + KEPT_OUTPUT_TAIL) {
+        const outputFile = join(
+          workDir,
+          "outputs",
+          item.id,
+          `${result.tree}.txt`,
+        );
+        await mkdir(dirname(outputFile), { recursive: true, mode: 0o700 });
+        await writeFile(outputFile, result.output, { mode: 0o600 });
+        keptOutput = `${headAndTail(result.output, KEPT_OUTPUT_HEAD, KEPT_OUTPUT_TAIL)}\n[The complete output is kept for the operator at ${outputFile}; it is not readable from the worker's checkout.]`;
+      }
       return repairOutcome(
         item,
         "validate",
         result.detail,
         {
-          ...failure(item, result.output),
+          ...failure(item, keptOutput),
         },
         context,
         deps,
@@ -1140,6 +1217,7 @@ async function selectStep(
       kind: "chosen",
       set: own.selection.set,
       bound: own.selection.bound,
+      ...(own.selection.reason ? { reason: own.selection.reason } : {}),
     };
     decided = own.selection;
   } else {
@@ -1179,6 +1257,7 @@ async function selectStep(
     bound: read.bound,
     by: decided.by,
     at: decided.at,
+    ...(read.reason ? { reason: read.reason } : {}),
   };
   return { kind: "done", result: done };
 }
@@ -1207,6 +1286,15 @@ async function reviewStep(
     kept<string[]>(state, item.id, "questions"),
   );
   const chosen = selection(state)(item.id);
+  const place = stackLayer(plan, deps, item.id);
+  const position: DeliveryPosition = place
+    ? {
+        kind: "native-stack",
+        layer: place.layer + 1,
+        layers: place.unit.items.length,
+        predecessor: place.unit.items[place.layer - 1]?.id ?? null,
+      }
+    : { kind: "regular" };
   const review = await reviewResult({
     planner: deps.planner,
     plan,
@@ -1224,6 +1312,14 @@ async function reviewStep(
     inputs: workerInputs(state, [item.id]),
     ...(validated.artifacts ? { artifacts: validated.artifacts } : {}),
     decisions,
+    delivery: position,
+    dependencies: await dependencyResults(
+      state,
+      item,
+      deps.config.checkout,
+      work.base,
+      signal,
+    ),
     signal,
     log: context.log,
   });
@@ -1253,6 +1349,82 @@ function workerInputs(state: ObjectiveState, ids: string[]): InputRecord[] {
     item: id,
     inputs: kept<MediaInput[]>(state, id, "inputs") ?? [],
   }));
+}
+
+/**
+ * Each item `item` depends on, transitively, with its accepted result: its
+ * merge, or for a native-stack layer below, its published PR. Ready items
+ * have every dependency delivered; one that isn't is left out.
+ */
+async function dependencyResults(
+  state: ObjectiveState,
+  item: WorkItem,
+  checkout: string,
+  base: string,
+  signal: AbortSignal,
+): Promise<DependencyResult[]> {
+  const plan = state.done.plan as Plan;
+  const byId = new Map(plan.items.map((entry) => [entry.id, entry]));
+  const closure = new Set<string>();
+  const visit = (id: string) => {
+    if (closure.has(id)) return;
+    closure.add(id);
+    for (const parent of byId.get(id)?.dependencies ?? []) visit(parent);
+  };
+  for (const id of item.dependencies) visit(id);
+  const results: DependencyResult[] = [];
+  const contains = async (commit: string) =>
+    (
+      await hostGitExit(
+        checkout,
+        ["merge-base", "--is-ancestor", commit, base],
+        {
+          signal,
+        },
+      )
+    ).code === 0;
+  for (const entry of plan.items) {
+    if (!closure.has(entry.id)) continue;
+    const merged = mergeOf(state, entry.id);
+    const published = state.done[stepKey(entry.id, "publish")] as
+      | PublishResult
+      | undefined;
+    if (entry.kind === "aggregate") {
+      if (merged)
+        results.push({
+          id: entry.id,
+          title: entry.title,
+          status: "aggregate-complete",
+          inReviewedBase: true,
+        });
+      continue;
+    }
+    const work = state.done[stepKey(entry.id, "work")] as
+      | WorkResult
+      | undefined;
+    const validated = state.done[stepKey(entry.id, "validate")] as
+      | ValidateResult
+      | undefined;
+    if (!work || !validated || (!merged && !published)) continue;
+    const ci = state.done[stepKey(entry.id, "ci")] as
+      | { head: string }
+      | undefined;
+    const head = ci?.head ?? published?.head;
+    const delivered = merged?.mergeSha ?? head;
+    results.push({
+      id: entry.id,
+      title: entry.title,
+      status: merged ? "merged" : "published-unmerged",
+      resultCommitSha: candidate(state, entry.id),
+      resultTreeSha: validated.tree,
+      validationCommands: validated.commands,
+      ...(published ? { pullRequest: published.pr } : {}),
+      ...(head ? { deliveredHeadSha: head } : {}),
+      ...(merged ? { mergeCommitSha: merged.mergeSha } : {}),
+      inReviewedBase: delivered ? await contains(delivered) : false,
+    });
+  }
+  return results;
 }
 
 /** Pass is done, refused repairs, needs-human asks (saving the criteria it asks about under `pendingKey`). */

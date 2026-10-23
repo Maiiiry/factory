@@ -49,12 +49,13 @@ import { packageManagerUpdate } from "./planning/prompts.js";
 import type { Plan, WorkItem } from "./planning/types.js";
 import {
   captureReviewArtifacts,
+  outputLimit,
   plannedReviewArtifactsProblem,
   type ReviewArtifact,
   type ReviewArtifactSelector,
   selectorsFor,
 } from "./review/artifacts.js";
-import { runSandboxed } from "./sandbox.js";
+import { runSandboxed, sandboxAvailable } from "./sandbox.js";
 import type { ObjectiveBlock } from "./shown.js";
 import { errorMessage, headAndTail } from "./text.js";
 import { privateStagingPath } from "./work/collect.js";
@@ -196,7 +197,7 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
   if (dropped)
     return objectiveWide(
       hold(
-        `${dropped}. Restore these selectors in the installation's reviewArtifacts (others may stay or be added) and answer retry, answer replan to plan again with the current selectors, or cancel.`,
+        `${dropped}. Restore these selectors in the installation's reviewArtifacts (others may stay or be added), restart the service (it reads its configuration only at start) and answer retry; answer replan to plan again with the current selectors; or cancel.`,
         ["retry", "replan", "cancel"],
       ),
     );
@@ -293,11 +294,14 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       repository: input.repository,
       commit,
       members: input.media ?? [],
+      // Linked files are safe only behind the sandbox's read-only mounts.
+      link: sandboxAvailable().available,
       signal,
     });
     if (restored.kind !== "done") return restored;
     const lfsFiles: readonly LfsFile[] = restored.value;
     const hydrated = new Set(lfsFiles.map((file) => file.path));
+    const linked = lfsFiles.filter((file) => file.linked);
     const baseline = await status(worktree, signal);
     const dirty = mutationDetail(Buffer.alloc(0), baseline, hydrated);
     if (dirty) {
@@ -334,6 +338,7 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
         install && input.sandbox.network === "package-install" && !refused;
       const started = Date.now();
       input.log({ event: "validation-command", index, command, preparing });
+      const limit = capture ? outputLimit(selectors, command) : undefined;
       const run = await runSandboxed(command, {
         cwd: worktree,
         home: install ? await made("factory-install-home-") : home,
@@ -347,6 +352,8 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
         config: input.sandbox,
         packageInstall: install,
         network: online,
+        readOnlyFiles: linked.map((file) => file.path),
+        ...(limit ? { outputLimit: limit } : {}),
         signal: input.signal,
         timeoutMs: input.commandTimeoutMs ?? 30 * MINUTE,
       });
@@ -356,6 +363,27 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
             `The command sandbox could not run \`${command}\`: ${run.detail}. ${run.fix}.`,
           ),
         );
+      // After every command, the last too: a command that moved a linked
+      // file's directory left another file at its path, unchecked by
+      // rewrittenMedia, and would leave the operator's LFS object writable
+      // to the next command.
+      const moved = movedLinks(worktree, linked);
+      if (moved.length) {
+        const detail = `Validation command modified the result tree: Git LFS files moved or replaced: ${moved
+          .slice(0, 20)
+          .join(
+            ", ",
+          )}${moved.length > 20 ? ` and ${moved.length - 20} more` : ""}`;
+        return {
+          kind: "failed",
+          tree,
+          commands: sequence,
+          results,
+          failed: { index, command },
+          detail,
+          output: detail,
+        };
+      }
       const output = `${run.stdout}${run.stderr}`;
       const durationMs = Date.now() - started;
       const overflow =
@@ -518,6 +546,24 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       () => undefined,
     );
   }
+}
+
+/**
+ * The linked Git LFS files whose path no longer holds their inode as a
+ * regular file reached without links.
+ */
+function movedLinks(worktree: string, linked: readonly LfsFile[]): string[] {
+  return linked
+    .filter((file) => {
+      const path = join(worktree, file.path);
+      const seen = lstatSync(path, { throwIfNoEntry: false });
+      return (
+        !seen?.isFile() ||
+        seen.ino !== file.linked?.ino ||
+        realpathSync(path) !== join(realpathSync(worktree), file.path)
+      );
+    })
+    .map((file) => file.path);
 }
 
 const sourceDeclared = (items: readonly WorkItem[]) =>
