@@ -418,9 +418,27 @@ async function localSource(
   }
 }
 
-/** Hosts an attachment may redirect to. */
+/**
+ * Hosts an attachment may redirect to: GitHub, its content domain, and the
+ * S3 buckets GitHub serves user, repository and release files from, by
+ * exact name (bucket names are global, so no pattern on amazonaws.com).
+ */
+const ATTACHMENT_BUCKETS = new Set(
+  [
+    "github-production-user-asset-6210df",
+    "github-production-repository-file-5c1aeb",
+    "github-production-repository-image-32fea6",
+    "github-production-release-asset-2e65be",
+    "github-production-upload-manifest-file-7fdce7",
+    "github-cloud",
+  ].map((bucket) => `${bucket}.s3.amazonaws.com`),
+);
 function attachmentHost(host: string): boolean {
-  return host === "github.com" || host.endsWith(".githubusercontent.com");
+  return (
+    host === "github.com" ||
+    host.endsWith(".githubusercontent.com") ||
+    ATTACHMENT_BUCKETS.has(host)
+  );
 }
 
 /** A download that passed MAX_ATTACHMENT_BYTES. */
