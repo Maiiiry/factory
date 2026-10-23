@@ -673,6 +673,46 @@ test("a new wait class starts its own budget and ends a run of errors", async ()
   await stopped(service);
 });
 
+test("an open question pauses other steps' wait clocks", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await closedPort()}`);
+  // Five hours on a question, while check's transient wait (due then)
+  // could not run: those hours are not check's, so no 3 h question.
+  const asked = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+  seed(inst, 24, "holding", {
+    resumeStatus: "checking",
+    hold: {
+      id: `plan@${asked}`,
+      step: "plan",
+      question: "A question",
+      answers: ["retry", "cancel"],
+      recommended: "retry",
+      askedAt: asked,
+    },
+    retries: {
+      check: {
+        count: 0,
+        attempts: 1,
+        since: asked,
+        nextAt: asked,
+        lastError: "GitHub GET: down",
+        cause: "GitHub GET: down",
+      },
+    },
+  });
+  assert.equal(cli(inst, "answer", "24", "retry").code, 0);
+  const service = serve(inst);
+  await until(
+    () => stateOf(inst, 24).retries.check?.attempts >= 3,
+    "check retries after the answer",
+  );
+  const { hold, retries } = stateOf(inst, 24);
+  assert.equal(hold, null, "the question's hours aren't check's budget");
+  assert.ok(Date.parse(retries.check.since) > Date.now() - 60_000);
+  assert.equal(cli(inst, "cancel", "24").code, 0);
+  await stopped(service);
+});
+
 test("a wait on a human gate takes no slot", async () => {
   const inst = installation();
   const later = new Date(Date.now() + 60 * 60 * 1000).toISOString();

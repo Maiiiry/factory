@@ -478,8 +478,11 @@ export class GitHubSync {
    * A wait shown on the issue: one status note, edited in place, once an
    * unknown transient cause has lasted `noteAfterMs`; one reminder once a
    * human gate (an approval, a required review) has lasted `remindAfterMs`.
+   * Neither while a question is open: no step waits then but on its
+   * answer, and the engine pauses their clocks until it comes.
    */
   private note(runner: ObjectiveRunner, module: GitHubModule): void {
+    if (runner.state.hold) return;
     const now = this.now();
     const issue = runner.state.issue;
     const waits = Object.entries(runner.state.retries)

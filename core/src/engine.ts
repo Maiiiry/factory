@@ -607,7 +607,8 @@ export class ObjectiveRunner {
 
   /**
    * Open a question. One question is open at a time: a second step that
-   * asks while another question is open runs again after the answer, and
+   * asks while another question is open records nothing; it can't run
+   * while the question is open, so it runs again after the answer, and
    * asks then.
    */
   private hold(
@@ -618,18 +619,7 @@ export class ObjectiveRunner {
   ): void {
     const state = this.state;
     const now = this.now().toISOString();
-    if (state.hold && state.hold.step !== key) {
-      const previous = state.retries[key];
-      state.retries[key] = {
-        ...previous,
-        count: previous?.count ?? 0,
-        attempts: previous?.attempts ?? 0,
-        since: previous?.since ?? now,
-        nextAt: now,
-        lastError: "waiting for the open question",
-      };
-      return;
-    }
+    if (state.hold && state.hold.step !== key) return;
     const all = answers.includes("cancel") ? answers : [...answers, "cancel"];
     state.hold = {
       id: `${key}@${now}`,
@@ -690,11 +680,32 @@ export class ObjectiveRunner {
         };
       delete this.state.retries[hold.step];
     }
+    this.resume(hold.askedAt, hold.step);
     this.state.hold = null;
     this.state.status =
       this.state.resumeStatus ?? this.workflow.status(this.state);
     delete this.state.resumeStatus;
     return null;
+  }
+
+  /**
+   * A closed question's time is not the waiting steps' time: a step can't
+   * run while a question is open, so its wait clocks (`since`, a granted
+   * wait) pause from when it was due, or the question was asked if later,
+   * until now. Its budgets and the status note count only time it could run.
+   */
+  private resume(askedAt: string, held: string): void {
+    const now = this.now().getTime();
+    for (const [key, retry] of Object.entries(this.state.retries)) {
+      if (key === held) continue;
+      const paused =
+        now - Math.max(Date.parse(askedAt), Date.parse(retry.nextAt));
+      if (!(paused > 0)) continue;
+      const later = (at: string) =>
+        new Date(Date.parse(at) + paused).toISOString();
+      retry.since = later(retry.since);
+      if (retry.grantedUntil) retry.grantedUntil = later(retry.grantedUntil);
+    }
   }
 
   /** Configured provider names other than the one this Objective runs on. */
