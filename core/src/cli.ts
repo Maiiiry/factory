@@ -328,13 +328,18 @@ async function status(paths: Paths, args: Args): Promise<number> {
     });
   }
   const live = await serviceLive(paths);
+  const loop = live ? crashLoop(paths) : undefined;
   if (args.flags.json !== undefined) {
     process.stdout.write(
-      `${JSON.stringify({ service: live ? "running" : "stopped", objectives: rows }, null, 2)}\n`,
+      `${JSON.stringify({ service: live ? "running" : "stopped", ...(loop ? { crashLoop: loop } : {}), objectives: rows }, null, 2)}\n`,
     );
     return 0;
   }
   const lines = [`Service: ${live ? "running" : "stopped"}`];
+  if (loop)
+    lines.push(
+      `  Crash loop: the service restarted after ${loop.crashes} deaths in a row; interrupted steps ${Date.parse(loop.resumeAt) > Date.now() ? "resume" : "resumed"} at ${loop.resumeAt}.`,
+    );
   if (rows.length === 0) lines.push("No Objectives.");
   for (const row of rows) {
     lines.push(`#${row.issue}: ${row.status}`);
@@ -502,6 +507,32 @@ async function request(
   }
   process.stdout.write("Sent; the service hasn't applied it yet.\n");
   return 0;
+}
+
+/**
+ * The running service's crash loop, from `service.json`: the deaths in a
+ * row before this start, and when it resumes interrupted steps. Shown
+ * until the run has lived 10 min past that time.
+ */
+function crashLoop(
+  paths: Paths,
+): { crashes: number; resumeAt: string } | undefined {
+  try {
+    const record = JSON.parse(
+      readFileSync(join(paths.root, "service.json"), "utf8"),
+    ) as { starts?: string[]; resumeAt?: string };
+    if (
+      !record.resumeAt ||
+      Date.now() > Date.parse(record.resumeAt) + 10 * 60 * 1000
+    )
+      return undefined;
+    return {
+      crashes: (record.starts?.length ?? 1) - 1,
+      resumeAt: record.resumeAt,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** The service holds its abstract socket while it lives. */

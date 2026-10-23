@@ -63,7 +63,7 @@ export type Wait =
   | { kind: "gate"; gate: string };
 
 export interface Retry {
-  /** Consecutive escaped errors, missed deadlines and interrupted attempts; any other outcome resets it. */
+  /** Consecutive escaped errors and missed deadlines; any other outcome resets it. */
   count: number;
   /** Retries in this run of one wait class (`Wait`, or an unknown cause); sets the backoff. */
   attempts: number;
@@ -106,8 +106,11 @@ export interface ObjectiveState {
   repairs: Record<string, { count: number; findings: string[] }>;
   /** Steps that finished, with their saved results. */
   done: Record<string, unknown>;
-  /** Steps started and not yet finished. One found after a restart was interrupted. */
-  attempts: Record<string, { startedAt: string }>;
+  /**
+   * Steps started and not yet finished, with the service run that started
+   * each. One found after a restart was interrupted, and runs again.
+   */
+  attempts: Record<string, { startedAt: string; run?: string }>;
   /** The latest applied requests and their results, so a request is never applied twice. */
   appliedRequests: { id: string; message: string }[];
   /** Per-capability data. Modules own their key. */

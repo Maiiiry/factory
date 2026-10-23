@@ -10,11 +10,13 @@ export interface QueueItem {
   /** When the option was last set, by anyone (GitHub's clock). */
   optionAt: string | null;
   order: number | null;
+  /** Whether the issue is open. A closed one is queued only to run a finished Objective again. */
   open: boolean;
 }
 
 /** A queue read: the cards, and what it couldn't read. */
 export interface QueueRead {
+  /** Queued cards, and the cards of `known` issues: a known issue missing here has no card on the Project. */
   items: QueueItem[];
   /** Known issues GitHub no longer has here: deleted, transferred or converted. */
   gone: number[];
@@ -130,18 +132,21 @@ const MAX_PAGES = 10;
 const BY_NUMBER = 50;
 
 /**
- * The Project filter for open queued cards: a field is named in lower
- * case with dashes for spaces, and its option is quoted.
+ * The Project filter for queued cards: a field is named in lower case with
+ * dashes for spaces, and its option is quoted. Closed issues are read too,
+ * so a finished Objective queued again is never ignored because its issue
+ * is closed (CORE.md#Queue).
  */
 function queuedFilter(config: CoreConfig): string {
   const field = config.queue.field.trim().toLowerCase().replace(/\s+/g, "-");
   const option = config.queue.options.queued.replace(/"/g, "");
-  return `${field}:"${option}" is:open`;
+  return `${field}:"${option}"`;
 }
 
 /**
- * Open queued issues of this repository on the configured Project, and
- * `known` issues (read from the issue side) whatever their option. A known
+ * Queued issues of this repository on the configured Project, open or
+ * closed, and `known` issues (read from the issue side) whatever their
+ * option. A known
  * issue GitHub no longer has is reported in `gone`, never a failed read;
  * any other failed or partial read throws, and callers keep their last
  * good view.
@@ -161,14 +166,14 @@ export async function readQueue(
   ) =>
     cards.set(
       issue,
-      node && open
+      node
         ? {
             issue,
             itemId: node.id,
             option: node.option?.name ?? null,
             optionAt: node.option?.updatedAt ?? null,
             order: node.order?.number ?? null,
-            open: true,
+            open,
           }
         : null,
     );
@@ -291,7 +296,19 @@ mutation($project: ID!, $item: ID!, $field: ID!, $option: String!, $name: String
   }
 }`;
 
-/** Writes the Factory field. Field and option ids are looked up once per process. */
+const GET = `
+query($item: ID!, $name: String!) {
+  node(id: $item) {
+    ... on ProjectV2Item {
+      isArchived
+      value: fieldValueByName(name: $name) {
+        ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt }
+      }
+    }
+  }
+}`;
+
+/** Reads and writes the Factory field. Field and option ids are looked up once per process. */
 export class QueueDisplay {
   private field?: { id: string; options: Map<string, string> };
 
@@ -299,6 +316,25 @@ export class QueueDisplay {
     private readonly github: GitHub,
     private readonly config: CoreConfig,
   ) {}
+
+  /** The card's option now, read directly; null when unset or the card is off the Project. */
+  async get(
+    itemId: string,
+    signal?: AbortSignal,
+  ): Promise<{ option: string | null; at?: string }> {
+    const data = await this.github.graphql<{
+      node: {
+        isArchived?: boolean;
+        value?: { name?: string; updatedAt?: string } | null;
+      } | null;
+    }>(GET, { item: itemId, name: this.config.queue.field }, signal);
+    const node = data.node;
+    if (!node || node.isArchived || !node.value?.name) return { option: null };
+    return {
+      option: node.value.name,
+      ...(node.value.updatedAt ? { at: node.value.updatedAt } : {}),
+    };
+  }
 
   /** Set the option; returns when the field now says it was set (GitHub's clock). */
   async set(

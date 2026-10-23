@@ -16,6 +16,7 @@ import {
 } from "../delivery.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead } from "../git.js";
+import { GitHubError } from "../github.js";
 import {
   type CandidateSet,
   captureAssets,
@@ -2029,9 +2030,11 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
 }
 
 /**
- * Before a new run of the Objective checks the issue again: close the
+ * Before a new run of the Objective checks the issue again: reopen the
+ * issue if it is closed (a finished Objective queued again; the earlier
+ * run, or the Project's "Auto-close issue" workflow, closed it), close the
  * earlier run's open PRs and remove its worktrees, so the new plan starts
- * clean. It retries; it never asks.
+ * clean. It asks only when GitHub refuses the reopen.
  */
 export function rerunCleanupStep(deps: BuildDeps): Step {
   return {
@@ -2040,6 +2043,18 @@ export function rerunCleanupStep(deps: BuildDeps): Step {
     run: (context) =>
       guardedItem(deps, async () => {
         const { state, signal } = context;
+        try {
+          await deps.github.reopenIssue(state.issue, "rerun:reopen", signal);
+        } catch (error) {
+          if (
+            error instanceof GitHubError &&
+            (error.status === 403 || error.status === 422)
+          )
+            return hold(
+              `Issue #${state.issue} was queued again, but it is closed and GitHub refused to reopen it (${error.message.slice(0, 300)}). Reopen it yourself, then answer retry; or cancel. If the Project's "Auto-close issue" workflow closes it again, set the item's Status off Done first.`,
+            );
+          throw error;
+        }
         await closeFactoryPulls(
           deps,
           state.issue,
@@ -2097,7 +2112,8 @@ async function closeFactoryPulls(
 
 /**
  * Every worktree and selection ref of the Objective, whatever plan made
- * them, its captured media, review artifacts and final media scratch.
+ * them, then its whole work directory: captured media, review artifacts,
+ * final media and review scratch, and the planning tree.
  */
 async function removeWorkFiles(
   issue: number,
@@ -2128,6 +2144,5 @@ async function removeWorkFiles(
     .filter(Boolean);
   for (const ref of refs)
     await hostGit(checkout, ["update-ref", "-d", ref], { signal });
-  for (const files of ["assets", "artifacts", "final-media"])
-    await forceRemove(join(workDir, files));
+  await forceRemove(workDir);
 }

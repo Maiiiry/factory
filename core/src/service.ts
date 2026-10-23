@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -13,6 +14,7 @@ import {
   DEFAULT_LIMITS,
   type EngineLimits,
   ObjectiveRunner,
+  type ServiceRun,
   type Workflow,
 } from "./engine.js";
 import type {
@@ -102,8 +104,12 @@ export async function serve(options: ServeOptions): Promise<number> {
   }
   for (const dir of [paths.objectives, paths.requests, paths.logs])
     mkdirSync(dir, { recursive: true });
-  const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
+  const startedAt = new Date();
+  const runId = `${startedAt.toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
   const log = new RunLog(paths.logs, runId);
+  const run: ServiceRun = { id: runId, finished: 0, resumeAt: 0 };
+  // The last run's record, read before this run's first heartbeat replaces it.
+  const previous = readServiceRecord(paths.root);
   // Unfinished Objectives, and finished ones until their cleanup and their
   // final sync are done. Other finished ones are read from disk only when a
   // request or the queue names them (rule 6: cost follows active work).
@@ -122,6 +128,7 @@ export async function serve(options: ServeOptions): Promise<number> {
       workflow,
       paths.objectives,
       log,
+      run,
       limits,
     );
     runners.set(state.issue, runner);
@@ -188,6 +195,38 @@ export async function serve(options: ServeOptions): Promise<number> {
     if (name.endsWith(".tmp"))
       rmSync(join(paths.objectives, name), { force: true });
   for (const issue of listObjectives(paths.objectives)) load(issue);
+  const record = startRecord(previous, startedAt, runId, runners, limits);
+  run.resumeAt = Date.parse(record.resumeAt ?? "") || 0;
+  if (record.resumeAt)
+    log.write(0, {
+      event: "crash-loop",
+      crashes: record.starts.length - 1,
+      resumeAt: record.resumeAt,
+    });
+  const heartbeat = (stopped = false): void =>
+    writeServiceRecord(paths.root, record, run, unreadable, stopped);
+  // Saved before any hold below, so a crash in between never counts the
+  // same death twice.
+  heartbeat();
+  const culprit = suspect(record.crashes);
+  if (culprit) {
+    try {
+      runners
+        .get(culprit.issue)
+        ?.suspect(
+          culprit.step,
+          `The service died ${SUSPECT_CRASHES} times in a row while step ${culprit.step} ran, and other steps finished in between, so this step may be what stops it (for example, by running the host out of memory). \`retry\` runs it again; or cancel.`,
+        );
+    } catch (error) {
+      log.write(culprit.issue, {
+        event: "suspect-failed",
+        error: String(error),
+      });
+    }
+    // The evidence is spent: another hold needs three new deaths.
+    record.crashes = [];
+    heartbeat();
+  }
   crashPoint("serve:loaded");
 
   const applyRequests = (): void => {
@@ -300,7 +339,7 @@ export async function serve(options: ServeOptions): Promise<number> {
         slots -= 1;
         run = true;
       } else if (state.status === "holding")
-        // A hold takes no slot; settle an interrupted attempt, which may open a hold.
+        // A hold takes no slot; a step the service's death interrupted resumes.
         run = Object.keys(state.attempts).length > 0;
       // A wait on a human gate (an approval, a required review) has no
       // deadline, so it takes no slot: it polls, and its paths stay owned.
@@ -435,7 +474,7 @@ export async function serve(options: ServeOptions): Promise<number> {
         observed.delete(issue);
       }
     }
-    writeHeartbeat(paths.root, runId, unreadable);
+    heartbeat();
   };
 
   let stopping = false;
@@ -471,6 +510,8 @@ export async function serve(options: ServeOptions): Promise<number> {
     }
     await new Promise((resolve) => setTimeout(resolve, options.tickMs ?? 1000));
   }
+  // A clean stop (an upgrade, a reboot) ends any crash streak.
+  heartbeat(true);
   lock.close();
   return 0;
 }
@@ -591,23 +632,150 @@ function sweepResults(dir: string): void {
   }
 }
 
-function writeHeartbeat(
-  root: string,
-  runId: string,
-  unreadable: Map<number, UnreadableObjective>,
-): void {
+/**
+ * `service.json`: the heartbeat `status` reads, and what the next start
+ * needs to tell a crash from a clean stop.
+ */
+interface ServiceRecord {
+  pid: number;
+  runId: string;
+  /** The last heartbeat: about when the run died, if it died. */
+  at: string;
+  startedAt: string;
+  /**
+   * The starts of this crash streak, oldest first: each start after the
+   * first follows a run that died (no clean stop) within STREAK_MS of
+   * resuming its interrupted steps.
+   */
+  starts: string[];
+  /** When this run resumes interrupted steps; absent when it did at once. */
+  resumeAt?: string;
+  /** Step attempts that finished in this run. */
+  finished: number;
+  /** The latest deaths, oldest first: the steps running at each, and whether the run that died finished any step. */
+  crashes: Crash[];
+  /** Set by a clean stop. */
+  stopped?: boolean;
+  unreadable: Record<string, string>;
+}
+
+interface Crash {
+  at: string;
+  running: { issue: number; step: string }[];
+  progressed: boolean;
+}
+
+/** A run that dies this soon after resuming continues a crash streak. */
+const STREAK_MS = 10 * 60 * 1000;
+/** Starts in a streak before interrupted steps are delayed: 30 s, doubling, up to MAX_RESUME_DELAY_MS. */
+const LOOP_STARTS = 3;
+const MAX_RESUME_DELAY_MS = 30 * 60 * 1000;
+/** Deaths in a row with one step running at each before that step holds. */
+const SUSPECT_CRASHES = 3;
+
+function readServiceRecord(root: string): Partial<ServiceRecord> | undefined {
   try {
-    writeFileSync(
-      join(root, "service.json"),
-      JSON.stringify({
-        pid: process.pid,
-        runId,
-        at: new Date().toISOString(),
-        unreadable: Object.fromEntries(
-          [...unreadable].map(([issue, entry]) => [issue, entry.error]),
-        ),
-      }),
-    );
+    return JSON.parse(readFileSync(join(root, "service.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * This run's record. A start after a run that didn't stop cleanly is a
+ * crash restart: it records the steps that were running (the open attempts
+ * that run started), and continues the crash streak if that run died within
+ * STREAK_MS of resuming. From the third start in a streak, interrupted
+ * steps resume after a delay: 30 s (the base backoff), doubling, up to
+ * 30 min. A clean stop starts afresh.
+ */
+function startRecord(
+  previous: Partial<ServiceRecord> | undefined,
+  startedAt: Date,
+  runId: string,
+  runners: ReadonlyMap<number, ObjectiveRunner>,
+  limits: EngineLimits,
+): ServiceRecord {
+  const now = startedAt.toISOString();
+  const crashed = previous?.runId !== undefined && !previous.stopped;
+  const lived =
+    Date.parse(previous?.at ?? "") -
+    Date.parse(previous?.resumeAt ?? previous?.startedAt ?? "");
+  const starts = [
+    ...(crashed && lived < STREAK_MS ? (previous.starts ?? []) : []),
+    now,
+  ].slice(-20);
+  const crashes: Crash[] = crashed
+    ? [
+        ...(previous.crashes ?? []),
+        {
+          at: now,
+          running: [...runners.values()].flatMap((runner) =>
+            Object.entries(runner.state.attempts)
+              .filter(([, attempt]) => attempt.run === previous.runId)
+              .map(([step]) => ({ issue: runner.state.issue, step })),
+          ),
+          progressed: (previous.finished ?? 0) > 0,
+        },
+      ].slice(-SUSPECT_CRASHES)
+    : [];
+  const delay =
+    starts.length >= LOOP_STARTS
+      ? Math.min(
+          limits.baseBackoffMs * 2 ** (starts.length - LOOP_STARTS),
+          MAX_RESUME_DELAY_MS,
+        )
+      : 0;
+  return {
+    pid: process.pid,
+    runId,
+    at: now,
+    startedAt: now,
+    starts,
+    ...(delay
+      ? { resumeAt: new Date(startedAt.getTime() + delay).toISOString() }
+      : {}),
+    finished: 0,
+    crashes,
+    unreadable: {},
+  };
+}
+
+/**
+ * The one step running at each of the last SUSPECT_CRASHES deaths, when
+ * other steps finished in the runs between them: the strongest sign the
+ * saved state gives that this step stops the service. Two or more such
+ * steps prove nothing about either.
+ */
+function suspect(crashes: Crash[]): Crash["running"][number] | undefined {
+  if (crashes.length < SUSPECT_CRASHES) return undefined;
+  const last = crashes.slice(-SUSPECT_CRASHES);
+  if (!last.slice(1).every((crash) => crash.progressed)) return undefined;
+  const id = (r: { issue: number; step: string }) => `${r.issue} ${r.step}`;
+  const common = last[0]!.running.filter((r) =>
+    last.every((crash) => crash.running.some((o) => id(o) === id(r))),
+  );
+  return common.length === 1 ? common[0] : undefined;
+}
+
+function writeServiceRecord(
+  root: string,
+  record: ServiceRecord,
+  run: ServiceRun,
+  unreadable: Map<number, UnreadableObjective>,
+  stopped: boolean,
+): void {
+  record.at = new Date().toISOString();
+  record.finished = run.finished;
+  record.unreadable = Object.fromEntries(
+    [...unreadable].map(([issue, entry]) => [issue, entry.error]),
+  );
+  if (stopped) record.stopped = true;
+  const path = join(root, "service.json");
+  try {
+    // Whole or not at all: the next start reads it to tell a crash.
+    writeFileSync(`${path}.tmp`, JSON.stringify(record));
+    renameSync(`${path}.tmp`, path);
   } catch {
     // Status falls back to the lock probe.
   }

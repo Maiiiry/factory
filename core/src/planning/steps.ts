@@ -887,7 +887,7 @@ export async function readObjective(
   if (found.state !== "open")
     return {
       hold: hold(
-        `Issue #${issue} is closed. Reopen it and answer \`${again}\`, or cancel.`,
+        `Issue #${issue} is closed. Reopen it and answer \`${again}\`, or cancel. If the Project's "Auto-close issue" workflow closes it again, set the item's Status off Done first.`,
         [again, "cancel"],
         "cancel",
       ),

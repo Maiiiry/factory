@@ -23,6 +23,8 @@ export type Outcome =
   /**
    * Try again. `afterMs: -1` is an error (an escaped exception, a missed
    * deadline, an idle model or an invalid answer): three in a row hold.
+   * An attempt the service's death interrupted is never an outcome: it
+   * runs again (see `ObjectiveRunner.tick`).
    * Anything else is a wait, classed by `wait` (CORE.md#Waits).
    */
   | {
@@ -94,6 +96,16 @@ export interface Workflow {
 }
 
 export type HostResource = "worker" | "cpu";
+
+/** This run of the service, shared by its Objectives' runners. */
+export interface ServiceRun {
+  /** Saved on each attempt this run starts, so a restart knows what was running when it died. */
+  readonly id: string;
+  /** Step attempts that finished in this run (any outcome). */
+  finished: number;
+  /** Interrupted attempts wait until then (a crash loop, see `serve`); 0 when they resume at once. */
+  resumeAt: number;
+}
 
 /**
  * Host-wide caps shared by every Objective in the service: how many worker
@@ -170,13 +182,12 @@ interface Running {
   controller: AbortController;
 }
 
-const INTERRUPTED = "the service stopped during this step";
-
 /**
  * Runs one Objective's steps. All state changes happen here, synchronously,
  * one at a time, and each is saved before the next begins. A step's start is
- * saved too, so a step that never finishes (because the process died) counts
- * as an error after a restart and holds after `maxErrors`.
+ * saved too, with the service run that started it, so a step that never
+ * finished (because the process died) runs again after a restart, and the
+ * service can tell which steps were running when it died.
  */
 export class ObjectiveRunner {
   private readonly running = new Map<string, Running>();
@@ -191,6 +202,7 @@ export class ObjectiveRunner {
     private readonly workflow: Workflow,
     private readonly dir: string,
     private readonly log: RunLog,
+    private readonly run: ServiceRun,
     private readonly limits: EngineLimits = DEFAULT_LIMITS,
     private readonly now: () => Date = () => new Date(),
   ) {}
@@ -228,20 +240,37 @@ export class ObjectiveRunner {
     }
   }
 
-  /** Start every runnable step that isn't running or waiting to retry. */
+  /**
+   * Start every runnable step that isn't running or waiting to retry.
+   *
+   * An attempt saved as started but not running here was interrupted: by
+   * the service's death, or by a save that failed after the step finished.
+   * That is never the step's error: it runs again at once, with no backoff,
+   * even while another step's question is open, unless the service is in a
+   * crash loop (`ServiceRun.resumeAt`). An interrupted attempt of a step
+   * that is no longer next is dropped.
+   */
   tick(): void {
-    // An attempt saved as started but not running here was interrupted:
-    // by a restart, or by a save that failed after the step finished.
-    for (const key of Object.keys(this.state.attempts))
-      if (!this.running.has(key))
-        this.apply(key, { kind: "retry", reason: INTERRUPTED, afterMs: -1 });
-    if (this.state.status === "holding") return;
+    const steps = this.workflow.steps(this.state);
+    const stale = Object.keys(this.state.attempts).filter(
+      (key) => !this.running.has(key) && !steps.some((s) => s.key === key),
+    );
+    if (stale.length)
+      this.transact(() => {
+        for (const key of stale) delete this.state.attempts[key];
+      });
+    const holding = this.state.status === "holding";
     const now = this.now().getTime();
-    for (const step of this.workflow.steps(this.state)) {
+    for (const step of steps) {
       if (this.running.size >= this.limits.concurrency) return;
       if (this.running.has(step.key)) continue;
-      const retry = this.state.retries[step.key];
-      if (retry && Date.parse(retry.nextAt) > now) continue;
+      if (this.state.attempts[step.key]) {
+        if (now < this.run.resumeAt) continue;
+      } else if (holding) continue;
+      else {
+        const retry = this.state.retries[step.key];
+        if (retry && Date.parse(retry.nextAt) > now) continue;
+      }
       if (step.resource && !hostLimits.acquire(step.resource)) continue;
       try {
         this.start(step);
@@ -254,7 +283,10 @@ export class ObjectiveRunner {
 
   private start(step: Step): void {
     this.transact(() => {
-      this.state.attempts[step.key] = { startedAt: this.now().toISOString() };
+      this.state.attempts[step.key] = {
+        startedAt: this.now().toISOString(),
+        run: this.run.id,
+      };
     });
     crashPoint(`engine:${step.key}:started`);
     const token = this.nextToken++;
@@ -298,11 +330,12 @@ export class ObjectiveRunner {
       if (step.resource) hostLimits.release(step.resource);
       if (this.running.get(step.key)?.token !== token) return;
       this.running.delete(step.key);
+      this.run.finished += 1;
       try {
         this.apply(step.key, outcome);
       } catch (error) {
         // The save failed and the state went back to disk, where the
-        // attempt is still open: the next tick retries it as interrupted.
+        // attempt is still open: the next tick runs it again.
         this.log.write(this.state.issue, {
           step: step.key,
           event: "apply-failed",
@@ -313,10 +346,10 @@ export class ObjectiveRunner {
   }
 
   /**
-   * Apply one outcome and save. `afterMs: -1` marks an escaped error, missed
-   * deadline or interrupted attempt, which counts toward `maxErrors`; other
-   * retries are waits (see `retry`). Throws only if the save fails, after
-   * putting the state back as it is on disk.
+   * Apply one outcome and save. `afterMs: -1` marks an escaped error or a
+   * missed deadline, which counts toward `maxErrors`; other retries are
+   * waits (see `retry`). Throws only if the save fails, after putting the
+   * state back as it is on disk.
    */
   apply(key: string, outcome: Outcome): void {
     const terminal = TERMINAL.includes(this.state.status);
@@ -517,6 +550,25 @@ export class ObjectiveRunner {
     state.retries[key] = record;
     if (question)
       this.hold(key, question.text, question.answers, question.answers[0]!);
+  }
+
+  /**
+   * The service died while this interrupted step ran, again and again, and
+   * other steps finished in between (see `serve`): ask before running it
+   * again. Cleanup after the end never asks: the crash loop's delay covers it.
+   */
+  suspect(key: string, question: string): void {
+    if (
+      TERMINAL.includes(this.state.status) ||
+      this.running.has(key) ||
+      !this.state.attempts[key]
+    )
+      return;
+    this.transact(() => {
+      delete this.state.attempts[key];
+      this.hold(key, question, ERROR_ANSWERS, "retry");
+    });
+    this.log.write(this.state.issue, { step: key, event: "suspect" });
   }
 
   /** Stop running steps now; their late outcomes are dropped by the token check in `start`. */

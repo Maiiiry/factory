@@ -339,6 +339,23 @@ export class GitHub {
     crashPoint(`${point}:after`);
   }
 
+  /** Reopen a closed issue, unless it is open already. */
+  async reopenIssue(
+    issue: number,
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if ((await this.issue(issue, signal)).state === "open") return;
+    crashPoint(`${point}:before`);
+    await this.rest(
+      "PATCH",
+      `/repos/${this.repository}/issues/${issue}`,
+      { state: "open" },
+      signal,
+    );
+    crashPoint(`${point}:after`);
+  }
+
   /** Branch names under `prefix` (such as `factory/12/`) on the repository. */
   async branches(prefix: string, signal?: AbortSignal): Promise<string[]> {
     const refs = await this.pages<{ ref?: unknown }>(

@@ -293,6 +293,8 @@ const GITHUB_CRASH_POINTS = [
   "rerun:pr-comment:after",
   "rerun:pr-close:before",
   "rerun:pr-close:after",
+  "rerun:reopen:before",
+  "rerun:reopen:after",
   "serve:withdrawn",
 ];
 for (const point of GITHUB_CRASH_POINTS)
@@ -404,21 +406,75 @@ test("logs keep the newest runs", async () => {
   assert.equal(kept[0], "2026-01-01T00-00-05.jsonl");
 });
 
-test("a step that keeps killing the service holds after three tries", async () => {
+test("three deaths while two Objectives run hold neither; the restart backs off", async () => {
   const inst = installation();
-  seed(inst, 12);
+  // GitHub never answers, so both checks are running whenever the service dies.
+  configured(inst, `http://127.0.0.1:${await silentServer()}`);
+  seed(inst, 51);
+  seed(inst, 52);
+  const runId = () =>
+    JSON.parse(readFileSync(join(inst.root, "service.json"), "utf8")).runId;
+  const runningIn = (run) =>
+    [51, 52].every((issue) => stateOf(inst, issue).attempts.check?.run === run);
   for (let i = 0; i < 3; i++) {
-    const death = await serve(inst, "engine:check:started").exit;
-    assert.equal(death.signal, "SIGKILL");
+    const service = serve(inst);
+    await until(() => status(inst).service === "running", "service");
+    const run = runId();
+    await until(() => runningIn(run), "both checks running");
+    service.child.kill("SIGKILL");
+    await service.exit;
   }
   const service = serve(inst);
-  await until(() => stateOf(inst, 12).hold, "hold");
-  const { hold } = stateOf(inst, 12);
+  await until(() => status(inst).service === "running", "service");
+  const { crashLoop } = status(inst);
+  assert.equal(crashLoop.crashes, 3);
+  assert.ok(Date.parse(crashLoop.resumeAt) > Date.now() - 60_000);
+  const run = runId();
+  await until(() => runningIn(run), "both checks resumed");
+  for (const issue of [51, 52]) {
+    const state = stateOf(inst, issue);
+    assert.equal(state.hold, null, `#${issue} holds`);
+    assert.deepEqual(state.retries, {}, `#${issue} counts an error`);
+  }
+  await stopped(service);
+});
+
+test("the one step running at three deaths, with progress between, holds", async () => {
+  const inst = installation();
+  const at = new Date().toISOString();
+  seed(inst, 61, "checking", {
+    attempts: { check: { startedAt: at, run: "dead" } },
+  });
+  const running = (...issues) =>
+    issues.map((issue) => ({ issue, step: "check" }));
+  writeFileSync(
+    join(inst.root, "service.json"),
+    JSON.stringify({
+      pid: 1,
+      runId: "dead",
+      at,
+      startedAt: at,
+      starts: [at],
+      finished: 4,
+      crashes: [
+        { at, running: running(61, 62), progressed: false },
+        { at, running: running(61), progressed: true },
+      ],
+      unreadable: {},
+    }),
+  );
+  const service = serve(inst);
+  await until(() => stateOf(inst, 61).hold, "hold");
+  const { hold } = stateOf(inst, 61);
   assert.match(
     hold.question,
-    /keeps failing \(the service stopped during this step\)/,
+    /^The service died 3 times in a row while step check ran/,
   );
   assert.deepEqual(hold.answers, ["retry", "cancel"]);
+  const record = JSON.parse(
+    readFileSync(join(inst.root, "service.json"), "utf8"),
+  );
+  assert.deepEqual(record.crashes, [], "the evidence is spent");
   await stopped(service);
 });
 

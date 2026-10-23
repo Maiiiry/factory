@@ -16,6 +16,20 @@ export interface GitHubModule {
   order?: number | null;
   /** The Factory field option last written. */
   shown?: string;
+  /**
+   * The option Factory last saw on the card or wrote, null when the card
+   * had none (cleared, or off the Project). A card that changes from this
+   * changed by someone else: a change from queued dequeues.
+   */
+  seen?: string | null;
+  /**
+   * The option Factory would have written when someone else changed the
+   * started Objective's card: not written over that change until the
+   * status moves on.
+   */
+  ceded?: string;
+  /** An option Factory began writing: a card showing it is Factory's own write, landed or not. */
+  writing?: string;
   /** When Factory last wrote the option, by GitHub's clock. */
   shownAt?: string;
   /** When the card was set to queued for this run, by GitHub's clock. */
@@ -98,13 +112,24 @@ const COMMAND = /^\/factory\s+(\S+)(?:\s+([\s\S]*))?$/;
  *
  * The queue is read by edges, never by levels: Factory writes the queued
  * option itself (while an Objective is checked or waits for a slot), so a
- * card that reads queued means nothing alone. A card queues or dequeues
- * only when its option was set after Factory's own last write (GitHub's
- * `updatedAt` of the option, against the `shownAt` and `queuedAt` Factory
- * saved), so a stale card never re-admits a finished or cancelled run.
+ * card that reads queued means nothing alone. A finished Objective queues
+ * again only when its option was set after Factory's own last write
+ * (GitHub's `updatedAt` of the option, against the `shownAt` and
+ * `queuedAt` Factory saved), so a stale card never re-admits a finished or
+ * cancelled run. An unfinished one dequeues when its card changes from
+ * queued to anything else, cleared or off the Project included, against
+ * the option Factory last saw or wrote (`seen`), which has no clock to need.
  */
 export class GitHubSync {
   private view: QueueItem[] = [];
+  /** The issues the last read asked for by number: one missing from `view` has no card. */
+  private viewKnown = new Set<number>();
+  /** When the last read started (this host's clock). */
+  private viewAt = 0;
+  /** When Factory last wrote each card (this host's clock): a read that started earlier is stale for it. */
+  private readonly wroteAt = new Map<number, number>();
+  /** Cards whose option changed under a pending write: shown again only after a fresh read. */
+  private readonly changed = new Set<number>();
   /** A queue read landed since the last intake. */
   private fresh = false;
   /** Known issues GitHub no longer has: left out of later reads. */
@@ -149,12 +174,15 @@ export class GitHubSync {
         ]),
       ].filter((issue) => !this.gone.has(issue));
       // The poll interval paces the queue read; it needs no backoff.
+      const startedAt = this.now();
       this.background(
         0,
         "queue",
         async () => {
           const read = await readQueue(this.github, this.config, known);
           this.view = read.items;
+          this.viewKnown = new Set(known);
+          this.viewAt = startedAt;
           this.fresh = true;
           for (const issue of read.gone)
             if (!this.gone.has(issue)) {
@@ -220,7 +248,9 @@ export class GitHubSync {
     if (!module) return true;
     return (
       TERMINAL.includes(state.status) &&
-      module.shown === this.config.queue.options[OPTION[state.status]] &&
+      [module.shown, module.ceded].includes(
+        this.config.queue.options[OPTION[state.status]],
+      ) &&
       !unreplied(state, module).length
     );
   }
@@ -228,6 +258,8 @@ export class GitHubSync {
   /** Forget an Objective the service let go of, or whose run was replaced. */
   forget(issue: number): void {
     this.settled.delete(issue);
+    this.changed.delete(issue);
+    this.wroteAt.delete(issue);
     for (const key of this.backoff.keys())
       if (key.endsWith(`:${issue}`) || key.includes(`:${issue}:`))
         this.backoff.delete(key);
@@ -236,52 +268,68 @@ export class GitHubSync {
   /**
    * Act on a fresh queue read, once: a card set to queued after Factory's
    * last write admits its Objective (a new one is admitted on first sight,
-   * so it is checked at once; planning waits for a slot), and a card moved
-   * out of queued dequeues an Objective that hasn't started. Every
+   * so it is checked at once; planning waits for a slot), and a card that
+   * changed from what Factory last saw or wrote (`seen`) is someone else's
+   * change: from queued to anything else (another option, cleared, or off
+   * the Project) dequeues an Objective that hasn't started. Every
    * unfinished Objective takes its order from the card, so reordering works
-   * until it starts.
+   * until it starts. A card Factory wrote after the read began is skipped:
+   * the read is stale for it.
    */
   private intake(sync: SyncView): void {
     const queuedOption = this.config.queue.options.queued;
-    for (const item of this.view) {
-      if (sync.unreadable.has(item.issue)) continue;
+    const items = new Map(this.view.map((item) => [item.issue, item]));
+    for (const issue of new Set([...items.keys(), ...this.viewKnown])) {
+      if (sync.unreadable.has(issue)) continue;
+      if (
+        this.busy.has(`show:${issue}`) ||
+        (this.wroteAt.get(issue) ?? -1) >= this.viewAt
+      )
+        continue;
+      this.changed.delete(issue);
+      // Missing from a read that asked for it by number: no card.
+      const item = items.get(issue);
       try {
-        let runner = sync.runners.get(item.issue);
-        if (item.option === queuedOption && !runner)
-          runner = sync.find(item.issue);
+        let runner = sync.runners.get(issue);
+        if (item?.option === queuedOption && !runner) runner = sync.find(issue);
         if (!runner) {
-          if (item.option === queuedOption && !sync.unreadable.has(item.issue))
+          // A closed issue with no run isn't queued: only a finished
+          // Objective runs again from a closed issue.
+          if (item?.option === queuedOption && item.open)
             this.admitItem(item, sync);
           continue;
         }
         const state = runner.state;
         if (TERMINAL.includes(state.status)) {
-          // Queued again after it finished: its cleanup ends first.
+          // Queued again after it finished: its cleanup ends first. The new
+          // run reopens a closed issue (rerun:cleanup).
           if (
-            item.option === queuedOption &&
+            item?.option === queuedOption &&
             !runner.hasWork &&
             moved(item, state)
           )
             this.admitItem(item, sync);
           continue;
         }
-        if (item.option !== queuedOption && moved(item, state)) {
-          if (sync.withdraw(item.issue)) {
-            this.log.write(item.issue, {
-              event: "dequeued",
-              option: item.option,
-            });
-            continue;
-          }
-        }
         const module = state.modules.github as GitHubModule | undefined;
-        if (module && (module.order ?? null) !== item.order)
+        if (!module) continue;
+        const option = item?.option ?? null;
+        if (module.seen === undefined || option === module.writing)
+          runner.transact(() => {
+            const github = runner.state.modules.github as GitHubModule;
+            github.seen = option;
+            delete github.writing;
+          });
+        else if (option !== module.seen) {
+          if (this.cardChanged(runner, option, sync) === "withdrawn") continue;
+        }
+        if (item && (module.order ?? null) !== item.order)
           runner.transact(() => {
             (runner.state.modules.github as GitHubModule).order = item.order;
           });
       } catch (error) {
         // A state read or save that failed: the next fresh read tries again.
-        this.log.write(item.issue, {
+        this.log.write(issue, {
           event: "queue-intake-failed",
           error: errorMessage(error),
         });
@@ -289,45 +337,113 @@ export class GitHubSync {
     }
   }
 
+  /**
+   * Someone else changed the card since Factory last saw or wrote it. From
+   * queued, that dequeues an Objective that hasn't started. A finished
+   * Objective set to queued is left to intake, which runs it again. Any
+   * other change stands: Factory doesn't write over it until the status
+   * moves on (`ceded`).
+   */
+  private cardChanged(
+    runner: ObjectiveRunner,
+    option: string | null,
+    sync: SyncView,
+  ): "withdrawn" | "requeued" | "ceded" {
+    const issue = runner.state.issue;
+    const queued = this.config.queue.options.queued;
+    const module = runner.state.modules.github as GitHubModule;
+    if (TERMINAL.includes(runner.state.status)) {
+      if (option === queued) return "requeued";
+    } else if (
+      module.seen === queued &&
+      option !== queued &&
+      sync.withdraw(issue)
+    ) {
+      this.log.write(issue, { event: "dequeued", option });
+      return "withdrawn";
+    }
+    const desired = this.desired(runner, sync);
+    runner.transact(() => {
+      const github = runner.state.modules.github as GitHubModule;
+      github.seen = option;
+      github.ceded = desired;
+    });
+    this.log.write(issue, { event: "card-changed", option, ceded: desired });
+    return "ceded";
+  }
+
   private admitItem(item: QueueItem, sync: SyncView): void {
     sync.admit(item.issue, {
       itemId: item.itemId,
       order: item.order,
+      seen: item.option,
       ...(item.optionAt ? { queuedAt: item.optionAt } : {}),
       commentsSince: new Date(this.now()).toISOString(),
     });
   }
 
+  /** The option the Objective's status shows. */
+  private desired(runner: ObjectiveRunner, sync: SyncView): string {
+    const status = runner.state.status;
+    return this.config.queue.options[
+      !TERMINAL.includes(status) &&
+      status !== "holding" &&
+      sync.waitingForSlot(runner.state.issue)
+        ? "queued"
+        : OPTION[status]
+    ];
+  }
+
+  /**
+   * Show the status on the card. The card is read first: Factory writes
+   * only over what it last saw or wrote itself, never over someone else's
+   * change (see `cardChanged`). The option being written is saved first, so
+   * after a crash the card showing it still reads as Factory's own.
+   */
   private show(
     runner: ObjectiveRunner,
     module: GitHubModule,
     sync: SyncView,
   ): void {
-    const status = runner.state.status;
     const issue = runner.state.issue;
-    const option =
-      this.config.queue.options[
-        !TERMINAL.includes(status) &&
-        status !== "holding" &&
-        sync.waitingForSlot(issue)
-          ? "queued"
-          : OPTION[status]
-      ];
-    if (module.shown === option) return;
+    const option = this.desired(runner, sync);
+    if (
+      module.shown === option ||
+      module.ceded === option ||
+      this.changed.has(issue)
+    )
+      return;
+    const github = () => runner.state.modules.github as GitHubModule;
     this.background(issue, `show:${issue}`, async () => {
-      crashPoint("sync:show:before");
-      const at = await this.display.set(module.itemId, option);
-      crashPoint("sync:show:after");
-      runner.transact(() => {
-        const github = runner.state.modules.github as GitHubModule;
-        github.shown = option;
-        if (at) github.shownAt = at;
-      });
-      const item = this.view.find((i) => i.issue === issue);
-      if (item) {
-        item.option = option;
-        item.optionAt = at ?? item.optionAt;
+      const card = await this.display.get(github().itemId);
+      const { seen, writing } = github();
+      if (
+        seen !== undefined &&
+        card.option !== seen &&
+        card.option !== writing
+      ) {
+        if (this.cardChanged(runner, card.option, sync) === "requeued")
+          this.changed.add(issue);
+        return;
       }
+      let at = card.at;
+      if (card.option !== option) {
+        runner.transact(() => {
+          github().writing = option;
+        });
+        crashPoint("sync:show:before");
+        at = await this.display.set(github().itemId, option);
+        crashPoint("sync:show:after");
+        this.wroteAt.set(issue, this.now());
+      }
+      runner.transact(() => {
+        const module = github();
+        module.shown = option;
+        module.seen = option;
+        delete module.writing;
+        delete module.ceded;
+        if (at) module.shownAt = at;
+      });
     });
   }
 
