@@ -33,6 +33,8 @@ import { type Database, openStore, withStore } from "./store.js";
 export async function planningKnowledge(input: {
   state: ObjectiveState;
   body: string;
+  /** The Objective is a Factory-created split child. */
+  child: boolean;
   files: BaseFiles;
   /** The target's curated playbook at the base; empty when there is none. */
   playbook: string;
@@ -44,7 +46,7 @@ export async function planningKnowledge(input: {
     : undefined;
   // Git reads fail as TransientError, which the planning step retries.
   const sources = context?.memory
-    ? (await planningSources(input.body, input.files)).sources
+    ? (await planningSources(input.body, input.files, input.child)).sources
     : [];
   const issue = input.state.issue;
   const run = runOf(input.state);

@@ -18,6 +18,7 @@ import {
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead } from "../git.js";
 import { GitHubError } from "../github.js";
+import { shownMarkdown } from "../markdown.js";
 import {
   type CandidateSet,
   captureAssets,
@@ -54,7 +55,7 @@ import {
 } from "../planning/schedule.js";
 import {
   guarded,
-  objectiveText,
+  type ObjectiveInputs,
   type PlanningDeps,
 } from "../planning/steps.js";
 import type { Plan, WorkItem } from "../planning/types.js";
@@ -419,7 +420,7 @@ async function workStep(
   const { state, signal } = context;
   const { config } = deps;
   const plan = state.done.plan as Plan;
-  const body = objectiveBody(state);
+  const body = objectiveInputs(state).body;
   const workDir = deps.workDir(state.issue);
   const worktree = worktreePath(workDir, state.issue, item.id);
   const media = mediaDirectory(workDir, item.id);
@@ -997,7 +998,7 @@ async function validateStep(
     commit: candidate(state, item.id),
     item,
     plan,
-    body: objectiveBody(state),
+    body: objectiveInputs(state).body,
     ...(work.base !== plan.base ? { predecessor: work.base } : {}),
     reviewArtifacts: {
       configured: config.reviewArtifacts,
@@ -1801,7 +1802,7 @@ export function finalStep(deps: BuildDeps): Step {
           directory: join(workDir, "final"),
           commit: head,
           plan,
-          body: objectiveBody(state),
+          body: objectiveInputs(state).body,
           reviewArtifacts: {
             configured: config.reviewArtifacts,
             planned: plan.reviewArtifacts,
@@ -1946,12 +1947,11 @@ async function objectiveEdited(
   deps: BuildDeps,
 ): Promise<Outcome | undefined> {
   const { state, signal } = context;
-  const issue = await deps.github.issue(state.issue, signal);
-  const body = objectiveText(issue.body);
-  const accepted = objectiveText(
+  const issue = await deps.github.renderedIssue(state.issue, signal);
+  const body = shownMarkdown(issue.body_html);
+  const accepted =
     ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
-      objectiveBody(state),
-  );
+    objectiveInputs(state).body;
   if (context.answer?.answer === "continue")
     return body === accepted
       ? undefined
@@ -1976,15 +1976,15 @@ async function objectiveEdited(
   return undefined;
 }
 
-/** The Objective body as planning read it. */
-function objectiveBody(state: ObjectiveState): string {
-  let latest = (state.done.check as { body: string }).body;
+/** The Objective as planning read it. */
+function objectiveInputs(state: ObjectiveState): ObjectiveInputs {
+  let latest = state.done.check as ObjectiveInputs;
   for (const [key, value] of Object.entries(state.done))
     if (
       /^plan:\d+:1$/.test(key) &&
-      (value as { inputs?: { body: string } }).inputs
+      (value as { inputs?: ObjectiveInputs }).inputs
     )
-      latest = (value as { inputs: { body: string } }).inputs.body;
+      latest = (value as { inputs: ObjectiveInputs }).inputs;
   return latest;
 }
 
@@ -2004,9 +2004,11 @@ async function pinnedSources(
   signal: AbortSignal,
 ) {
   const plan = state.done.plan as Plan;
+  const objective = objectiveInputs(state);
   const { sources } = await planningSources(
-    objectiveBody(state),
+    objective.body,
     new BaseFiles(deps.config.checkout, plan.base, signal),
+    objective.child === true,
   );
   return sources;
 }

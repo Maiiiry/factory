@@ -249,8 +249,9 @@ export class GitHub {
 
   /**
    * The issue with GitHub's own rendering of its body (`body_html`, from the
-   * same read, so the two always match). Unreadable when a body comes back
-   * without one: the rendering check never runs without it.
+   * same read, so the two always match): planning reads only what it shows.
+   * A non-empty body without one is Unreadable (transient, so the step
+   * retries); the raw body never stands in for it.
    */
   async renderedIssue(
     issue: number,
@@ -270,17 +271,6 @@ export class GitHub {
       return { ...found, body_html: found.body_html };
     if (!found.body) return { ...found, body_html: "" };
     throw new Unreadable(`GitHub sent issue #${issue} without body_html`);
-  }
-
-  /** `text` as GitHub renders an issue body in this repository (POST /markdown, gfm). */
-  async renderMarkdown(text: string, signal?: AbortSignal): Promise<string> {
-    const response = await this.send(
-      "POST",
-      "/markdown",
-      { text, mode: "gfm", context: this.repository },
-      signal,
-    );
-    return response.text();
   }
 
   async postComment(

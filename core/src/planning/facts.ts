@@ -156,10 +156,14 @@ function utf8(bytes: Buffer): string | undefined {
 
 // ── Objective ───────────────────────────────────────────────────────────
 
-/** A Factory-created child Objective carries its parent's model-written goal. */
-export function childIdentity(body: string): boolean {
-  return /^<!-- factory:parent=[1-9][0-9]*;child=[a-z][a-z0-9-]{0,63} -->\n/.test(
-    body,
+/**
+ * A Factory-created child Objective carries its parent's model-written goal.
+ * Read from the raw issue body by the marker's exact pattern, as structure;
+ * the marker is never planning text.
+ */
+export function childIdentity(raw: string): boolean {
+  return /^<!-- factory:parent=[1-9][0-9]*;child=[a-z][a-z0-9-]{0,63} -->\r?\n/.test(
+    raw,
   );
 }
 
@@ -167,11 +171,11 @@ export function childIdentity(body: string): boolean {
  * The Objective body as a pinned source. A split child's body carries the
  * model-written goal, so it isn't operator-authored.
  */
-function objectiveSource(body: string): PinnedSource {
+function objectiveSource(body: string, child: boolean): PinnedSource {
   return {
     path: "OBJECTIVE",
     content: body,
-    ...(!childIdentity(body) && { operatorAuthored: true as const }),
+    ...(!child && { operatorAuthored: true as const }),
   };
 }
 
@@ -239,8 +243,9 @@ export function sectionText(text: string, heading: string): string | undefined {
 export async function planningSources(
   body: string,
   files: BaseFiles,
+  child = false,
 ): Promise<{ sources: PinnedSource[]; problems: string[] }> {
-  const sources: PinnedSource[] = [objectiveSource(body)];
+  const sources: PinnedSource[] = [objectiveSource(body, child)];
   const problems: string[] = [];
   const defaults: SourceRef[] = [];
   for (const path of ["AGENTS.md", "README.md"])
@@ -904,6 +909,8 @@ const REQUIRED_COMMANDS_SOURCE =
 export interface FactsArgs {
   objective: number;
   body: string;
+  /** The Objective is a Factory-created split child (childIdentity). */
+  child?: boolean;
   base: string;
   checkout: string;
   /** The installation's required final commands; their scripts stay fixed. */
@@ -931,7 +938,11 @@ export async function buildFacts(
   args: FactsArgs,
 ): Promise<{ facts: PlanningFacts } | { problems: string[] }> {
   const files = new BaseFiles(args.checkout, args.base, args.signal);
-  const { sources, problems } = await planningSources(args.body, files);
+  const { sources, problems } = await planningSources(
+    args.body,
+    files,
+    args.child,
+  );
   if (problems.length) return { problems };
   const ciOnlyCommands = [...(args.ciOnlyCommands ?? [])];
   const facts: PlanningFacts = {
@@ -973,10 +984,13 @@ export async function objectiveCommandProblems(
     requiredCommands?: readonly string[];
     ciOnlyCommands?: readonly string[];
     signal?: AbortSignal;
+    /** The Objective is a Factory-created split child (childIdentity). */
+    child?: boolean;
   } = {},
 ): Promise<string[]> {
+  const child = options.child === true;
   const files = new BaseFiles(checkout, base, options.signal);
-  const { sources, problems } = await planningSources(body, files);
+  const { sources, problems } = await planningSources(body, files, child);
   const finals = finalObjectiveCommands(body);
   const ciOnly = new Set((options.ciOnlyCommands ?? []).map(ciOnlyKey));
   let authorized: string[] | undefined;
@@ -1007,7 +1021,7 @@ export async function objectiveCommandProblems(
   }
 
   // A Factory-created child carries its parent's prose; the parent was checked.
-  if (!finals.length && !childIdentity(body)) {
+  if (!finals.length && !child) {
     const named: string[] = [];
     for (const span of new Set(inlineSpans(body))) {
       if (!span) continue;
@@ -1048,7 +1062,7 @@ export async function objectiveCommandProblems(
 
   const required = options.requiredCommands ?? [];
   const requiredSources: PinnedSource[] = [
-    objectiveSource(body),
+    objectiveSource(body, child),
     { path: REQUIRED_COMMANDS_SOURCE, content: required.join("\n") },
   ];
   for (const command of required)
