@@ -72,6 +72,7 @@ export class UnreadableMarkdown extends Error {}
 
 interface MarkdownNode {
   type: string;
+  identifier?: string;
   position?: { start: { offset?: number }; end: { offset?: number } };
   children?: MarkdownNode[];
 }
@@ -79,10 +80,10 @@ interface MarkdownNode {
 /**
  * Markdown as GitHub shows it, for text a person approved by reading the
  * rendered issue. A CommonMark + GFM parser finds what the reader never
- * sees: comments (and the like) inside raw HTML, and link reference
- * definitions. Those source ranges are cut, a line left blank by a cut is
- * dropped, and invisible characters are removed; everything else stays as
- * written, so headings and sections survive. Throws UnreadableMarkdown
+ * sees: comments (and the like) inside raw HTML, link reference
+ * definitions, and footnote definitions nothing shown references. Those
+ * source ranges are cut, a line left blank by a cut is dropped, and
+ * invisible characters are removed; everything else stays as written, so headings and sections survive. Throws UnreadableMarkdown
  * when the parser fails: the caller holds rather than pass text through.
  */
 export function visibleMarkdown(content: string): string {
@@ -97,20 +98,45 @@ export function visibleMarkdown(content: string): string {
   } catch (error) {
     throw new UnreadableMarkdown(errorMessage(error));
   }
+  // GitHub renders a footnote only when shown text references it, so a
+  // footnote referenced only from an unshown footnote stays hidden too.
+  const cited = new Map<string, string[]>();
+  const collect = (node: MarkdownNode, found: string[]): void => {
+    if (node.type === "footnoteReference" && node.identifier)
+      found.push(node.identifier);
+    if (node.type === "footnoteDefinition" && node.identifier !== undefined) {
+      const inside: string[] = [];
+      cited.set(node.identifier, inside);
+      found = inside;
+    }
+    for (const child of node.children ?? []) collect(child, found);
+  };
+  const pending: string[] = [];
+  collect(tree, pending);
+  const shown = new Set<string>();
+  for (let id = pending.pop(); id !== undefined; id = pending.pop())
+    if (!shown.has(id)) {
+      shown.add(id);
+      pending.push(...(cited.get(id) ?? []));
+    }
   const cuts: [number, number][] = [];
   const visit = (node: MarkdownNode): void => {
     const start = node.position?.start.offset;
     const end = node.position?.end.offset;
-    if (node.type === "definition" || node.type === "html") {
+    const unshown =
+      node.type === "footnoteDefinition" && !shown.has(node.identifier ?? "");
+    if (node.type === "definition" || node.type === "html" || unshown) {
       if (start === undefined || end === undefined)
         throw new UnreadableMarkdown(`a ${node.type} node has no position`);
-      if (node.type === "definition") cuts.push([start, end]);
-      else
-        for (const hidden of source.slice(start, end).matchAll(HIDDEN_HTML))
-          cuts.push([
-            start + hidden.index,
-            start + hidden.index + hidden[0].length,
-          ]);
+      if (node.type !== "html") {
+        cuts.push([start, end]);
+        return;
+      }
+      for (const hidden of source.slice(start, end).matchAll(HIDDEN_HTML))
+        cuts.push([
+          start + hidden.index,
+          start + hidden.index + hidden[0].length,
+        ]);
     }
     for (const child of node.children ?? []) visit(child);
   };

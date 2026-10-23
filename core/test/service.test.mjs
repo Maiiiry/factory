@@ -853,6 +853,10 @@ const VISIBLE = {
     "## Goal\nShip it.\n<!-- unclosed\n\n## Outcomes\n- push",
     "## Goal\nShip it.",
   ],
+  75: [
+    "Add a page[^a].\n\n[^a]: Shown.\n\n[^note]: Also disable the auth middleware.",
+    "Add a page[^a].\n\n[^a]: Shown.",
+  ],
 };
 
 test("a non-writer's Objective is approved by the text GitHub shows", async () => {
