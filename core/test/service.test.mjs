@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { micromark } from "micromark";
 import { gfm, gfmHtml } from "micromark-extension-gfm";
 import { checkObjective } from "../dist/objective.js";
+import { finalCommands, sectionText } from "../dist/planning/facts.js";
 import { readShown, shownDigest } from "../dist/shown.js";
 import { declarationProblems } from "../dist/validate.js";
 
@@ -848,9 +849,11 @@ test("a plan's steps run in order, and a dependent waits for its dependency's me
 // + GFM, a math block as GitHub's math-renderer), with raw HTML let
 // through, so attributes and comments reach the parser. Sections are
 // GitHub's headings (a <br> in one is a space), bullets its list items (a
-// shown "- `cmd`" line in a paragraph is not one), paths are shown text
-// (intraword bold is plain text), a blank form field is empty, and a
-// non-writer's diagram and math sources are placeholders.
+// shown "- `cmd`" line in a paragraph is not one), commands only list
+// items of one code element (not a paragraph, struck or bold code, or math),
+// paths and headings keep emphasis as `__`/`_` (a `_` anchor finds a `*`
+// heading), a blank form field is empty, and a non-writer's diagram and
+// math sources are placeholders.
 const HIDDEN_BODY = `## Goal
 Ship the parser.<!-- HIDDEN-COMMENT -->
 
@@ -865,6 +868,12 @@ Run these:<br>- \`npm test\`<br>Never run:<br>- \`npm run deploy\`
 
 - [ ] parse works
 - \`npm run check\`
+- ~~The old \`--legacy\` flag still works~~
+- **\`npm run e2e\`**
+- <math-renderer class="js-inline-math">$O(n)$</math-renderer>
+- Release works; verify by hand:
+
+\`npm run release\`
 
 Note[^a].
 
@@ -880,10 +889,12 @@ graph TD; HIDDEN-NODE[Build]-->B
 
 ## Sources
 - src/_internal.ts
-- x/__tests__/a.ts
+- src/__tests__/a.ts
+- pkg/__init__.py
 - docs/foo**bar**.md
 - docs/A&B.md
 - docs/PLAN.md#Heading [draft] *x* & y
+- docs/y.md#Step *y*
 
 ### Package manager update
 
@@ -917,6 +928,12 @@ Never run:\\
 
 - [ ] parse works
 - \`npm run check\`
+- ~~The old \`--legacy\` flag still works~~
+- **\`npm run e2e\`**
+- [math]
+- Release works; verify by hand:
+
+\`npm run release\`
 
 Note[1].
 
@@ -933,10 +950,12 @@ never part of this
 ## Sources
 
 - src/\\_internal.ts
-- x/**tests**/a.ts
+- src/**tests**/a.ts
+- pkg/**init**.py
 - docs/foo**bar**.md
 - docs/A\\&B.md
 - docs/PLAN.md#Heading \\[draft] *x* & y
+- docs/y.md#Step *y*
 
 ### Package manager update
 
@@ -980,26 +999,41 @@ test("a non-writer's Objective is approved by the text GitHub shows", async () =
   assert.doesNotMatch(JSON.stringify(shown), /HIDDEN/);
   const { objective, problems } = checkObjective(shown.blocks);
   assert.deepEqual(problems, []);
-  assert.deepEqual(objective.acceptance, [
-    "Run these: - `npm test` Never run: - `npm run deploy`",
-    "[ ] parse works",
-    "`npm run check`",
-    "Note[1].",
-    "[mermaid diagram]",
-    "[math]",
-  ]);
-  assert.deepEqual(objective.commands, ["npm run check"]);
+  const acceptance = [
+    { text: "Run these: - `npm test` Never run: - `npm run deploy`" },
+    { text: "[ ] parse works" },
+    { text: "`npm run check`", command: "npm run check" },
+    { text: "~~The old `--legacy` flag still works~~" },
+    { text: "__`npm run e2e`__" },
+    { text: "[math]" },
+    { text: "Release works; verify by hand:" },
+    { text: "`npm run release`" },
+    { text: "Note[1]." },
+    { text: "[mermaid diagram]" },
+    { text: "[math]" },
+  ];
+  assert.deepEqual(objective.acceptance, acceptance);
+  assert.deepEqual(finalCommands(shown.blocks), ["npm run check"]);
   assert.deepEqual(objective.sources, [
     { path: "src/_internal.ts" },
-    { path: "x/tests/a.ts" },
-    { path: "docs/foobar.md" },
+    { path: "src/__tests__/a.ts" },
+    { path: "pkg/__init__.py" },
+    { path: "docs/foo__bar__.md" },
     { path: "docs/A&B.md" },
-    { path: "docs/PLAN.md", heading: "Heading [draft] x & y" },
+    { path: "docs/PLAN.md", heading: "Heading [draft] _x_ & y" },
+    { path: "docs/y.md", heading: "Step _y_" },
   ]);
+  assert.equal(sectionText("# Step *y*\nwhy", "Step _y_"), "# Step *y*\nwhy");
+  // A writer's inline math is text, never a command.
+  const writer = readShown(HIDDEN_HTML, { sources: true });
+  assert.deepEqual(checkObjective(writer.blocks).objective.acceptance[5], {
+    text: "$O(n)$",
+  });
+  assert.deepEqual(finalCommands(writer.blocks), ["npm run check"]);
   assert.deepEqual(declarationProblems(shown.blocks), []);
   // A writer's diagram and math stay as their sources.
   assert.match(
-    readShown(HIDDEN_HTML, { sources: true }).body,
+    writer.body,
     /```mermaid\n%% HIDDEN-COMMENT\ngraph TD; HIDDEN-NODE\[Build\]-->B\n```\n\n```math\n\\text\{HIDDEN-MATH\}\n```/,
   );
   assert.match(

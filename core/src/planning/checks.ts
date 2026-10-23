@@ -53,7 +53,13 @@ export async function checkPlan(
   const shapes = workShapes(draft);
   await commandFindings(shapes, facts, files, found);
   await boundaryFindings(shapes, facts, files, found);
-  graphLint(draft, new Map(), facts.authorizedCommands, found);
+  graphLint(
+    draft,
+    new Map(),
+    facts.authorizedCommands,
+    facts.coverageObligations,
+    found,
+  );
   await citationFindings(shapes, facts.sources, files, found);
   await mediaFindings(shapes, facts, files, found);
   gateFindings(draft, facts, found);
@@ -271,6 +277,7 @@ function graphLint(
   /** In a split, each item's child Objective: children run as separate Objectives. */
   childOf: ReadonlyMap<string, string>,
   authorized: readonly string[],
+  obligations: readonly CoverageObligation[],
   found: Found,
 ): void {
   const byId = new Map(draft.items.map((item) => [item.id, item]));
@@ -333,14 +340,19 @@ function graphLint(
         `Work Item ${item.id} has no validation command, so its acceptance has no local executable evidence: select one of the authorized commands (${listCommands(authorized)}) that runs the tests it owns, or, if its proof needs an environment local validation lacks, ask through decisionRequired`,
         item.id,
       );
+  // An Objective command criterion is run by final validation.
+  const commands = new Set(
+    obligations.flatMap(({ source }) =>
+      source.path === "OBJECTIVE" && source.command ? [source.text] : [],
+    ),
+  );
   for (const entry of draft.coverage) {
     const kind = entry.proof?.kind;
     if (!kind) continue;
     const claim = coverageCriterion(entry).match(SAFETY_CLAIM)?.[0];
-    // A criterion that is exactly one backticked command is run by Factory.
     if (
       claim &&
-      !/^\s*`[^`]+`\s*$/.test(coverageCriterion(entry)) &&
+      !(entry.source.path === "OBJECTIVE" && commands.has(entry.source.text)) &&
       !/-command$/.test(kind) &&
       kind !== "final-controller"
     ) {
@@ -660,9 +672,13 @@ async function splitFindings(
     }
     const childFacts: PlanningFacts = {
       ...facts,
-      coverageObligations: child.outcomes.map((text) => ({
-        source: { path: "OBJECTIVE", text },
-      })),
+      // An outcome keeps its parent criterion's command.
+      coverageObligations: child.outcomes.map(
+        (text) =>
+          facts.coverageObligations.find(
+            ({ source }) => source.path === "OBJECTIVE" && source.text === text,
+          ) ?? { source: { path: "OBJECTIVE", text } },
+      ),
     };
     for (const finding of await checkPlan(child.graph, childFacts, files))
       findings.push({ ...finding, message: `${label}: ${finding.message}` });

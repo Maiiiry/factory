@@ -18,11 +18,18 @@ export interface SourceRef {
 
 export interface ParsedObjective {
   goal: string;
-  /** Each Acceptance criterion's shown text, code as backticked spans. */
-  acceptance: string[];
-  /** The Acceptance criteria that are exactly one code element, in order. */
-  commands: string[];
+  /**
+   * Each Acceptance criterion: its shown text (code as backticked spans,
+   * emphasis and strikethrough with their markers) and, for a list item
+   * that is exactly one code element, its command.
+   */
+  acceptance: Criterion[];
   sources: SourceRef[];
+}
+
+export interface Criterion {
+  text: string;
+  command?: string;
 }
 
 const KNOWN = [
@@ -80,15 +87,16 @@ function blockText(block: ObjectiveBlock): string {
  */
 function bullets(
   section: Section | undefined,
-): { text: string; code?: string }[] {
+): { text: string; code?: string; item: boolean }[] {
   return (section?.blocks ?? []).flatMap((block) => {
     if (block.kind === "empty" || block.kind === "heading") return [];
     const text = block.text.replace(/\s+/g, " ").trim();
     if (!text) return [];
+    const item = block.kind === "item";
     return [
       block.kind !== "code" && block.code !== undefined
-        ? { text, code: block.code }
-        : { text },
+        ? { text, code: block.code, item }
+        : { text, item },
     ];
   });
 }
@@ -152,9 +160,9 @@ export function checkObjective(blocks: readonly ObjectiveBlock[]): {
   return {
     objective: {
       goal,
-      acceptance: criteria.map((entry) => entry.text),
-      commands: criteria.flatMap((entry) =>
-        entry.code?.trim() ? [entry.code] : [],
+      // A command is a list item only: a paragraph or quote is prose.
+      acceptance: criteria.map(({ text, code, item }) =>
+        item && code?.trim() ? { text, command: code } : { text },
       ),
       sources,
     },

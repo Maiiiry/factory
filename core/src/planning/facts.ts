@@ -190,11 +190,13 @@ function objectiveSource(shown: ShownObjective, child: boolean): PinnedSource {
 }
 
 /**
- * Commands the integrated result must pass: the Acceptance criteria that
+ * Commands the integrated result must pass: the Acceptance list items that
  * are exactly one code element. Any other criterion is a fact for review.
  */
 function finalObjectiveCommands(blocks: readonly ObjectiveBlock[]): string[] {
-  return checkObjective(blocks).objective.commands;
+  return checkObjective(blocks).objective.acceptance.flatMap((criterion) =>
+    criterion.command ? [criterion.command] : [],
+  );
 }
 
 /**
@@ -214,16 +216,23 @@ export function finalCommands(
 function coverageObligations(
   blocks: readonly ObjectiveBlock[],
 ): CoverageObligation[] {
-  return checkObjective(blocks).objective.acceptance.map((text) => ({
-    source: { path: "OBJECTIVE", text },
-  }));
+  return checkObjective(blocks).objective.acceptance.map(
+    ({ text, command }) => ({
+      source: { path: "OBJECTIVE", text, ...(command ? { command } : {}) },
+    }),
+  );
 }
 
-/** One exact heading's section of a markdown file; undefined unless it occurs once. */
+/**
+ * One exact heading's section of a markdown file; undefined unless it
+ * occurs once. `*` and `_` are one emphasis marker: shown text writes
+ * emphasis with `_`, so `#Step _y_` finds the heading `Step *y*`.
+ */
 export function sectionText(text: string, heading: string): string | undefined {
   const lines = markdownLines(text);
+  const marked = (value: string) => value.replaceAll("*", "_");
   const matches = lines.flatMap((line, index) =>
-    line.heading?.text === heading
+    line.heading !== undefined && marked(line.heading.text) === marked(heading)
       ? [{ index, level: line.heading.level }]
       : [],
   );

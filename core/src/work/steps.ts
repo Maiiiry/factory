@@ -1922,8 +1922,9 @@ export function finalReviewStep(deps: BuildDeps): Step {
           }),
           inputs: workerInputs(state, mergedIds),
           sources: await pinnedSources(state, deps, signal),
-          acceptance: checkObjective(objectiveInputs(state).shown.blocks)
-            .objective.acceptance,
+          acceptance: checkObjective(
+            objectiveInputs(state).shown.blocks,
+          ).objective.acceptance.map((criterion) => criterion.text),
           dir: join(deps.workDir(state.issue), "final-review"),
           ...(decisions ? { decisions } : {}),
           signal,

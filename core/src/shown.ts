@@ -148,9 +148,10 @@ function shown(
           ? [element("p", {}, [literal("[math]")])]
           : [literal("[math]")];
       const source = textOf(node);
+      // Inline math is shown text (`$…$`), never a code element: it is not a command.
       return display
         ? [codeBlock(source.replace(/^\$\$|\$\$$/g, ""), "math")]
-        : [element("code", {}, [{ type: "text", value: source }])];
+        : [literal(source)];
     }
     const kind = MEDIA[tag];
     if (kind) return [literal(`[${kind}: ${fileName(p)}]`)];
@@ -312,9 +313,11 @@ function codeOf(nodes: readonly ElementContent[]): { code?: string } {
 
 /**
  * Shown inline text: text as written (no escapes), code as a backticked
- * span, a link as `[text](href)` (its text alone when that is the href), a
- * task box as `[ ]` or `[x]`, a line break and every block boundary as a
- * new line.
+ * span, strong as `__text__`, emphasis as `_text_`, struck text as
+ * `~~text~~`, a link as `[text](href)` (its text alone when that is the
+ * href), a task box as `[ ]` or `[x]`, a line break and every block
+ * boundary as a new line. Underscore markers give back the common paths
+ * GitHub renders as emphasis (`pkg/__init__.py`, `src/__tests__/a.ts`).
  */
 function inline(nodes: readonly ElementContent[]): string {
   return nodes
@@ -324,6 +327,8 @@ function inline(nodes: readonly ElementContent[]): string {
       const tag = node.tagName;
       if (tag === "br") return "\n";
       if (tag === "code") return span(textOf(node));
+      const marker = MARKERS[tag];
+      if (marker) return `${marker}${inline(node.children)}${marker}`;
       if (tag === "input")
         return node.properties.type === "checkbox"
           ? node.properties.checked
@@ -344,6 +349,16 @@ function inline(nodes: readonly ElementContent[]): string {
     })
     .join("");
 }
+
+/** The marker each emphasis element is written back with. */
+const MARKERS: Record<string, string> = {
+  strong: "__",
+  b: "__",
+  em: "_",
+  i: "_",
+  del: "~~",
+  s: "~~",
+};
 
 /** A code span around `text`, with a fence longer than any backtick run in it. */
 function span(text: string): string {

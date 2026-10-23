@@ -95,6 +95,8 @@ export interface CoverageObligation {
     heading?: string;
     text?: string;
     lines?: [number, number];
+    /** An Objective criterion's command: an Acceptance list item that is exactly one code element. */
+    command?: string;
   };
   statement?: string;
 }
