@@ -268,6 +268,7 @@ export async function serve(options: ServeOptions): Promise<number> {
       // replies and shows it cancelled.
       const state = newObjective(request.issue, new Date());
       state.status = "cancelled";
+      state.endedAt = state.updatedAt;
       state.appliedRequests = [{ id: stored.id, message: "ok" }];
       if (broken.github) state.modules.github = broken.github;
       saveState(paths.objectives, state);

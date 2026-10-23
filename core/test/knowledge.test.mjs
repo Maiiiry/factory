@@ -12,6 +12,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -240,13 +241,23 @@ after(() => {
   for (const child of services) child.kill("SIGKILL");
 });
 
-/** The real service. Its GitHub reads fail (a token GitHub refuses) and are retried, as a run's are. */
-function serve(inst) {
+/** A local port nothing listens on. */
+async function closedPort() {
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+/** The real service. Its GitHub reads fail (nothing listens on its API port) and are retried, as a run's are. */
+async function serve(inst) {
   const child = spawn(process.execPath, [CLI, "serve", "--repo", REPO], {
     env: {
       ...inst.env,
       FACTORY_TICK_MS: "50",
-      FACTORY_GITHUB_TOKEN: "refused",
+      FACTORY_GITHUB_API: `http://127.0.0.1:${await closedPort()}`,
+      FACTORY_GITHUB_TOKEN: "unused",
     },
     stdio: "ignore",
   });
@@ -285,7 +296,7 @@ test("the service retries a failed observation, and one run keeps one episode ac
   // Another writer holds the store's write lock: the service's observation fails.
   const blocker = store(inst);
   blocker.exec("BEGIN IMMEDIATE");
-  const first = serve(inst);
+  const first = await serve(inst);
   await until(() => logged(inst, 7, "observe-failed"), "a failed observation");
   blocker.exec("COMMIT");
   blocker.close();
@@ -306,7 +317,7 @@ test("the service retries a failed observation, and one run keeps one episode ac
     commentsSince: state.updatedAt,
   };
   writeFileSync(path, JSON.stringify(state));
-  const second = serve(inst);
+  const second = await serve(inst);
   // Its startup observation runs on the first tick.
   await new Promise((resolve) => setTimeout(resolve, 1500));
   await second.stop();

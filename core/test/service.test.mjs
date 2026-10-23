@@ -114,7 +114,7 @@ function seed(inst, issue, status = "checking", fields = {}) {
  * A configured installation whose GitHub API is `api`: a closed port (the
  * network is down) or a socket that never answers (a stalled network).
  */
-function configured(inst, api, env = {}) {
+function configured(inst, api, env = {}, fields = {}) {
   const config = join(inst.root, "config.json");
   mkdirSync(inst.root, { recursive: true });
   writeFileSync(
@@ -123,6 +123,7 @@ function configured(inst, api, env = {}) {
       repository: REPO,
       checkout: join(inst.root, "checkout"),
       queue: { projectId: "PVT_none", pollSeconds: 5 },
+      ...fields,
     }),
   );
   Object.assign(inst.env, {
@@ -547,6 +548,57 @@ test("a transient wait retries without counting errors, then asks, and wait wait
     "the question again once the grant is spent",
   );
   assert.equal(cli(inst, "cancel", "22").code, 0);
+  await stopped(service);
+});
+
+test("switch moves an Objective held on a usage limit to the named provider", async () => {
+  const inst = installation();
+  configured(
+    inst,
+    `http://127.0.0.1:${await closedPort()}`,
+    {},
+    {
+      providers: {
+        codex: { planner: "codex", worker: { kind: "codex" } },
+        claude: { planner: "claude", worker: { kind: "claude" } },
+      },
+      defaultProvider: "codex",
+    },
+  );
+  const now = new Date().toISOString();
+  seed(inst, 41, "holding", {
+    resumeStatus: "checking",
+    hold: {
+      id: `check@${now}`,
+      step: "check",
+      question: "Codex usage limit: weekly.",
+      answers: ["wait", "switch", "cancel"],
+      recommended: "wait",
+      askedAt: now,
+    },
+    retries: {
+      check: {
+        count: 0,
+        attempts: 1,
+        since: now,
+        nextAt: now,
+        lastError: "Codex usage limit",
+        wait: { kind: "reset", provider: "codex" },
+      },
+    },
+  });
+  const service = serve(inst);
+  await until(() => status(inst).service === "running", "service");
+  const unknown = cli(inst, "answer", "41", "switch", "nope");
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.out, /one of claude/);
+  assert.equal(cli(inst, "answer", "41", "switch").code, 0);
+  const state = stateOf(inst, 41);
+  assert.equal(state.hold, null);
+  assert.equal(state.provider.name, "claude");
+  assert.equal(state.provider.selectedBy, "switch");
+  assert.equal(state.provider.settings.planner, "claude");
+  assert.equal(cli(inst, "cancel", "41").code, 0);
   await stopped(service);
 });
 
