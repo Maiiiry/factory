@@ -1,4 +1,5 @@
 import type { CandidateSet, MediaInput, Selection } from "../media.js";
+import type { IgnoredPredecessor } from "../planning/predecessors.js";
 import type { Retirement } from "../planning/types.js";
 import type { RepairFinding } from "../repair.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
@@ -100,6 +101,8 @@ export interface ObjectiveFacts {
   rerun: true;
   /** The re-run's cleanup reopened the issue (planning/steps.ts `REOPENED`). */
   "rerun:reopened": true;
+  /** Predecessors the operator answered `ignore` to (planning/predecessors.ts). */
+  "predecessors:ignored": IgnoredPredecessor[];
 }
 
 /** A finished worker run, kept until its result is collected, so a collection question doesn't run the worker again. */
