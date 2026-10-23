@@ -96,6 +96,43 @@ interface WorkerHome {
   env: Record<string, string>;
 }
 
+/** The proxy variables Codex keeps for itself (codex.ts ENVIRONMENT). */
+const PROXY = /^(?:HTTPS?|NO|ALL)_PROXY$/i;
+
+/**
+ * What the worker's shell sees of the proxy variables Codex keeps to reach
+ * its API: nothing when the shell has no network; with network, each URL
+ * without its user name and password (a URL that doesn't parse is left
+ * out), so the shell never holds a proxy credential.
+ */
+function proxyPolicy(source: NodeJS.ProcessEnv, network: boolean): string {
+  const set: string[] = [];
+  const exclude: string[] = [];
+  for (const [name, value] of Object.entries(source)) {
+    if (!PROXY.test(name) || value === undefined) continue;
+    if (!network) {
+      exclude.push(name);
+      continue;
+    }
+    if (/^no_proxy$/i.test(name)) continue;
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      exclude.push(name);
+      continue;
+    }
+    if (!url.username && !url.password) continue;
+    url.username = "";
+    url.password = "";
+    set.push(`${JSON.stringify(name)} = ${JSON.stringify(url.href)}`);
+  }
+  return `
+[shell_environment_policy]
+inherit = "all"
+${exclude.length ? `exclude = ${JSON.stringify(exclude)}\n` : ""}${set.length ? `\n[shell_environment_policy.set]\n${set.join("\n")}\n` : ""}`;
+}
+
 /**
  * A private CODEX_HOME, HOME and TMPDIR for one turn, with Factory's
  * permission profile and a link to the operator's subscription login.
@@ -155,7 +192,7 @@ ${grants.join("\n")}
 
 [permissions.factory.network]
 enabled = ${network}
-`;
+${proxyPolicy(source, network)}`;
     },
     finish: ({ root, home, env }) => {
       // Package caches stay in the private HOME, never in the worktree.
