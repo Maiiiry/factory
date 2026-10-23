@@ -287,7 +287,13 @@ async function status(paths: Paths, args: Args): Promise<number> {
   const rows: StatusRow[] = [];
   for (const issue of listObjectives(paths.objectives)) {
     if (only !== undefined && issue !== only) continue;
-    const loaded = loadState(paths.objectives, issue);
+    let loaded: ReturnType<typeof loadState>;
+    try {
+      loaded = loadState(paths.objectives, issue);
+    } catch (error) {
+      process.stderr.write(`#${issue}: can't read its state now: ${error}\n`);
+      continue;
+    }
     if (!loaded) continue;
     if (loaded.kind === "unreadable") {
       rows.push({

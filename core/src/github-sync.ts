@@ -1,11 +1,11 @@
 import type { CoreConfig, QueueOption } from "./config.js";
 import { crashPoint } from "./crash.js";
 import type { EngineLimits, ObjectiveRunner } from "./engine.js";
-import { type GitHub, TransientError } from "./github.js";
+import { type GitHub, GitHubError, TransientError } from "./github.js";
 import type { RunLog } from "./log.js";
 import { QueueDisplay, type QueueItem, queued, readQueue } from "./queue.js";
 import { writeRequest } from "./requests.js";
-import type { ObjectiveStatus } from "./state.js";
+import type { ObjectiveState, ObjectiveStatus } from "./state.js";
 import { TERMINAL } from "./state.js";
 import { errorMessage } from "./text.js";
 
@@ -16,6 +16,10 @@ export interface GitHubModule {
   order?: number | null;
   /** The Factory field option last written. */
   shown?: string;
+  /** When Factory last wrote the option, by GitHub's clock. */
+  shownAt?: string;
+  /** When the card was set to queued for this run, by GitHub's clock. */
+  queuedAt?: string;
   /** The hold whose question comment exists. */
   askedHold?: string;
   /** Comments are read from here on. */
@@ -26,6 +30,18 @@ export interface GitHubModule {
   noted?: string;
   /** The human gate a reminder was posted for (`<step>@<since>`). */
   reminded?: string;
+  /** `/factory` comments whose author's access couldn't be read yet, oldest first. */
+  unchecked?: UncheckedComment[];
+}
+
+/** A `/factory` comment waiting for its author's access to be read. */
+export interface UncheckedComment {
+  id: number;
+  login: string;
+  body: string;
+  createdAt: string;
+  failures: number;
+  nextAt: string;
 }
 
 /** An Objective whose state file can't be read: it holds, with `cancel`. */
@@ -38,8 +54,12 @@ export interface UnreadableObjective {
 export interface SyncView {
   runners: ReadonlyMap<number, ObjectiveRunner>;
   unreadable: ReadonlyMap<number, UnreadableObjective>;
+  /** The Objective's run, read from disk when it isn't in memory; throws when the read fails. */
+  find(issue: number): ObjectiveRunner | undefined;
   /** Start (or start again) an Objective seen queued; the service decides whether it may. */
   admit(issue: number, github: GitHubModule): void;
+  /** Withdraw an Objective dequeued before it started; false when it has started. */
+  withdraw(issue: number): boolean;
   /** Checked and waiting for a slot: still shown as queued. */
   waitingForSlot(issue: number): boolean;
   requestsDir: string;
@@ -64,16 +84,31 @@ const OPTION: Record<ObjectiveStatus, QueueOption> = {
 /** A sync job that failed waits this long, doubling, up to MAX_BACKOFF_MS. */
 const BASE_BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 10 * 60_000;
+/** Comments kept waiting for their author's access to be read, per Objective. */
+const MAX_UNCHECKED = 20;
+const COMMAND = /^\/factory\s+(\S+)(?:\s+([\s\S]*))?$/;
 
 /**
  * GitHub is input and display, never a precondition: every call here runs in
  * the background, and nothing here can fail a run. A failed job is logged
  * and tried again after a backoff of its own (per job and Objective, capped
  * at ten minutes), so one Objective's bad card or locked issue never spends
- * the rate limit the others need. A finished Objective is synced once.
+ * the rate limit the others need. A finished Objective stays until its
+ * final option and replies are written.
+ *
+ * The queue is read by edges, never by levels: Factory writes the queued
+ * option itself (while an Objective is checked or waits for a slot), so a
+ * card that reads queued means nothing alone. A card queues or dequeues
+ * only when its option was set after Factory's own last write (GitHub's
+ * `updatedAt` of the option, against the `shownAt` and `queuedAt` Factory
+ * saved), so a stale card never re-admits a finished or cancelled run.
  */
 export class GitHubSync {
   private view: QueueItem[] = [];
+  /** A queue read landed since the last intake. */
+  private fresh = false;
+  /** Known issues GitHub no longer has: left out of later reads. */
+  private readonly gone = new Set<number>();
   private lastPoll = 0;
   /** Running jobs, by key, with their Objective. */
   private readonly busy = new Map<string, number>();
@@ -81,7 +116,7 @@ export class GitHubSync {
     string,
     { failures: number; nextAt: number }
   >();
-  /** Finished Objectives that had their one sync pass. */
+  /** Finished Objectives whose final option and replies are written. */
   private readonly settled = new Set<number>();
   private readonly display: QueueDisplay;
   private readonly writers = new Map<string, boolean>();
@@ -112,58 +147,81 @@ export class GitHubSync {
             .map((runner) => runner.state.issue),
           ...sync.unreadable.keys(),
         ]),
-      ];
+      ].filter((issue) => !this.gone.has(issue));
       // The poll interval paces the queue read; it needs no backoff.
       this.background(
         0,
         "queue",
         async () => {
-          this.view = await readQueue(this.github, this.config, known);
+          const read = await readQueue(this.github, this.config, known);
+          this.view = read.items;
+          this.fresh = true;
+          for (const issue of read.gone)
+            if (!this.gone.has(issue)) {
+              this.gone.add(issue);
+              this.log.write(issue, { event: "queue-issue-gone" });
+            }
+          if (read.truncated)
+            this.log.write(0, {
+              event: "queue-truncated",
+              unread: read.truncated,
+            });
         },
         false,
       );
     }
-    this.admit(sync);
+    if (this.fresh) {
+      this.fresh = false;
+      this.intake(sync);
+    }
     for (const runner of sync.runners.values()) {
       const module = runner.state.modules.github as GitHubModule | undefined;
       const issue = runner.state.issue;
       const finished =
         TERMINAL.includes(runner.state.status) && !runner.hasWork;
       if (finished && this.settled.has(issue)) continue;
-      if (!module) {
-        if (finished) this.settled.add(issue);
-        continue;
-      }
-      this.show(runner, module, sync);
-      this.ask(runner, module);
-      this.reply(runner, module, sync);
-      if (finished) {
+      if (finished && this.synced(runner.state)) {
         this.settled.add(issue);
         continue;
       }
+      if (!module) continue;
+      this.show(runner, module, sync);
+      this.ask(runner, module);
+      this.reply(runner, module, sync);
+      if (finished) continue;
       this.note(runner, module);
       if (due && !TERMINAL.includes(runner.state.status))
         this.readComments(
           issue,
-          module.commentsSince,
-          Boolean(runner.state.hold),
+          module,
+          () => Boolean(runner.state.hold),
           sync,
-          (latest) =>
-            runner.transact(() => {
-              (runner.state.modules.github as GitHubModule).commentsSince =
-                latest;
-            }),
+          (change) =>
+            runner.transact(() =>
+              change(runner.state.modules.github as GitHubModule),
+            ),
         );
     }
     for (const [issue, entry] of sync.unreadable)
       this.unreadable(issue, entry, due, sync);
   }
 
-  /** Whether a finished Objective had its sync pass and no job of it is running. */
+  /** Whether a finished Objective's sync is done and no job of it is running. */
   idle(issue: number): boolean {
     return (
       this.settled.has(issue) &&
       ![...this.busy.values()].some((owner) => owner === issue)
+    );
+  }
+
+  /** Whether a finished Objective's card shows its final option and every reply is posted. */
+  synced(state: ObjectiveState): boolean {
+    const module = state.modules.github as GitHubModule | undefined;
+    if (!module) return true;
+    return (
+      TERMINAL.includes(state.status) &&
+      module.shown === this.config.queue.options[OPTION[state.status]] &&
+      !unreplied(state, module).length
     );
   }
 
@@ -176,23 +234,68 @@ export class GitHubSync {
   }
 
   /**
-   * Every queued Objective without an unfinished run is offered to the
-   * service at once, so it is checked when it is first seen; planning
-   * waits for a slot.
+   * Act on a fresh queue read, once: a card set to queued after Factory's
+   * last write admits its Objective (a new one is admitted on first sight,
+   * so it is checked at once; planning waits for a slot), and a card moved
+   * out of queued dequeues an Objective that hasn't started. Every
+   * unfinished Objective takes its order from the card, so reordering works
+   * until it starts.
    */
-  private admit(sync: SyncView): void {
-    for (const item of queued(this.view, this.config)) {
-      const runner = sync.runners.get(item.issue);
-      if (runner && !TERMINAL.includes(runner.state.status)) continue;
-      // Never over an unreadable state: it waits for its own answer.
+  private intake(sync: SyncView): void {
+    const queuedOption = this.config.queue.options.queued;
+    for (const item of this.view) {
       if (sync.unreadable.has(item.issue)) continue;
-      // A finished run shows its final option, so a queued one was queued again.
-      sync.admit(item.issue, {
-        itemId: item.itemId,
-        order: item.order,
-        commentsSince: new Date(this.now()).toISOString(),
-      });
+      try {
+        let runner = sync.runners.get(item.issue);
+        if (item.option === queuedOption && !runner)
+          runner = sync.find(item.issue);
+        if (!runner) {
+          if (item.option === queuedOption && !sync.unreadable.has(item.issue))
+            this.admitItem(item, sync);
+          continue;
+        }
+        const state = runner.state;
+        if (TERMINAL.includes(state.status)) {
+          // Queued again after it finished: its cleanup ends first.
+          if (
+            item.option === queuedOption &&
+            !runner.hasWork &&
+            moved(item, state)
+          )
+            this.admitItem(item, sync);
+          continue;
+        }
+        if (item.option !== queuedOption && moved(item, state)) {
+          if (sync.withdraw(item.issue)) {
+            this.log.write(item.issue, {
+              event: "dequeued",
+              option: item.option,
+            });
+            continue;
+          }
+        }
+        const module = state.modules.github as GitHubModule | undefined;
+        if (module && (module.order ?? null) !== item.order)
+          runner.transact(() => {
+            (runner.state.modules.github as GitHubModule).order = item.order;
+          });
+      } catch (error) {
+        // A state read or save that failed: the next fresh read tries again.
+        this.log.write(item.issue, {
+          event: "queue-intake-failed",
+          error: errorMessage(error),
+        });
+      }
     }
+  }
+
+  private admitItem(item: QueueItem, sync: SyncView): void {
+    sync.admit(item.issue, {
+      itemId: item.itemId,
+      order: item.order,
+      ...(item.optionAt ? { queuedAt: item.optionAt } : {}),
+      commentsSince: new Date(this.now()).toISOString(),
+    });
   }
 
   private show(
@@ -213,13 +316,18 @@ export class GitHubSync {
     if (module.shown === option) return;
     this.background(issue, `show:${issue}`, async () => {
       crashPoint("sync:show:before");
-      await this.display.set(module.itemId, option);
+      const at = await this.display.set(module.itemId, option);
       crashPoint("sync:show:after");
       runner.transact(() => {
-        (runner.state.modules.github as GitHubModule).shown = option;
+        const github = runner.state.modules.github as GitHubModule;
+        github.shown = option;
+        if (at) github.shownAt = at;
       });
       const item = this.view.find((i) => i.issue === issue);
-      if (item) item.option = option;
+      if (item) {
+        item.option = option;
+        item.optionAt = at ?? item.optionAt;
+      }
     });
   }
 
@@ -330,9 +438,10 @@ export class GitHubSync {
     if (module.shown !== option)
       this.background(issue, `show:${issue}`, async () => {
         crashPoint("sync:show:before");
-        await this.display.set(module.itemId, option);
+        const at = await this.display.set(module.itemId, option);
         crashPoint("sync:show:after");
         module.shown = option;
+        if (at) module.shownAt = at;
       });
     if (module.askedHold !== "unreadable")
       this.background(issue, `ask:${issue}`, async () => {
@@ -350,41 +459,77 @@ export class GitHubSync {
         module.askedHold = "unreadable";
       });
     else if (due)
-      this.readComments(issue, module.commentsSince, true, sync, (latest) => {
-        module.commentsSince = latest;
-      });
+      this.readComments(
+        issue,
+        module,
+        () => true,
+        sync,
+        (change) => change(module),
+      );
   }
 
   /**
-   * Read new `/factory` comments and turn each into a request. One comment
-   * that can't be checked is logged and skipped; the cursor moves past it,
-   * so it never blocks the comments after it.
+   * Read new `/factory` comments and turn each into a request. A comment is
+   * skipped only on a definite answer about its author (no such user, or
+   * no write access). One whose author's access can't be read now waits in
+   * a bounded list, tried again with backoff on later polls; the cursor
+   * still moves past it, so it never blocks the comments after it.
    */
   private readComments(
     issue: number,
-    since: string,
-    holding: boolean,
+    module: GitHubModule,
+    holding: () => boolean,
     sync: SyncView,
-    advance: (latest: string) => void,
+    save: (change: (module: GitHubModule) => void) => void,
   ): void {
     this.background(issue, `comments:${issue}`, async () => {
+      const since = module.commentsSince;
       const comments = await this.github.comments(issue, since);
+      const waiting = module.unchecked ?? [];
+      const now = this.now();
       let latest = since;
+      const fresh: UncheckedComment[] = [];
       for (const comment of comments) {
         if (comment.created_at > latest) latest = comment.created_at;
-        const command = comment.body
-          .trim()
-          .match(/^\/factory\s+(\S+)(?:\s+([\s\S]*))?$/);
-        if (!command || !comment.user) continue;
-        const login = comment.user.login;
+        if (
+          !comment.user ||
+          !COMMAND.test(comment.body.trim()) ||
+          waiting.some((w) => w.id === comment.id)
+        )
+          continue;
+        fresh.push({
+          id: comment.id,
+          login: comment.user.login,
+          body: comment.body.trim().slice(0, 20_000),
+          createdAt: comment.created_at,
+          failures: 0,
+          nextAt: new Date(now).toISOString(),
+        });
+      }
+      const unchecked: UncheckedComment[] = [];
+      for (const comment of [...waiting, ...fresh]) {
+        if (Date.parse(comment.nextAt) > now) {
+          unchecked.push(comment);
+          continue;
+        }
         let allowed: boolean;
         try {
-          allowed = await this.canWrite(login);
+          allowed = await this.canWrite(comment.login);
         } catch (error) {
+          const failures = comment.failures + 1;
+          unchecked.push({
+            ...comment,
+            failures,
+            nextAt: new Date(
+              now +
+                Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS),
+            ).toISOString(),
+          });
           this.log.write(issue, {
             event: "comment-unchecked",
             comment: comment.id,
-            login,
+            login: comment.login,
+            failures,
             error: errorMessage(error),
           });
           continue;
@@ -393,31 +538,55 @@ export class GitHubSync {
           this.log.write(issue, {
             event: "comment-ignored",
             comment: comment.id,
-            login,
+            login: comment.login,
           });
           continue;
         }
-        const answer = command[1]!.toLowerCase();
-        const text = command[2]?.trim();
-        writeRequest(
-          sync.requestsDir,
-          answer === "cancel"
-            ? { kind: "cancel", issue }
-            : answer === "retry" && !holding
-              ? { kind: "retry", issue }
-              : {
-                  kind: "answer",
-                  issue,
-                  answer,
-                  ...(text ? { text } : {}),
-                  writtenAt: comment.created_at,
-                },
-          login,
-          `comment-${comment.id}`,
-        );
+        this.request(issue, comment, holding(), sync);
       }
-      if (latest !== since) advance(latest);
+      for (const dropped of unchecked.slice(0, -MAX_UNCHECKED))
+        this.log.write(issue, {
+          event: "comment-dropped",
+          comment: dropped.id,
+          login: dropped.login,
+        });
+      const kept = unchecked.slice(-MAX_UNCHECKED);
+      if (latest !== since || JSON.stringify(kept) !== JSON.stringify(waiting))
+        save((github) => {
+          github.commentsSince = latest;
+          if (kept.length) github.unchecked = kept;
+          else delete github.unchecked;
+        });
     });
+  }
+
+  /** A `/factory` comment from a writer, as a request; its id makes writing it twice harmless. */
+  private request(
+    issue: number,
+    comment: UncheckedComment,
+    holding: boolean,
+    sync: SyncView,
+  ): void {
+    const command = comment.body.match(COMMAND);
+    if (!command) return;
+    const answer = command[1]!.toLowerCase();
+    const text = command[2]?.trim();
+    writeRequest(
+      sync.requestsDir,
+      answer === "cancel"
+        ? { kind: "cancel", issue }
+        : answer === "retry" && !holding
+          ? { kind: "retry", issue }
+          : {
+              kind: "answer",
+              issue,
+              answer,
+              ...(text ? { text } : {}),
+              writtenAt: comment.createdAt,
+            },
+      comment.login,
+      `comment-${comment.id}`,
+    );
   }
 
   /** Reply to each `/factory` comment with what happened. */
@@ -427,11 +596,7 @@ export class GitHubSync {
     sync: SyncView,
   ): void {
     const issue = runner.state.issue;
-    const pending = runner.state.appliedRequests.filter(
-      (r) =>
-        r.id.startsWith("comment-") && !(module.replied ?? []).includes(r.id),
-    );
-    for (const request of pending) {
+    for (const request of unreplied(runner.state, module)) {
       this.background(issue, `reply:${issue}:${request.id}`, async () => {
         const marker = MARK(issue, "reply", request.id);
         const message = sync.result(request.id) ?? request.message;
@@ -461,13 +626,21 @@ export class GitHubSync {
     return (await this.github.findComment(issue, marker, from)) !== undefined;
   }
 
+  /** Whether `login` may write to the repository; throws when GitHub can't say now. */
   private async canWrite(login: string): Promise<boolean> {
     const known = this.writers.get(login);
     if (known !== undefined) return known;
-    const { permission } = await this.github.rest<{ permission: string }>(
-      "GET",
-      `/repos/${this.config.repository}/collaborators/${encodeURIComponent(login)}/permission`,
-    );
+    let permission: string;
+    try {
+      ({ permission } = await this.github.rest<{ permission: string }>(
+        "GET",
+        `/repos/${this.config.repository}/collaborators/${encodeURIComponent(login)}/permission`,
+      ));
+    } catch (error) {
+      // No such user: a definite no. Anything else may pass.
+      if (!(error instanceof GitHubError && error.status === 404)) throw error;
+      permission = "none";
+    }
     const ok = ["admin", "maintain", "write"].includes(permission);
     this.writers.set(login, ok);
     return ok;
@@ -508,4 +681,30 @@ export class GitHubSync {
       })
       .finally(() => this.busy.delete(key));
   }
+}
+
+/** Requests from comments that have no reply yet. */
+function unreplied(
+  state: ObjectiveState,
+  module: GitHubModule,
+): { id: string; message: string }[] {
+  return state.appliedRequests.filter(
+    (r) =>
+      r.id.startsWith("comment-") && !(module.replied ?? []).includes(r.id),
+  );
+}
+
+/**
+ * Whether the card's option was set after Factory's own last write for
+ * this run (by GitHub's clock): an operator's queue or dequeue. A run with
+ * no GitHub time saved falls back to its last save.
+ */
+function moved(item: QueueItem, state: ObjectiveState): boolean {
+  const at = Date.parse(item.optionAt ?? "");
+  if (!Number.isFinite(at)) return false;
+  const module = state.modules.github as GitHubModule | undefined;
+  const marks = [module?.shownAt, module?.queuedAt]
+    .map((mark) => Date.parse(mark ?? ""))
+    .filter(Number.isFinite);
+  return at > (marks.length ? Math.max(...marks) : Date.parse(state.updatedAt));
 }

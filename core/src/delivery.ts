@@ -91,6 +91,15 @@ export interface Repair {
 export const REPUBLISH = "republish";
 
 /**
+ * The answer that replaces a Factory branch holding commits Factory did not
+ * make with the current result: the publish step passes `reset: true`.
+ */
+export const RESET_BRANCH = "reset";
+
+/** Commits beyond the default branch checked for Factory's ownership; more is not Factory's. */
+const MAX_OWNED_COMMITS = 250;
+
+/**
  * GitHub has no commits between the default branch and the result: the
  * result adds nothing to the base. The publish step treats it as a repair
  * finding (an empty change).
@@ -148,6 +157,8 @@ export interface PublishInput {
   };
   /** The operator answered REPUBLISH to this step's question. */
   republish?: boolean;
+  /** The operator answered RESET_BRANCH: replace the branch whoever made it. */
+  reset?: boolean;
   /**
    * The PR's base: omitted (the default branch) for a regular item or the
    * bottom layer of a native stack; the predecessor layer's branch
@@ -210,10 +221,11 @@ export function publish(
     const branch = itemBranch(input.issue, input.item.id);
     const origin = await originHold(context);
     if (origin) return origin;
-    const { expected: baseBranch, bases } = await acceptedBases(
-      context,
-      input.baseBranch,
-    );
+    const {
+      expected: baseBranch,
+      defaultBranch,
+      bases,
+    } = await acceptedBases(context, input.baseBranch);
     const current = new Set([input.commit]);
     const earlier = new Set(
       input.pushedHeads.filter((h) => h !== input.commit),
@@ -243,17 +255,19 @@ export function publish(
     // The branch's head once pushed: the commit, or GitHub's update of it.
     let delivered = remote ?? input.commit;
     if (!remote || !(await updates(context, remote, current, bases))) {
-      // A head Factory pushed in an earlier run of this Objective (before a
-      // replan, or before it was cancelled and queued again) is Factory's
-      // own: the push below resets it, with a lease on exactly that head.
+      // A branch whose every commit Factory made (a head of an earlier run,
+      // before a replan or a re-queue) is Factory's own: the push below
+      // resets it, with a lease on exactly that head. Anyone else's commit
+      // on it is never overwritten without the operator's answer.
       if (
         remote &&
+        !input.reset &&
         !(await updates(context, remote, earlier, bases)) &&
-        !(await earlierRun(context, input, branch, remote, pulls))
+        !(await factoryMade(context, remote, defaultBranch))
       )
         return hold(
-          `Remote branch ${branch} holds a commit Factory did not push (${remote}; Factory pushed ${[...known].join(", ")}). Inspect it; delete or restore the branch and answer retry, or cancel.`,
-          ["cancel", "retry"],
+          `Remote branch ${branch} holds commits Factory did not make (head ${remote}; Factory pushed ${[...known].join(", ")}). Move them off the branch and answer retry; answer ${RESET_BRANCH} to replace the branch with Factory's result, dropping them from it; or cancel.`,
+          ["retry", RESET_BRANCH, "cancel"],
         );
       // Only before a push: a branch that holds the result already has its objects.
       const media = await lfsPushIfPointers({
@@ -333,30 +347,29 @@ export function publish(
 }
 
 /**
- * Whether `remote` is a head of Factory's own from an earlier run: the head
- * of a PR Factory opened for this branch (its body carries Factory's
- * marker), or a commit Factory made (its author is Factory's).
+ * Whether Factory made every commit `remote` has beyond the default branch:
+ * each is committed as FACTORY_EMAIL (Factory commits with a clean Git
+ * environment; an amend, rebase or cherry-pick by anyone else changes the
+ * committer), or is GitHub's update-branch merge (committed by web-flow,
+ * whose other parent is on a base). The whole range is read; a range too
+ * long to read is not Factory's.
  */
-async function earlierRun(
+async function factoryMade(
   context: DeliveryContext,
-  input: PublishInput,
-  branch: string,
   remote: string,
-  pulls: PullRequest[],
+  defaultBranch: string,
 ): Promise<boolean> {
-  const marker = pullMarker(input.issue, input.item.id);
-  if (
-    pulls.some(
-      (pull) =>
-        pull.head.ref === branch &&
-        pull.head.sha === remote &&
-        (pull.body ?? "").includes(marker),
-    )
-  )
-    return true;
-  return (
-    (await context.github.commit(remote, context.signal)).authorEmail ===
-    FACTORY_EMAIL
+  const { total, commits } = await context.github.commitsBeyond(
+    defaultBranch,
+    remote,
+    MAX_OWNED_COMMITS,
+    context.signal,
+  );
+  if (total > commits.length) return false;
+  return commits.every(
+    (commit) =>
+      commit.committerEmail === FACTORY_EMAIL ||
+      (commit.committer === "web-flow" && commit.parents.length === 2),
   );
 }
 
@@ -699,20 +712,20 @@ async function judge(
       finding: `PR #${pr} conflicts with its base branch; rebase the change`,
       conflict: {},
     };
-  // GitHub can report a PR CLEAN before a required check registers on its
-  // head. A required check with no run and no status yet is pending (#626).
+  // A required check with no run and no status yet is pending, whatever
+  // GitHub's readiness says: CLEAN can come before it registers (#626), and
+  // a missing one makes the PR BLOCKED. Missing required checks are judged
+  // before any gate, so one that never registers reaches the hold below
+  // instead of reading as a wait for a review.
   const reported = new Set<string>(
     [
       ...runs.map((run) => run.name),
       ...statuses.map((status) => status.context),
     ].filter((name): name is string => typeof name === "string" && !!name),
   );
-  const unreported =
-    readiness === "ready"
-      ? (await github.requiredChecks(baseBranch, signal)).filter(
-          (name) => !reported.has(name),
-        )
-      : [];
+  const unreported = (await github.requiredChecks(baseBranch, signal)).filter(
+    (name) => !reported.has(name),
+  );
   const pending = [
     ...new Set([
       ...runs
@@ -766,7 +779,8 @@ async function judge(
         );
     }
     // Jobs held for an environment's approval, or a review the branch
-    // requires: people outside Factory decide, so there is no deadline.
+    // requires once every required check is there: people outside Factory
+    // decide, so there is no deadline.
     const approvals = runs
       .filter((run) => run.status === "waiting")
       .map((run) => run.name);

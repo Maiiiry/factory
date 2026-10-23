@@ -11,6 +11,7 @@ import {
   type PullInput,
   publish,
   REPUBLISH,
+  RESET_BRANCH,
   type Repair,
 } from "../delivery.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
@@ -1279,6 +1280,7 @@ async function publishStep(
         ...(flaky ? { flaky: { command: flaky.command, exitCode: null } } : {}),
       },
       ...(republish ? { republish: true } : {}),
+      ...(context.answer?.answer === RESET_BRANCH ? { reset: true } : {}),
       ...(branch ? { baseBranch: branch } : {}),
     },
   );

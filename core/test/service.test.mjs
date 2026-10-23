@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -292,6 +293,7 @@ const GITHUB_CRASH_POINTS = [
   "rerun:pr-comment:after",
   "rerun:pr-close:before",
   "rerun:pr-close:after",
+  "serve:withdrawn",
 ];
 for (const point of GITHUB_CRASH_POINTS)
   test(`crash at ${point}, restart, finish once`, {
@@ -525,5 +527,83 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
   assert.equal(waiting.hold, null, "#32 waits on #31's paths");
   assert.deepEqual(waiting.attempts, {});
   assert.equal(stateOf(inst, 31).hold.step, "item:a:work");
+  await stopped(service);
+});
+
+test("a new wait class starts its own budget and ends a run of errors", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await closedPort()}`);
+  // Eight hours on a human gate, after two errors: then GitHub is down.
+  const long = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+  seed(inst, 23, "checking", {
+    retries: {
+      check: {
+        count: 2,
+        attempts: 9,
+        since: long,
+        nextAt: long,
+        lastError: "Waiting on a required review",
+        cause: "Waiting on a required review",
+        wait: { kind: "gate", gate: "a required review" },
+      },
+    },
+  });
+  const service = serve(inst);
+  await until(
+    () =>
+      !stateOf(inst, 23).retries.check?.wait &&
+      stateOf(inst, 23).retries.check?.attempts >= 2,
+    "transient retries",
+  );
+  const { hold, retries } = stateOf(inst, 23);
+  assert.equal(hold, null, "the gate's hours aren't the transient budget");
+  assert.equal(retries.check.wait, undefined);
+  assert.equal(retries.check.count, 0, "a wait ends the run of errors");
+  assert.ok(Date.parse(retries.check.since) > Date.parse(long) + 60_000);
+  assert.match(retries.check.cause, /GitHub GET/);
+  assert.equal(cli(inst, "cancel", "23").code, 0);
+  await stopped(service);
+});
+
+test("a wait on a human gate takes no slot", async () => {
+  const inst = installation();
+  const later = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  // #41 started first and waits on a review; #42 needs the only slot.
+  seed(inst, 41, "building", {
+    done: { check: {}, plan: { items: [] } },
+    retries: {
+      build: {
+        count: 0,
+        attempts: 1,
+        since: new Date().toISOString(),
+        nextAt: later,
+        lastError: "Waiting on a required review on PR #1",
+        wait: { kind: "gate", gate: "a required review on PR #1" },
+      },
+    },
+  });
+  seed(inst, 42, "planning", { done: { check: {} } });
+  const service = serve(inst);
+  await until(() => stateOf(inst, 42).hold, "#42 runs and asks");
+  assert.equal(stateOf(inst, 41).hold, null, "#41 still waits on its gate");
+  await stopped(service);
+});
+
+test("a state file that can't be read now is read again, not marked unreadable", {
+  skip: process.getuid?.() === 0 && "root reads any file",
+}, async () => {
+  const inst = installation();
+  seed(inst, 43);
+  const file = join(inst.objectives, "43.json");
+  chmodSync(file, 0o000);
+  const service = serve(inst);
+  await until(() => status(inst).service === "running", "service");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  chmodSync(file, 0o600);
+  await until(() => stateOf(inst, 43).hold, "the Objective runs once readable");
+  assert.equal(
+    JSON.parse(readFileSync(join(inst.root, "service.json"))).unreadable[43],
+    undefined,
+  );
   await stopped(service);
 });

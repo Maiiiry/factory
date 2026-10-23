@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -62,11 +63,11 @@ export type Wait =
   | { kind: "gate"; gate: string };
 
 export interface Retry {
-  /** Consecutive escaped errors, missed deadlines and interrupted attempts. */
+  /** Consecutive escaped errors, missed deadlines and interrupted attempts; any other outcome resets it. */
   count: number;
-  /** Retries of any kind in this run of retries; sets the backoff. */
+  /** Retries in this run of one wait class (`Wait`, or an unknown cause); sets the backoff. */
   attempts: number;
-  /** When this run of retries began (wall clock, so a restart doesn't reset it). */
+  /** When this run of one wait class began (wall clock, so a restart doesn't reset it). */
   since: string;
   nextAt: string;
   lastError: string;
@@ -172,17 +173,33 @@ export function saveState(dir: string, state: ObjectiveState): void {
   crashPoint("state:saved");
 }
 
+/** Remove the Objective's state: it was dequeued before it started. */
+export function removeState(dir: string, issue: number): void {
+  rmSync(statePath(dir, issue), { force: true });
+  const dirFd = openSync(dir, "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+}
+
 export type Loaded =
   | { kind: "ok"; state: ObjectiveState }
   | { kind: "unreadable"; issue: number; error: string };
 
+/**
+ * The Objective's state; null when it has none. Only a file that doesn't
+ * parse, or has another version, is unreadable; a read that fails (EMFILE,
+ * EIO) throws, and the caller tries again later.
+ */
 export function loadState(dir: string, issue: number): Loaded | null {
   let text: string;
   try {
     text = readFileSync(statePath(dir, issue), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return { kind: "unreadable", issue, error: String(error) };
+    throw error;
   }
   try {
     const state = JSON.parse(text) as ObjectiveState;

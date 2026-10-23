@@ -13,6 +13,11 @@ export class TransientError extends Error {
     message: string,
     /** When GitHub said to come back, if it did. */
     readonly retryAfterMs?: number,
+    /**
+     * A rate limit (429, or a 403 rate limit): `retryAfterMs` is when it
+     * resets. Otherwise it is only a backoff hint (a 5xx's retry-after).
+     */
+    readonly limited = false,
   ) {
     super(message);
   }
@@ -45,8 +50,9 @@ const TIMEOUT_MS = 60_000;
  * limits are TransientErrors) naming the `permission` the call needs, and
  * a missing repository or issue (404, `missing`). A rate limit waits for
  * its reset. Everything else (5xx, timeouts, 409, 410, 422, GraphQL
- * errors) may change, so it retries as a transient wait. Undefined for an
- * error that isn't GitHub's.
+ * errors) may change, so it retries as an unknown transient wait; a 5xx's
+ * retry-after only sets its backoff. Undefined for an error that isn't
+ * GitHub's.
  */
 export function githubOutcome(
   error: unknown,
@@ -58,14 +64,16 @@ export function githubOutcome(
     return {
       kind: "retry",
       reason: error.message,
-      ...(error.retryAfterMs !== undefined
-        ? {
-            wait: {
-              kind: "reset",
-              at: new Date(Date.now() + error.retryAfterMs).toISOString(),
-            },
-          }
-        : {}),
+      ...(error.retryAfterMs === undefined
+        ? {}
+        : error.limited
+          ? {
+              wait: {
+                kind: "reset",
+                at: new Date(Date.now() + error.retryAfterMs).toISOString(),
+              },
+            }
+          : { afterMs: error.retryAfterMs }),
     };
   if (!(error instanceof GitHubError)) return undefined;
   const detail = error.message.slice(0, 500);
@@ -80,6 +88,13 @@ export function githubOutcome(
   if (error.status === 404)
     return hold(`${missing} (${detail}).`, ["retry", "cancel"], "cancel");
   return { kind: "retry", reason: error.message };
+}
+
+export interface GraphQLError {
+  type?: string;
+  message: string;
+  /** Where in the data it applies: field names and aliases, then indexes. */
+  path?: (string | number)[];
 }
 
 export interface IssueComment {
@@ -153,6 +168,7 @@ export interface AsyncMerge {
 export class GitHub {
   private token: string | undefined;
   private secrets: readonly string[] = [];
+  private self: string | undefined;
 
   constructor(
     readonly repository: string,
@@ -244,16 +260,39 @@ export class GitHub {
     return (await this.markedComment(issue, marker, since, signal))?.id;
   }
 
-  /** The issue comment Factory marked with `marker`, if it exists. */
+  /**
+   * The issue comment Factory marked with `marker`, if it exists. Markers
+   * are predictable, so only a comment by Factory's own login counts:
+   * anyone else's comment that carries one is ignored.
+   */
   async markedComment(
     issue: number,
     marker: string,
     since?: string,
     signal?: AbortSignal,
   ): Promise<IssueComment | undefined> {
-    return (await this.comments(issue, since, signal)).find((c) =>
-      c.body.startsWith(marker),
+    const self = await this.login(signal);
+    return (await this.comments(issue, since, signal)).find(
+      (c) =>
+        c.body.startsWith(marker) &&
+        c.user !== null &&
+        sameLogin(c.user.login, self),
     );
+  }
+
+  /** The login Factory acts as, read once per process. */
+  async login(signal?: AbortSignal): Promise<string> {
+    if (this.self) return this.self;
+    const user = await this.rest<{ login?: unknown }>(
+      "GET",
+      "/user",
+      undefined,
+      signal,
+    );
+    if (typeof user.login !== "string" || !user.login)
+      throw new TransientError("GitHub GET /user: no login");
+    this.self = user.login;
+    return this.self;
   }
 
   /**
@@ -317,6 +356,21 @@ export class GitHub {
     variables: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
+    return (await this.graphqlPartial<T>(query, variables, signal, () => false))
+      .data;
+  }
+
+  /**
+   * A GraphQL read that may come back partial: errors that `accept` takes
+   * (such as one missing issue among many) are returned with the data;
+   * any other error throws as `graphql` does.
+   */
+  async graphqlPartial<T>(
+    query: string,
+    variables: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    accept: (error: GraphQLError) => boolean,
+  ): Promise<{ data: T; errors: GraphQLError[] }> {
     const response = await this.send(
       "POST",
       "/graphql",
@@ -325,16 +379,24 @@ export class GitHub {
     );
     const result = (await response.json()) as {
       data?: T;
-      errors?: { type?: string; message: string }[];
+      errors?: GraphQLError[];
     };
-    if (result.errors?.length) {
-      const message = result.errors.map((e) => e.message).join("; ");
-      if (result.errors.some((e) => e.type === "RATE_LIMITED"))
-        throw new TransientError(`GitHub GraphQL: ${message}`);
+    const errors = result.errors ?? [];
+    const refused = errors.filter((e) => !accept(e));
+    if (refused.length) {
+      const message = refused.map((e) => e.message).join("; ");
+      if (refused.some((e) => e.type === "RATE_LIMITED")) {
+        const reset = Number(response.headers.get("x-ratelimit-reset"));
+        throw new TransientError(
+          `GitHub GraphQL: ${message}`,
+          reset > 0 ? Math.max(0, reset * 1000 - Date.now()) : undefined,
+          true,
+        );
+      }
       throw new GitHubError(`GitHub GraphQL: ${message}`, 200);
     }
     if (!result.data) throw new TransientError("GitHub GraphQL: no data");
-    return result.data;
+    return { data: result.data, errors };
   }
 
   /** Every item of a paginated list of 100 per page, up to `maxPages` pages. */
@@ -534,22 +596,18 @@ export class GitHub {
     sha: string;
     parents: string[];
     committer?: string;
-    authorEmail?: string;
   }> {
     const commit = await this.rest<{
       sha?: string;
       parents?: { sha?: unknown }[];
       committer?: { login?: unknown } | null;
-      commit?: { author?: { email?: unknown } | null } | null;
     }>("GET", this.repo(`commits/${sha}`), undefined, signal);
-    const email = commit.commit?.author?.email;
     return {
       sha: String(commit.sha),
       parents: (commit.parents ?? []).map((parent) => String(parent?.sha)),
       ...(typeof commit.committer?.login === "string"
         ? { committer: commit.committer.login }
         : {}),
-      ...(typeof email === "string" ? { authorEmail: email } : {}),
     };
   }
 
@@ -568,6 +626,67 @@ export class GitHub {
       signal,
     );
     return typeof result.status === "string" ? result.status : undefined;
+  }
+
+  /**
+   * The commits on `head` that `base` doesn't have, up to `max` of them,
+   * with GitHub's count of all of them: each with its parents, its
+   * committer's email, and its committer's login when GitHub knows it.
+   */
+  async commitsBeyond(
+    base: string,
+    head: string,
+    max: number,
+    signal?: AbortSignal,
+  ): Promise<{
+    total: number;
+    commits: {
+      sha: string;
+      parents: string[];
+      committerEmail?: string;
+      committer?: string;
+    }[];
+  }> {
+    const ref = (name: string) =>
+      name.split("/").map(encodeURIComponent).join("/");
+    let total = 0;
+    const commits: Awaited<ReturnType<GitHub["commitsBeyond"]>>["commits"] = [];
+    for (let page = 1; commits.length < max; page++) {
+      const result = await this.rest<{
+        total_commits?: unknown;
+        commits?: {
+          sha?: unknown;
+          parents?: { sha?: unknown }[];
+          committer?: { login?: unknown } | null;
+          commit?: { committer?: { email?: unknown } | null } | null;
+        }[];
+      }>(
+        "GET",
+        this.repo(
+          `compare/${ref(base)}...${ref(head)}?per_page=100&page=${page}`,
+        ),
+        undefined,
+        signal,
+      );
+      if (typeof result.total_commits !== "number" || !result.commits)
+        throw new TransientError(
+          `GitHub compare ${base}...${head}: no commits`,
+        );
+      total = result.total_commits;
+      for (const commit of result.commits) {
+        const email = commit.commit?.committer?.email;
+        commits.push({
+          sha: String(commit.sha),
+          parents: (commit.parents ?? []).map((parent) => String(parent?.sha)),
+          ...(typeof email === "string" ? { committerEmail: email } : {}),
+          ...(typeof commit.committer?.login === "string"
+            ? { committer: commit.committer.login }
+            : {}),
+        });
+      }
+      if (result.commits.length < 100 || commits.length >= total) break;
+    }
+    return { total, commits: commits.slice(0, max) };
   }
 
   /** The latest check run of each check suite on the commit. */
@@ -901,7 +1020,7 @@ export class GitHub {
           /rate limit/i.test(text)));
     // A 401 that a fresh token didn't fix is a login problem, not a hiccup.
     if (response.status === 401) throw new GitHubError(detail, 401, answer);
-    if (limited || response.status >= 500)
+    if (limited)
       throw new TransientError(
         detail,
         retryAfter > 0
@@ -909,6 +1028,14 @@ export class GitHub {
           : reset > 0
             ? Math.max(0, reset * 1000 - Date.now())
             : undefined,
+        true,
+      );
+    // A 5xx is an outage, not a limit: GitHub sends x-ratelimit-* headers on
+    // every answer, so only its retry-after counts, and only as a backoff.
+    if (response.status >= 500)
+      throw new TransientError(
+        detail,
+        retryAfter > 0 ? retryAfter * 1000 : undefined,
       );
     throw new GitHubError(detail, response.status, answer);
   }
@@ -946,6 +1073,12 @@ export class GitHub {
       );
     return this.token;
   }
+}
+
+/** One account, as a user (`name`) or as its app's bot (`name[bot]`). */
+function sameLogin(a: string, b: string): boolean {
+  const plain = (login: string) => login.toLowerCase().replace(/\[bot\]$/, "");
+  return plain(a) === plain(b);
 }
 
 /** A stack as GitHub returns it; a shape Factory can't read is Unreadable. */
