@@ -27,6 +27,12 @@ import { isScalar, parseDocument, visit } from "yaml";
 import type { SandboxConfig } from "./config.js";
 import { hold, type Outcome } from "./engine.js";
 import { githubEmptyField, markdownLines } from "./markdown.js";
+import {
+  hydrateTree,
+  type LfsFile,
+  rewrittenMedia,
+  type SelectedMember,
+} from "./media.js";
 import { installNetworkRefusal } from "./package-network.js";
 import { forceRemove, openParent, within } from "./paths.js";
 import {
@@ -39,6 +45,13 @@ import {
 import { ownsPath } from "./planning/graph.js";
 import { packageManagerUpdate } from "./planning/prompts.js";
 import type { Plan, WorkItem } from "./planning/types.js";
+import {
+  captureReviewArtifacts,
+  plannedReviewArtifactsProblem,
+  type ReviewArtifact,
+  type ReviewArtifactSelector,
+  selectorsFor,
+} from "./review/artifacts.js";
 import { runSandboxed } from "./sandbox.js";
 import { errorMessage, headAndTail } from "./text.js";
 import { privateStagingPath } from "./work/collect.js";
@@ -75,6 +88,33 @@ export interface ValidateInput {
    * under the item's owned paths that Git ignores come back to it.
    */
   returnTo?: string;
+  /**
+   * Review artifact capture, for the validate step and final validation
+   * (never the worker's own Validate). Each passing, non-preparation command
+   * is captured with `selectorsFor(configured, item)` while its checkout and
+   * TMPDIR still exist; the captures come back as `artifacts` in `passed`.
+   */
+  reviewArtifacts?: {
+    /** The installation's selectors now: `config.reviewArtifacts`. */
+    configured: readonly ReviewArtifactSelector[];
+    /**
+     * The selectors the plan was compiled and reviewed with. One the
+     * installation no longer configures holds before anything runs.
+     */
+    planned?: readonly ReviewArtifactSelector[];
+    /** Private capture directory, such as `<state>/artifacts/<issue>/<item>` or `.../final`; emptied first. */
+    dir: string;
+  };
+  /** Origin's `owner/name`: Git LFS objects the local store lacks are fetched from it. */
+  repository: string;
+  /**
+   * The selected media the tree must hold: media's `validationMembers(plan,
+   * item, selection)`. Every Git LFS file of the tree, these and any other,
+   * is restored before any command runs (hydrateTree); restored files are
+   * left out of the clean and mutation checks, and after the commands
+   * their bytes must still be their pointers'.
+   */
+  media?: readonly SelectedMember[];
   signal: AbortSignal;
   log(event: Record<string, unknown>): void;
 }
@@ -98,6 +138,8 @@ export type Validation =
       results: CommandResult[];
       /** What came back to `returnTo`, for the worker; absent when nothing did. */
       produced?: string;
+      /** Every review artifact captured, in command order; present when `reviewArtifacts` was given. */
+      artifacts?: ReviewArtifact[];
     }
   /** The candidate's fault: the step repairs it. */
   | {
@@ -106,7 +148,7 @@ export type Validation =
       commands: string[];
       /** The commands that passed before the failure. */
       results: CommandResult[];
-      /** The failed command, when one ran; absent for a pin or the mutation check. */
+      /** The failed command, when one ran or its review artifact capture failed; absent for a pin or the mutation check. */
       failed?: { index: number; command: string };
       /** What people read: the start and end of the output. */
       detail: string;
@@ -116,7 +158,18 @@ export type Validation =
     }
   | Extract<Outcome, { kind: "retry" | "hold" }>;
 
-/** Validate `commit`: pins first, then every command in a fresh checkout. */
+/**
+ * Validate `commit`: pins first, then every command in a fresh checkout.
+ *
+ * Outcomes: `passed` → done (keep `artifacts` in the done result for
+ * review); `failed` → repair in the validate step (final validation: the
+ * final step's handling of a failed command), and a failed review artifact
+ * capture is one, naming its command; `retry` → retry; `hold` → hold. A
+ * plan selector the installation dropped is a hold with retry (after the
+ * selector is restored), replan or cancel; a required media member whose
+ * pointer is gone, a Git LFS file neither the local store nor origin can
+ * restore, or LFS files over the bound are media's hold (hydrateTree).
+ */
 export async function validateTree(input: ValidateInput): Promise<Validation> {
   const { checkout, commit, plan, item } = input;
   const { preparation, commands } = item
@@ -132,6 +185,16 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
     return hold(
       "Factory does not validate trees that contain submodule gitlinks: host-side Git would enter repositories sandboxed commands can write. Use Factory on a repository without submodules.",
     );
+  const capture = input.reviewArtifacts;
+  const dropped =
+    capture?.planned &&
+    plannedReviewArtifactsProblem(capture.planned, capture.configured);
+  if (dropped)
+    return hold(
+      `${dropped}. Restore these selectors in the installation's reviewArtifacts (others may stay or be added) and answer retry, answer replan to plan again with the current selectors, or cancel.`,
+      ["retry", "replan", "cancel"],
+    );
+  const selectors = capture ? selectorsFor(capture.configured, item) : [];
   const refusal = await pinRefusal(
     new Revisions(checkout, commit, signal),
     plan.base,
@@ -217,8 +280,20 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       return hold(
         `The validation checkout's tree ${checkedOut} is not the candidate's tree ${tree}. Answer retry to make it again; if it repeats, report it: Factory's checkout is wrong.`,
       );
+    // Git LFS files arrive as pointers; commands get their bytes, as in a
+    // clone. Restored files differ from their pointer blobs by design.
+    const restored = await hydrateTree({
+      directory: worktree,
+      repository: input.repository,
+      commit,
+      members: input.media ?? [],
+      signal,
+    });
+    if (restored.kind !== "done") return restored;
+    const lfsFiles: readonly LfsFile[] = restored.value;
+    const hydrated = new Set(lfsFiles.map((file) => file.path));
     const baseline = await status(worktree, signal);
-    const dirty = mutationDetail(Buffer.alloc(0), baseline);
+    const dirty = mutationDetail(Buffer.alloc(0), baseline, hydrated);
     if (dirty) {
       // Checkout filters (line-ending or other attributes) rewrite what
       // the candidate committed; the candidate commits files as checked out.
@@ -233,6 +308,7 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       };
     }
     const results: CommandResult[] = [];
+    let artifacts: ReviewArtifact[] = [];
     for (const [index, command] of sequence.entries()) {
       const preparing = index < preparation.length;
       // Only Factory's exact script-disabled install, run first (before any
@@ -297,6 +373,36 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
           durationMs,
           tail: output.slice(-PASSED_OUTPUT_TAIL),
         });
+        if (preparing || !capture || !selectors.length) continue;
+        // Capture reads the full output and the TMPDIR, so it runs now,
+        // before the next command and before cleanup.
+        const captured = await captureReviewArtifacts({
+          selectors,
+          checkout,
+          worktree,
+          tree,
+          commandIndex: index,
+          command,
+          stdout: run.stdout,
+          stderr: run.stderr,
+          truncated: run.truncated,
+          temporary,
+          dir: capture.dir,
+          prior: artifacts,
+          signal,
+        });
+        if (captured.kind === "retry") return captured;
+        if (captured.kind === "failed")
+          return {
+            kind: "failed",
+            tree,
+            commands: sequence,
+            results,
+            failed: { index, command },
+            detail: captured.detail,
+            output: captured.detail,
+          };
+        artifacts = captured.artifacts;
         continue;
       }
       // Past the sandbox's disk budget or the time limit the command
@@ -364,7 +470,14 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
     }
     if (input.returnTo && item)
       produced = await returnProduced(worktree, input.returnTo, item, signal);
-    const mutation = mutationDetail(baseline, await status(worktree, signal));
+    // Hydrated files are left out of the status comparison, so their
+    // bytes are checked against their pointers instead.
+    const rewritten = await rewrittenMedia(worktree, lfsFiles);
+    const mutation =
+      mutationDetail(baseline, await status(worktree, signal), hydrated) ??
+      (rewritten.length
+        ? `Git LFS files rewritten: ${rewritten.slice(0, 20).join(", ")}${rewritten.length > 20 ? ` and ${rewritten.length - 20} more` : ""}`
+        : undefined);
     if (mutation || (await revParse(worktree, "HEAD", signal)) !== commit) {
       const detail = `Validation command modified the result tree: ${mutation ?? "HEAD moved"}`;
       return {
@@ -383,6 +496,7 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       commands: sequence,
       results,
       ...(produced && { produced }),
+      ...(capture && { artifacts }),
     };
   } finally {
     await Promise.all(scratch.map((path) => forceRemove(path)));
@@ -438,14 +552,24 @@ async function revParse(
     .trim();
 }
 
-/** The status records that differ between two listings, at most 20 paths, or undefined. */
-function mutationDetail(before: Buffer, after: Buffer): string | undefined {
+/**
+ * The status records that differ between two listings, at most 20 paths, or
+ * undefined. A `hydrated` Git LFS file's modified record is left out: its
+ * bytes replaced its pointer on purpose (rewrittenMedia checks those bytes).
+ * Deleting or renaming it still counts.
+ */
+function mutationDetail(
+  before: Buffer,
+  after: Buffer,
+  hydrated: ReadonlySet<string>,
+): string | undefined {
   const records = (listing: Buffer) => {
     const fields = listing.toString("utf8").split("\0");
     const result: string[] = [];
     for (let index = 0; index < fields.length; index += 1) {
       const field = fields[index]!;
       if (!field) continue;
+      if (field.startsWith(" M ") && hydrated.has(field.slice(3))) continue;
       // A rename or copy carries its source as the next field.
       if (/[RC]/.test(field.slice(0, 2)))
         result.push(`${field} (from ${fields[++index]})`);

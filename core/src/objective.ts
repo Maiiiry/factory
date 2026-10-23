@@ -146,3 +146,20 @@ export function validPath(path: string): boolean {
     path.split("/").some((part) => !part || part === "." || part === "..")
   );
 }
+
+/**
+ * Whether the Objective names `path` as a whole token: a code span's
+ * whole text, or a word between whitespace, quotes or brackets (sentence
+ * punctuation after it aside). A prefix or part of a named path is not
+ * named. Planning's source-asset check and resolveInputs both use it.
+ */
+export function namesPath(body: string, path: string): boolean {
+  if (!path) return false;
+  const spans = body.split("`").filter((_, index) => index % 2 === 1);
+  return (
+    spans.some((span) => span.trim() === path) ||
+    body
+      .split(/[\s`'"()<>[\]{}]+/)
+      .some((word) => word.replace(/[.,;:!?]+$/, "") === path)
+  );
+}

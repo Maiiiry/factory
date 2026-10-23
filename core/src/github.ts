@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { redact } from "./log.js";
 import { errorMessage } from "./text.js";
 
 const run = promisify(execFile);
@@ -15,11 +16,20 @@ export class TransientError extends Error {
   }
 }
 
+/**
+ * A preview-API answer (native stacks) in a shape Factory can't read. It
+ * is a TransientError, so it retries wherever it escapes; delivery turns a
+ * run of them into a question after GitHub's lag window.
+ */
+export class Unreadable extends TransientError {}
+
 /** GitHub answered, and the answer won't change by asking again: 404, 422. */
 export class GitHubError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** The response body as JSON, when it was JSON. */
+    readonly body?: unknown,
   ) {
     super(message);
   }
@@ -70,6 +80,25 @@ export interface WorkflowRun {
   conclusion?: unknown;
 }
 
+/** A native stack of PRs: its base branch and its PRs, bottom first. */
+export interface Stack {
+  number: number;
+  base: string;
+  pulls: number[];
+}
+
+/**
+ * A merge-async request: `pending` with the uuid to poll, `queued` (a
+ * merge queue holds it, nothing to poll), `merged` with the merge commit,
+ * or `failed` with GitHub's reason.
+ */
+export interface AsyncMerge {
+  status: string;
+  uuid?: string;
+  sha?: string;
+  message?: string;
+}
+
 /**
  * A small GitHub client. The token comes from the GitHub CLI login and stays
  * in the service; workers never see it. Every request has a deadline, and
@@ -77,11 +106,22 @@ export interface WorkflowRun {
  */
 export class GitHub {
   private token: string | undefined;
+  private secrets: readonly string[] = [];
 
   constructor(
     readonly repository: string,
     private readonly api = "https://api.github.com",
   ) {}
+
+  /**
+   * Redact these secret values (policy.allowedSecretNames) from every text
+   * Factory writes to GitHub: comments, PR bodies, titles. One choke point,
+   * so no hold, report or log excerpt can carry a value a worker saw.
+   */
+  redacting(secrets: readonly string[]): this {
+    this.secrets = secrets.filter((secret) => secret.length >= 4);
+    return this;
+  }
 
   get owner(): string {
     return this.repository.split("/")[0]!;
@@ -301,6 +341,77 @@ export class GitHub {
       this.repo(`pulls/${number}/merge`),
       { sha, merge_method: "merge" },
       signal,
+    );
+  }
+
+  // ── Native stacks (preview API; only this file calls it) ──────────────
+
+  /** The stacks that hold `pull`: none, or the one stack it is a layer of. */
+  async findStack(pull: number, signal?: AbortSignal): Promise<Stack[]> {
+    const listed = await this.rest<unknown>(
+      "GET",
+      this.repo(`stacks?pull_request=${pull}`),
+      undefined,
+      signal,
+    );
+    if (!Array.isArray(listed))
+      throw new Unreadable(`GitHub GET stacks of PR #${pull}: not a list`);
+    return listed.map((stack) => stackOf(stack));
+  }
+
+  /** Register `pulls`, bottom first, as one native stack. */
+  async createStack(pulls: number[], signal?: AbortSignal): Promise<Stack> {
+    return stackOf(
+      await this.rest<unknown>(
+        "POST",
+        this.repo("stacks"),
+        { pull_requests: pulls },
+        signal,
+      ),
+    );
+  }
+
+  /**
+   * Merge a native stack through its top PR with one merge commit, only if
+   * the top's head is still `sha`. A request already pending (an earlier
+   * one whose answer was lost) comes back as `pending` with its uuid.
+   */
+  async mergeAsync(
+    top: number,
+    sha: string,
+    signal?: AbortSignal,
+  ): Promise<AsyncMerge> {
+    try {
+      return asyncMergeOf(
+        await this.rest<unknown>(
+          "PUT",
+          this.repo(`pulls/${top}/merge-async`),
+          { sha, merge_method: "merge", merge_action: "default" },
+          signal,
+        ),
+      );
+    } catch (error) {
+      if (error instanceof GitHubError && error.status === 409) {
+        const pending = asyncMergeOf(error.body);
+        if (pending.status === "pending" && pending.uuid) return pending;
+      }
+      throw error;
+    }
+  }
+
+  /** Where a merge-async request on `top` stands. */
+  async mergeStatus(
+    top: number,
+    uuid: string,
+    signal?: AbortSignal,
+  ): Promise<AsyncMerge> {
+    return asyncMergeOf(
+      await this.rest<unknown>(
+        "GET",
+        this.repo(`pulls/${top}/merge-async/${encodeURIComponent(uuid)}`),
+        undefined,
+        signal,
+      ),
     );
   }
 
@@ -633,7 +744,13 @@ export class GitHub {
           ...(body === undefined ? {} : { "content-type": "application/json" }),
           ...headers,
         },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined
+          ? {}
+          : {
+              body: JSON.stringify(
+                method === "GET" ? body : redactDeep(body, this.secrets),
+              ),
+            }),
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
       });
     } catch (error) {
@@ -644,6 +761,12 @@ export class GitHub {
     }
     if (response.ok) return response;
     const text = await response.text().catch(() => "");
+    let answer: unknown;
+    try {
+      answer = JSON.parse(text);
+    } catch {
+      answer = undefined;
+    }
     const detail = `GitHub ${method} ${path}: ${response.status} ${text.slice(0, 300)}`;
     if (response.status === 401 && !refreshed)
       return this.send(method, path, body, signal, headers, true);
@@ -655,7 +778,7 @@ export class GitHub {
         (response.headers.get("x-ratelimit-remaining") === "0" ||
           /rate limit/i.test(text)));
     // A 401 that a fresh token didn't fix is a login problem, not a hiccup.
-    if (response.status === 401) throw new GitHubError(detail, 401);
+    if (response.status === 401) throw new GitHubError(detail, 401, answer);
     if (limited || response.status >= 500)
       throw new TransientError(
         detail,
@@ -665,7 +788,12 @@ export class GitHub {
             ? Math.max(0, reset * 1000 - Date.now())
             : undefined,
       );
-    throw new GitHubError(detail, response.status);
+    throw new GitHubError(detail, response.status, answer);
+  }
+
+  /** The service token, for downloads outside the REST API (media attachments). */
+  serviceToken(): Promise<string> {
+    return this.auth(false);
   }
 
   private async auth(refresh: boolean): Promise<string> {
@@ -692,4 +820,62 @@ export class GitHub {
       );
     return this.token;
   }
+}
+
+/** A stack as GitHub returns it; a shape Factory can't read is Unreadable. */
+function stackOf(value: unknown): Stack {
+  const stack = value as {
+    number?: unknown;
+    base?: { ref?: unknown } | null;
+    pull_requests?: unknown;
+  } | null;
+  const pulls = Array.isArray(stack?.pull_requests)
+    ? stack.pull_requests.map(
+        (pull) => (pull as { number?: unknown } | null)?.number,
+      )
+    : [];
+  if (
+    typeof stack?.number !== "number" ||
+    typeof stack.base?.ref !== "string" ||
+    !pulls.length ||
+    !pulls.every((number) => typeof number === "number")
+  )
+    throw new Unreadable("GitHub returned a native stack Factory can't read");
+  return {
+    number: stack.number,
+    base: stack.base.ref,
+    pulls: pulls as number[],
+  };
+}
+
+function asyncMergeOf(value: unknown): AsyncMerge {
+  const body = value as {
+    status?: unknown;
+    details?: { uuid?: unknown; sha?: unknown; message?: unknown } | null;
+  } | null;
+  const details = body?.details;
+  return {
+    status: typeof body?.status === "string" ? body.status : "unknown",
+    ...(typeof details?.uuid === "string" &&
+    /^[A-Za-z0-9-]{1,64}$/.test(details.uuid)
+      ? { uuid: details.uuid }
+      : {}),
+    ...(typeof details?.sha === "string" && /^[a-f0-9]{40}$/.test(details.sha)
+      ? { sha: details.sha }
+      : {}),
+    ...(typeof details?.message === "string"
+      ? { message: details.message.slice(0, 500) }
+      : {}),
+  };
+}
+
+/** Every string inside `value`, redacted; the shape is kept. */
+function redactDeep(value: unknown, secrets: readonly string[]): unknown {
+  if (typeof value === "string") return redact(value, secrets);
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, secrets));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [k, redactDeep(v, secrets)]),
+    );
+  return value;
 }

@@ -111,6 +111,8 @@ export interface ClaudeWorkerOptions {
   plan: Plan;
   /** The Objective body as planned: its package-manager and workspace pins. */
   body: string;
+  /** Origin's `owner/name`: Validate fetches Git LFS objects the local store lacks from it. */
+  repository: string;
   /** Operator variables the worker's commands may see, by name. */
   allowedSecretNames?: readonly string[];
 }
@@ -724,6 +726,7 @@ class Attempt {
     const { tree, commit } = snapped;
     const result = await validateTree({
       checkout: input.worktree,
+      repository: options.repository,
       directory: `${input.worktree}.validation`,
       commit,
       item: input.item,

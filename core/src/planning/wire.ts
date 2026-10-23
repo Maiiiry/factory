@@ -44,6 +44,8 @@ export interface WireOptions {
   child?: boolean;
   /** Execution profiles the planner chooses from, by id. */
   profiles?: { id: string }[];
+  /** The installation configures reviewArtifacts selectors, so validation captures. */
+  reviewArtifacts?: boolean;
 }
 
 /** A choice the planner can revise. Caught inside this module and returned as a Finding. */
@@ -122,8 +124,22 @@ const short = (criterion: string, max: number): string => {
 const AGGREGATE_ACCEPTANCE =
   "Every explicit child Work Item has completed acceptance. Implementation child results are integrated into this aggregate's exact candidate; read-only QA and aggregate children have accepted proof against that candidate without a worker or delivery.";
 
+/**
+ * The guarantees this installation gives: review artifact capture only
+ * when it configures selectors.
+ */
+export function controllerGuarantees(
+  reviewArtifacts: boolean,
+): { id: string; statement: string }[] {
+  return reviewArtifacts
+    ? CONTROLLER_GUARANTEES
+    : CONTROLLER_GUARANTEES.filter(
+        (entry) => entry.id !== "review-artifact-capture",
+      );
+}
+
 /** What Factory itself guarantees; a final-controller proof names one by index. */
-export const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
+const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
   {
     id: "independent-result-review",
     statement:
@@ -142,7 +158,7 @@ export const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
   {
     id: "selected-set-materialization",
     statement:
-      "Factory captures complete candidate AssetSets in private staging and stops for explicit human whole-set selection. It then materializes only selected bytes to Work Item-owned destinations, enforces the target Git attributes for every required LFS role, scans the staged result, and verifies each committed LFS pointer against the captured SHA-256 digest and byte count.",
+      "Factory captures complete candidate AssetSets in private staging and stops for explicit human whole-set selection. It then materializes only selected bytes to Work Item-owned destinations, enforces the target Git attributes for every required LFS role, scans the staged result, and verifies each committed LFS pointer against the captured SHA-256 digest and byte count. Unselected sets stay in private staging: they are never committed, validated, reviewed as delivered bytes or merged; review receives a controller receipt of every captured set and the selection.",
   },
   {
     id: "review-artifact-capture",
@@ -228,7 +244,7 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
   const sources = facts.sources;
   const obligations = facts.coverageObligations;
   const checkNames = facts.checkNames;
-  const guarantees = CONTROLLER_GUARANTEES;
+  const guarantees = controllerGuarantees(Boolean(options.reviewArtifacts));
   const itemSchema = strict({
     kind: text,
     id: {
@@ -279,6 +295,19 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
     },
     priority: { type: "integer" },
     resources: { type: "array", items: text },
+    scheduling: {
+      description:
+        "Optional advisory duration for this item, including preparation, validation and review; Factory uses it only to order runnable items by critical path. null means unknown; an estimate grants no capacity or deadline.",
+      anyOf: [
+        { type: "null" },
+        strict({
+          // A decimal pattern, as for minimumAssetSets: numeric bounds are not
+          // supported by every structured-output grammar.
+          estimatedDurationMs: { type: "string", pattern: "^[1-9][0-9]*$" },
+          reason: { ...text, minLength: 1 },
+        }),
+      ],
+    },
     validation: {
       type: "array",
       items: {
@@ -337,7 +366,12 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
           },
           // Numeric bounds are not supported by every structured-output grammar.
           // A decimal pattern enforces positivity before strict safe-integer decoding.
-          minimumAssetSets: { type: "string", pattern: "^[1-9][0-9]*$" },
+          minimumAssetSets: {
+            type: "string",
+            pattern: "^[1-9][0-9]*$",
+            description:
+              "How many alternative sets the worker offers for the operator to choose from; only the selected set is delivered and validated.",
+          },
           requiredLfsRoles: { type: "array", items: text },
         }),
       ],
@@ -1241,6 +1275,7 @@ function decodeItem(wire: Contract, raw: unknown, lint: Finding[]): WorkItem {
   );
   const children = list("children");
   const resources = list("resources");
+  const scheduling = schedulingHint(item.scheduling);
   const decoded: WorkItem = {
     kind: kind as WorkItem["kind"] & string,
     id,
@@ -1257,6 +1292,7 @@ function decodeItem(wire: Contract, raw: unknown, lint: Finding[]): WorkItem {
     ...(children.length ? { children } : {}),
     ...(resources.length ? { resources } : {}),
     ...(item.priority ? { priority: item.priority as number } : {}),
+    ...(scheduling ? { scheduling } : {}),
   };
   if (kind !== "work") return decoded;
   if (item.executionProfile !== undefined) {
@@ -1329,6 +1365,24 @@ function decodeItem(wire: Contract, raw: unknown, lint: Finding[]): WorkItem {
       decoded.ownedPaths.push(manifest);
   }
   return decoded;
+}
+
+/**
+ * The item's advisory duration estimate, decoded from the wire's decimal
+ * string; null is unknown. Only the shape is read here: graph.ts
+ * (`itemFields`) is the one place that validates the values, for every draft.
+ */
+function schedulingHint(value: unknown): WorkItem["scheduling"] | undefined {
+  if (value === null) return undefined;
+  const hint = object(value, "scheduling");
+  keys(hint, ["estimatedDurationMs", "reason"], "scheduling");
+  return {
+    estimatedDurationMs: Number(hint.estimatedDurationMs),
+    reason:
+      typeof hint.reason === "string"
+        ? hint.reason.trim()
+        : (hint.reason as string),
+  };
 }
 
 /** A validation choice: a line of a pinned source, or a command observed at the base. */

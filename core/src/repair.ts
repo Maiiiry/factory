@@ -28,7 +28,13 @@ export type RepairFinding =
    * names, URLs and excerpts GitHub supplied), a conflict, or a collection
    * refusal.
    */
-  | { kind: "failure"; detail: string };
+  | { kind: "failure"; detail: string }
+  /**
+   * The change was moved onto a new base: its PR conflicted with its base,
+   * or the stack layer below it moved. A mechanical repair: the worker
+   * resolves what the replay left, with no diagnosis (see work/steps.ts).
+   */
+  | { kind: "conflict"; detail: string };
 
 export interface Correction {
   source: "review-findings" | "diagnosis" | "operator";
@@ -127,7 +133,7 @@ function accepted(
 
 /** The failure as text: every refused criterion, or the failure detail. */
 function failureDetail(finding: RepairFinding): string {
-  if (finding.kind === "failure") return finding.detail;
+  if (finding.kind !== "review") return finding.detail;
   return finding.refused
     .map(
       (refused) =>

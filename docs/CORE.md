@@ -86,8 +86,8 @@ The service loop:
 ```text
 every second:   apply request files
 every 30 s:     read the queue (on failure, keep the last good view)
-for the active Objective (one at a time in v1):
-    pick the next runnable steps (up to 2 Work Items at once)
+for each active Objective (up to queue.maxActiveObjectives):
+    pick the next runnable steps (up to execution.concurrency at once)
     run each step with its deadline → outcome → save state → log
 ```
 
@@ -176,6 +176,7 @@ A hold is a question with named answers:
 - **In an agent host.** The director skill shows each open hold with the host's question tool (Claude Code's AskUserQuestion, or its Codex equivalent): the question, each answer with the recommended one first, and a one-line consequence for each. That gives the operator an app notification. The chosen answer runs `factory answer`. `factory status --json` lists open holds in this shape so the skill needs no parsing.
 - An answer that doesn't match the open hold gets a reply naming the valid answers. Nothing else changes.
 - `cancel` is valid at every hold and at any time.
+- **Repair diagnosis.** When diagnosing a refused result needs a decision, the work step holds with `answer <decision>` (a correction for the worker), `retry` (diagnose again) and `cancel`. While the refused result is kept, still exists on the item's base and (for media) its selection stands, it also offers `revalidate`: the result was correct and Factory's check was at fault. The work step then finishes with that same result, without the worker or collection, and the selection, validation, review and delivery run again. It isn't counted as a repair, and a rerun after a crash does the same.
 
 ## Cancel
 

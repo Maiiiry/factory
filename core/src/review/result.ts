@@ -3,7 +3,10 @@
  * candidate tree and judges every criterion. The reviewer's working
  * directory is a private read-only evidence root with `candidate/` (the
  * exported result), `base/` (the base copy of each changed path),
- * `changes/` (each changed path's complete patch) and `changes/INDEX.json`.
+ * `changes/` (each changed path's complete patch), `changes/INDEX.json`
+ * and, when validation captured review artifacts, `artifacts/`; for an
+ * item with candidate media sets, a controller candidate receipt and
+ * `media-sets/` (media.ts candidateReceipts).
  * The prompt carries the criteria and indexed evidence rows; the reviewer
  * cites rows by index. A refusal lists every refused criterion at once, for
  * repair (repair.ts); a needs-human verdict becomes a question for the
@@ -14,6 +17,7 @@
 import { lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { type CandidateRecord, candidateReceipts } from "../media.js";
 import { validPath } from "../objective.js";
 import { coverageCriterion, isRecord } from "../planning/graph.js";
 import { TREE_READ_GUIDANCE } from "../planning/prompts.js";
@@ -26,6 +30,11 @@ import { DESIGN_CHECKLIST, ENGINEERING_STANDARD } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
 import type { Planner } from "../providers/planner.js";
 import { hostGit } from "../worktree.js";
+import {
+  REVIEW_ARTIFACT_GUIDANCE,
+  type ReviewArtifact,
+  reviewArtifactEvidence,
+} from "./artifacts.js";
 
 /**
  * The criteria a result review judges: the item's own acceptance, then each
@@ -128,6 +137,13 @@ export interface ResultReviewInput {
   dir: string;
   /** The worker's handoff and verification notes, rendered. */
   notes?: string;
+  /** The item's captured candidate sets and the operator's selection. */
+  candidates?: readonly CandidateRecord[];
+  /**
+   * What the validate step captured (its passed result's artifacts): text
+   * rows, and images the reviewer sees. Captures of another tree are ignored.
+   */
+  artifacts?: readonly ReviewArtifact[];
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
   decisions?: readonly CriterionDecision[];
   signal: AbortSignal;
@@ -156,18 +172,34 @@ export async function reviewResult(
   const root = await evidenceRoot(input.dir, tree);
   try {
     const { changes, rows } = await materialize(input, root);
+    const captured = await reviewArtifactEvidence(
+      [{ artifacts: input.artifacts ?? [] }],
+      tree,
+      root,
+    );
+    const receipts = await candidateRows(root, input.candidates);
     const evidence = [
       ...sourceRows(input.sources),
       ...controllerRows(input, changes),
+      ...receipts,
+      ...captured.rows,
       ...rows,
     ];
     const ask = async (previousInvalid?: string) => {
       const answer = await input.planner.answer({
         role: "reviewer",
         phase: "result-review",
-        prompt: renderResultReview(input, criteria, evidence, previousInvalid),
+        prompt: renderResultReview(
+          input,
+          criteria,
+          evidence,
+          captured.rows.length > 0,
+          receipts.length > 0,
+          previousInvalid,
+        ),
         schema: resultReviewSchema(evidence),
         readDir: root,
+        ...(captured.images.length ? { images: captured.images } : {}),
         signal: input.signal,
         log: input.log,
       });
@@ -751,6 +783,24 @@ function controllerRows(
   ];
 }
 
+/** The evidence path of an item's controller candidate receipt. */
+export function receiptPath(itemId: string): string {
+  return `Controller candidate receipt: ${itemId}`;
+}
+
+/** The controller candidate receipt of each item with a selection; see candidateReceipts. */
+export async function candidateRows(
+  root: string,
+  candidates: readonly CandidateRecord[] = [],
+): Promise<ResultEvidence[]> {
+  return (await candidateReceipts(root, candidates)).map((receipt) => ({
+    origin: "controller",
+    path: receiptPath(receipt.item),
+    content: receipt.content,
+    complete: true,
+  }));
+}
+
 /** Each pinned source as a complete source row. */
 export function sourceRows(sources: readonly PinnedSource[]): ResultEvidence[] {
   return sources.map((source) => ({
@@ -997,6 +1047,13 @@ export const REVIEW_GUIDANCE = {
 };
 
 /**
+ * How review judges an item that offered candidate media sets: both the
+ * result and the final review give it when a candidate receipt is supplied.
+ */
+export const CANDIDATE_GUIDANCE =
+  "Candidate media sets: alternatives exist so the operator can choose one. Factory delivers, validates, reviews, publishes and merges only the selected set; unselected sets stay in Factory's private staging and are never committed or validated, by design. Judge a criterion about the alternatives (how many were offered, that each was complete, how they differ) from the Controller candidate receipt: it lists every captured set with each member's role, destination, media type, size and sha256, the capture checks every set passed, which roles' bytes differ across sets, and the operator's selection; where a member has a reviewCopy, media-sets/ holds Factory's digest-checked copy of its bytes for read-only comparison. The operator viewed every set before choosing, so the selection is the human judgment of the alternatives' appearance; never ask the operator to confirm it again. Judge the delivered bytes (format, content, tests) from the selected set in candidate/ and the validation that passed on this tree. A criterion worded about each candidate or every alternative is judged for the delivered selection plus the receipt's facts about the alternatives: never ask for, and never refuse or hold for missing, validation, tests or review of an unselected set.";
+
+/**
  * The result-review prompt: product logic kept verbatim from the old
  * reviewer, trimmed to what the core supplies: no receipts, bindings or
  * historical references. Instructions
@@ -1007,6 +1064,8 @@ function renderResultReview(
   input: ResultReviewInput,
   criteria: readonly string[],
   evidence: readonly ResultEvidence[],
+  artifacts: boolean,
+  candidates: boolean,
   previousInvalid?: string,
 ): string {
   const itemCriteria = input.item.acceptance.length;
@@ -1027,6 +1086,8 @@ function renderResultReview(
     REVIEW_GUIDANCE.design,
     REVIEW_GUIDANCE.labels,
     REVIEW_GUIDANCE.evidenceRoot,
+    ...(artifacts ? [REVIEW_ARTIFACT_GUIDANCE] : []),
+    ...(candidates ? [CANDIDATE_GUIDANCE] : []),
   ].join("\n");
   return reviewPrompt(
     instructions,

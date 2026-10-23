@@ -398,7 +398,10 @@ export class ObjectiveRunner {
         for (const cleared of outcome.clear) {
           delete state.done[cleared];
           delete state.answers[cleared];
+          delete state.attempts[cleared];
+          if (cleared !== outcome.target) delete state.retries[cleared];
         }
+        this.abortRunning(outcome.clear);
         state.repairs ??= {};
         const repair = state.repairs[outcome.target] ?? {
           count: 0,
@@ -421,6 +424,23 @@ export class ObjectiveRunner {
         break;
       }
     }
+  }
+
+  /**
+   * Stop the running steps among `keys` once the change is saved, as cancel
+   * does: the work they build on was cleared, so their late outcomes would
+   * write back stale results. The token check in `start` drops them.
+   */
+  private abortRunning(keys: readonly string[]): void {
+    const stale = keys.filter((key) => this.running.has(key));
+    if (!stale.length) return;
+    this.afterSave.push(() => {
+      for (const key of stale) {
+        this.running.get(key)?.controller.abort(new Error("cleared"));
+        this.running.delete(key);
+      }
+      this.log.write(this.state.issue, { event: "aborted", steps: stale });
+    });
   }
 
   /**

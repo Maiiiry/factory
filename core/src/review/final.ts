@@ -12,13 +12,21 @@
  * operator. Provider failures escape as `PlannerError`.
  */
 import { rm } from "node:fs/promises";
+import type { CandidateRecord } from "../media.js";
 import { parseObjective } from "../objective.js";
 import { coverageCriterion } from "../planning/graph.js";
 import { DESIGN_CHECKLIST } from "../planning/rubric.js";
 import type { PinnedSource, Plan, WorkItem } from "../planning/types.js";
 import type { Planner } from "../providers/planner.js";
 import {
+  REVIEW_ARTIFACT_GUIDANCE,
+  type ReviewArtifactGroup,
+  reviewArtifactEvidence,
+} from "./artifacts.js";
+import {
+  CANDIDATE_GUIDANCE,
   type CriterionDecision,
+  candidateRows,
   changeIndexRow,
   decisionRows,
   decodeResultReview,
@@ -48,7 +56,16 @@ export async function reviewObjective(input: {
   /** Each Work Item's merge commit, in merge order: the change under review. */
   merges: readonly string[];
   validation: PassedValidation;
+  /**
+   * Captures of the integrated tree: final validation's (no itemId), then
+   * each merged Work Item's validate captures with its itemId, reused only
+   * where their tree is the integrated tree and final validation didn't
+   * capture the same output.
+   */
+  artifacts?: readonly ReviewArtifactGroup[];
   sources: readonly PinnedSource[];
+  /** Each merged item's captured candidate sets and the operator's selection. */
+  candidates?: readonly CandidateRecord[];
   /** A private directory for the evidence root. */
   dir: string;
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
@@ -70,6 +87,12 @@ export async function reviewObjective(input: {
   const root = await evidenceRoot(input.dir, tree);
   try {
     const { changes, rows } = await materialize(input, root);
+    const captured = await reviewArtifactEvidence(
+      input.artifacts ?? [],
+      tree,
+      root,
+    );
+    const receipts = await candidateRows(root, input.candidates);
     const evidence: ResultEvidence[] = [
       ...sourceRows(input.sources),
       ...input.plan.items.map(
@@ -83,6 +106,8 @@ export async function reviewObjective(input: {
       ...decisionRows(input.plan),
       changeIndexRow(input.base, input.commit, tree, changes, input.merges),
       validationRow(input.validation),
+      ...receipts,
+      ...captured.rows,
       ...rows,
     ];
     const ask = async (previousInvalid?: string) => {
@@ -90,7 +115,11 @@ export async function reviewObjective(input: {
         role: "reviewer",
         phase: "objective-review",
         prompt: reviewPrompt(
-          FINAL_INSTRUCTIONS,
+          [
+            FINAL_INSTRUCTIONS,
+            ...(captured.rows.length ? [REVIEW_ARTIFACT_GUIDANCE] : []),
+            ...(receipts.length ? [CANDIDATE_GUIDANCE] : []),
+          ].join("\n"),
           criteria,
           evidence,
           input.base,
@@ -99,6 +128,7 @@ export async function reviewObjective(input: {
         ),
         schema: resultReviewSchema(evidence),
         readDir: root,
+        ...(captured.images.length ? { images: captured.images } : {}),
         signal: input.signal,
         log: input.log,
       });
