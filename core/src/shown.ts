@@ -358,6 +358,7 @@ const MARKERS: Record<string, string> = {
   i: "_",
   del: "~~",
   s: "~~",
+  strike: "~~",
 };
 
 /** A code span around `text`, with a fence longer than any backtick run in it. */

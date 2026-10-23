@@ -225,17 +225,24 @@ function coverageObligations(
 
 /**
  * One exact heading's section of a markdown file; undefined unless it
- * occurs once. `*` and `_` are one emphasis marker: shown text writes
- * emphasis with `_`, so `#Step _y_` finds the heading `Step *y*`.
+ * occurs once. An exact match wins; otherwise `*` and `_` count as one
+ * emphasis marker (shown text writes emphasis with `_`), so `#Step _y_`
+ * finds the heading `Step *y*`.
  */
 export function sectionText(text: string, heading: string): string | undefined {
   const lines = markdownLines(text);
+  const find = (same: (a: string) => boolean) =>
+    lines.flatMap((line, index) =>
+      line.heading !== undefined && same(line.heading.text)
+        ? [{ index, level: line.heading.level }]
+        : [],
+    );
+  // Exact first; the marker-folded match only when nothing matches exactly.
   const marked = (value: string) => value.replaceAll("*", "_");
-  const matches = lines.flatMap((line, index) =>
-    line.heading !== undefined && marked(line.heading.text) === marked(heading)
-      ? [{ index, level: line.heading.level }]
-      : [],
-  );
+  const exact = find((text) => text === heading);
+  const matches = exact.length
+    ? exact
+    : find((text) => marked(text) === marked(heading));
   if (matches.length !== 1) return undefined;
   const { index, level } = matches[0]!;
   const end = lines.findIndex(

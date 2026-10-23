@@ -432,7 +432,13 @@ async function citationFindings(
     for (const citation of item.citations) {
       const pins = sources.filter((source) => source.path === citation.path);
       const heading = citation.heading ?? "";
-      if (citationChoices(pins).includes(heading)) continue;
+      // The same resolution the worker prompt uses, so check and build agree.
+      if (
+        heading === ""
+          ? citationChoices(pins).includes("")
+          : pins.some((pin) => sectionText(pin.content, heading) !== undefined)
+      )
+        continue;
       const problem = await repositoryCitation(citation, tracked, files, cited);
       if (problem === undefined) {
         if (
