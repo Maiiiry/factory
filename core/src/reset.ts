@@ -7,6 +7,7 @@ import type { Plan } from "./planning/types.js";
 import { readQueue } from "./queue.js";
 import { type RequestResult, refused, type StoredRequest } from "./requests.js";
 import {
+  deadlineAt,
   type Frozen,
   newObjective,
   type ObjectiveState,
@@ -36,7 +37,7 @@ export interface ResetRecord {
 
 /**
  * The record that stands while the state is rebuilt: the old run's
- * identity (`startedAt`), frozen configuration, Project card and comment cursor, and
+ * identity (`startedAt`), deadline, frozen configuration, Project card and comment cursor, and
  * the operator's pause or drain, so nothing the operator did or wrote is
  * lost meanwhile.
  */
@@ -47,11 +48,16 @@ export function resetRecord(
   hadState: boolean,
   github: GitHubModule | undefined,
   frozen: Frozen | undefined,
+  /** `queue.objectiveDeadlineSeconds`: a reset with no readable old state admits the Objective, so its deadline starts now. */
+  deadlineSeconds: number | undefined,
 ): ObjectiveState {
   const now = new Date();
   const state = newObjective(issue, now, old?.frozen ?? frozen);
   state.status = "resetting";
   if (old?.startedAt) state.startedAt = old.startedAt;
+  // A readable old state keeps its deadline, or its lack of one.
+  const deadline = old ? old.deadline : deadlineAt(now, deadlineSeconds);
+  if (deadline) state.deadline = deadline;
   if (old?.control) state.control = old.control;
   if (old) state.appliedRequests = old.appliedRequests;
   const module = (old?.modules.github as GitHubModule | undefined) ?? github;
@@ -236,6 +242,7 @@ export async function rebuildState(
 
   const state = newObjective(issue, new Date(requestedAt), record.frozen);
   if (record.startedAt) state.startedAt = record.startedAt;
+  if (record.deadline) state.deadline = record.deadline;
   if (card)
     state.modules.github = {
       itemId: card.itemId,
