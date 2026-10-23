@@ -5,7 +5,7 @@
  * the result (work/collect.ts).
  */
 import type { WorkItem } from "../planning/types.js";
-import type { Answer } from "../state.js";
+import type { Answer, Wait } from "../state.js";
 
 /**
  * What a paid worker has spent on one Work Item across attempts and
@@ -47,8 +47,8 @@ export type WorkerResult = (
       /** The tree the worker's own Validate last passed, with its commands. */
       validated?: { tree: string; commands: string[] };
     }
-  /** Usage or rate limit, idle timeout, lost turn. */
-  | { kind: "retry"; reason: string; afterMs?: number }
+  /** Usage or rate limit (`wait`), lost turn; an idle timeout has `afterMs: -1` (an error). */
+  | { kind: "retry"; reason: string; afterMs?: number; wait?: Wait }
   /** Login expired, sandbox unavailable, configuration fault. */
   | { kind: "hold"; question: string; answers: string[]; recommended: string }
 ) & {

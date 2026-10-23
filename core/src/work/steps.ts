@@ -1,5 +1,6 @@
-import { lstat } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { crashPoint } from "../crash.js";
 import {
   ACCEPT,
   type DeliveryContext,
@@ -417,7 +418,7 @@ function itemStep(item: WorkItem, phase: Phase, deps: BuildDeps): Step {
     run: (context) =>
       context.answer?.answer === "replan"
         ? Promise.resolve(replanOutcome(context.state))
-        : guardedItem(() => run(item, context, deps)),
+        : guardedItem(deps, () => run(item, context, deps)),
   };
 }
 
@@ -1622,11 +1623,21 @@ function replanOutcome(state: ObjectiveState): Outcome {
         ...items.flatMap((item) => PHASES.map((p) => stepKey(item.id, p))),
       ]),
     ],
-    keep: Object.fromEntries(
-      Object.keys(state.kept ?? {}).map((key) => [key, null]),
-    ),
+    keep: {
+      ...Object.fromEntries(
+        Object.keys(state.kept ?? {}).map((key) => [key, null]),
+      ),
+      [RERUN]: true,
+    },
   };
 }
+
+/**
+ * Set when an Objective runs again: after a `replan` once the plan was
+ * accepted, or when a finished Objective is queued again. The earlier
+ * run's open PRs and work files go before the new run checks the issue.
+ */
+export const RERUN = "rerun";
 
 // ---------------------------------------------------------------------------
 // aggregates and not-yet-ported kinds
@@ -1677,7 +1688,7 @@ export function finalStep(deps: BuildDeps): Step {
     resource: "cpu",
     deadlineMs: 60 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
         const { config } = deps;
         const plan = state.done.plan as Plan;
@@ -1760,7 +1771,7 @@ export function finalReviewStep(deps: BuildDeps): Step {
     key: "final-review",
     deadlineMs: 45 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
         if (context.answer?.answer === "replan") return replanOutcome(state);
         // A fix on the default branch: validate the new head before reviewing again.
@@ -1917,8 +1928,11 @@ async function pinnedSources(
 }
 
 /** Item steps map Git refusals to a hold; everything else goes through planning's mapping. */
-async function guardedItem(work: () => Promise<Outcome>): Promise<Outcome> {
-  return guarded(async () => {
+async function guardedItem(
+  deps: BuildDeps,
+  work: () => Promise<Outcome>,
+): Promise<Outcome> {
+  return guarded(deps.config.repository, async () => {
     try {
       return await work();
     } catch (error) {
@@ -1937,9 +1951,9 @@ export function reportStep(deps: BuildDeps): Step {
     key: "report",
     deadlineMs: 10 * MINUTE,
     run: (context) =>
-      guardedItem(async () => {
+      guardedItem(deps, async () => {
         const { state, signal } = context;
-        const { config, github } = deps;
+        const { github } = deps;
         if (context.answer?.answer === "replan") return replanOutcome(state);
         const marker = `<!-- factory:${state.issue}:report -->`;
         // Once the report is posted, the issue close that follows is Factory's
@@ -1968,16 +1982,18 @@ export function reportStep(deps: BuildDeps): Step {
           0,
         );
         const body = `${marker}\n**Factory finished this Objective.**\n\n${lines.join("\n")}\n\nFinal validation and final review passed on \`${final.commit.slice(0, 12)}\` (${final.commands.map((c) => `\`${c}\``).join(", ")}).${repairs ? ` ${repairs} repair${repairs === 1 ? "" : "s"} along the way.` : ""}${final.media ? `\n\n${final.media}` : ""}`;
-        if (!reported) await github.postComment(state.issue, body, signal);
-        const issue = await github.issue(state.issue, signal);
-        if (issue.state === "open")
-          await github.rest(
-            "PATCH",
-            `/repos/${config.repository}/issues/${state.issue}`,
-            { state: "closed", state_reason: "completed" },
-            signal,
-          );
-        await removeWorkFiles(state, deps, signal);
+        if (!reported) {
+          crashPoint("report:comment:before");
+          await github.postComment(state.issue, body, signal);
+          crashPoint("report:comment:after");
+        }
+        await github.closeIssue(
+          state.issue,
+          "completed",
+          "report:close",
+          signal,
+        );
+        await removeWorkFiles(state.issue, deps, signal);
         return { kind: "done" };
       }),
   };
@@ -1989,70 +2005,127 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
     key: "cancel:cleanup",
     deadlineMs: 10 * MINUTE,
     run: async ({ state, signal }) => {
-      const plan = state.done.plan as Plan | undefined;
-      const { config, github } = deps;
-      for (const item of plan?.items ?? []) {
-        const branch = `${config.repository.split("/")[0]}:${itemBranch(state.issue, item.id)}`;
-        const pulls = await github.rest<{ number: number }[]>(
-          "GET",
-          `/repos/${config.repository}/pulls?head=${encodeURIComponent(branch)}&state=open`,
-          undefined,
-          signal,
-        );
-        for (const pull of pulls) {
-          const marker = `<!-- factory:${state.issue}:pr-cancelled:${item.id} -->`;
-          if (
-            !(await github.findComment(pull.number, marker, undefined, signal))
-          )
-            await github.postComment(
-              pull.number,
-              `${marker}\nFactory cancelled Objective #${state.issue}; closing this PR.`,
-              signal,
-            );
-          await github.rest(
-            "PATCH",
-            `/repos/${config.repository}/pulls/${pull.number}`,
-            { state: "closed" },
-            signal,
-          );
-        }
-      }
+      await closeFactoryPulls(
+        deps,
+        state.issue,
+        "cancelled",
+        `Factory cancelled Objective #${state.issue}; closing this PR.`,
+        signal,
+      );
       // The Objective's issue closes as not planned, so the queue and the
       // issue agree; the operator can reopen and queue it again.
-      const issue = await github.issue(state.issue, signal);
-      if (issue.state === "open")
-        await github.rest(
-          "PATCH",
-          `/repos/${config.repository}/issues/${state.issue}`,
-          { state: "closed", state_reason: "not_planned" },
-          signal,
-        );
-      await removeWorkFiles(state, deps, signal);
+      await deps.github.closeIssue(
+        state.issue,
+        "not_planned",
+        "cancel:close",
+        signal,
+      );
+      await removeWorkFiles(state.issue, deps, signal);
       return { kind: "done" };
     },
   };
 }
 
-/** The Objective's worktrees, selection refs, captured media, review artifacts and final media scratch. */
+/**
+ * Before a new run of the Objective checks the issue again: close the
+ * earlier run's open PRs and remove its worktrees, so the new plan starts
+ * clean. It retries; it never asks.
+ */
+export function rerunCleanupStep(deps: BuildDeps): Step {
+  return {
+    key: "rerun:cleanup",
+    deadlineMs: 10 * MINUTE,
+    run: (context) =>
+      guardedItem(deps, async () => {
+        const { state, signal } = context;
+        await closeFactoryPulls(
+          deps,
+          state.issue,
+          "replanned",
+          `Factory is running Objective #${state.issue} again from a new plan; closing this PR from the earlier one.`,
+          signal,
+        );
+        await removeWorkFiles(state.issue, deps, signal);
+        return { kind: "done", keep: { [RERUN]: null } };
+      }),
+  };
+}
+
+/**
+ * Close every open PR of the Objective: every branch under
+ * `factory/<issue>/`, whatever plan made it, so PRs of an earlier plan
+ * close too. Each gets one marked comment first.
+ */
+async function closeFactoryPulls(
+  deps: BuildDeps,
+  issue: number,
+  kind: string,
+  text: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const { config, github } = deps;
+  const point = kind === "cancelled" ? "cancel" : "rerun";
+  for (const branch of await github.branches(`factory/${issue}/`, signal)) {
+    const pulls = await github.rest<{ number: number }[]>(
+      "GET",
+      `/repos/${config.repository}/pulls?head=${encodeURIComponent(`${github.owner}:${branch}`)}&state=open`,
+      undefined,
+      signal,
+    );
+    for (const pull of pulls) {
+      const marker = `<!-- factory:${issue}:pr-${kind}:${branch.slice(`factory/${issue}/`.length)} -->`;
+      await github.upsertComment(
+        pull.number,
+        marker,
+        `${marker}\n${text}`,
+        `${point}:pr-comment`,
+        signal,
+      );
+      crashPoint(`${point}:pr-close:before`);
+      await github.rest(
+        "PATCH",
+        `/repos/${config.repository}/pulls/${pull.number}`,
+        { state: "closed" },
+        signal,
+      );
+      crashPoint(`${point}:pr-close:after`);
+    }
+  }
+}
+
+/**
+ * Every worktree and selection ref of the Objective, whatever plan made
+ * them, its captured media, review artifacts and final media scratch.
+ */
 async function removeWorkFiles(
-  state: ObjectiveState,
+  issue: number,
   deps: BuildDeps,
   signal: AbortSignal,
 ): Promise<void> {
-  const plan = state.done.plan as Plan | undefined;
-  const workDir = deps.workDir(state.issue);
-  for (const item of plan?.items ?? []) {
-    await removeWorktree(
-      deps.config.checkout,
-      worktreePath(workDir, state.issue, item.id),
-      signal,
-    );
-    await hostGit(
-      deps.config.checkout,
-      ["update-ref", "-d", selectionRef(state.issue, item.id)],
-      { signal },
-    );
+  const { checkout } = deps.config;
+  const workDir = deps.workDir(issue);
+  const root = dirname(worktreePath(workDir, issue, "item"));
+  let names: string[] = [];
+  try {
+    names = await readdir(root);
+  } catch {
+    // No worktrees.
   }
+  for (const name of names)
+    if (!name.endsWith(".shell") && !name.endsWith(".validation"))
+      await removeWorktree(checkout, join(root, name), signal);
+  const refs = (
+    await hostGit(
+      checkout,
+      ["for-each-ref", "--format=%(refname)", `refs/factory/${issue}/`],
+      { signal },
+    )
+  )
+    .toString("utf8")
+    .split("\n")
+    .filter(Boolean);
+  for (const ref of refs)
+    await hostGit(checkout, ["update-ref", "-d", ref], { signal });
   for (const files of ["assets", "artifacts", "final-media"])
     await forceRemove(join(workDir, files));
 }

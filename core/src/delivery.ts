@@ -20,6 +20,7 @@ import {
   type CheckRun,
   type GitHub,
   GitHubError,
+  githubOutcome,
   type PullRequest,
   type Stack,
   TransientError,
@@ -30,15 +31,18 @@ import { lfsPushIfPointers } from "./media.js";
 import { BaseFiles, workflowCheckNames } from "./planning/facts.js";
 import type { WorkItem } from "./planning/types.js";
 import { errorMessage } from "./text.js";
+import { FACTORY_EMAIL } from "./work/collect.js";
 import { GitRefusal, hostGit, hostGitExit, originProblem } from "./worktree.js";
 
 const MINUTE = 60_000;
 /** How long GitHub may not yet show what Factory just did. */
 const GITHUB_LAG_MS = 2 * MINUTE;
-/** How long a newly pushed head may show no checks before Factory asks. */
-const CHECK_SETTLE_MS = 20 * MINUTE;
-/** Checks pending with the same set this long become a question. */
-const ESCALATE_AFTER_MS = 24 * 60 * MINUTE;
+/**
+ * How long a newly pushed head may show no run or status of a check it
+ * needs before Factory asks: a check that never registers, or a workflow
+ * that didn't trigger, needs a person (CORE.md#Waits).
+ */
+const CHECK_SETTLE_MS = 15 * MINUTE;
 const CI_POLL_MS = 20_000;
 /** How long a fetched default-branch head serves renamed-check lookups. */
 const DEFAULT_HEAD_REUSE_MS = 10 * MINUTE;
@@ -239,7 +243,14 @@ export function publish(
     // The branch's head once pushed: the commit, or GitHub's update of it.
     let delivered = remote ?? input.commit;
     if (!remote || !(await updates(context, remote, current, bases))) {
-      if (remote && !(await updates(context, remote, earlier, bases)))
+      // A head Factory pushed in an earlier run of this Objective (before a
+      // replan, or before it was cancelled and queued again) is Factory's
+      // own: the push below resets it, with a lease on exactly that head.
+      if (
+        remote &&
+        !(await updates(context, remote, earlier, bases)) &&
+        !(await earlierRun(context, input, branch, remote, pulls))
+      )
         return hold(
           `Remote branch ${branch} holds a commit Factory did not push (${remote}; Factory pushed ${[...known].join(", ")}). Inspect it; delete or restore the branch and answer retry, or cancel.`,
           ["cancel", "retry"],
@@ -319,6 +330,39 @@ export function publish(
       merged: false,
     };
   });
+}
+
+/**
+ * Whether `remote` is a head of Factory's own from an earlier run: the head
+ * of a PR Factory opened for this branch (its body carries Factory's
+ * marker), or a commit Factory made (its author is Factory's).
+ */
+async function earlierRun(
+  context: DeliveryContext,
+  input: PublishInput,
+  branch: string,
+  remote: string,
+  pulls: PullRequest[],
+): Promise<boolean> {
+  const marker = pullMarker(input.issue, input.item.id);
+  if (
+    pulls.some(
+      (pull) =>
+        pull.head.ref === branch &&
+        pull.head.sha === remote &&
+        (pull.body ?? "").includes(marker),
+    )
+  )
+    return true;
+  return (
+    (await context.github.commit(remote, context.signal)).authorEmail ===
+    FACTORY_EMAIL
+  );
+}
+
+/** The hidden marker in the body of every PR Factory opens. */
+function pullMarker(issue: number, item: string): string {
+  return `<!-- factory:${issue}:pr:${item} -->`;
 }
 
 /** Push with a lease on `remote`; undefined once the branch holds `commit`. */
@@ -494,6 +538,7 @@ async function pullRequestBody(
     );
   parts.push(
     `Candidate commit: ${code(input.commit)}\n\nCandidate tree: ${code(input.tree)}`,
+    pullMarker(input.issue, input.item.id),
   );
   return parts.join("\n\n");
 }
@@ -534,8 +579,10 @@ export type CiResult =
  * (#1637). Each plan-named check must pass by name. A PR BEHIND its base
  * under strict protection is updated by GitHub and observed again. A PR
  * made a draft, closed without merging, with only cancelled checks nothing
- * re-ran, with the same checks pending for a day, or with no checks at all,
- * is a question (#1640).
+ * re-ran, with a needed check that never registered, or with no checks at
+ * all, is a question (#1640). Checks queued or running are a transient
+ * wait; an environment approval or a required review is a human gate the
+ * engine waits on without a deadline (CORE.md#Waits).
  */
 export function observeCi(
   context: DeliveryContext,
@@ -702,36 +749,43 @@ async function judge(
       unreported,
     );
     if (renamed) return renamed;
-    // A check held for an approval or a runner, a status nobody completes,
-    // or a plan-named check that never runs or settles without success,
-    // never settles on its own: after a day with the same pending set, ask.
-    // A time GitHub doesn't show counts from when this wait began retrying.
-    const times = [
-      ...runs
-        .filter((run) => run.status !== "completed")
-        .map((run) => run.started_at),
-      ...runs
-        .filter((run) => run.status === "completed" && named.includes(run.name))
-        .map((run) => run.completed_at),
-      ...statuses
-        .filter((status) => status.state === "pending")
-        .map((status) => status.updated_at),
-      ...(unreported.length || absent.length
-        ? [await github.pushTime(pull.head.ref, head, signal)]
-        : []),
-    ].map((time) => (typeof time === "string" ? Date.parse(time) : Number.NaN));
-    const began = Date.parse(context.retryingSince ?? "");
-    // NaN only before the first retry is recorded: the next poll decides.
-    const since = Math.max(
-      ...(times.length ? times : [began]).map((time) =>
-        Number.isFinite(time) ? time : began,
-      ),
-    );
-    if (Date.now() - since >= ESCALATE_AFTER_MS)
-      return hold(
-        `Checks on PR #${pr} have been pending since ${new Date(since).toISOString()}: ${pending.join(", ") || named.join(", ") || "unnamed"}. Complete or re-run them, or merge the PR by hand, then answer retry; or cancel.`,
-      );
-    return { kind: "retry", reason: waiting, afterMs: CI_POLL_MS };
+    // A required or plan-named check with no run or status a while after
+    // the push never registered: a person must trigger or fix it.
+    const missing = [...new Set([...unreported, ...absent])];
+    if (missing.length) {
+      const pushedAt = await github.pushTime(pull.head.ref, head, signal);
+      const from = Number.isFinite(Date.parse(pushedAt ?? ""))
+        ? Date.parse(pushedAt!)
+        : Date.parse(context.retryingSince ?? "");
+      if (Number.isFinite(from) && Date.now() - from >= CHECK_SETTLE_MS)
+        return hold(
+          `Check ${bounded(
+            missing.map((name) => JSON.stringify(name)),
+            ", ",
+          )} has no run or status on PR #${pr}'s head ${head} ${CHECK_SETTLE_MS / MINUTE} minutes after ${pushedAt ? `its push at ${pushedAt}` : "Factory began waiting"}, though ${absent.length ? "the plan" : "branch protection"} requires it. Trigger or fix the workflow that reports it, then answer retry; or cancel.`,
+        );
+    }
+    // Jobs held for an environment's approval, or a review the branch
+    // requires: people outside Factory decide, so there is no deadline.
+    const approvals = runs
+      .filter((run) => run.status === "waiting")
+      .map((run) => run.name);
+    const gate = approvals.length
+      ? `an environment approval for ${bounded(approvals, ", ")} on PR #${pr}`
+      : readiness === "waiting" &&
+          !pending.length &&
+          !named.length &&
+          ["REVIEW_REQUIRED", "CHANGES_REQUESTED"].includes(
+            state.reviewDecision ?? "",
+          )
+        ? `a required review on PR #${pr}`
+        : undefined;
+    return {
+      kind: "retry",
+      reason: gate ? `Waiting on ${gate}` : waiting,
+      afterMs: CI_POLL_MS,
+      ...(gate ? { wait: { kind: "gate", gate } } : {}),
+    };
   }
   const unregistered = await unregisteredChecks(
     context,
@@ -948,8 +1002,10 @@ async function unregisteredChecks(
   const pr = pull.number;
   const pushedAt = await github.pushTime(pull.head.ref, head, signal);
   let actions: "running" | "failed" | "completed" | "none" | undefined;
+  let approval = false;
   if (others) {
     const workflows = await github.workflowRuns(head, signal);
+    approval = Boolean(workflows?.some((run) => run?.status === "waiting"));
     actions = !workflows
       ? undefined
       : workflows.some((run) => run?.status !== "completed")
@@ -970,13 +1026,22 @@ async function unregisteredChecks(
       `Actions workflow runs on PR #${pr}'s head ${head} ended without jobs or success (a startup failure, or awaiting approval). Fix or approve them, then answer retry; or merge the PR by hand, then answer retry; or cancel.`,
     );
   const question = others
-    ? `No Actions checks registered on PR #${pr}'s head ${head}, and GitHub does not show ${actions === "running" ? "its runs finishing" : "when it was pushed or its Actions runs"}. Inspect its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`
+    ? `No Actions checks registered on PR #${pr}'s head ${head}, and GitHub does not show when it was pushed or its Actions runs. Inspect its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`
     : `No checks registered on PR #${pr}'s head ${head}: does a path filter or a push-only workflow skip it? Add or fix its checks, then answer retry; or merge the PR by hand, then answer retry; or cancel.`;
   const pushed = Date.parse(pushedAt ?? "");
-  // A run held for a concurrency group or a runner: wait, for a day at most.
+  // A run held for a concurrency group or a runner is a transient wait; one
+  // held for an environment's approval waits on that person.
   if (actions === "running")
-    return Date.now() - pushed >= ESCALATE_AFTER_MS
-      ? hold(question)
+    return approval
+      ? {
+          kind: "retry",
+          reason: `Waiting on an environment approval for Actions workflow runs on PR #${pr}`,
+          afterMs: CI_POLL_MS,
+          wait: {
+            kind: "gate",
+            gate: `an environment approval for Actions workflow runs on PR #${pr}`,
+          },
+        }
       : {
           kind: "retry",
           reason: `Awaiting Actions workflow runs on PR #${pr} to start their jobs`,
@@ -1861,11 +1926,10 @@ function needing(error: unknown, permission: string): unknown {
 }
 
 /**
- * GitHub's and git's transient failures become a retry. A rejected login
- * (401) is a hold naming `gh auth login`; GitHub's refusals (403, or a 404
- * the login can't see past) become a hold naming the permission the call
- * needs; its other answers (409, 422, GraphQL errors) may change, so they
- * retry. A GitRefusal, and anything else, escapes to the caller.
+ * GitHub's and git's failures as outcomes (github.ts githubOutcome): a
+ * rejected login or a refusal holds, naming the permission the call needs;
+ * anything else GitHub says may change, so it retries. A GitRefusal, and
+ * anything else, escapes to the caller.
  */
 async function guarded<T>(
   context: DeliveryContext,
@@ -1875,29 +1939,13 @@ async function guarded<T>(
     return await body();
   } catch (error) {
     if (context.signal.aborted || error instanceof GitRefusal) throw error;
-    if (error instanceof TransientError)
-      return {
-        kind: "retry",
-        reason: error.message,
-        ...(error.retryAfterMs !== undefined
-          ? { afterMs: error.retryAfterMs }
-          : {}),
-      };
-    const refused = error instanceof Refused ? error.error : error;
-    if (!(refused instanceof GitHubError)) throw error;
-    if (refused.status === 401)
-      return hold(
-        `GitHub rejected Factory's login on ${context.github.repository} (${refused.message.slice(0, 300)}). Log in again with \`gh auth login\` (or replace FACTORY_GITHUB_TOKEN), then answer retry; or cancel.`,
-      );
-    if (refused.status === 403 || refused.status === 404)
-      return hold(
-        `${refused.message.slice(0, 500)}. Give Factory's login ${error instanceof Refused ? error.permission : "read access to the repository, its pull requests and its checks (fine-grained token: Contents, Pull requests, Checks and Commit statuses: read)"} on ${context.github.repository}, then answer retry; or cancel.`,
-      );
-    return {
-      kind: "retry",
-      reason: refused.message,
-      afterMs: CI_POLL_MS,
-    };
+    const outcome = githubOutcome(
+      error instanceof Refused ? error.error : error,
+      context.github.repository,
+      error instanceof Refused ? error.permission : undefined,
+    );
+    if (!outcome) throw error;
+    return outcome as Retry | Hold;
   }
 }
 

@@ -11,6 +11,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -76,7 +77,7 @@ function status(inst) {
   return JSON.parse(cli(inst, "status", "--json").out);
 }
 
-function seed(inst, issue, status = "checking") {
+function seed(inst, issue, status = "checking", fields = {}) {
   mkdirSync(inst.objectives, { recursive: true });
   const now = new Date().toISOString();
   writeFileSync(
@@ -85,16 +86,71 @@ function seed(inst, issue, status = "checking") {
       version: 1,
       issue,
       status,
+      // The provider a configuration without `providers` freezes.
+      provider: {
+        name: "codex",
+        selectedBy: "defaultProvider",
+        settings: {
+          planner: "codex",
+          worker: { kind: "codex", network: "off" },
+        },
+      },
       hold: null,
       answers: {},
       retries: {},
+      kept: {},
       done: {},
       attempts: {},
       appliedRequests: [],
       modules: {},
       updatedAt: now,
+      ...fields,
     }),
   );
+}
+
+/**
+ * A configured installation whose GitHub API is `api`: a closed port (the
+ * network is down) or a socket that never answers (a stalled network).
+ */
+function configured(inst, api, env = {}) {
+  const config = join(inst.root, "config.json");
+  mkdirSync(inst.root, { recursive: true });
+  writeFileSync(
+    config,
+    JSON.stringify({
+      repository: REPO,
+      checkout: join(inst.root, "checkout"),
+      queue: { projectId: "PVT_none", pollSeconds: 5 },
+    }),
+  );
+  Object.assign(inst.env, {
+    FACTORY_CONFIG: config,
+    FACTORY_GITHUB_API: api,
+    FACTORY_GITHUB_TOKEN: "unused",
+    ...env,
+  });
+}
+
+/** A local port nothing listens on. */
+async function closedPort() {
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+/** A server that accepts connections and never answers. */
+async function silentServer() {
+  const sockets = new Set();
+  const server = createServer((socket) => sockets.add(socket));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  after(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  });
+  return server.address().port;
 }
 
 function stateOf(inst, issue) {
@@ -203,6 +259,45 @@ test("unreadable state holds with cancel, and cancel works", async () => {
 // Every crash point the hold → cancel path passes. A crash at each one, then
 // a clean restart, must end cancelled and cleaned up, with the request
 // applied once and no stray files.
+// Crash points around GitHub effects: the hold, reply, note and reminder
+// comments, the Status write, the plan, report and cancel comments, the
+// issue close and the PR close. CI has no GitHub, so the drill covers them.
+const GITHUB_CRASH_POINTS = [
+  "serve:admitted",
+  "sync:show:before",
+  "sync:show:after",
+  "sync:ask:before",
+  "sync:ask:after",
+  "sync:reply:before",
+  "sync:reply:after",
+  "sync:note:before",
+  "sync:note:after",
+  "sync:remind:before",
+  "sync:remind:after",
+  "plan:data:before",
+  "plan:data:after",
+  "plan:post:before",
+  "plan:post:after",
+  "report:comment:before",
+  "report:comment:after",
+  "report:close:before",
+  "report:close:after",
+  "cancel:pr-comment:before",
+  "cancel:pr-comment:after",
+  "cancel:pr-close:before",
+  "cancel:pr-close:after",
+  "cancel:close:before",
+  "cancel:close:after",
+  "rerun:pr-comment:before",
+  "rerun:pr-comment:after",
+  "rerun:pr-close:before",
+  "rerun:pr-close:after",
+];
+for (const point of GITHUB_CRASH_POINTS)
+  test(`crash at ${point}, restart, finish once`, {
+    skip: "needs GitHub: covered by the milestone drill",
+  });
+
 const CRASH_POINTS = [
   "serve:loaded",
   "state:before-rename",
@@ -349,5 +444,86 @@ test("a finished Objective can't be cancelled", async () => {
   assert.equal(result.code, 1);
   assert.match(result.out, /already finished \(done\)/);
   assert.equal(stateOf(inst, 13).status, "done");
+  await stopped(service);
+});
+
+test("a step past its deadline retries, then holds after three", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await silentServer()}`, {
+    FACTORY_DEADLINE_MS: "300",
+  });
+  seed(inst, 21);
+  const service = serve(inst);
+  await until(() => stateOf(inst, 21).hold, "hold");
+  const { hold } = stateOf(inst, 21);
+  assert.match(hold.question, /keeps failing \(deadline\)/);
+  assert.deepEqual(hold.answers, ["retry", "cancel"]);
+  assert.equal(stateOf(inst, 21).retries.check.count, 3);
+  await stopped(service);
+});
+
+test("a transient wait retries without counting errors, then asks, and wait waits on", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await closedPort()}`, {
+    FACTORY_WAIT_MS: "1500",
+  });
+  seed(inst, 22);
+  const service = serve(inst);
+  await until(() => stateOf(inst, 22).retries.check?.attempts >= 3, "retries");
+  assert.equal(stateOf(inst, 22).hold, null, "no hold before the budget");
+  assert.equal(stateOf(inst, 22).retries.check.count, 0, "waits aren't errors");
+  await until(() => stateOf(inst, 22).hold, "the wait's question");
+  const first = stateOf(inst, 22);
+  assert.match(first.hold.question, /has been retrying since/);
+  assert.match(first.hold.question, /Last error: GitHub GET/);
+  assert.deepEqual(first.hold.answers, ["wait", "retry", "cancel"]);
+  assert.equal(first.hold.recommended, "wait");
+
+  assert.equal(cli(inst, "answer", "22", "wait").code, 0);
+  const granted = stateOf(inst, 22);
+  assert.equal(granted.status, "checking");
+  assert.ok(granted.retries.check.grantedUntil, "wait grants more time");
+  assert.equal(granted.retries.check.since, first.retries.check.since);
+  await until(
+    () => stateOf(inst, 22).hold && stateOf(inst, 22).hold.id !== first.hold.id,
+    "the question again once the grant is spent",
+  );
+  assert.equal(cli(inst, "cancel", "22").code, 0);
+  await stopped(service);
+});
+
+test("a held Objective and one waiting on its paths don't stall the queue", async () => {
+  const inst = installation();
+  const plan = (paths) => ({
+    items: [{ id: "a", ownedPaths: paths, dependencies: [] }],
+  });
+  const asked = new Date().toISOString();
+  // #31 holds while it owns src/; #32 owns src/x.ts, so it waits for #31.
+  seed(inst, 31, "holding", {
+    resumeStatus: "building",
+    hold: {
+      id: `item:a:work@${asked}`,
+      step: "item:a:work",
+      question: "Step item:a:work keeps failing (error: broken).",
+      answers: ["retry", "cancel"],
+      recommended: "retry",
+      askedAt: asked,
+    },
+    done: { check: {}, plan: plan(["src/"]) },
+    kept: { "plan:acceptedAt": "2026-01-01T00:00:00.000Z" },
+  });
+  seed(inst, 32, "building", {
+    done: { check: {}, plan: plan(["src/x.ts"]) },
+    kept: { "plan:acceptedAt": "2026-01-02T00:00:00.000Z" },
+  });
+  // #33 is checked and needs the only slot (no configuration: one at a time).
+  seed(inst, 33, "planning", { done: { check: {} } });
+  const service = serve(inst);
+  await until(() => stateOf(inst, 33).hold, "#33 runs and asks");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const waiting = stateOf(inst, 32);
+  assert.equal(waiting.hold, null, "#32 waits on #31's paths");
+  assert.deepEqual(waiting.attempts, {});
+  assert.equal(stateOf(inst, 31).hold.step, "item:a:work");
   await stopped(service);
 });

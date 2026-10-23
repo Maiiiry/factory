@@ -132,6 +132,13 @@ export function providerWorkflow(
       return workflow ? workflow.steps(state) : [unavailable(state, routes)];
     },
     status: (state) => (frozen(state) ?? fallback).status(state),
+    // `switch NAME` freezes these settings, so the new route matches them.
+    providers: Object.fromEntries(
+      [...routes].map(([name, route]) => [
+        name,
+        frozenSettings(route.settings),
+      ]),
+    ),
   };
 }
 

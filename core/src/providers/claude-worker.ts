@@ -992,7 +992,11 @@ function failure(
         `The Work Item's prompt is larger than the worker model's context window; choose a model with a larger window or replan the item smaller, then answer retry (${ended})`,
       );
     case "limit":
-      return { kind: "retry", reason: failed.message, afterMs: failed.afterMs };
+      return {
+        kind: "retry",
+        reason: failed.message,
+        ...(failed.wait ? { wait: failed.wait } : {}),
+      };
     case "other":
       return { kind: "retry", reason: ended };
   }
@@ -1368,7 +1372,8 @@ export class ClaudeWorker implements Worker {
       }
     } catch (error) {
       const idle = watchdog.expired;
-      if (idle) return { kind: "retry", reason: idle.message };
+      // An idle model is an error: three in a row hold.
+      if (idle) return { kind: "retry", reason: idle.message, afterMs: -1 };
       // Cancelled, or past the step's deadline: the engine decides.
       if (input.signal.aborted) throw input.signal.reason ?? error;
       return {

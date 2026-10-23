@@ -9,7 +9,7 @@ import {
 import { connect } from "node:net";
 import { join } from "node:path";
 import { type CoreConfig, configPath, loadConfig } from "./config.js";
-import { DEFAULT_LIMITS, hostLimits } from "./engine.js";
+import { DEFAULT_LIMITS, type EngineLimits, hostLimits } from "./engine.js";
 import { GitHub } from "./github.js";
 import { GitHubSync } from "./github-sync.js";
 import { dreamCommand, runDream } from "./knowledge/dream.js";
@@ -57,6 +57,7 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
         [--default]              Add or change a named provider in the configuration
   status [ISSUE] [--json]        Show Objectives and open questions
   answer ISSUE ANSWER [--text T] Answer an Objective's open question
+                                 (switch NAME: run it on another provider)
   cancel ISSUE                   Cancel an Objective
   retry ISSUE                    Retry an Objective's waiting steps now
   dream [--preview] [--budget-bytes N] [--input-budget-bytes N] [--provider NAME]
@@ -72,7 +73,14 @@ interface StatusRow {
   status: ObjectiveStatus | "unreadable";
   hold: Hold | null;
   provider?: FrozenProvider;
-  waiting: { step: string; nextAt: string; lastError: string }[];
+  waiting: {
+    step: string;
+    nextAt: string;
+    lastError: string;
+    since: string;
+    /** A person outside Factory the step waits on, such as an environment approval. */
+    gate?: string;
+  }[];
   error?: string;
 }
 
@@ -91,6 +99,7 @@ async function main(argv: string[]): Promise<number> {
   const paths = installationPaths(repository);
   switch (command) {
     case "serve": {
+      const limits = envLimits();
       let sync: GitHubSync | undefined;
       let loaded: CoreConfig | undefined;
       let workflow = objectiveWorkflow();
@@ -111,12 +120,20 @@ async function main(argv: string[]): Promise<number> {
           selectedBy: args.flags.provider ? "--provider" : "defaultProvider",
           settings: frozenSettings(config.providers[name]!),
         };
-        const github = new GitHub(config.repository).redacting(
+        const github = new GitHub(
+          config.repository,
+          process.env.FACTORY_GITHUB_API,
+        ).redacting(
           config.policy.allowedSecretNames.flatMap(
             (name) => process.env[name] ?? [],
           ),
         );
-        sync = new GitHubSync(github, config, new RunLog(paths.logs, "sync"));
+        sync = new GitHubSync(
+          github,
+          config,
+          new RunLog(paths.logs, "sync"),
+          limits,
+        );
         const routes = new Map<string, ProviderRoute>();
         for (const [each, settings] of Object.entries(config.providers))
           routes.set(each, {
@@ -147,15 +164,12 @@ async function main(argv: string[]): Promise<number> {
           ? { tickMs: Number(process.env.FACTORY_TICK_MS) }
           : {}),
         limits: {
-          ...DEFAULT_LIMITS,
+          ...limits,
           ...(loaded
             ? {
                 concurrency: loaded.execution.concurrency,
                 maxRepairs: loaded.execution.repairs,
               }
-            : {}),
-          ...(process.env.FACTORY_BACKOFF_MS
-            ? { baseBackoffMs: Number(process.env.FACTORY_BACKOFF_MS) }
             : {}),
         },
       });
@@ -241,6 +255,33 @@ function settledState(paths: Paths, issue: number): ObjectiveState | string {
   return state;
 }
 
+/**
+ * The engine's limits, with shorter timings from the environment for
+ * tests: FACTORY_BACKOFF_MS (first backoff), FACTORY_WAIT_MS (transient
+ * budget), FACTORY_NOTE_MS (status note), FACTORY_REMIND_MS (gate
+ * reminder), FACTORY_DEADLINE_MS (a cap on step deadlines).
+ */
+function envLimits(): EngineLimits {
+  const env = (name: string): number | undefined => {
+    const value = Number(process.env[name]);
+    return process.env[name] && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  };
+  const set = <K extends keyof EngineLimits>(key: K, name: string) => {
+    const value = env(name);
+    return value === undefined ? {} : { [key]: value };
+  };
+  return {
+    ...DEFAULT_LIMITS,
+    ...set("baseBackoffMs", "FACTORY_BACKOFF_MS"),
+    ...set("maxWaitMs", "FACTORY_WAIT_MS"),
+    ...set("noteAfterMs", "FACTORY_NOTE_MS"),
+    ...set("remindAfterMs", "FACTORY_REMIND_MS"),
+    ...set("maxDeadlineMs", "FACTORY_DEADLINE_MS"),
+  };
+}
+
 async function status(paths: Paths, args: Args): Promise<number> {
   const only = args.positional[1] ? Number(args.positional[1]) : undefined;
   const rows: StatusRow[] = [];
@@ -275,6 +316,8 @@ async function status(paths: Paths, args: Args): Promise<number> {
         step,
         nextAt: retry.nextAt,
         lastError: retry.lastError,
+        since: retry.since,
+        ...(retry.wait?.kind === "gate" ? { gate: retry.wait.gate } : {}),
       })),
     });
   }
@@ -301,7 +344,9 @@ async function status(paths: Paths, args: Args): Promise<number> {
       );
     for (const wait of row.waiting)
       lines.push(
-        `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
+        wait.gate
+          ? `  Waiting on ${wait.gate} (${wait.step}, since ${wait.since})`
+          : `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
       );
   }
   process.stdout.write(`${lines.join("\n")}\n`);
@@ -416,11 +461,13 @@ async function request(
       process.stderr.write("factory: answer needs an answer\n");
       return 2;
     }
+    // `answer ISSUE switch NAME` names the provider, as `--text NAME` does.
+    const text = args.flags.text ?? args.positional[3];
     body = {
       kind: "answer",
       issue,
       answer,
-      ...(args.flags.text ? { text: args.flags.text } : {}),
+      ...(text ? { text } : {}),
     };
   } else body = { kind: command, issue };
   const by = process.env.USER ?? "operator";

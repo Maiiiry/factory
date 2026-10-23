@@ -112,7 +112,20 @@ function sessionFailure(
           "hold",
           `Restore the Copilot plan or billing for the service's login, then answer retry (${shown})`,
         )
-      : new PlannerError("retry", `Copilot quota: ${shown}`, 15 * 60 * 1000);
+      : // A spent premium-request quota resets at a time Copilot doesn't
+        // say: Factory asks whether to wait or switch (CORE.md#Waits).
+        new PlannerError("retry", `Copilot quota: ${shown}`, undefined, {
+          kind: "reset",
+          provider: "copilot",
+        });
+  if (data.errorType === "rate_limit")
+    return data.errorCode === "user_weekly_rate_limited"
+      ? new PlannerError("retry", `Copilot weekly limit: ${shown}`, undefined, {
+          kind: "reset",
+          provider: "copilot",
+        })
+      : // A short rate limit is an unknown transient cause: back off.
+        new PlannerError("retry", `Copilot rate limit: ${shown}`);
   if (data.errorType === "context_limit")
     return new PlannerError(
       "fail",
@@ -425,6 +438,7 @@ export class CopilotWorker implements Worker {
           kind: "retry",
           reason: error.message,
           ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+          ...(error.wait && { wait: error.wait }),
         };
       return error.outcome === "hold"
         ? hold(error.message)

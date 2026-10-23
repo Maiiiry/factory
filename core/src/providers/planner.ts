@@ -5,6 +5,7 @@
  */
 import { accessSync, constants, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import type { Wait } from "../state.js";
 
 export type PlannerPhase =
   | "plan"
@@ -53,8 +54,10 @@ export class PlannerError extends Error {
   constructor(
     readonly outcome: "retry" | "hold" | "fail",
     reason: string,
-    /** For `retry`: when the provider said to come back. */
+    /** For `retry`: when to come back; -1 makes it an error (an idle model), which holds after three. */
     readonly afterMs?: number,
+    /** For `retry`: a usage limit and its reset (CORE.md#Waits). */
+    readonly wait?: Wait,
   ) {
     super(reason);
   }

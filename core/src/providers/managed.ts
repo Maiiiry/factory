@@ -321,6 +321,10 @@ function statusFailure(
   status: number | undefined,
   what: string,
   key: string,
+  /** The response's Retry-After header, for a 429. */
+  retryAfter?: string | null,
+  /** The worker kind, named in a usage limit's wait. */
+  provider?: string,
 ): PlannerError {
   if (status === 401 || status === 403)
     return new PlannerError(
@@ -332,10 +336,31 @@ function statusFailure(
       "hold",
       `${what} refused the request (${status}); check the managed worker settings, then answer retry`,
     );
+  if (status === 429) {
+    // A rate limit that names its reset waits until then (CORE.md#Waits);
+    // without one it is an unknown transient cause and backs off.
+    const at = retryAt(retryAfter);
+    return new PlannerError(
+      "retry",
+      `${what} rate limit (429)`,
+      undefined,
+      at ? { kind: "reset", at, ...(provider ? { provider } : {}) } : undefined,
+    );
+  }
   return new PlannerError(
     "retry",
     `${what} failed${status ? ` (${status})` : ""}`,
   );
+}
+
+/** A Retry-After header (seconds or an HTTP date) as an ISO time. */
+function retryAt(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  const at = Number.isFinite(seconds)
+    ? Date.now() + seconds * 1000
+    : Date.parse(header);
+  return Number.isFinite(at) ? new Date(at).toISOString() : undefined;
 }
 
 /** A classified failure as the worker's outcome; anything else is retried. */
@@ -346,6 +371,7 @@ function outcome(error: unknown, signal: AbortSignal): WorkerResult {
         kind: "retry",
         reason: error.message,
         ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+        ...(error.wait && { wait: error.wait }),
       };
     return hold(error.message);
   }
@@ -641,6 +667,8 @@ export class OpenAIManagedWorker extends ManagedWorker {
         response.status,
         `OpenAI Agents API ${method} ${path}`,
         this.config.apiKeyEnv,
+        response.headers.get("retry-after"),
+        "openai-agents",
       );
     return response;
   }
@@ -895,6 +923,8 @@ export class ClaudeManagedWorker extends ManagedWorker {
               error.status,
               `Claude Managed Agents ${what}`,
               this.config.credentialEnv,
+              error.headers?.get("retry-after"),
+              "claude-managed-agents",
             )
           : new PlannerError(
               "retry",
