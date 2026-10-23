@@ -12,6 +12,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
@@ -600,21 +601,38 @@ for (const point of CRASH_POINTS) {
   });
 }
 
-test("logs keep the newest runs", async () => {
+test("logs keep the newest runs, each with its captures", async () => {
   const inst = installation();
   const dir = join(inst.logs, "5");
   mkdirSync(dir, { recursive: true });
-  for (let i = 0; i < 25; i++)
-    writeFileSync(
-      join(dir, `2026-01-01T00-00-${String(i).padStart(2, "0")}.jsonl`),
-      "{}\n",
-    );
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  for (let i = 0; i < 25; i++) {
+    const run = `2026-01-01T00-00-${String(i).padStart(2, "0")}`;
+    writeFileSync(join(dir, `${run}.jsonl`), "{}\n");
+    // Every other run captured a call: its directory goes with its run.
+    if (i % 2) {
+      mkdirSync(join(dir, `${run}.captures`));
+      writeFileSync(join(dir, `${run}.captures`, "c.json"), "{}");
+      utimesSync(join(dir, `${run}.captures`), old, old);
+    }
+    // Run 1 was written to minutes ago (a dream call still running): kept.
+    if (i !== 1) utimesSync(join(dir, `${run}.jsonl`), old, old);
+  }
   const service = serve(inst);
   await until(() => status(inst).service === "running", "service");
   await stopped(service);
   const kept = readdirSync(dir).sort();
-  assert.equal(kept.length, 20);
-  assert.equal(kept[0], "2026-01-01T00-00-05.jsonl");
+  const runs = kept.filter((name) => name.endsWith(".jsonl"));
+  assert.equal(runs.length, 21, "the 20 newest and the live one");
+  assert.equal(runs[0], "2026-01-01T00-00-01.jsonl");
+  assert.equal(runs[1], "2026-01-01T00-00-05.jsonl");
+  assert.equal(kept.length, 32, "the 11 kept odd runs keep their captures");
+  // The service's own events went to a file named by its run id.
+  assert.ok(
+    readdirSync(join(inst.logs, "0")).some((name) =>
+      /^\d{4}-\d\d-\d\dT[\d-]+Z-\d+\.jsonl$/.test(name),
+    ),
+  );
 });
 
 test("three deaths while two Objectives run hold neither; the restart backs off", async () => {
