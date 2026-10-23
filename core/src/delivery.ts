@@ -14,7 +14,12 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome } from "./engine.js";
-import { defaultHead, operatorGit, pathsHoldingSecrets } from "./git.js";
+import {
+  defaultHead,
+  operatorGit,
+  pathsHoldingSecrets,
+  pinnedGitExit,
+} from "./git.js";
 import {
   type AsyncMerge,
   type CheckRun,
@@ -378,9 +383,9 @@ export function publish(
  * Whether Factory made every commit `remote` has beyond the default branch:
  * each is committed as FACTORY_EMAIL (Factory commits with a clean Git
  * environment; an amend, rebase or cherry-pick by anyone else changes the
- * committer), or is GitHub's update-branch merge (committed by web-flow,
- * whose other parent is on a base). The whole range is read; a range too
- * long to read is not Factory's.
+ * committer), or is GitHub's update-branch merge (updateMerge) whose first
+ * parent is one of those commits and whose other is on the default branch.
+ * The whole range is read; a range too long to read is not Factory's.
  */
 async function factoryMade(
   context: DeliveryContext,
@@ -394,11 +399,17 @@ async function factoryMade(
     context.signal,
   );
   if (total > commits.length) return false;
-  return commits.every(
-    (commit) =>
-      commit.committerEmail === FACTORY_EMAIL ||
-      (commit.committer === "web-flow" && commit.parents.length === 2),
-  );
+  const range = new Set(commits.map((commit) => commit.sha));
+  for (const commit of commits)
+    if (
+      commit.committerEmail !== FACTORY_EMAIL &&
+      !(
+        range.has(commit.parents[0] ?? "") &&
+        (await updateMerge(context, commit, [defaultBranch]))
+      )
+    )
+      return false;
+  return true;
 }
 
 /** The hidden marker in the body of every PR Factory opens. */
@@ -1169,9 +1180,9 @@ async function deliveredHead(
 }
 
 /**
- * Whether `sha` is one of `heads`, or GitHub's update-branch of one: a
- * merge committed by web-flow whose first parent is the earlier head and
- * whose second is on one of the base branches, followed back a few updates.
+ * Whether `sha` is one of `heads`, or GitHub's update-branch of one
+ * (updateMerge) whose first parent is the earlier head, followed back a
+ * few updates.
  */
 async function updates(
   context: DeliveryContext,
@@ -1183,31 +1194,78 @@ async function updates(
     if (heads.has(sha)) return true;
     if (!heads.size || !/^[a-f0-9]{40}$/.test(sha)) return false;
     const commit = await context.github.commit(sha, context.signal);
-    const [first, merged] = commit.parents;
-    if (
-      commit.sha !== sha ||
-      commit.parents.length !== 2 ||
-      commit.committer !== "web-flow" ||
-      !first ||
-      !merged
-    )
+    if (commit.sha !== sha || !(await updateMerge(context, commit, bases)))
       return false;
-    let onBase = false;
-    for (const base of bases) {
-      const compared = await context.github.compare(
-        merged,
-        base,
-        context.signal,
-      );
-      if (compared === "identical" || compared === "ahead") {
-        onBase = true;
-        break;
-      }
-    }
-    if (!onBase) return false;
-    sha = first;
+    sha = commit.parents[0]!;
   }
   return false;
+}
+
+/**
+ * Whether `commit` is GitHub's update-branch merge and nothing more: two
+ * parents, committed by web-flow, the second on one of `bases`, and its
+ * tree exactly what `git merge-tree` makes of the two parents. Anyone can
+ * commit as web-flow (GitHub attributes noreply@github.com to it); only
+ * the tree check shows the merge adds nothing of its own. The commit is
+ * fetched from origin when the checkout lacks it.
+ */
+async function updateMerge(
+  context: DeliveryContext,
+  commit: { sha: string; parents: string[]; committer?: string },
+  bases: readonly string[],
+): Promise<boolean> {
+  const [first, merged] = commit.parents;
+  if (
+    commit.parents.length !== 2 ||
+    commit.committer !== "web-flow" ||
+    !first ||
+    !merged ||
+    !/^[a-f0-9]{40}$/.test(commit.sha)
+  )
+    return false;
+  let onBase = false;
+  for (const base of bases) {
+    const compared = await context.github.compare(merged, base, context.signal);
+    if (compared === "identical" || compared === "ahead") {
+      onBase = true;
+      break;
+    }
+  }
+  if (!onBase) return false;
+  const git = (args: string[]) =>
+    pinnedGitExit(context.checkout, args, { signal: context.signal });
+  if ((await git(["cat-file", "-e", `${commit.sha}^{commit}`])).code !== 0)
+    try {
+      await remoteGit(context, [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "origin",
+        commit.sha,
+      ]);
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw new TransientError(`git fetch ${commit.sha}: ${message(error)}`);
+    }
+  const local = await git([
+    "rev-parse",
+    `${commit.sha}^1`,
+    `${commit.sha}^2`,
+    `${commit.sha}^{tree}`,
+  ]);
+  const [one, two, tree] = local.stdout.toString("utf8").trim().split("\n");
+  if (local.code !== 0 || one !== first || two !== merged || !tree)
+    throw new TransientError(
+      `git can't read the parents and tree of ${commit.sha}: ${local.stderr}`,
+    );
+  const made = await git(["merge-tree", "--write-tree", first, merged]);
+  // 1: the parents conflict, so no merge GitHub made can be this one.
+  if (made.code === 1) return false;
+  if (made.code !== 0)
+    throw new TransientError(
+      `git merge-tree ${first} ${merged}: ${made.stderr}`,
+    );
+  return made.stdout.toString("utf8").split("\n")[0] === tree;
 }
 
 // ── Merge ───────────────────────────────────────────────────────────────
