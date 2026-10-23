@@ -5,13 +5,14 @@
  * every read or write is checked to stay inside its directory. Copilot
  * shell, web, GitHub, MCP, plugins and configuration discovery are off.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type {
   CopilotClient,
   CopilotSession,
   PermissionRequest,
+  SessionConfigBase,
   SessionEvent,
   Tool,
 } from "@github/copilot-sdk";
@@ -32,6 +33,7 @@ import { pathInsideRoot } from "./claude-worker.js";
 import {
   callImages,
   detail,
+  freshOnOverflow,
   IdleWatchdog,
   loggedCall,
   type ModelChoice,
@@ -44,6 +46,17 @@ import {
   providerOutcome,
 } from "./planner.js";
 import {
+  type Conversation,
+  openTurn,
+  overflowed,
+  ResumeOverflow,
+  type Session,
+  type Turn as SessionTurn,
+  turnFields,
+  withoutPrevious,
+} from "./session.js";
+import {
+  captureRequest,
   captureResponse,
   captureToolOutput,
   describeRequest,
@@ -140,6 +153,14 @@ interface Turn {
   onEvent(event: SessionEvent): void;
   /** The call's model-usage record (usage.ts): its tokens and tool calls as they arrive. */
   record: Record<string, unknown>;
+  /**
+   * A retained conversation's turn (session.ts): it resumes the kept
+   * session when it continues one, and keeps its session after a finished
+   * turn instead of deleting it.
+   */
+  conversation?: SessionTurn;
+  /** A session this turn replaces: deleted once this one is open. */
+  replaces?: string;
 }
 
 interface TurnResult {
@@ -204,8 +225,7 @@ function sessionFailure(
       : // A short rate limit is an unknown transient cause: back off.
         new PlannerError("retry", `Copilot rate limit: ${shown}`);
   if (data.errorType === "context_limit")
-    return new PlannerError(
-      "fail",
+    return PlannerError.contextOverflow(
       `The request is larger than the model's context window: ${shown}`,
     );
   return new PlannerError("retry", `Copilot call failed: ${shown}`);
@@ -293,9 +313,9 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
     /** The provider's own usage per model, summed over its responses. */
     const byModel: Record<string, Record<string, number>> = {};
     let sentAt: number | undefined;
-    // One fresh session per call, one prompt: its first turn.
-    turn.record.sessionTurn = 1;
-    turn.record.sessionMode = "fresh";
+    // One prompt per call: a fresh session's first turn, or the next turn
+    // of the retained session it resumes.
+    turnFields(turn.record, turn.conversation ?? { number: 1 });
     turn.record.imageOutputs = 0;
     let settle: () => void = () => undefined;
     let fail: (error: PlannerError) => void = () => undefined;
@@ -338,8 +358,13 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
             feedback: "Factory grants file access only inside this directory",
           };
     };
+    const resumed = turn.conversation?.resumed?.id;
+    const open = (config: SessionConfigBase) =>
+      resumed
+        ? client.resumeSession(resumed, config)
+        : client.createSession(config);
     session = await watchdog.race(
-      client.createSession({
+      open({
         clientName: "factory",
         model: turn.choice.model,
         reasoningEffort: turn.choice.effort as never,
@@ -455,6 +480,7 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
         remoteSession: "off",
       }),
     );
+    if (turn.replaces) await bounded(client.deleteSession(turn.replaces));
     sent = true;
     sentAt = Date.now();
     await watchdog.race(
@@ -487,11 +513,54 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
     if (session) {
       if (!finished) await bounded(session.abort());
       await bounded(session.disconnect());
-      await bounded(client.deleteSession(session.sessionId));
+      // A retained conversation's finished session stays for its next turn.
+      if (!(finished && turn.conversation))
+        await bounded(client.deleteSession(session.sessionId));
     }
     await bounded(client.stop());
     await bounded(client.forceStop());
   }
+}
+
+/**
+ * Open a retained Copilot turn (session.ts openTurn). Whether the kept
+ * session is still there is known only when it is resumed: a resume that
+ * fails leaves the turn's mark, so the next attempt starts fresh.
+ */
+function copilotTurn(
+  conversation: Conversation | undefined,
+  prompt: string,
+  model: string,
+): SessionTurn | undefined {
+  if (!conversation) return undefined;
+  try {
+    return openTurn(conversation, prompt, "copilot", model, () => true);
+  } catch (error) {
+    throw new PlannerError(
+      "hold",
+      `Factory could not set up the Copilot conversation; fix the host's work directory, then answer retry (${detail(String(error))})`,
+    );
+  }
+}
+
+/** The session a turn left, as an answer's or result's field. */
+function withSession(session: Session | undefined): { session?: Session } {
+  return session ? { session } : {};
+}
+
+/** A turn's conversation for runTurn: the session it continues or replaces. */
+function replacing(
+  turn: SessionTurn | undefined,
+  conversation: Conversation | undefined,
+): Pick<Turn, "conversation" | "replaces"> {
+  if (!turn) return {};
+  const previous = conversation?.previous;
+  return {
+    conversation: turn,
+    ...(!turn.resumed && previous?.provider === "copilot"
+      ? { replaces: previous.id }
+      : {}),
+  };
 }
 
 /** Planning and review through Copilot, with read-only tools over `readDir`. */
@@ -501,25 +570,36 @@ export class CopilotPlanner implements Planner {
   ) {}
 
   answer(call: PlannerCall): Promise<PlannerAnswer> {
+    return freshOnOverflow(call, (once) => this.once(once));
+  }
+
+  private once(call: PlannerCall): Promise<PlannerAnswer> {
     const choice = modelChoice(this.models, call);
     return loggedCall("copilot", call, choice, async (record) => {
       const started = Date.now();
       const images = callImages(call);
-      // Without a tree the session gets an empty directory and no tools.
-      const empty = call.readDir
-        ? undefined
-        : mkdtempSync(join(tmpdir(), "factory-copilot-"));
+      const turn = copilotTurn(call.conversation, call.prompt, choice.model);
+      if (turn?.resumed) captureRequest(record, turn.prompt);
+      // Without a tree the session gets an empty directory and no tools: a
+      // retained conversation's own, so it is the same on every turn.
+      let empty: string | undefined;
+      if (!call.readDir && call.conversation) {
+        empty = join(call.conversation.dir, "work");
+        mkdirSync(empty, { recursive: true, mode: 0o700 });
+      } else if (!call.readDir)
+        empty = mkdtempSync(join(tmpdir(), "factory-copilot-"));
       try {
         const result = await runTurn({
           choice,
           directory: call.readDir ?? empty!,
           tools: call.readDir ? READ_TOOLS : [],
           writes: false,
-          prompt: `${call.prompt}\n\nAnswer with only one JSON object that matches this JSON Schema, with no other text:\n${JSON.stringify(call.schema)}`,
+          prompt: `${turn?.prompt ?? call.prompt}\n\nAnswer with only one JSON object that matches this JSON Schema, with no other text:\n${JSON.stringify(call.schema)}`,
           images,
           record,
           idleMs: PLANNER_IDLE_MS,
           signal: call.signal,
+          ...replacing(turn, call.conversation),
           onEvent: (event) => {
             call.activity?.();
             call.log({
@@ -550,9 +630,13 @@ export class CopilotPlanner implements Planner {
           model: choice.model,
           effort: choice.effort,
           usage: result.usage,
+          ...withSession(turn?.end(result.session)),
         };
+      } catch (error) {
+        throw overflowed(error, turn);
       } finally {
-        if (empty) rmSync(empty, { recursive: true, force: true });
+        if (empty && !call.conversation)
+          rmSync(empty, { recursive: true, force: true });
       }
     });
   }
@@ -599,6 +683,19 @@ export class CopilotWorker implements Worker {
   constructor(private readonly options: CopilotWorkerOptions) {}
 
   async run(input: WorkerInput): Promise<WorkerResult> {
+    try {
+      return await this.once(input);
+    } catch (error) {
+      // A continued session ran out of context: once more, fresh.
+      if (!(error instanceof ResumeOverflow)) throw error;
+      return this.once({
+        ...input,
+        conversation: withoutPrevious(input.conversation),
+      });
+    }
+  }
+
+  private async once(input: WorkerInput): Promise<WorkerResult> {
     const started = Date.now();
     const tools = copilotTools(this.options.tools);
     const record = usageRecord({
@@ -612,6 +709,18 @@ export class CopilotWorker implements Worker {
       prompt: input.prompt,
       ...(input.facts ? { facts: input.facts } : {}),
     });
+    let turn: SessionTurn | undefined;
+    try {
+      turn = copilotTurn(
+        input.conversation,
+        input.prompt,
+        this.options.model.model,
+      );
+    } catch (error) {
+      if (error instanceof PlannerError) return providerOutcome(error);
+      throw error;
+    }
+    if (turn?.resumed) captureRequest(record, turn.prompt);
     /** Running tool calls' names by id, for their completions. */
     const toolNames = new Map<string, string>();
     // Validate, as Claude's (work/self-validate.ts): only declared commands.
@@ -656,8 +765,9 @@ export class CopilotWorker implements Worker {
             },
           },
         ],
-        prompt: input.prompt,
+        prompt: turn?.prompt ?? input.prompt,
         record,
+        ...replacing(turn, input.conversation),
         idleMs: this.options.idleMs,
         ...(validator && {
           toolIdleMs: validationDeadlineMs(
@@ -677,8 +787,13 @@ export class CopilotWorker implements Worker {
         kind: "finished",
         finalResponse: result.text,
         ...(tree && { validated: { tree, commands: [...input.commands] } }),
+        ...withSession(turn?.end(result.session)),
       };
     } catch (error) {
+      if (turn?.resumed && error instanceof PlannerError && error.tooLarge) {
+        record.outcome = error.outcome;
+        throw new ResumeOverflow();
+      }
       if (!(error instanceof PlannerError)) {
         record.outcome = "error";
         record.error = detail(String(error));

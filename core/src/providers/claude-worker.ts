@@ -58,15 +58,22 @@ import { validationEnvironment } from "../worktree.js";
 import {
   ACTIVE_TOOL_IDLE_MS,
   apiErrorStatus,
+  baselineOf,
   type ClaudeEffort,
   claudeEnvironment,
+  claudeSessionEnvironment,
+  claudeTurn,
   DEFAULT_MAX_OUTPUT_TOKENS,
   failedResult,
+  modelCounts,
+  ownCost,
   type SessionFacts,
   SYNTHETIC_MODEL,
   serviceLoginEnvironment,
+  sessionOptions,
   toolResultText,
   usageOf,
+  withModels,
 } from "./claude.js";
 import { CLAUDE_TOOLS } from "./config.js";
 import {
@@ -76,8 +83,16 @@ import {
   providerOutcome,
 } from "./planner.js";
 import {
+  ResumeOverflow,
+  type Session,
+  type Turn,
+  turnFields,
+  withoutPrevious,
+} from "./session.js";
+import {
   addTokens,
   addUsage,
+  captureRequest,
   captureResponse,
   captureToolOutput,
   describeRequest,
@@ -906,6 +921,8 @@ const LOGIN_HOLD =
 function failure(
   result: SDKResultMessage,
   facts: SessionFacts,
+  /** The query continued a session: running out of context runs it again fresh (ResumeOverflow). */
+  resumed: boolean,
 ): WorkerResult | undefined {
   const succeeded = result.subtype === "success" && !result.is_error;
   const ended = `Claude worker ended with ${result.subtype}${result.stop_reason ? ` (stop_reason ${result.stop_reason})` : ""}: ${detail(resultError(result) ?? "") || "no detail"}`;
@@ -923,6 +940,7 @@ function failure(
         new PlannerError("hold", `${LOGIN_HOLD} (${ended})`),
       );
     case "too-long":
+      if (resumed) throw new ResumeOverflow();
       return hold(
         `The Work Item's prompt is larger than the worker model's context window; choose a model with a larger window or replan the item smaller, then answer retry (${ended})`,
       );
@@ -963,6 +981,19 @@ export class ClaudeWorker implements Worker {
   }
 
   async run(input: WorkerInput): Promise<WorkerResult> {
+    try {
+      return await this.once(input);
+    } catch (error) {
+      // A continued session ran out of context: once more, fresh.
+      if (!(error instanceof ResumeOverflow)) throw error;
+      return this.once({
+        ...input,
+        conversation: withoutPrevious(input.conversation),
+      });
+    }
+  }
+
+  private async once(input: WorkerInput): Promise<WorkerResult> {
     input.signal.throwIfAborted();
     let sdk: SdkModule;
     let z: Zod;
@@ -1045,9 +1076,33 @@ export class ClaudeWorker implements Worker {
       prompt: input.prompt,
       ...(input.facts ? { facts: input.facts } : {}),
     });
+    // A repair continues the item's conversation when it can; never with
+    // the operator's own settings, which the transcript doesn't bind.
+    let retained: Retained | undefined;
+    if (!config.settingSources.length && input.conversation)
+      try {
+        const turn = claudeTurn(input.conversation, input.prompt, config.model);
+        if (turn)
+          retained = {
+            turn,
+            env: claudeSessionEnvironment(input.conversation.dir),
+          };
+      } catch (error) {
+        await attempt.close();
+        return providerOutcome(
+          new PlannerError(
+            "hold",
+            `Factory could not set up the Claude worker conversation; fix the host's work directory, then answer retry (${detail(String(error))})`,
+          ),
+        );
+      }
+    if (retained) {
+      turnFields(record, retained.turn);
+      if (retained.turn.resumed) captureRequest(record, retained.turn.prompt);
+    }
     const started = Date.now();
     try {
-      const result = await this.converse(attempt, sdk, login, record);
+      const result = await this.converse(attempt, sdk, login, record, retained);
       record.outcome = result.kind;
       return result;
     } catch (error) {
@@ -1065,6 +1120,7 @@ export class ClaudeWorker implements Worker {
     attempt: Attempt,
     login: Record<string, string>,
     abortController: AbortController,
+    retained: Retained | undefined,
   ): Options {
     const { config } = this;
     const model = sdkModel(config.model);
@@ -1133,6 +1189,7 @@ export class ClaudeWorker implements Worker {
         // A Read over this many tokens fails and tells the worker to use
         // offset/limit or search; whole-file reads otherwise fill its context.
         CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS: "8000",
+        ...retained?.env,
       },
       mcpServers: attempt.servers(),
       strictMcpConfig: true,
@@ -1146,7 +1203,7 @@ export class ClaudeWorker implements Worker {
       // Prompts carry untrusted source text; never expand @paths or commands.
       verbatimPrompts: true,
       thinking: { type: "adaptive" },
-      persistSession: false,
+      ...sessionOptions(retained?.turn),
     };
   }
 
@@ -1161,8 +1218,15 @@ export class ClaudeWorker implements Worker {
     sdk: SdkModule,
     login: Record<string, string>,
     record: Record<string, unknown>,
+    retained: Retained | undefined,
   ): Promise<WorkerResult> {
+    const turn = retained?.turn;
+    // Where this query's cumulative cost and counts start (claude.ts
+    // baselineOf); a credential restart moves it.
+    let base = baselineOf(turn);
+    let compacted = false;
     const { input } = attempt;
+    const prompt = turn?.prompt ?? input.prompt;
     // A running Validate or shell command sends no events; its silence is
     // bounded by the item's whole validation deadline, as for Copilot.
     const watchdog = new IdleWatchdog(
@@ -1181,8 +1245,9 @@ export class ClaudeWorker implements Worker {
     let facts: SessionFacts = { initialized: false, modelResponded: false };
     const abort = () => controller.abort(watchdog.signal.reason);
     watchdog.signal.addEventListener("abort", abort, { once: true });
-    // Every query is a fresh session (none resumes); its turns count from 1.
-    record.sessionMode = "fresh";
+    // A query continues the item's session when its turn resumes one; its
+    // turns count on from the session's.
+    record.sessionMode = turn?.resumed ? "resumed" : "fresh";
     record.imageOutputs = 0;
     const callStarted = Date.now();
     const send = (content: string) => {
@@ -1193,11 +1258,11 @@ export class ClaudeWorker implements Worker {
       turns = userTurns();
       controller = new AbortController();
       facts = { initialized: false, modelResponded: false };
-      record.sessionTurn = 0;
+      record.sessionTurn = (turn?.number ?? 1) - 1;
       send(prompt);
       session = sdk.query({
         prompt: turns.messages(),
-        options: this.queryOptions(attempt, login, controller),
+        options: this.queryOptions(attempt, login, controller, retained),
       });
       return session[Symbol.asyncIterator]();
     };
@@ -1221,7 +1286,7 @@ export class ClaudeWorker implements Worker {
     const tools = new NativeTools();
     let response: string | undefined;
     try {
-      let events = start(input.prompt);
+      let events = start(prompt);
       for (;;) {
         const next = await watchdog.race(events.next());
         if (next.done) break;
@@ -1294,6 +1359,8 @@ export class ClaudeWorker implements Worker {
           if (message.message.model !== SYNTHETIC_MODEL)
             facts.modelResponded = true;
         }
+        if (message.type === "system" && message.subtype === "compact_boundary")
+          compacted = true;
         if (message.type === "system" && message.subtype === "init") {
           facts.initialized = true;
           record.session = message.session_id;
@@ -1301,9 +1368,10 @@ export class ClaudeWorker implements Worker {
         }
         if (message.type !== "result") continue;
         result = message;
-        if (Number.isFinite(message.total_cost_usd))
-          queryUsd = message.total_cost_usd;
-        queryTokens = tokens({ ...usageOf(message) });
+        // A continued session reports its cost and per-model counts
+        // cumulatively: this turn's are what follows the kept total.
+        queryUsd = ownCost(message, base) ?? queryUsd;
+        queryTokens = tokens({ ...usageOf(message, base.models) });
         record.tokens = addTokens(spentTokens, queryTokens);
         record.costUsd = spentUsd + queryUsd;
         record.turns = message.num_turns;
@@ -1340,11 +1408,21 @@ export class ClaudeWorker implements Worker {
           result = undefined;
           spentUsd += queryUsd;
           queryUsd = 0;
+          // A resumed turn's restart resumes the same session, whose totals
+          // now include this query; a fresh turn's starts a new session.
+          base = turn?.resumed
+            ? {
+                costUsd: Number.isFinite(message.total_cost_usd)
+                  ? message.total_cost_usd
+                  : base.costUsd,
+                models: modelCounts(message) ?? base.models,
+              }
+            : baselineOf(undefined);
           spentTokens = addTokens(spentTokens, queryTokens);
           spentUsage = addUsage(spentUsage, queryUsage);
           queryUsage = undefined;
           queryTokens = tokens({ input: 0, output: 0, cached: 0 });
-          events = start(`${input.prompt}${CREDENTIAL_RESTART}`);
+          events = start(`${prompt}${CREDENTIAL_RESTART}`);
           continue;
         }
         if (
@@ -1400,7 +1478,7 @@ export class ClaudeWorker implements Worker {
     }
     if (!result)
       return { kind: "retry", reason: "Claude SDK ended without a result" };
-    const failed = failure(result, facts);
+    const failed = failure(result, facts, Boolean(turn?.resumed));
     if (failed) return failed;
     if (!facts.initialized)
       return {
@@ -1413,12 +1491,35 @@ export class ClaudeWorker implements Worker {
     if (attempt.grants.validate) record.finalTreeValidated = Boolean(tree);
     const finalResponse = result.subtype === "success" ? result.result : "";
     captureResponse(record, finalResponse);
+    const sessionId = record.session as string | undefined;
     return {
       kind: "finished",
       finalResponse,
+      ...withSession(
+        turn &&
+          sessionId &&
+          turn.end(sessionId, {
+            compacted,
+            costUsd: result.total_cost_usd,
+            ...withModels(modelCounts(result)),
+          }),
+      ),
       ...(tree && { validated: { tree, commands: [...input.commands] } }),
     };
   }
+}
+
+/** A retained turn and the environment that keeps its transcript (claude.ts claudeSessionEnvironment). */
+interface Retained {
+  turn: Turn;
+  env: Record<string, string>;
+}
+
+/** The session a turn left, as a WorkerResult field. */
+function withSession(session: Session | "" | undefined): {
+  session?: Session;
+} {
+  return session ? { session } : {};
 }
 
 /** The named operator variables a worker's commands may see; never Git, GitHub or SSH ones. */

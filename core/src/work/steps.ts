@@ -108,6 +108,11 @@ import {
   type WorkItem,
 } from "../planning/types.js";
 import { type DeliveryUnit, unitOf, units } from "../planning/units.js";
+import {
+  conversationDir,
+  type Session,
+  scopeOf,
+} from "../providers/session.js";
 import { moveStatusOffDone } from "../queue.js";
 import {
   type Correction,
@@ -128,6 +133,7 @@ import {
   type DependencyResult,
   decisionLines,
   type ResultReview,
+  type ReviewConversation,
   receiptPath,
   reviewQa,
   reviewResult,
@@ -878,12 +884,23 @@ async function workStep(
       context.log,
       deps.config.secrets,
     );
-    const { spend, ...result } = await deps
+    // A repair continues the item's worker conversation when it can.
+    const conversation = retained(
+      state,
+      deps,
+      `work-${item.id}`,
+      runnable,
+      fact(state, "workSession", item.id),
+    );
+    const { spend, session, ...result } = await deps
       .worker(plan, shown.blocks, profile)
       .run({
         worktree,
         prompt: prepared.prompt,
         facts: prepared.facts,
+        ...(conversation
+          ? { conversation: { ...conversation, prompt: prepared.prompt } }
+          : {}),
         item: runnable,
         commands: runnable.validation.map((v) => v.command),
         base,
@@ -894,6 +911,8 @@ async function workStep(
         ...(context.answer ? { answer: context.answer } : {}),
       })
       .finally(() => activity.close());
+    if (conversation)
+      context.keep(facts({ workSession: session ?? null }, item.id));
     // A paid worker's spend outlives retries, restarts and repairs.
     if (spend) keepAll = { ...keepAll, ...facts({ spend }, item.id) };
     if (result.kind !== "finished") return withKeep(result, keepAll);
@@ -1073,6 +1092,44 @@ function acceptedNotes(
       );
   }
   return notes;
+}
+
+/**
+ * A retained conversation of this Objective (providers/session.ts) that
+ * continues `previous`, scoped to the accepted plan, so a replan or a
+ * reset starts it fresh; none with `sessions.enabled` off.
+ */
+function retained(
+  state: ObjectiveState,
+  deps: BuildDeps,
+  name: string,
+  /** What it reviews or builds: its Work Item's design, or the whole plan; an amendment that changes it starts fresh. */
+  design: unknown,
+  previous: Session | undefined,
+): ReviewConversation | undefined {
+  if (!deps.config.sessions.enabled) return undefined;
+  return {
+    dir: conversationDir(deps.workDir(state.issue), name),
+    // The accepted plan, the design and the frozen configuration: a
+    // replan, a reset, an amendment or `adopt` starts fresh.
+    scope: scopeOf(state.kept[ACCEPTED_AT], design, state.frozen?.digest),
+    policy: deps.config.sessions,
+    ...(previous ? { previous } : {}),
+  };
+}
+
+/**
+ * An answer or fact that asks for an independent second look (`retry`,
+ * `revalidate`, a rereview): the review starts fresh, not from its own
+ * earlier verdict.
+ */
+function secondLook(context: StepContext, item?: string): boolean {
+  const answer = context.answer?.answer;
+  return (
+    answer === "retry" ||
+    answer === "revalidate" ||
+    (item !== undefined && fact(context.state, "rereview", item) !== undefined)
+  );
 }
 
 /** Add facts to keep to any outcome that can carry them. */
@@ -2047,10 +2104,20 @@ async function reviewStep(
     deps,
     work.base,
   );
+  const conversation = retained(
+    state,
+    deps,
+    `review-${item.id}`,
+    item,
+    secondLook(context, item.id)
+      ? undefined
+      : fact(state, "reviewSession", item.id),
+  );
   const review = await reviewResult({
     planner: deps.planner,
     plan,
     item,
+    ...(conversation ? { conversation } : {}),
     checkout: deps.config.checkout,
     base: work.base,
     commit: candidate(state, item.id),
@@ -2078,6 +2145,8 @@ async function reviewStep(
     signal,
     log: context.log,
   });
+  if (conversation?.kept !== undefined)
+    context.keep(facts({ reviewSession: conversation.kept }, item.id));
   const held = (asked: ResultReview | null) => facts({ held: asked }, item.id);
   return withKeep(
     reviewOutcome(review, held, REFUSES_ITEM, (refusal) =>
@@ -3067,6 +3136,8 @@ function repairOutcome(
           selection: null,
           refused: null,
           diagnosis: null,
+          workSession: null,
+          reviewSession: null,
         },
         item.id,
       )
@@ -3790,8 +3861,16 @@ function finalReviewStep(deps: BuildDeps): Step {
             ]
           : [];
       });
+      const conversation = retained(
+        state,
+        deps,
+        "final-review",
+        plan,
+        secondLook(context) ? undefined : fact(state, "session:final-review"),
+      );
       const review = await reviewObjective({
         planner: deps.planner,
+        ...(conversation ? { conversation } : {}),
         plan,
         checkout: deps.config.checkout,
         base: plan.base,
@@ -3842,6 +3921,8 @@ function finalReviewStep(deps: BuildDeps): Step {
         signal,
         log: context.log,
       });
+      if (conversation?.kept !== undefined)
+        context.keep(facts({ "session:final-review": conversation.kept }));
       const held = (asked: ResultReview | null) =>
         facts({ "final-review:held": asked });
       // Only an Objective criterion or a coverage obligation can be
@@ -4280,7 +4361,8 @@ async function closeFactoryPulls(
 /**
  * Every worktree and selection ref of the Objective, whatever plan made
  * them, then its whole work directory: captured media, review artifacts,
- * final media and review scratch, and the planning tree.
+ * final media and review scratch, the planning tree, and the retained
+ * conversations (`sessions/`: Codex session records, Claude transcripts).
  */
 async function removeWorkFiles(
   issue: number,

@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -23,14 +24,20 @@ import { within } from "../paths.js";
 import { errorMessage } from "../text.js";
 import {
   addCodexTelemetry,
+  type CodexBaseline,
+  codexBaseline,
+  codexSessionRecord,
+  codexTelemetry,
   codexTokens,
   codexTurnUsage,
   modelItem,
   SDK_OPERATIONS,
+  turnTokens,
 } from "./codex-telemetry.js";
 import {
   callImages,
   detail,
+  freshOnOverflow,
   IdleWatchdog,
   loggedCall,
   type ModelChoice,
@@ -41,7 +48,13 @@ import {
   PlannerError,
   type PlannerModels,
 } from "./planner.js";
-import { captureResponse, firstToken, Tallies } from "./usage.js";
+import { openTurn, overflowed, type Turn, turnFields } from "./session.js";
+import {
+  captureRequest,
+  captureResponse,
+  firstToken,
+  Tallies,
+} from "./usage.js";
 
 export type CodexEffort = ModelReasoningEffort;
 
@@ -214,6 +227,12 @@ export interface CodexHome {
  * `finish` completes the home; on any failure the root is removed.
  */
 export function privateCodexHome<T>(options: {
+  /**
+   * A retained conversation's home (session.ts), kept across turns: its
+   * Codex state (`codex-home`, with the thread's session record) stays,
+   * and everything else is made again. Absent: a new temporary root.
+   */
+  root?: string;
   outside?: { directory: string; name: string };
   config: (home: CodexHome) => string;
   /** The environment the ambient variables come from; process.env by default. */
@@ -222,16 +241,20 @@ export function privateCodexHome<T>(options: {
   keep?: readonly string[];
   finish: (home: CodexHome) => T;
 }): T {
-  const root = mkdtempSync(join(tmpdir(), "factory-codex-"));
+  const root = options.root ?? mkdtempSync(join(tmpdir(), "factory-codex-"));
   try {
     const { outside, keep = [] } = options;
+    if (options.root) {
+      mkdirSync(root, { recursive: true, mode: 0o700 });
+      trimCodexHome(root);
+    }
     if (outside && within(realpathSync(root), realpathSync(outside.directory)))
       throw new Error(`Codex homes must stay outside the ${outside.name}`);
     const home = join(root, "home");
     const codexDir = join(root, "codex-home");
     const temporary = join(root, "tmp");
     for (const directory of [home, codexDir, temporary])
-      mkdirSync(directory, { mode: 0o700 });
+      mkdirSync(directory, { mode: 0o700, recursive: Boolean(options.root) });
     const env: Record<string, string> = {};
     const created: CodexHome = { root, home, codexDir, temporary, env };
     writeFileSync(join(codexDir, "config.toml"), options.config(created), {
@@ -263,15 +286,38 @@ export function privateCodexHome<T>(options: {
 }
 
 /**
+ * A retained home between turns: only its Codex state (`codex-home`, with
+ * the thread's session record) stays; scratch, HOME, caches, the login
+ * link and the configuration go.
+ */
+export function trimCodexHome(root: string): void {
+  for (const entry of readdirSync(root))
+    if (entry !== "codex-home")
+      rmSync(join(root, entry), { recursive: true, force: true });
+  // The login link and Factory's configuration are made again each turn.
+  for (const entry of ["config.toml", "auth.json", "models_cache.json"])
+    rmSync(join(root, "codex-home", entry), { force: true });
+}
+
+/** Where a retained conversation keeps its Codex home, inside its directory. */
+export function codexHomeOf(conversationDir: string): string {
+  return join(conversationDir, "codex");
+}
+
+/**
  * A planning call's home with a working directory. `readDir` turns on the
  * read-only shell over that directory alone.
  */
-function codexHome(readDir: string | undefined): {
+function codexHome(
+  readDir: string | undefined,
+  root: string | undefined,
+): {
   root: string;
   workdir: string;
   env: Record<string, string>;
 } {
   return privateCodexHome({
+    ...(root && { root }),
     ...(readDir && { outside: { directory: readDir, name: "read directory" } }),
     config: () =>
       readDir
@@ -324,8 +370,7 @@ export function codexFailure(message: string): PlannerError {
       "context window exceeded",
     )
   )
-    return new PlannerError(
-      "fail",
+    return PlannerError.contextOverflow(
       `The request is larger than the model's context window: ${shown}`,
     );
   const usageLimit = /you[’']ve hit your usage limit\b/.test(text);
@@ -419,8 +464,10 @@ export class CodexPlanner implements Planner {
 
   async answer(call: PlannerCall): Promise<PlannerAnswer> {
     const choice = modelChoice(this.models, call);
-    return loggedCall("codex", call, choice, (record) =>
-      this.run(call, choice, record),
+    return freshOnOverflow(call, (once) =>
+      loggedCall("codex", once, choice, (record) =>
+        this.run(once, choice, record),
+      ),
     );
   }
 
@@ -457,10 +504,27 @@ export class CodexPlanner implements Planner {
       call.signal,
     );
     let home: ReturnType<typeof codexHome>;
+    let turn: Turn;
     try {
+      // A retained conversation's home lives in its directory, kept
+      // across turns; a turn that can't continue empties it first.
+      turn = openTurn(
+        call.conversation,
+        call.prompt,
+        "codex",
+        choice.model,
+        (session) =>
+          codexSessionRecord(
+            join(codexHomeOf(call.conversation!.dir), "codex-home"),
+            session.id,
+          ) !== undefined,
+      );
       // Removes its own folder when it fails; the folder of a home that
       // was set up is removed in the finally below on every path.
-      home = codexHome(call.readDir);
+      home = codexHome(
+        call.readDir,
+        call.conversation && codexHomeOf(call.conversation.dir),
+      );
     } catch (error) {
       watchdog.stop();
       throw new PlannerError(
@@ -469,6 +533,7 @@ export class CodexPlanner implements Planner {
       );
     }
     let events: AsyncGenerator<ThreadEvent> | undefined;
+    let baseline: CodexBaseline | undefined;
     try {
       const tier =
         choice.serviceTier === "fast"
@@ -493,16 +558,24 @@ export class CodexPlanner implements Planner {
           ? { workingDirectory: resolve(call.readDir) }
           : { workingDirectory: home.workdir, sandboxMode: "read-only" }),
       };
-      const thread = codex.startThread(options);
-      record.sessionTurn = 1;
-      record.sessionMode = "fresh";
+      turnFields(record, turn);
+      if (turn.resumed) {
+        record.thread = turn.resumed.id;
+        captureRequest(record, turn.prompt);
+      }
+      // A continued thread's earlier turns are in its record already.
+      if (turn.resumed)
+        baseline = codexBaseline(home.env.CODEX_HOME!, turn.resumed.id);
+      const thread = turn.resumed
+        ? codex.resumeThread(turn.resumed.id, options)
+        : codex.startThread(options);
       // Images go as local_image input: codex exec attaches them with --image.
       const input: Input = images.length
         ? [
-            { type: "text", text: call.prompt },
+            { type: "text", text: turn.prompt },
             ...images.map((path) => ({ type: "local_image" as const, path })),
           ]
-        : call.prompt;
+        : turn.prompt;
       // The SDK spawns codex with only our env and kills it on this signal.
       // Finding 10 (left as is, checked by the milestone drill): the SDK
       // spawns codex outside its own process group and signals only codex,
@@ -574,12 +647,16 @@ export class CodexPlanner implements Planner {
         }
         if (event.type === "turn.completed") {
           completed = true;
-          usage = {
-            input: event.usage.input_tokens,
-            output: event.usage.output_tokens,
-            cached: event.usage.cached_input_tokens,
-          };
-          record.tokens = codexTokens(event.usage);
+          const counts = baseline
+            ? turnTokens(codexTokens(event.usage), baseline.tokens)
+            : codexTokens(event.usage);
+          record.tokens = counts;
+          if (counts.input !== null && counts.output !== null)
+            usage = {
+              input: counts.input,
+              output: counts.output,
+              ...(counts.cached !== null && { cached: counts.cached }),
+            };
           codexTurnUsage(record, event.usage);
         }
         if (event.type === "turn.failed")
@@ -603,22 +680,33 @@ export class CodexPlanner implements Planner {
           `Codex answer is not JSON: ${detail(response)}`,
         );
       }
+      const threadId =
+        (record.thread as string | undefined) ?? turn.resumed?.id;
+      const session =
+        threadId &&
+        turn.end(threadId, {
+          compacted: Boolean(
+            codexTelemetry(home.env.CODEX_HOME!, threadId, baseline?.size)
+              ?.compacted,
+          ),
+        });
       return {
         value,
         model: choice.model,
         effort: choice.effort,
         ...(usage && { usage }),
         turns: 1,
+        ...(session ? { session } : {}),
       };
     } catch (error) {
-      if (error instanceof PlannerError) throw error;
+      if (error instanceof PlannerError) throw overflowed(error, turn);
       const idle = watchdog.expired;
       if (idle)
         throw new PlannerError("retry", idle.message, { kind: "error" });
       // The step was cancelled or hit its deadline: the engine decides.
       if (call.signal.aborted) throw call.signal.reason ?? error;
       // A failed codex process: its stderr is in the message.
-      throw codexFailure(errorMessage(error));
+      throw overflowed(codexFailure(errorMessage(error)), turn);
     } finally {
       watchdog.stop();
       // Closing the stream makes the SDK kill a codex process still running.
@@ -634,8 +722,13 @@ export class CodexPlanner implements Planner {
         clearTimeout(timer);
       }
       saveModelsCache(home.env.CODEX_HOME!);
-      addCodexTelemetry(record, home.env.CODEX_HOME!);
-      keepOrRemove(home.root, record.thread as string | undefined, call.log);
+      addCodexTelemetry(record, home.env.CODEX_HOME!, baseline?.size);
+      // A retained conversation's home stays for its next turn, unless a
+      // later turn has taken it (a hedge's loser, an aborted attempt).
+      if (call.conversation) {
+        if (turn.owns()) trimCodexHome(home.root);
+      } else
+        keepOrRemove(home.root, record.thread as string | undefined, call.log);
     }
   }
 }
