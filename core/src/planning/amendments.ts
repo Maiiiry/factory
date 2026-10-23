@@ -613,11 +613,6 @@ function amendPlanStep(proposal: AmendmentProposal, deps: PlanningDeps): Step {
         reply?.answer === "answer" &&
         !answered.some((entry) => entry.holdId === reply.holdId)
       ) {
-        if (!reply.text?.trim())
-          return hold(
-            `${reply.question ?? "Planning this amendment needs your answer."}\n\n\`answer\` needs text after it, for example \`/factory answer use the existing parser\`.`,
-            ["answer", "refuse", "cancel"],
-          );
         return {
           kind: "retry",
           reason: "Recorded the operator's answer for the amendment planner",
@@ -628,7 +623,8 @@ function amendPlanStep(proposal: AmendmentProposal, deps: PlanningDeps): Step {
               {
                 holdId: reply.holdId,
                 question: reply.question ?? "",
-                answer: reply.text.trim(),
+                // Text is required (`needsText`): the engine refuses an answer without it.
+                answer: (reply.text ?? "").trim(),
               },
             ],
           },
@@ -740,7 +736,21 @@ function amendPlanStep(proposal: AmendmentProposal, deps: PlanningDeps): Step {
       if (decoded.question)
         return hold(
           `Planning amendment ${proposal.id} needs a decision:\n\n${decoded.question}\n\n\`answer <your choice>\` plans the amendment again with it; \`refuse\` rejects the amendment.`,
-          ["answer", "refuse", "cancel"],
+          [
+            {
+              answer: "answer",
+              family: "answer",
+              consequence: "Plans the amendment again with your answer.",
+              needsText: true,
+            },
+            {
+              answer: "refuse",
+              family: "refuse",
+              consequence:
+                "Rejects the amendment, so it can be replaced or the plan runs without it.",
+            },
+            "cancel",
+          ],
         );
       if (!decoded.plan) return reject(decoded.findings);
       const findings = [
@@ -919,7 +929,14 @@ function rejectionStep(
       if (answer?.answer === "continue") return done({});
       return hold(
         `Amendment ${rejected.proposal.id} was rejected: ${rejected.error}\n\nPropose a replacement that repeats its discovery with a new diagnosis and correction, or \`continue\` to run the plan without it.`,
-        ["continue", "cancel"],
+        [
+          {
+            answer: "continue",
+            family: "accept",
+            consequence: "Runs the plan without this amendment.",
+          },
+          "cancel",
+        ],
       );
     },
   };

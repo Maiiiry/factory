@@ -452,6 +452,7 @@ export async function serve(options: ServeOptions): Promise<number> {
             stored.by,
             request.writtenAt,
             request.question,
+            request.arg,
           );
           break;
         case "pause":
