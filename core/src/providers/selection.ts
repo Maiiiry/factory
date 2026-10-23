@@ -146,9 +146,18 @@ function unavailable(
       const what = routes.has(provider.name)
         ? `whose settings changed since then. It needs them as they were: ${JSON.stringify(provider.settings)}. Restore them`
         : "which the configuration no longer names. Restore it with the settings it had";
-      return hold(
-        `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry; or cancel.`,
-      );
+      // Another configured provider: `switch` moves the Objective onto it
+      // now, without a configuration change and a restart.
+      const others = [...routes.keys()].filter((n) => n !== provider.name);
+      const named = others.map((n) => `\`${n}\``).join(", ");
+      return others.length
+        ? hold(
+            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry. Or ${others.length === 1 ? `answer \`switch\` to run it on provider ${named}` : `answer \`switch NAME\` to run it on another configured provider: ${named}`}; or cancel.`,
+            ["switch", "retry", "cancel"],
+          )
+        : hold(
+            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry; or cancel.`,
+          );
     },
   };
 }
