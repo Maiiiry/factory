@@ -1080,7 +1080,7 @@ export async function guarded(
           ...(error.afterMs !== undefined ? { afterMs: error.afterMs } : {}),
           ...(error.wait ? { wait: error.wait } : {}),
         };
-      if (error.outcome === "hold") return hold(error.message);
+      if (error.outcome === "hold") return hold(error.message, error.answers);
       // Too large for the model, or refused: the Objective has to change.
       return hold(
         `${error.message}\n\nEdit the Objective (for example, pin smaller Sources) and answer \`replan\`.`,

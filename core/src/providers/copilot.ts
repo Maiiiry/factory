@@ -48,6 +48,21 @@ const READ_TOOLS = ["view", "rg", "glob"];
 const LOGIN_HOLD =
   "Copilot login is missing or expired: run `copilot` and `/login` (or `gh auth login`) as the service's user, then answer retry";
 
+/**
+ * A model the login can't use: no retry serves it (each would bill a
+ * request), so the answer is the setting, then `switch` to re-freeze the
+ * provider's new settings or to move to another provider.
+ */
+function modelHold(model: string, why: string): PlannerError {
+  return new PlannerError(
+    "hold",
+    `${why}. Set this provider's model to one the Copilot login can use and restart the service, then answer \`switch NAME\` with this provider's name to run on its new settings, or with another configured provider's name; or cancel.`,
+    undefined,
+    undefined,
+    ["switch", "cancel"],
+  );
+}
+
 const WORKER_SYSTEM =
   "You are an implementation worker controlled by Factory. Work only in the current working directory and only on paths owned by the Work Item. Do not commit, push, publish, open or edit issues or pull requests, access GitHub tools, deploy, or change the current Git HEAD. You have file tools and no shell; Factory validates your result after you finish. Return a concise description and stop when complete or safely blocked.";
 
@@ -239,9 +254,9 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
             event.data.model !== turn.choice.model
           )
             fail(
-              new PlannerError(
-                "hold",
-                `Copilot served ${event.data.model}, not the configured ${turn.choice.model}. Choose a model the Copilot login can use in the provider's settings, then answer retry.`,
+              modelHold(
+                turn.choice.model,
+                `Copilot served ${event.data.model}, not the configured ${turn.choice.model}`,
               ),
             );
           if (event.type === "assistant.usage") {
@@ -441,7 +456,7 @@ export class CopilotWorker implements Worker {
           ...(error.wait && { wait: error.wait }),
         };
       return error.outcome === "hold"
-        ? hold(error.message)
+        ? hold(error.message, error.answers)
         : hold(`${error.message}. Narrow the Work Item, then answer retry.`);
     } finally {
       record.ms = Date.now() - started;

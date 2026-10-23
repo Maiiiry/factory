@@ -60,6 +60,8 @@ export class PlannerError extends Error {
     readonly afterMs?: number,
     /** For `retry`: a usage limit and its reset (CORE.md#Waits). */
     readonly wait?: Wait,
+    /** For `hold`: its answers, when not `retry` and `cancel`. */
+    readonly answers?: string[],
   ) {
     super(reason);
   }

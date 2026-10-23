@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { crashPoint } from "./crash.js";
 import type { RunLog } from "./log.js";
 import type { ProviderConfig } from "./providers/config.js";
@@ -665,7 +666,7 @@ export class ObjectiveRunner {
         if (!name || !settings || !others.includes(name))
           return others.length
             ? `Name the provider to switch to: \`${SWITCH} NAME\`, one of ${others.join(", ")}.`
-            : "No other provider is configured to switch to.";
+            : "No other provider is configured, and this one's settings are unchanged, so there is nothing to switch to.";
         // The Objective's frozen provider changes for the rest of its run.
         this.state.provider = {
           name,
@@ -712,10 +713,20 @@ export class ObjectiveRunner {
   }
 
   /** Configured provider names other than the one this Objective runs on. */
+  /**
+   * Providers `switch` can move to: every other configured one, and this
+   * one when its configured settings changed since they were frozen (a
+   * model fixed in the configuration, then the service restarted).
+   */
   private otherProviders(): string[] {
-    return Object.keys(this.workflow.providers ?? {}).filter(
-      (name) => name !== this.state.provider?.name,
-    );
+    const current = this.state.provider;
+    return Object.entries(this.workflow.providers ?? {})
+      .filter(
+        ([name, settings]) =>
+          name !== current?.name ||
+          !isDeepStrictEqual(settings, current.settings),
+      )
+      .map(([name]) => name);
   }
 
   /**
