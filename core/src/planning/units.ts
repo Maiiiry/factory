@@ -52,6 +52,11 @@ export function units(
     for (const dependency of item.dependencies)
       children.set(dependency, [...(children.get(dependency) ?? []), item.id]);
   const blocked = expansionBarriers(plan);
+  // An expansion's children will depend on these, so the units keep their
+  // shape when the children appear: they never chain as a parent.
+  const envelopeDependencies = new Set(
+    (plan.expansions ?? []).flatMap((envelope) => envelope.dependencies),
+  );
   // Items that never join a chain, as a child or as a parent.
   const standalone = (item: WorkItem | undefined) =>
     item === undefined ||
@@ -73,7 +78,11 @@ export function units(
     )
       continue;
     const parent = item.dependencies[0] as string;
-    if (standalone(byId.get(parent)) || children.get(parent)?.length !== 1)
+    if (
+      standalone(byId.get(parent)) ||
+      envelopeDependencies.has(parent) ||
+      children.get(parent)?.length !== 1
+    )
       continue;
     continuation.set(parent, item.id);
     childOf.add(item.id);
@@ -119,8 +128,9 @@ export function unitOf(
 
 /**
  * Items at or behind an expansion's integration barrier never chain: the
- * barrier must integrate on its own. Core does not settle expansions, so
- * every declared barrier counts.
+ * barrier waits for every child the expansion adds (planning/expansion.ts),
+ * so it integrates on its own. Children never chain either: each depends
+ * on the discovery producer, which is standalone.
  */
 function expansionBarriers(
   plan: Pick<Plan, "items" | "expansions">,
