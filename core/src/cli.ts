@@ -34,15 +34,18 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
 
   serve                          Run the service (the only writer of state)
   status [ISSUE] [--json]        Show Objectives and open questions
-  answer ISSUE ANSWER [--text T] Answer an Objective's open question
+  answer ISSUE ANSWER [--question ID] [--text T]
+                                 Answer the question ID (default: the oldest open one)
   cancel ISSUE                   Cancel an Objective
-  retry ISSUE                    Retry an Objective's waiting steps now
+  retry ISSUE [--question ID]    Retry an Objective's waiting steps now, or
+                                 answer retry to an open question
 `;
 
 interface StatusRow {
   issue: number;
   status: ObjectiveStatus | "unreadable";
-  hold: Hold | null;
+  /** Open questions, oldest first. */
+  holds: Hold[];
   waiting: {
     step: string;
     nextAt: string;
@@ -224,14 +227,16 @@ async function status(paths: Paths, args: Args): Promise<number> {
       rows.push({
         issue,
         status: "unreadable",
-        hold: {
-          id: "unreadable",
-          step: "state",
-          question: `Factory can't read this Objective's state (${loaded.error}).`,
-          answers: ["cancel"],
-          recommended: "cancel",
-          askedAt: "",
-        },
+        holds: [
+          {
+            id: "unreadable",
+            step: "state",
+            question: `Factory can't read this Objective's state (${loaded.error}).`,
+            answers: ["cancel"],
+            recommended: "cancel",
+            askedAt: "",
+          },
+        ],
         waiting: [],
         error: loaded.error,
       });
@@ -241,7 +246,7 @@ async function status(paths: Paths, args: Args): Promise<number> {
     rows.push({
       issue,
       status: state.status,
-      hold: state.hold,
+      holds: state.holds,
       waiting: Object.entries(state.retries).map(([step, retry]) => ({
         step,
         nextAt: retry.nextAt,
@@ -262,11 +267,11 @@ async function status(paths: Paths, args: Args): Promise<number> {
   if (rows.length === 0) lines.push("No Objectives.");
   for (const row of rows) {
     lines.push(`#${row.issue}: ${row.status}`);
-    if (row.hold)
+    for (const hold of row.holds)
       lines.push(
-        `  Question: ${row.hold.question}`,
-        `  Answers: ${row.hold.answers.join(", ")} (recommended: ${row.hold.recommended})`,
-        `  Answer with: factory answer ${row.issue} <answer>`,
+        `  Question ${hold.id}${hold.item ? ` (Work Item ${hold.item})` : ""}: ${hold.question}`,
+        `  Answers: ${hold.answers.join(", ")} (recommended: ${hold.recommended})`,
+        `  Answer with: factory answer ${row.issue} <answer> --question ${hold.id}`,
       );
     for (const wait of row.waiting)
       lines.push(
@@ -301,8 +306,15 @@ async function request(
       issue,
       answer,
       ...(args.flags.text ? { text: args.flags.text } : {}),
+      ...(args.flags.question ? { question: args.flags.question } : {}),
     };
-  } else body = { kind: command, issue };
+  } else if (command === "retry")
+    body = {
+      kind: "retry",
+      issue,
+      ...(args.flags.question ? { question: args.flags.question } : {}),
+    };
+  else body = { kind: command, issue };
   const by = process.env.USER ?? "operator";
   const id = writeRequest(paths.requests, body, by);
   if (!(await serviceLive(paths))) {

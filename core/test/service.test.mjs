@@ -84,10 +84,10 @@ function seed(inst, issue, status = "checking", fields = {}) {
   writeFileSync(
     join(inst.objectives, `${issue}.json`),
     JSON.stringify({
-      version: 1,
+      version: 2,
       issue,
       status,
-      hold: null,
+      holds: [],
       answers: {},
       retries: {},
       kept: {},
@@ -186,22 +186,22 @@ test("a step that can't run holds with answers that work", async () => {
   const inst = installation();
   seed(inst, 7);
   const service = serve(inst);
-  await until(() => status(inst).objectives[0]?.hold, "hold");
+  await until(() => status(inst).objectives[0]?.holds.length, "hold");
   const [row] = status(inst).objectives;
   assert.equal(row.status, "holding");
-  assert.deepEqual(row.hold.answers, ["retry", "cancel"]);
+  assert.deepEqual(row.holds[0].answers, ["retry", "cancel"]);
 
   const wrong = cli(inst, "answer", "7", "approve");
   assert.equal(wrong.code, 1);
   assert.match(wrong.out, /Answers: retry, cancel/);
   assert.equal(status(inst).objectives[0].status, "holding");
 
-  const firstHold = status(inst).objectives[0].hold.id;
+  const firstHold = status(inst).objectives[0].holds[0].id;
   assert.equal(cli(inst, "answer", "7", "retry").code, 0);
   await until(
     () =>
-      status(inst).objectives[0].hold?.id !== undefined &&
-      status(inst).objectives[0].hold.id !== firstHold,
+      status(inst).objectives[0].holds[0]?.id !== undefined &&
+      status(inst).objectives[0].holds[0].id !== firstHold,
     "a new hold after retry",
   );
 
@@ -211,7 +211,7 @@ test("a step that can't run holds with answers that work", async () => {
     "cleanup after cancel",
   );
   assert.equal(stateOf(inst, 7).status, "cancelled");
-  assert.equal(stateOf(inst, 7).hold, null);
+  assert.equal(stateOf(inst, 7).holds.length, 0);
   await stopped(service);
 });
 
@@ -238,7 +238,7 @@ test("unreadable state holds with cancel, and cancel works", async () => {
   await until(() => status(inst).service === "running", "service");
   const [row] = status(inst).objectives;
   assert.equal(row.status, "unreadable");
-  assert.deepEqual(row.hold.answers, ["cancel"]);
+  assert.deepEqual(row.holds[0].answers, ["cancel"]);
   assert.equal(cli(inst, "answer", "9", "retry").code, 1);
   assert.equal(cli(inst, "cancel", "9").code, 0);
   await until(
@@ -318,7 +318,7 @@ for (const point of CRASH_POINTS) {
     let killedByTest = false;
     const holdOrDeath = await Promise.race([
       crashing.exit.then(() => "died"),
-      until(() => stateOf(inst, 11).hold, "hold")
+      until(() => stateOf(inst, 11).holds.length, "hold")
         .then(() => "held")
         .catch(() => "no hold"),
     ]);
@@ -349,7 +349,8 @@ for (const point of CRASH_POINTS) {
     if (stateOf(inst, 11).status !== "cancelled") {
       await until(
         () =>
-          stateOf(inst, 11).hold || stateOf(inst, 11).status === "cancelled",
+          stateOf(inst, 11).holds.length ||
+          stateOf(inst, 11).status === "cancelled",
         "hold after restart",
       );
       cli(inst, "cancel", "11");
@@ -403,8 +404,8 @@ test("a step that keeps killing the service holds after three tries", async () =
     assert.equal(death.signal, "SIGKILL");
   }
   const service = serve(inst);
-  await until(() => stateOf(inst, 12).hold, "hold");
-  const { hold } = stateOf(inst, 12);
+  await until(() => stateOf(inst, 12).holds.length, "hold");
+  const [hold] = stateOf(inst, 12).holds;
   assert.match(
     hold.question,
     /keeps failing \(the service stopped during this step\)/,
@@ -447,8 +448,8 @@ test("a step past its deadline retries, then holds after three", async () => {
   });
   seed(inst, 21);
   const service = serve(inst);
-  await until(() => stateOf(inst, 21).hold, "hold");
-  const { hold } = stateOf(inst, 21);
+  await until(() => stateOf(inst, 21).holds.length, "hold");
+  const [hold] = stateOf(inst, 21).holds;
   assert.match(hold.question, /keeps failing \(deadline\)/);
   assert.deepEqual(hold.answers, ["retry", "cancel"]);
   assert.equal(stateOf(inst, 21).retries.check.count, 3);
@@ -463,14 +464,14 @@ test("a transient wait retries without counting errors, then asks, and wait wait
   seed(inst, 22);
   const service = serve(inst);
   await until(() => stateOf(inst, 22).retries.check?.attempts >= 3, "retries");
-  assert.equal(stateOf(inst, 22).hold, null, "no hold before the budget");
+  assert.equal(stateOf(inst, 22).holds.length, 0, "no hold before the budget");
   assert.equal(stateOf(inst, 22).retries.check.count, 0, "waits aren't errors");
-  await until(() => stateOf(inst, 22).hold, "the wait's question");
+  await until(() => stateOf(inst, 22).holds.length, "the wait's question");
   const first = stateOf(inst, 22);
-  assert.match(first.hold.question, /has been retrying since/);
-  assert.match(first.hold.question, /Last error: GitHub GET/);
-  assert.deepEqual(first.hold.answers, ["wait", "retry", "cancel"]);
-  assert.equal(first.hold.recommended, "wait");
+  assert.match(first.holds[0].question, /has been retrying since/);
+  assert.match(first.holds[0].question, /Last error: GitHub GET/);
+  assert.deepEqual(first.holds[0].answers, ["wait", "retry", "cancel"]);
+  assert.equal(first.holds[0].recommended, "wait");
 
   assert.equal(cli(inst, "answer", "22", "wait").code, 0);
   const granted = stateOf(inst, 22);
@@ -478,7 +479,9 @@ test("a transient wait retries without counting errors, then asks, and wait wait
   assert.ok(granted.retries.check.grantedUntil, "wait grants more time");
   assert.equal(granted.retries.check.since, first.retries.check.since);
   await until(
-    () => stateOf(inst, 22).hold && stateOf(inst, 22).hold.id !== first.hold.id,
+    () =>
+      stateOf(inst, 22).holds.length &&
+      stateOf(inst, 22).holds[0].id !== first.holds[0].id,
     "the question again once the grant is spent",
   );
   assert.equal(cli(inst, "cancel", "22").code, 0);
@@ -493,15 +496,17 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
   const asked = new Date().toISOString();
   // #31 holds while it owns src/; #32 owns src/x.ts, so it waits for #31.
   seed(inst, 31, "holding", {
-    resumeStatus: "building",
-    hold: {
-      id: `item:a:work@${asked}`,
-      step: "item:a:work",
-      question: "Step item:a:work keeps failing (error: broken).",
-      answers: ["retry", "cancel"],
-      recommended: "retry",
-      askedAt: asked,
-    },
+    holds: [
+      {
+        id: `item:a:work@${asked}`,
+        step: "item:a:work",
+        item: "a",
+        question: "Step item:a:work keeps failing (error: broken).",
+        answers: ["retry", "cancel"],
+        recommended: "retry",
+        askedAt: asked,
+      },
+    ],
     done: { check: {}, plan: plan(["src/"]) },
     kept: { "plan:acceptedAt": "2026-01-01T00:00:00.000Z" },
   });
@@ -512,12 +517,113 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
   // #33 is checked and needs the only slot (no configuration: one at a time).
   seed(inst, 33, "planning", { done: { check: {} } });
   const service = serve(inst);
-  await until(() => stateOf(inst, 33).hold, "#33 runs and asks");
+  await until(() => stateOf(inst, 33).holds.length, "#33 runs and asks");
   await new Promise((resolve) => setTimeout(resolve, 500));
   const waiting = stateOf(inst, 32);
-  assert.equal(waiting.hold, null, "#32 waits on #31's paths");
+  assert.deepEqual(waiting.holds, [], "#32 waits on #31's paths");
   assert.deepEqual(waiting.attempts, {});
-  assert.equal(stateOf(inst, 31).hold.step, "item:a:work");
+  assert.equal(stateOf(inst, 31).holds[0].step, "item:a:work");
+  await stopped(service);
+});
+
+test("an item's question holds only that item and its dependents", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await closedPort()}`);
+  const item = (id, kind, dependencies = []) => ({
+    id,
+    kind,
+    ownedPaths: [],
+    dependencies,
+    ...(kind === "aggregate" ? { children: [] } : {}),
+  });
+  const asked = new Date().toISOString();
+  // a holds; b is unrelated; c depends on a; d is unrelated and asks too
+  // (QA items hold on this build).
+  seed(inst, 61, "holding", {
+    holds: [
+      {
+        id: `item:a:work@${asked}`,
+        step: "item:a:work",
+        item: "a",
+        question: "Which asset set?",
+        answers: ["retry", "cancel"],
+        recommended: "retry",
+        askedAt: asked,
+      },
+    ],
+    done: {
+      check: {},
+      plan: {
+        items: [
+          item("a", "qa"),
+          item("b", "aggregate"),
+          item("c", "aggregate", ["a"]),
+          item("d", "qa"),
+        ],
+      },
+    },
+  });
+  let service = serve(inst);
+  await until(
+    () =>
+      stateOf(inst, 61).done["item:b:merge"] &&
+      stateOf(inst, 61).holds.length === 2,
+    "b finishes and d asks while a holds",
+  );
+  const both = stateOf(inst, 61);
+  assert.equal(both.status, "holding");
+  assert.deepEqual(
+    both.holds.map((hold) => hold.item),
+    ["a", "d"],
+  );
+  const held = (state) =>
+    [
+      ...Object.keys(state.done),
+      ...Object.keys(state.attempts),
+      ...Object.keys(state.retries),
+    ].filter((key) => key.startsWith("item:c:"));
+  assert.deepEqual(held(both), [], "c waits for a");
+  assert.equal(status(inst).objectives[0].holds.length, 2);
+
+  // A bound answer goes to its question; d asks again.
+  const [a, d] = both.holds;
+  assert.equal(cli(inst, "answer", "61", "retry", "--question", d.id).code, 0);
+  await until(
+    () => stateOf(inst, 61).holds.some((h) => h.item === "d" && h.id !== d.id),
+    "d asks again",
+  );
+  assert.equal(stateOf(inst, 61).holds[0].id, a.id, "a is still open");
+  const stale = cli(inst, "answer", "61", "retry", "--question", d.id);
+  assert.equal(stale.code, 1);
+  assert.match(stale.out, /isn't open/);
+
+  // An unbound answer goes to the oldest question.
+  assert.equal(cli(inst, "answer", "61", "retry").code, 0);
+  await until(
+    () =>
+      stateOf(inst, 61).holds.length === 2 &&
+      !stateOf(inst, 61).holds.some((h) => h.id === a.id),
+    "a asks again",
+  );
+  const before = stateOf(inst, 61);
+  assert.deepEqual(
+    before.holds.map((hold) => hold.item),
+    ["d", "a"],
+  );
+
+  // Open questions survive a crash.
+  service.child.kill("SIGKILL");
+  await service.exit;
+  service = serve(inst);
+  await until(() => status(inst).service === "running", "restart");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual(stateOf(inst, 61).holds, before.holds);
+  assert.equal(stateOf(inst, 61).status, "holding");
+  assert.deepEqual(held(stateOf(inst, 61)), [], "c still waits for a");
+
+  assert.equal(cli(inst, "cancel", "61").code, 0);
+  assert.deepEqual(stateOf(inst, 61).holds, []);
+  assert.equal(stateOf(inst, 61).status, "cancelled");
   await stopped(service);
 });
 
@@ -546,8 +652,8 @@ test("a new wait class starts its own budget and ends a run of errors", async ()
       stateOf(inst, 23).retries.check?.attempts >= 2,
     "transient retries",
   );
-  const { hold, retries } = stateOf(inst, 23);
-  assert.equal(hold, null, "the gate's hours aren't the transient budget");
+  const { holds, retries } = stateOf(inst, 23);
+  assert.deepEqual(holds, [], "the gate's hours aren't the transient budget");
   assert.equal(retries.check.wait, undefined);
   assert.equal(retries.check.count, 0, "a wait ends the run of errors");
   assert.ok(Date.parse(retries.check.since) > Date.parse(long) + 60_000);
@@ -575,8 +681,12 @@ test("a wait on a human gate takes no slot", async () => {
   });
   seed(inst, 42, "planning", { done: { check: {} } });
   const service = serve(inst);
-  await until(() => stateOf(inst, 42).hold, "#42 runs and asks");
-  assert.equal(stateOf(inst, 41).hold, null, "#41 still waits on its gate");
+  await until(() => stateOf(inst, 42).holds.length, "#42 runs and asks");
+  assert.equal(
+    stateOf(inst, 41).holds.length,
+    0,
+    "#41 still waits on its gate",
+  );
   await stopped(service);
 });
 
@@ -591,7 +701,10 @@ test("a state file that can't be read now is read again, not marked unreadable",
   await until(() => status(inst).service === "running", "service");
   await new Promise((resolve) => setTimeout(resolve, 300));
   chmodSync(file, 0o600);
-  await until(() => stateOf(inst, 43).hold, "the Objective runs once readable");
+  await until(
+    () => stateOf(inst, 43).holds.length,
+    "the Objective runs once readable",
+  );
   assert.equal(
     JSON.parse(readFileSync(join(inst.root, "service.json"))).unreadable[43],
     undefined,

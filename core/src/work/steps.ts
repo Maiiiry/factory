@@ -203,7 +203,7 @@ export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
       ...Object.entries(state.kept ?? {})
         .filter(([key, value]) => key.endsWith(":base") && value != null)
         .map(([key]) => key),
-      ...(state.hold ? [state.hold.step] : []),
+      ...state.holds.map((hold) => hold.step),
     ]
       .filter((key) => key.startsWith("item:"))
       .map((key) => key.split(":")[1]),

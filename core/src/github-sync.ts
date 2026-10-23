@@ -20,8 +20,8 @@ export interface GitHubModule {
   shownAt?: string;
   /** When the card was set to queued for this run, by GitHub's clock. */
   queuedAt?: string;
-  /** The hold whose question comment exists. */
-  askedHold?: string;
+  /** The open holds whose question comment exists. */
+  asked?: string[];
   /** Comments are read from here on. */
   commentsSince: string;
   /** Request ids already replied to. */
@@ -87,6 +87,8 @@ const MAX_BACKOFF_MS = 10 * 60_000;
 /** Comments kept waiting for their author's access to be read, per Objective. */
 const MAX_UNCHECKED = 20;
 const COMMAND = /^\/factory\s+(\S+)(?:\s+([\s\S]*))?$/;
+/** `--question ID` right after the answer names the hold it answers. */
+const QUESTION = /^--question\s+(\S+)(?:\s+([\s\S]*))?$/;
 
 /**
  * GitHub is input and display, never a precondition: every call here runs in
@@ -194,7 +196,7 @@ export class GitHubSync {
         this.readComments(
           issue,
           module,
-          () => Boolean(runner.state.hold),
+          () => runner.state.holds.length > 0,
           sync,
           (change) =>
             runner.transact(() =>
@@ -331,29 +333,43 @@ export class GitHubSync {
     });
   }
 
-  /** Post the open question once, with its answers. */
+  /**
+   * Post each open question once, with its answers. An answer that names
+   * no question goes to the oldest, so every other question's comment
+   * shows the answers with its id.
+   */
   private ask(runner: ObjectiveRunner, module: GitHubModule): void {
-    const hold = runner.state.hold;
-    if (!hold || module.askedHold === hold.id) return;
     const issue = runner.state.issue;
-    this.background(issue, `ask:${issue}`, async () => {
-      const marker = MARK(issue, "hold", hold.id);
-      if (!(await this.posted(issue, marker, hold.askedAt))) {
-        const answers = hold.answers
-          .map(
-            (a) =>
-              `\`/factory ${a}\`${a === hold.recommended ? " (recommended)" : ""}`,
-          )
-          .join(", ");
-        crashPoint("sync:ask:before");
-        await this.github.postComment(
-          issue,
-          `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.`,
-        );
-        crashPoint("sync:ask:after");
-      }
-      runner.transact(() => {
-        (runner.state.modules.github as GitHubModule).askedHold = hold.id;
+    runner.state.holds.forEach((hold, index) => {
+      if (module.asked?.includes(hold.id)) return;
+      const bound = index > 0 ? ` --question ${hold.id}` : "";
+      this.background(issue, `ask:${issue}:${hold.id}`, async () => {
+        const marker = MARK(issue, "hold", hold.id);
+        if (!(await this.posted(issue, marker, hold.askedAt))) {
+          const answers = hold.answers
+            .map(
+              (a) =>
+                `\`/factory ${a}${bound}\`${a === hold.recommended ? " (recommended)" : ""}`,
+            )
+            .join(", ");
+          const about = hold.item
+            ? ` It holds Work Item \`${hold.item}\` and the items that depend on it; other work goes on.`
+            : "";
+          crashPoint("sync:ask:before");
+          await this.github.postComment(
+            issue,
+            `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.${about}${bound ? " Other questions are open too, so the answer names this one." : ""}`,
+          );
+          crashPoint("sync:ask:after");
+        }
+        runner.transact(() => {
+          const github = runner.state.modules.github as GitHubModule;
+          const open = runner.state.holds.map((h) => h.id);
+          github.asked = [
+            ...(github.asked ?? []).filter((id) => open.includes(id)),
+            hold.id,
+          ];
+        });
       });
     });
   }
@@ -443,7 +459,7 @@ export class GitHubSync {
         module.shown = option;
         if (at) module.shownAt = at;
       });
-    if (module.askedHold !== "unreadable")
+    if (!module.asked?.includes("unreadable"))
       this.background(issue, `ask:${issue}`, async () => {
         const marker = MARK(issue, "hold", "unreadable");
         const found = await this.github.markedComment(issue, marker);
@@ -456,7 +472,7 @@ export class GitHubSync {
           );
           crashPoint("sync:ask:after");
         }
-        module.askedHold = "unreadable";
+        module.asked = ["unreadable"];
       });
     else if (due)
       this.readComments(
@@ -570,12 +586,14 @@ export class GitHubSync {
     const command = comment.body.match(COMMAND);
     if (!command) return;
     const answer = command[1]!.toLowerCase();
-    const text = command[2]?.trim();
+    const bound = QUESTION.exec(command[2]?.trim() ?? "");
+    const question = bound?.[1];
+    const text = (bound ? bound[2] : command[2])?.trim();
     writeRequest(
       sync.requestsDir,
       answer === "cancel"
         ? { kind: "cancel", issue }
-        : answer === "retry" && !holding
+        : answer === "retry" && !holding && !question
           ? { kind: "retry", issue }
           : {
               kind: "answer",
@@ -583,6 +601,7 @@ export class GitHubSync {
               answer,
               ...(text ? { text } : {}),
               writtenAt: comment.createdAt,
+              ...(question ? { question } : {}),
             },
       comment.login,
       `comment-${comment.id}`,

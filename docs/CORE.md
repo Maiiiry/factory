@@ -33,7 +33,7 @@ Each rule has a test (see [Testing](#testing)).
 - **Plan:** the Work Items for an Objective, with their dependencies. It's posted on the issue.
 - **Work Item:** one unit of work, delivered as one PR.
 - **Step:** one unit of progress, such as "plan", "run the worker for item 3" or "merge item 3".
-- **Hold:** a step that needs a person. It's a question posted on the issue.
+- **Hold:** a step that needs a person. It's a question posted on the issue. A Work Item's hold stops only that item and the items that depend on it.
 - **Run log:** an append-only record of what happened, for status and analysis. It never drives progress.
 
 ## Process model
@@ -67,7 +67,7 @@ Each Objective has one JSON file: `objectives/<issue>.json` under the installati
       "lastError": null,
     },
   },
-  "hold": null, // or { "id", "question", "answers": [...], "recommended", "askedAt" }
+  "holds": [], // open questions, oldest first: { "id", "step", "item"?, "question", "answers": [...], "recommended", "askedAt" }
   "retries": { "<step key>": { "count": 2, "nextAt": "<time>" } },
   "modules": {/* per-capability state, see Capabilities */},
 }
@@ -102,13 +102,13 @@ check → plan → plan review → [hold: plan question?]
 
 Every step returns exactly one outcome:
 
-| Outcome                 | Meaning                                                         | What the core does                                                                 |
-| ----------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `done(data)`            | The step finished.                                              | Save the data and move on.                                                         |
-| `retry(reason, after?)` | An error, or a wait classed by its cause (see [Waits](#waits)). | Back off (30 s doubling to 15 min, or the reset time) and run the step again.      |
-| `repair(finding)`       | The work is wrong: validation, review or CI failed.             | Run the item's work step again with the finding, until the repair budget is spent. |
-| `hold(question)`        | Only a person can decide.                                       | Post the question on the issue, set Status to "Needs you", and wait.               |
-| `fail(reason)`          | The item can't be done as planned.                              | Hold, with the answers `retry`, `replan` and `cancel`.                             |
+| Outcome                 | Meaning                                                         | What the core does                                                                                     |
+| ----------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `done(data)`            | The step finished.                                              | Save the data and move on.                                                                             |
+| `retry(reason, after?)` | An error, or a wait classed by its cause (see [Waits](#waits)). | Back off (30 s doubling to 15 min, or the reset time) and run the step again.                          |
+| `repair(finding)`       | The work is wrong: validation, review or CI failed.             | Run the item's work step again with the finding, until the repair budget is spent.                     |
+| `hold(question)`        | Only a person can decide.                                       | Post the question on the issue, set Status to "Needs you", and wait (see [Holds](#holds-and-answers)). |
+| `fail(reason)`          | The item can't be done as planned.                              | Hold, with the answers `retry`, `replan` and `cancel`.                                                 |
 
 An exception that escapes a step counts as `retry`, and so do a missed deadline, an idle model and an invalid model answer: these are errors. After three in a row on the same step, it becomes a hold: the error, plus `retry` and `cancel`. A full disk holds at once. A step can't crash the service, block another Objective, or leave an Objective without an answer that works.
 
@@ -170,7 +170,7 @@ The GitHub Project is the source of truth for what is queued.
 - **Status is a display.** The service sets Status as the run moves, from the tick it admits the Objective: Queued (while it is checked and until it has a slot), Planning, Building, Needs you, Done, Failed, Cancelled. A failed write is logged and tried again after a backoff of its own, doubling to 10 min, so one Objective's bad card never spends the rate limit the others need. A finished Objective stays in memory, across restarts too, until its final Status and its replies are written.
 - **Edges, not levels.** Factory writes the queued option itself, so a card that reads queued means nothing alone. A card queues or dequeues only when its option was set after Factory's own last Status write for that run, by GitHub's clock: Factory saves when it wrote (`shownAt`) and when the card was queued for this run (`queuedAt`), and compares the option's `updatedAt`. A stale card, or a read that started before Factory's last write, never re-admits a run that was cancelled, finished or already admitted.
 - **Operator controls:** set an item's Status to the queued option to queue it (again, for a finished Objective: set it after its final Status shows), move it out of the queued option to dequeue it if it hasn't started, and set the order number to reorder. Dequeuing before planning starts withdraws the Objective: its state is removed, as if it was never admitted, so queuing it again checks it afresh. Order is read on every queue read until the Objective starts. There is no control card and no managed metadata field.
-- **Several at once.** Up to `queue.maxActiveObjectives` Objectives plan or build at once (default 3), in queue order. An Objective builds only when no Objective whose plan was accepted earlier, and that is unfinished, owns an overlapping path; planning never waits. A holding Objective, one whose every remaining step waits on a human gate, and one waiting on another's paths take no slot; a gated or holding Objective still owns its paths. Host-wide caps limit worker runs and validations (`execution.workers` and `execution.validations`, sized from the host).
+- **Several at once.** Up to `queue.maxActiveObjectives` Objectives plan or build at once (default 3), in queue order. An Objective builds only when no Objective whose plan was accepted earlier, and that is unfinished, owns an overlapping path; planning never waits. An Objective whose open holds stop every step it could start, one whose every remaining step waits on a human gate or a hold, and one waiting on another's paths take no slot; a gated or holding Objective still owns its paths. Host-wide caps limit worker runs and validations (`execution.workers` and `execution.validations`, sized from the host).
 - **Again.** Queuing a finished Objective again stops its old run (its steps, saves and GitHub jobs) once its cleanup is done, and starts a new one. The new run first closes the old run's open PRs and removes its worktrees, as `replan` does after a plan was accepted. Factory resets a Work Item branch only when it made every commit the branch has beyond the default branch: each is committed as Factory (Factory commits with a clean Git environment as `factory@users.noreply.github.com`; an amend, rebase or cherry-pick by anyone else changes the committer), or is GitHub's update-branch merge. Otherwise it holds with `retry` (after moving the commits off), `reset` (replace the branch anyway) and `cancel`.
 - **No approval step.** A clean, reviewed plan runs straight away. Factory asks only when review finds a decision for the operator.
 
@@ -193,10 +193,13 @@ A hold is a question with named answers:
 }
 ```
 
-- It is posted as one issue comment with a marker, and it lists the answers.
-- **Answering:** a comment `/factory <answer> [text]` from a user with write access to the repository, or `factory answer <issue> <answer> [--text ...]`. The service checks for comments every 30 s while it is holding. If someone without write access answers (or the user doesn't exist), that's ignored and logged. A comment whose author's access GitHub can't report now waits in a list of up to 20 per Objective and is checked again with backoff; the comments after it go on.
+- **Scope.** A hold from a Work Item's step (`item:<id>:…`) stops only that item, and the items that depend on it through deps or stack layers, because they wait for it to settle. Other items keep starting and finishing. Any other hold stops the whole Objective: planning, final, final review, report, cleanup, unreadable state, and the engine's error and wait holds on those steps. Final and report wait until every item is settled, so they wait for every item hold.
+- **Several at once.** At most one hold per Work Item and one for the Objective are open. A second step that asks in the same scope runs again after the answer, and asks then. Each hold has its own id, question and answers. The Objective shows `holding` (Status "Needs you") while any hold is open. A held Objective takes no queue slot only when its holds stop every step it could start.
+- **Saved.** Open holds are in the state file, so a restart restores them. A repair that clears a held step drops its hold (the question is about work that is gone); cancel drops them all.
+- It is posted as one issue comment per hold, each with its own marker, and it lists the answers.
+- **Answering:** a comment `/factory <answer> [--question <id>] [text]` from a user with write access to the repository, or `factory answer <issue> <answer> [--question <id>] [--text ...]`. An answer that names no question goes to the oldest open hold. So the oldest hold's comment shows the short form, and every other hold's comment shows its answers with `--question <id>`. An answer that names a hold that isn't open is refused, naming the open ones. `factory retry <issue> [--question <id>]` answers `retry` the same way while a hold is open. `factory status` lists every open hold with its id and the command that answers it. The service checks for comments every 30 s while it is holding. If someone without write access answers (or the user doesn't exist), that's ignored and logged. A comment whose author's access GitHub can't report now waits in a list of up to 20 per Objective and is checked again with backoff; the comments after it go on.
 - **In an agent host.** The director skill shows each open hold with the host's question tool (Claude Code's AskUserQuestion, or its Codex equivalent): the question, each answer with the recommended one first, and a one-line consequence for each. That gives the operator an app notification. The chosen answer runs `factory answer`. `factory status --json` lists open holds in this shape so the skill needs no parsing.
-- An answer that doesn't match the open hold gets a reply naming the valid answers. Nothing else changes.
+- An answer that doesn't match its hold gets a reply naming the valid answers. Nothing else changes.
 - `cancel` is valid at every hold and at any time.
 - **Repair diagnosis.** When diagnosing a refused result needs a decision, the work step holds with `answer <decision>` (a correction for the worker), `retry` (diagnose again) and `cancel`. While the refused result is kept, still exists on the item's base and (for media) its selection stands, it also offers `revalidate`: the result was correct and Factory's check was at fault. The work step then finishes with that same result, without the worker or collection, and the selection, validation, review and delivery run again. It isn't counted as a repair, and a rerun after a crash does the same.
 

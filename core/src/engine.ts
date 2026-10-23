@@ -2,6 +2,7 @@ import { crashPoint } from "./crash.js";
 import type { RunLog } from "./log.js";
 import {
   type Answer,
+  type Hold,
   type ObjectiveState,
   type ObjectiveStatus,
   type Retry,
@@ -168,6 +169,11 @@ interface Running {
 
 const INTERRUPTED = "the service stopped during this step";
 
+/** The Work Item a step belongs to: item steps are keyed `item:<id>:<phase>`. */
+export function itemOf(key: string): string | undefined {
+  return /^item:([^:]+):/.exec(key)?.[1];
+}
+
 /**
  * Runs one Objective's steps. All state changes happen here, synchronously,
  * one at a time, and each is saved before the next begins. A step's start is
@@ -193,6 +199,26 @@ export class ObjectiveRunner {
 
   get busy(): boolean {
     return this.running.size > 0;
+  }
+
+  /**
+   * The open question that stops `key`: the Objective's own, or one on the
+   * step's Work Item. The workflow keeps an item's dependents (by deps and
+   * stack layers) waiting until it settles, so they wait too.
+   */
+  heldBy(key: string): Hold | undefined {
+    const item = itemOf(key);
+    return this.state.holds.find(
+      (hold) => hold.item === undefined || hold.item === item,
+    );
+  }
+
+  /** Whether open questions stop every step it could start: it takes no slot. */
+  get held(): boolean {
+    return (
+      this.state.holds.length > 0 &&
+      this.workflow.steps(this.state).every((step) => this.heldBy(step.key))
+    );
   }
 
   /** Whether this Objective has steps to run: cleanup after cancel counts. */
@@ -231,11 +257,12 @@ export class ObjectiveRunner {
     for (const key of Object.keys(this.state.attempts))
       if (!this.running.has(key))
         this.apply(key, { kind: "retry", reason: INTERRUPTED, afterMs: -1 });
-    if (this.state.status === "holding") return;
+    // An Objective question stops every step; an item's stops that item.
+    if (this.state.holds.some((hold) => hold.item === undefined)) return;
     const now = this.now().getTime();
     for (const step of this.workflow.steps(this.state)) {
       if (this.running.size >= this.limits.concurrency) return;
-      if (this.running.has(step.key)) continue;
+      if (this.running.has(step.key) || this.heldBy(step.key)) continue;
       const retry = this.state.retries[step.key];
       if (retry && Date.parse(retry.nextAt) > now) continue;
       if (step.resource && !hostLimits.acquire(step.resource)) continue;
@@ -379,12 +406,6 @@ export class ObjectiveRunner {
         state.done[key] = outcome.result ?? true;
         delete state.retries[key];
         delete state.answers[key];
-        if (TERMINAL.includes(state.status)) break;
-        // Another step's question may be open: keep holding, and resume
-        // to the status this step's progress gives.
-        if (state.status === "holding")
-          state.resumeStatus = this.workflow.status(state);
-        else state.status = this.workflow.status(state);
         break;
       case "retry":
         this.retry(key, outcome);
@@ -409,6 +430,10 @@ export class ObjectiveRunner {
           if (cleared !== outcome.target) delete state.retries[cleared];
         }
         this.abortRunning(outcome.clear);
+        // A question about work the repair cleared is moot.
+        state.holds = state.holds.filter(
+          (hold) => !outcome.clear.includes(hold.step),
+        );
         state.repairs ??= {};
         const repair = state.repairs[outcome.target] ?? {
           count: 0,
@@ -431,6 +456,14 @@ export class ObjectiveRunner {
         break;
       }
     }
+    if (!TERMINAL.includes(state.status)) this.settle();
+  }
+
+  /** `holding` while any question is open; otherwise the status progress gives. */
+  private settle(): void {
+    this.state.status = this.state.holds.length
+      ? "holding"
+      : this.workflow.status(this.state);
   }
 
   /**
@@ -551,9 +584,10 @@ export class ObjectiveRunner {
   }
 
   /**
-   * Open a question. One question is open at a time: a second step that
-   * asks while another question is open runs again after the answer, and
-   * asks then.
+   * Open a question, on the step's Work Item or (for any other step) on the
+   * Objective. One question is open per Work Item and one for the
+   * Objective: a second step that asks while its scope's question is open
+   * runs again after the answer, and asks then.
    */
   private hold(
     key: string,
@@ -563,7 +597,9 @@ export class ObjectiveRunner {
   ): void {
     const state = this.state;
     const now = this.now().toISOString();
-    if (state.hold && state.hold.step !== key) {
+    const item = itemOf(key);
+    const open = state.holds.find((hold) => hold.item === item);
+    if (open && open.step !== key) {
       const previous = state.retries[key];
       state.retries[key] = {
         ...previous,
@@ -576,35 +612,47 @@ export class ObjectiveRunner {
       return;
     }
     const all = answers.includes("cancel") ? answers : [...answers, "cancel"];
-    state.hold = {
-      id: `${key}@${now}`,
-      step: key,
-      question,
-      answers: all,
-      recommended: all.includes(recommended) ? recommended : all[0]!,
-      askedAt: now,
-    };
-    if (state.status !== "holding") state.resumeStatus = state.status;
+    state.holds = [
+      ...state.holds.filter((hold) => hold !== open),
+      {
+        id: `${key}@${now}`,
+        step: key,
+        ...(item !== undefined ? { item } : {}),
+        question,
+        answers: all,
+        recommended: all.includes(recommended) ? recommended : all[0]!,
+        askedAt: now,
+      },
+    ];
     state.status = "holding";
   }
 
   /**
-   * Answer the open question. Returns null when applied, or the reason it
-   * doesn't fit. The caller saves (see `transact`).
+   * Answer an open question: the one `question` names (a hold id), or the
+   * oldest. Returns null when applied, or the reason it doesn't fit. The
+   * caller saves (see `transact`).
    */
   answer(
     answer: string,
     text: string | undefined,
     by: string,
     writtenAt?: string,
+    question?: string,
   ): string | null {
     if (answer === "cancel") return this.cancel(by);
-    const hold = this.state.hold;
-    if (!hold) return `#${this.state.issue} has no open question.`;
+    const holds = this.state.holds;
+    const hold =
+      question === undefined
+        ? holds[0]
+        : holds.find((open) => open.id === question);
+    if (!hold)
+      return question === undefined
+        ? `#${this.state.issue} has no open question.`
+        : `#${this.state.issue}'s question ${question} isn't open, so that answer wasn't applied. ${openQuestions(holds)}`;
     if (writtenAt && Date.parse(writtenAt) < Date.parse(hold.askedAt) - 60_000)
-      return `That answer was written before the current question was asked, so it wasn't applied. The open question asks: ${hold.question.slice(0, 300)} Answers: ${hold.answers.join(", ")}.`;
+      return `That answer was written before question ${hold.id} was asked, so it wasn't applied. It asks: ${hold.question.slice(0, 300)} Answers: ${hold.answers.join(", ")}.`;
     if (!hold.answers.includes(answer))
-      return `"${answer}" isn't an answer to this question. Answers: ${hold.answers.join(", ")}.`;
+      return `"${answer}" isn't an answer to question ${hold.id}. Answers: ${hold.answers.join(", ")}.`;
     const retry = this.state.retries[hold.step];
     if (answer === WAIT && retry) this.grant(retry);
     else {
@@ -625,10 +673,8 @@ export class ObjectiveRunner {
         };
       delete this.state.retries[hold.step];
     }
-    this.state.hold = null;
-    this.state.status =
-      this.state.resumeStatus ?? this.workflow.status(this.state);
-    delete this.state.resumeStatus;
+    this.state.holds = holds.filter((open) => open !== hold);
+    this.settle();
     return null;
   }
 
@@ -662,10 +708,9 @@ export class ObjectiveRunner {
       return `#${this.state.issue} has already finished (${status}).`;
     if (status === "cancelled") return null;
     this.state.status = "cancelled";
-    this.state.hold = null;
+    this.state.holds = [];
     this.state.attempts = {};
     this.state.retries = {};
-    delete this.state.resumeStatus;
     this.state.answers.cancel = {
       holdId: "",
       answer: "cancel",
@@ -680,13 +725,20 @@ export class ObjectiveRunner {
     return null;
   }
 
-  /** Run waiting steps now, or answer `retry` to an open question that offers it. */
-  retryNow(by: string): string | null {
-    const hold = this.state.hold;
-    if (hold) {
-      if (!hold.answers.includes("retry"))
-        return `#${this.state.issue}'s open question has no retry answer. Answers: ${hold.answers.join(", ")}.`;
-      return this.answer("retry", undefined, by);
+  /**
+   * Run waiting steps now; or, while a question is open, answer `retry` to
+   * the one `question` names, or the oldest.
+   */
+  retryNow(by: string, question?: string): string | null {
+    const holds = this.state.holds;
+    if (question !== undefined || holds.length) {
+      const hold =
+        question === undefined
+          ? holds[0]
+          : holds.find((open) => open.id === question);
+      if (hold && !hold.answers.includes("retry"))
+        return `#${this.state.issue}'s question ${hold.id} has no retry answer. Answers: ${hold.answers.join(", ")}.`;
+      return this.answer("retry", undefined, by, undefined, question);
     }
     for (const retry of Object.values(this.state.retries))
       retry.nextAt = this.now().toISOString();
@@ -697,6 +749,12 @@ export class ObjectiveRunner {
     this.state.updatedAt = this.now().toISOString();
     saveState(this.dir, this.state);
   }
+}
+
+function openQuestions(holds: readonly Hold[]): string {
+  return holds.length
+    ? `Open questions: ${holds.map((hold) => `${hold.id} (${hold.answers.join(", ")})`).join("; ")}.`
+    : "No question is open now.";
 }
 
 /** A retry's class: a reset, a gate, or an unknown cause (errors included). */

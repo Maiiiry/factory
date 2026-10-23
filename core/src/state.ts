@@ -12,7 +12,7 @@ import {
 import { join } from "node:path";
 import { crashPoint } from "./crash.js";
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 
 export type ObjectiveStatus =
   | "checking"
@@ -35,6 +35,11 @@ export interface Hold {
   id: string;
   /** The step that asked; it runs again with the answer. */
   step: string;
+  /**
+   * The Work Item it holds (a step keyed `item:<id>:…`): only that item
+   * waits, and its dependents with it. Absent: the whole Objective waits.
+   */
+  item?: string;
   question: string;
   answers: string[];
   recommended: string;
@@ -81,10 +86,10 @@ export interface Retry {
 export interface ObjectiveState {
   version: number;
   issue: number;
+  /** `holding` while any question is open. */
   status: ObjectiveStatus;
-  /** The status to return to when a hold is answered. */
-  resumeStatus?: ObjectiveStatus;
-  hold: Hold | null;
+  /** Open questions, oldest first: at most one for the Objective and one per Work Item. */
+  holds: Hold[];
   /** The latest answer per step, read by the step when it runs again. */
   answers: Record<string, Answer>;
   retries: Record<string, Retry>;
@@ -108,7 +113,7 @@ export function newObjective(issue: number, now: Date): ObjectiveState {
     version: STATE_VERSION,
     issue,
     status: "checking",
-    hold: null,
+    holds: [],
     answers: {},
     retries: {},
     repairs: {},
