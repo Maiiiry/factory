@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { redact } from "./log.js";
 import { errorMessage } from "./text.js";
 
 const run = promisify(execFile);
@@ -105,11 +106,22 @@ export interface AsyncMerge {
  */
 export class GitHub {
   private token: string | undefined;
+  private secrets: readonly string[] = [];
 
   constructor(
     readonly repository: string,
     private readonly api = "https://api.github.com",
   ) {}
+
+  /**
+   * Redact these secret values (policy.allowedSecretNames) from every text
+   * Factory writes to GitHub: comments, PR bodies, titles. One choke point,
+   * so no hold, report or log excerpt can carry a value a worker saw.
+   */
+  redacting(secrets: readonly string[]): this {
+    this.secrets = secrets.filter((secret) => secret.length >= 4);
+    return this;
+  }
 
   get owner(): string {
     return this.repository.split("/")[0]!;
@@ -732,7 +744,13 @@ export class GitHub {
           ...(body === undefined ? {} : { "content-type": "application/json" }),
           ...headers,
         },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined
+          ? {}
+          : {
+              body: JSON.stringify(
+                method === "GET" ? body : redactDeep(body, this.secrets),
+              ),
+            }),
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
       });
     } catch (error) {
@@ -849,4 +867,15 @@ function asyncMergeOf(value: unknown): AsyncMerge {
       ? { message: details.message.slice(0, 500) }
       : {}),
   };
+}
+
+/** Every string inside `value`, redacted; the shape is kept. */
+function redactDeep(value: unknown, secrets: readonly string[]): unknown {
+  if (typeof value === "string") return redact(value, secrets);
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, secrets));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [k, redactDeep(v, secrets)]),
+    );
+  return value;
 }

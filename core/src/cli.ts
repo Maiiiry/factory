@@ -65,7 +65,11 @@ async function main(argv: string[]): Promise<number> {
       if (existsSync(configPath(repository))) {
         const config = loadConfig(repository);
         loaded = config;
-        const github = new GitHub(config.repository);
+        const github = new GitHub(config.repository).redacting(
+          config.policy.allowedSecretNames.flatMap(
+            (name) => process.env[name] ?? [],
+          ),
+        );
         sync = new GitHubSync(github, config, new RunLog(paths.logs, "sync"));
         const planner = new HedgedPlanner(
           config.planning.provider === "claude"

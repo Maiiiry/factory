@@ -21,7 +21,6 @@ Each entry is marked **ported**, **in progress**, **slice N**, or **replaced**. 
    - binding CLI answers to the question they answer;
    - redaction and display time zone;
    - predecessor blame and `requiredEnvironment`;
-   - passing secret values to delivery's redaction (found missing at the slice 4 milestone).
 
    Done early, in the lean sweep after slice 3: the check refuses a malformed Quality checkpoint, Package manager update or Workspace package additions section.
 6. Capability ports:
@@ -236,7 +235,7 @@ Status words:
 - The director skill asks holds with AskUserQuestion, recommended answer first. Old: skills/director. **slice 5** (CORE.md#Holds; the skill is not rewritten yet).
 - Autonomy allowances (planningRevisions 1, implementationRepairs 6, resultRereviews 1), perPath caps, repairClasses; snapshotted, and running out stops for a decision. Old: src/repair-policy.ts. **in progress**: planningRevisions is ported as planning.revisions (config.ts, steps.ts), and the repair budget as config.ts execution.repairs (6 per Work Item by default, then a hold where `retry` allows one more). resultRereviews, perPath, repairClasses and snapshotting are **planned** (see Slices).
 - autonomy.requiredEnvironment secrets checked before planning. Old: USER-GUIDE#Autonomy limits. **slice 5** (moved from slice 3; nothing in core reads it).
-- policy.allowedSecretNames passed by name and redacted from output. Old: config.ts:342. **in progress**: the setting and the plumbing are ported (config.ts policy.allowedSecretNames; worktree.ts workerEnvironment; codex-worker.ts and claude-worker.ts pass the named variables). Missing: delivery.ts can redact secret values from PR text and log excerpts (DeliveryContext.secrets), but work/steps.ts doesn't pass them yet, and status and diagnostics don't redact. Both are **slice 5**.
+- policy.allowedSecretNames passed by name and redacted from output. Old: config.ts:342. **in progress**: the setting and the plumbing are ported (config.ts policy.allowedSecretNames; worktree.ts workerEnvironment; codex-worker.ts and claude-worker.ts pass the named variables). Every text Factory writes to GitHub (comments, PR bodies and titles, holds, reports) is redacted at one choke point (github.ts `redacting`, set in cli.ts from the named values). Missing: local status and diagnostics output don't redact; **slice 5**.
 - Predecessor blame: a failure in a merged predecessor's file stops with a decision and spends no repair. Old: USER-GUIDE#Decisions. **slice 5** (moved from slice 3). validate.ts uses the predecessor only to pin package scripts; a failure is always the item's repair.
 - `fail` holds with retry, replan and cancel (new). **slice 5**.
 
@@ -345,7 +344,7 @@ Status words:
 
   Ledger counts after this update, by the same rules: 107 ported, 21 replaced, 27 in progress, 57 planned, and 1 gap (213 lines). Delta from the slice 3 milestone: +17 ported, +1 replaced, -7 in progress, -5 planned, +6 lines. Of the lines that became ported, 5 had been done by the lean sweep after slice 3 and were still marked open: refusing malformed Quality checkpoint, Workspace package additions and Package manager update sections at the check, and the Codex and Claude worker settings in config. Still not ported from this area:
   - Peers' notes in result review, and every item's notes in final review: slice 6 (found at this milestone; the old tree had them).
-  - Passing secret values to delivery's redaction of PR text: slice 5 (found at this milestone).
+  - Secret values weren't redacted from GitHub writes (found at this milestone); fixed at the GitHub write choke point.
   - `retry --rereview` from holds other than repair diagnosis, `--review-artifacts` and the resultRereviews budget: slice 5.
   - Setup flags for delivery and the worker settings: slice 7.
   - QA and discovery items, execution profiles, conditions, capacityRecommendation and scheduling reservations: slice 6.

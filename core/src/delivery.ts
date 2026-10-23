@@ -114,8 +114,6 @@ export interface DeliveryContext {
    * Factory did; past GITHUB_LAG_MS from this, the lag becomes a question.
    */
   retryingSince?: string;
-  /** Secret values (policy.allowedSecretNames) redacted from PR text and excerpts. */
-  secrets?: string[];
 }
 
 /**
@@ -429,10 +427,10 @@ async function originHold(context: DeliveryContext): Promise<Hold | undefined> {
 
 /** Factory's PR text: the goal, links, changed paths, passing commands and the candidate. No model call. */
 async function pullRequestBody(
-  context: Pick<DeliveryContext, "github" | "checkout" | "signal" | "secrets">,
+  context: Pick<DeliveryContext, "github" | "checkout" | "signal">,
   input: PublishInput,
 ): Promise<string> {
-  const safe = (value: string) => redact(value, context.secrets);
+  const safe = (value: string) => redact(value);
   const code = (value: string) =>
     `<code>${safe(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\n", "&#10;").replaceAll("\r", "&#13;")}</code>`;
   const issues = `https://github.com/${context.github.repository}/issues`;
@@ -925,7 +923,7 @@ async function failureExcerpt(
     } catch (error) {
       tolerate(error);
     }
-  return parts.length ? redact(parts.join("\n"), context.secrets) : undefined;
+  return parts.length ? redact(parts.join("\n")) : undefined;
 }
 
 /**
