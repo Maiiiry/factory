@@ -40,7 +40,7 @@ import {
 } from "./requests.js";
 import { RESET, type ResetRecord, resetRecord } from "./reset.js";
 import {
-  type FrozenProvider,
+  type Frozen,
   findState,
   finishState,
   listObjectives,
@@ -68,8 +68,8 @@ export interface ServeOptions {
   tickMs?: number;
   /** GitHub queue, display and comments. Absent without configuration. */
   sync?: GitHubSync;
-  /** The provider each newly admitted Objective freezes. */
-  provider?: FrozenProvider;
+  /** The configuration each newly admitted Objective freezes. */
+  frozen?: Frozen;
   /** Reads Objectives as they move; never changes them (knowledge records memory here). */
   observer?: StateObserver;
   /** The workflow can rebuild a state from GitHub (`factory reset`, reset.ts): it has configuration. */
@@ -532,7 +532,7 @@ export async function serve(options: ServeOptions): Promise<number> {
       known ? structuredClone(known.state) : undefined,
       hadState,
       unreadable.get(issue)?.github,
-      options.provider,
+      options.frozen,
     );
     // Its steps are stopped, not waited for: an effect already in flight
     // (a merge) may land after the rebuild read GitHub (deferred to the
@@ -727,7 +727,7 @@ export async function serve(options: ServeOptions): Promise<number> {
         // before the new one exists, so only one run ever writes the file.
         previous?.stop();
         options.sync?.forget(issue);
-        const state = newObjective(issue, new Date(), options.provider);
+        const state = newObjective(issue, new Date(), options.frozen);
         state.modules.github = github;
         // The earlier run's PRs and worktrees go before the new run plans.
         if (previous) state.kept[RERUN] = true;
@@ -737,7 +737,12 @@ export async function serve(options: ServeOptions): Promise<number> {
         log.write(issue, {
           event: "admitted",
           again: Boolean(previous),
-          ...(options.provider ? { provider: options.provider } : {}),
+          ...(options.frozen
+            ? {
+                provider: options.frozen.provider,
+                config: options.frozen.digest,
+              }
+            : {}),
         });
       },
       withdraw: (issue: number) => {

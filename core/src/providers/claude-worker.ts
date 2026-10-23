@@ -98,7 +98,7 @@ export interface ClaudeWorkerConfig {
 const VALIDATE = "Validate";
 const FILE_TOOLS: string[] = CLAUDE_TOOLS.filter((tool) => tool !== VALIDATE);
 
-const DEFAULT_CLAUDE_WORKER: ClaudeWorkerConfig = {
+export const DEFAULT_CLAUDE_WORKER: ClaudeWorkerConfig = {
   model: "claude-opus-5-5",
   effort: "medium",
   permissionMode: "acceptEdits",
@@ -111,7 +111,8 @@ const DEFAULT_CLAUDE_WORKER: ClaudeWorkerConfig = {
 };
 
 export interface ClaudeWorkerOptions {
-  config?: Partial<ClaudeWorkerConfig>;
+  /** Resolved (selection.ts resolvedProvider): what the Objective froze. */
+  config: ClaudeWorkerConfig;
   sandbox: SandboxConfig;
   /** The accepted plan: Validate's pins and the handoff's peers. */
   plan: Plan;
@@ -865,7 +866,7 @@ export class ClaudeWorker implements Worker {
   private readonly config: ClaudeWorkerConfig;
 
   constructor(private readonly options: ClaudeWorkerOptions) {
-    this.config = { ...DEFAULT_CLAUDE_WORKER, ...options.config };
+    this.config = options.config;
   }
 
   async run(input: WorkerInput): Promise<WorkerResult> {
