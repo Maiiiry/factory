@@ -15,6 +15,7 @@ import { BaseFiles } from "../planning/facts.js";
 import type { Plan } from "../planning/types.js";
 import type { ObjectiveState } from "../state.js";
 import { TERMINAL } from "../state.js";
+import { mergeOf } from "../work/merged.js";
 import { admitted, type PlanningContext } from "./settings.js";
 import { type Database, sha256, transaction, withStore } from "./store.js";
 
@@ -225,10 +226,7 @@ export async function pathDigest(
 /** The tree an item's paths are cited at: its last work result, else its merge. */
 function itemTree(state: ObjectiveState, item: string): string | undefined {
   const work = state.done[`item:${item}:work`] as { tree?: string } | undefined;
-  const merge = state.done[`item:${item}:merge`] as
-    | { mergeSha?: string }
-    | undefined;
-  return work?.tree ?? merge?.mergeSha;
+  return work?.tree ?? mergeOf(state, item)?.mergeSha;
 }
 
 function stateRecords(state: ObjectiveState): MemoryRecord[] {
@@ -371,7 +369,7 @@ function episodeRecord(
       id: item.id,
       title: item.title,
       ownedPaths: item.ownedPaths,
-      merged: Boolean(state.done[`item:${item.id}:merge`]),
+      merged: Boolean(mergeOf(state, item.id)),
       pr: published?.pr ?? null,
       repairs,
     };

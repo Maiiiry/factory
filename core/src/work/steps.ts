@@ -79,6 +79,7 @@ import {
   worktreePath,
 } from "../worktree.js";
 import { collect, type HandoffNote } from "./collect.js";
+import { type MergeResult, mergeOf } from "./merged.js";
 import { prepareWorkPrompt, type RepairContext } from "./prompt.js";
 import type { Worker, WorkerSpend } from "./worker.js";
 
@@ -171,14 +172,6 @@ interface PublishResult {
   pr: number;
   head: string;
   merged: boolean;
-}
-
-interface MergeResult {
-  mergeSha: string;
-  integratedSha: string;
-  at: string;
-  /** A native stack's top: every layer's item, merged at `mergeSha`. */
-  items?: string[];
 }
 
 /**
@@ -292,19 +285,6 @@ export function built(state: ObjectiveState): boolean {
   // A split delivers through its children, which aren't created yet.
   if (!plan || plan.split) return false;
   return plan.items.every((item) => mergeOf(state, item.id));
-}
-
-/**
- * The merge that delivered `id`: its own merge step's, or, for a lower
- * native-stack layer, the stack's merge recorded on the unit's top.
- */
-function mergeOf(state: ObjectiveState, id: string): MergeResult | undefined {
-  const own = state.done[stepKey(id, "merge")] as MergeResult | undefined;
-  if (own) return own;
-  for (const [key, value] of Object.entries(state.done))
-    if (key.endsWith(":merge") && (value as MergeResult).items?.includes(id))
-      return value as MergeResult;
-  return undefined;
 }
 
 /** The item's unit and layer when it is in a native stack of more than one item. */
