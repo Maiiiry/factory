@@ -1,5 +1,6 @@
 import { lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { resultRereviews } from "../allowances.js";
 import { crashPoint } from "../crash.js";
 import {
   ACCEPT,
@@ -551,6 +552,7 @@ async function workStep(
     // The operator says the refused result is correct and Factory's check
     // was at fault: it is the step's result again, unchanged, with no
     // worker run, collection or repair. Only reads: a rerun does the same.
+    // The engine charged it to resultRereviews when the answer landed.
     const refused = await refusedResult(
       state,
       item,
@@ -925,6 +927,7 @@ async function repairContext(
     log: context.log,
   });
   if (result.kind === "question") {
+    const rereviewed = resultRereviews(state);
     const recheck = (await refusedResult(
       state,
       item,
@@ -932,7 +935,7 @@ async function repairContext(
       base,
       signal,
     ))
-      ? "\n\nIf the refused result is correct and Factory's own check was at fault (for example, the check could not see files the result has), answer `revalidate`: Factory runs validation, review and delivery again on the same result, unchanged, without running the worker. It doesn't count as a repair."
+      ? `\n\nIf the refused result is correct and Factory's own check was at fault (for example, the check could not see files the result has), answer \`revalidate\`: Factory runs validation, review and delivery again on the same result, unchanged, without running the worker. It doesn't count as a repair; it is a result rereview, and this Objective has used ${rereviewed.used} of ${rereviewed.allowed} (autonomy.allowances.resultRereviews).`
       : "";
     return {
       hold: hold(
@@ -955,7 +958,7 @@ async function repairContext(
                   answer: "revalidate",
                   family: "accept",
                   consequence:
-                    "Validates, reviews and delivers the same result again, without the worker.",
+                    "Validates, reviews and delivers the same result again, without the worker; uses a result rereview.",
                 } as const,
               ]
             : []),
@@ -1862,6 +1865,7 @@ function repairOutcome(
     kind: "repair",
     finding: text,
     target: stepKey(item.id, "work"),
+    ...(kept.kind === "conflict" ? { conflict: true as const } : {}),
     clear: [item, ...above].flatMap((entry) =>
       PHASES.map((p) => stepKey(entry.id, p)),
     ),
