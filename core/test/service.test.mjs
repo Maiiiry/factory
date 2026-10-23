@@ -624,8 +624,9 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
     items: [{ id: "a", ownedPaths: paths, dependencies: [] }],
   });
   const asked = new Date().toISOString();
-  // #31 holds while it owns src/; #32 owns src/x.ts, so it waits for #31.
-  seed(inst, 31, "holding", {
+  // #32 holds while it owns src/; #31 owns src/x.ts and its plan was
+  // accepted later (a replan), so the lower issue waits for #32.
+  seed(inst, 32, "holding", {
     resumeStatus: "building",
     hold: {
       id: `item:a:work@${asked}`,
@@ -638,7 +639,7 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
     done: { check: {}, plan: plan(["src/"]) },
     kept: { "plan:acceptedAt": "2026-01-01T00:00:00.000Z" },
   });
-  seed(inst, 32, "building", {
+  seed(inst, 31, "building", {
     done: { check: {}, plan: plan(["src/x.ts"]) },
     kept: { "plan:acceptedAt": "2026-01-02T00:00:00.000Z" },
   });
@@ -647,10 +648,10 @@ test("a held Objective and one waiting on its paths don't stall the queue", asyn
   const service = serve(inst);
   await until(() => stateOf(inst, 33).hold, "#33 runs and asks");
   await new Promise((resolve) => setTimeout(resolve, 500));
-  const waiting = stateOf(inst, 32);
-  assert.equal(waiting.hold, null, "#32 waits on #31's paths");
+  const waiting = stateOf(inst, 31);
+  assert.equal(waiting.hold, null, "#31 waits on #32's paths");
   assert.deepEqual(waiting.attempts, {});
-  assert.equal(stateOf(inst, 31).hold.step, "item:a:work");
+  assert.equal(stateOf(inst, 32).hold.step, "item:a:work");
   await stopped(service);
 });
 
