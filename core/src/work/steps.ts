@@ -72,6 +72,7 @@ import {
   GitRefusal,
   hostGit,
   hostGitExit,
+  isAncestor,
   removeWorktree,
   worktreePath,
 } from "../worktree.js";
@@ -1702,12 +1703,9 @@ export function finalStep(deps: BuildDeps): Step {
             | MergeResult
             | undefined;
           if (!merged?.mergeSha) continue;
-          const on = await hostGitExit(
-            config.checkout,
-            ["merge-base", "--is-ancestor", merged.mergeSha, head],
-            { signal },
-          );
-          if (on.code !== 0)
+          if (
+            !(await isAncestor(config.checkout, merged.mergeSha, head, signal))
+          )
             return hold(
               `Work Item ${item.id}'s merge \`${merged.mergeSha.slice(0, 12)}\` is not on the default branch (${head.slice(0, 12)}); someone may have reverted or force-pushed it. Restore it and answer \`retry\`, or \`replan\`.`,
               ["retry", "replan", "cancel"],

@@ -14,7 +14,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome } from "./engine.js";
-import { defaultHead, type GitExit, operatorGit } from "./git.js";
+import { defaultHead, operatorGit } from "./git.js";
 import {
   type AsyncMerge,
   type CheckRun,
@@ -32,7 +32,7 @@ import { BaseFiles, workflowCheckNames } from "./planning/facts.js";
 import type { WorkItem } from "./planning/types.js";
 import { errorMessage } from "./text.js";
 import { FACTORY_EMAIL } from "./work/collect.js";
-import { GitRefusal, hostGit, hostGitExit, originProblem } from "./worktree.js";
+import { GitRefusal, hostGit, isAncestor, originProblem } from "./worktree.js";
 
 const MINUTE = 60_000;
 /** How long GitHub may not yet show what Factory just did. */
@@ -1319,7 +1319,7 @@ async function integrate(
   mergeSha: string,
 ): Promise<Extract<MergeResult, { kind: "merged" }> | Retry | Hold> {
   const tip = await defaultHead(context.checkout, context.signal);
-  if (!(await ancestor(context, mergeSha, tip)))
+  if (!(await isAncestor(context.checkout, mergeSha, tip, context.signal)))
     return lagging(
       context,
       `The default branch does not show the merge of PR #${pr} (${mergeSha}) yet`,
@@ -1329,39 +1329,13 @@ async function integrate(
   if (
     !integrated ||
     integrated === mergeSha ||
-    (await ancestor(context, integrated, mergeSha))
+    (await isAncestor(context.checkout, integrated, mergeSha, context.signal))
   )
     return { kind: "merged", mergeSha, integratedSha: mergeSha };
-  if (await ancestor(context, mergeSha, integrated))
+  if (await isAncestor(context.checkout, mergeSha, integrated, context.signal))
     return { kind: "merged", mergeSha, integratedSha: integrated };
   return hold(
     `The merge of PR #${pr} (${mergeSha}) and Factory's integrated head ${integrated} have diverged. Inspect the default branch, then answer retry; or cancel.`,
-  );
-}
-
-/** `git merge-base --is-ancestor`: exit 1 is no, anything else but 0 is an error. */
-async function ancestor(
-  context: DeliveryContext,
-  older: string,
-  newer: string,
-): Promise<boolean> {
-  let result: GitExit;
-  try {
-    result = await hostGitExit(
-      context.checkout,
-      ["merge-base", "--is-ancestor", older, newer],
-      { signal: context.signal, timeoutMs: MINUTE },
-    );
-  } catch (error) {
-    if (context.signal.aborted || error instanceof GitRefusal) throw error;
-    throw new TransientError(
-      `git merge-base --is-ancestor ${older} ${newer}: ${message(error)}`,
-    );
-  }
-  if (result.code === 0) return true;
-  if (result.code === 1) return false;
-  throw new TransientError(
-    `git merge-base --is-ancestor ${older} ${newer} ${result.code === null ? `ended by ${result.signal}` : `exited ${result.code}`}: ${result.stderr}`,
   );
 }
 
@@ -1500,7 +1474,7 @@ async function acceptUnit(
     if (judged.kind !== "ready") return pin(judged, layer);
     const sha = await github.mergeCommitOf(layer.pr, signal);
     if (!sha) missing.push(`PR #${layer.pr} names no merge commit`);
-    else if (!(await ancestor(context, sha, tip)))
+    else if (!(await isAncestor(context.checkout, sha, tip, context.signal)))
       missing.push(
         `PR #${layer.pr}'s merge ${sha} is not on the default branch (${tip})`,
       );
@@ -1517,7 +1491,8 @@ async function acceptUnit(
     );
   let latest = shas[0]!;
   for (const sha of shas.slice(1))
-    if (await ancestor(context, latest, sha)) latest = sha;
+    if (await isAncestor(context.checkout, latest, sha, context.signal))
+      latest = sha;
   const result = await integrate(context, top.pr, integrated, latest);
   if (result.kind !== "merged") return pin(result, top);
   return {
