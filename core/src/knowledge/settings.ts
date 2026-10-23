@@ -78,7 +78,7 @@ export function loadKnowledgeSettings(input: {
   repository: string;
   root: string;
   checkout: string;
-  allowedSecretNames: readonly string[];
+  secrets: string[];
 }): KnowledgeSettings {
   const path = configPath(input.repository);
   const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
@@ -90,9 +90,7 @@ export function loadKnowledgeSettings(input: {
     root: input.root,
     checkout: input.checkout,
     ...(planningContext ? { planningContext } : {}),
-    secrets: input.allowedSecretNames
-      .map((name) => process.env[name])
-      .filter((value): value is string => Boolean(value)),
+    secrets: input.secrets,
   };
 }
 

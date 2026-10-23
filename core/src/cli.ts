@@ -123,11 +123,7 @@ async function main(argv: string[]): Promise<number> {
         const github = new GitHub(
           config.repository,
           process.env.FACTORY_GITHUB_API,
-        ).redacting(
-          config.policy.allowedSecretNames.flatMap(
-            (name) => process.env[name] ?? [],
-          ),
-        );
+        ).redacting(config.secrets);
         sync = new GitHubSync(
           github,
           config,
@@ -235,7 +231,7 @@ function knowledge(config: CoreConfig, paths: Paths): KnowledgeSettings {
     repository: config.repository,
     root: paths.root,
     checkout: config.checkout,
-    allowedSecretNames: config.policy.allowedSecretNames,
+    secrets: config.secrets,
   });
 }
 

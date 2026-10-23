@@ -176,12 +176,12 @@ export class GitHub {
   ) {}
 
   /**
-   * Redact these secret values (policy.allowedSecretNames) from every text
-   * Factory writes to GitHub: comments, PR bodies, titles. One choke point,
-   * so no hold, report or log excerpt can carry a value a worker saw.
+   * Redact these secret values (config.secrets) from every text Factory
+   * writes to GitHub: comments, PR bodies, titles. One choke point, so no
+   * hold, report or log excerpt can carry a value a worker saw.
    */
   redacting(secrets: readonly string[]): this {
-    this.secrets = secrets.filter((secret) => secret.length >= 4);
+    this.secrets = secrets;
     return this;
   }
 

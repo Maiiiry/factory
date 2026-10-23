@@ -60,6 +60,8 @@ export interface CodexWorkerOptions {
   network?: "host" | "off";
   /** Operator variables the worker's shell may see, by name. */
   allowedSecretNames?: readonly string[];
+  /** Values its reported commands and errors are redacted of (config.secrets). */
+  secrets?: readonly string[];
   /** Turns Codex child agents off, for a prompt that says they are. */
   childAgents?: "disabled";
   idleMs?: number;
@@ -250,9 +252,7 @@ export class CodexWorker implements Worker {
       );
     }
     const keep = this.options.allowedSecretNames ?? [];
-    const secrets = keep
-      .map((name) => process.env[name])
-      .filter((value): value is string => Boolean(value));
+    const secrets = this.options.secrets ?? [];
     let home: WorkerHome;
     try {
       home = workerHome(input.worktree, this.options.network === "host", keep);

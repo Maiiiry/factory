@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { serviceCredential } from "./providers/claude.js";
 import { type ProviderConfig, providersConfig } from "./providers/config.js";
 import {
   loadReviewArtifacts,
@@ -49,6 +50,11 @@ export interface CoreConfig {
     /** Operator variables a worker's shell may see, by name. */
     allowedSecretNames: string[];
   };
+  /**
+   * Every secret value Factory's output is redacted of, derived once here:
+   * the allowedSecretNames values and each managed provider's credential.
+   */
+  secrets: string[];
   finalValidation: {
     /** Commands every Objective's result must pass. */
     requiredCommands: string[];
@@ -320,6 +326,40 @@ export function configPath(repository: string): string {
 }
 
 /** Load and check the configuration. Throws one message naming every problem. */
+/** Shorter values would redact ordinary text. */
+const MIN_SECRET_LENGTH = 4;
+
+/**
+ * The values of the operator variables workers may see, and of each managed
+ * provider's credential (apiKeyEnv, credentialEnv) from the environment or
+ * the service's credentials. Only `names` reach a worker's environment;
+ * all of them are redacted from output.
+ */
+function secretValues(
+  names: readonly string[],
+  providers: Record<string, ProviderConfig>,
+): string[] {
+  const credentials = Object.values(providers).flatMap(({ worker }) =>
+    worker.kind === "openai-agents"
+      ? [worker.apiKeyEnv]
+      : worker.kind === "claude-managed-agents"
+        ? [worker.credentialEnv]
+        : [],
+  );
+  const values = new Set<string>();
+  for (const name of names) values.add(process.env[name] ?? "");
+  for (const name of credentials) {
+    let value = process.env[name];
+    try {
+      value ??= serviceCredential(name);
+    } catch {
+      // An unreadable credential can't be used, so it can't be written.
+    }
+    values.add(value ?? "");
+  }
+  return [...values].filter((value) => value.length >= MIN_SECRET_LENGTH);
+}
+
 export function loadConfig(repository: string): CoreConfig {
   const path = configPath(repository);
   let raw: Record<string, unknown>;
@@ -414,6 +454,10 @@ export function loadConfig(repository: string): CoreConfig {
       "policy.allowedSecretNames",
     ),
   };
+  config.secrets = secretValues(
+    config.policy.allowedSecretNames,
+    config.providers ?? {},
+  );
   config.finalValidation = {
     requiredCommands: list(
       final.requiredCommands,

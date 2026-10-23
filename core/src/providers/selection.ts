@@ -74,6 +74,7 @@ export function providerWorker(
           sandbox: config.sandbox,
           network: worker.network,
           allowedSecretNames,
+          secrets: config.secrets,
         });
     }
   };
