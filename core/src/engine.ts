@@ -385,8 +385,11 @@ export class ObjectiveRunner {
     const now = this.now();
     delete state.attempts[key];
     if ("keep" in outcome && outcome.keep) {
+      // null forgets a fact: readers see it as absent, never as null.
       state.kept ??= {};
-      Object.assign(state.kept, outcome.keep);
+      for (const [fact, value] of Object.entries(outcome.keep))
+        if (value === null) delete state.kept[fact];
+        else state.kept[fact] = value;
     }
     if (TERMINAL.includes(state.status) && outcome.kind !== "done") {
       // Cleanup after the end never asks and never blocks: it retries in
