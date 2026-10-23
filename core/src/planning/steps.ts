@@ -2,9 +2,10 @@ import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CoreConfig } from "../config.js";
 import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
-import { defaultHead } from "../git.js";
+import { defaultHead, sha256 } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
+import { visibleMarkdown } from "../markdown.js";
 import { parseObjective } from "../objective.js";
 import { type Planner, PlannerError } from "../providers/planner.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
@@ -299,12 +300,7 @@ function planRoundStep(
         let inputs: ObjectiveInputs;
         if (g > 1 && n === 1) {
           // A replan re-reads the issue and the default branch.
-          const fresh = await readObjective(
-            state.issue,
-            deps,
-            "replan",
-            signal,
-          );
+          const fresh = await readObjective(deps, "replan", context);
           if ("hold" in fresh) return fresh.hold;
           inputs = fresh.inputs;
         } else inputs = generationInputs(state, g);
@@ -666,9 +662,19 @@ function changedHold(
   );
 }
 
-/** An issue body as compared for edits: GitHub may send CRLF line ends. */
-export const normalizedBody = (text: string | null): string =>
-  (text ?? "").replace(/\r\n/g, "\n").trim();
+/**
+ * The Objective body as planning reads it and as edits are compared: only
+ * what GitHub shows a reader (visibleMarkdown), so a hidden comment never
+ * reaches a model, with a split child's leading marker kept. GitHub may
+ * send CRLF line ends.
+ */
+export function objectiveText(raw: string | null): string {
+  const text = (raw ?? "").replace(/\r\n?/g, "\n");
+  const marker = childIdentity(text)
+    ? text.slice(0, text.indexOf("\n") + 1)
+    : "";
+  return `${marker}${visibleMarkdown(text.slice(marker.length)).trim()}`;
+}
 
 /** Whether the issue body differs from the one this generation planned from. */
 async function objectiveChanged(
@@ -679,8 +685,7 @@ async function objectiveChanged(
 ): Promise<boolean> {
   const issue = await deps.github.issue(state.issue, signal);
   return (
-    normalizedBody(issue.body) !==
-    normalizedBody(generationInputs(state, g).body)
+    objectiveText(issue.body) !== objectiveText(generationInputs(state, g).body)
   );
 }
 
@@ -877,12 +882,13 @@ async function postPlan(
  * `again` is the answer that reads it again once the operator has edited it.
  */
 export async function readObjective(
-  issue: number,
   deps: PlanningDeps,
   again: "recheck" | "replan",
-  signal: AbortSignal,
+  context: StepContext,
 ): Promise<{ inputs: ObjectiveInputs } | { hold: Outcome }> {
   const { config } = deps;
+  const { state, signal } = context;
+  const issue = state.issue;
   const found = await deps.github.issue(issue, signal);
   if (found.state !== "open")
     return {
@@ -892,7 +898,9 @@ export async function readObjective(
         "cancel",
       ),
     };
-  const body = found.body ?? "";
+  const body = objectiveText(found.body);
+  const unapproved = await authorHold(found.user?.login, body, deps, context);
+  if (unapproved) return { hold: unapproved };
   const inputs = {
     body,
     base: await defaultHead(config.checkout, signal),
@@ -915,6 +923,45 @@ export async function readObjective(
     problems.push(...(await localExecutables(inputs, config, signal)).problems);
   if (problems.length) return { hold: objectiveProblemsHold(problems, again) };
   return { inputs };
+}
+
+/** Where the operator's approval of a non-writer's Objective is kept. */
+const AUTHOR_APPROVAL = "objective:author-approval";
+
+/**
+ * An issue a non-writer wrote is planned only once a writer approves its
+ * text: until then nothing in it (its commands, Sources, local assets or
+ * instructions) counts. The approval holds for that exact visible text, by
+ * digest, so a later edit asks again. The question names the digest, and
+ * an `approve` counts only while the text still has it, so an edit made
+ * between the question and the answer asks again too.
+ */
+async function authorHold(
+  author: string | undefined,
+  body: string,
+  deps: PlanningDeps,
+  context: StepContext,
+): Promise<Outcome | undefined> {
+  const { state, answer, signal } = context;
+  if (author && (await deps.github.canWrite(author, signal))) return undefined;
+  const digest = sha256(Buffer.from(body)).slice(0, 16);
+  const approval = state.kept?.[AUTHOR_APPROVAL] as
+    | { digest: string }
+    | undefined;
+  if (approval?.digest === digest) return undefined;
+  if (answer?.answer === "approve" && answer.question?.includes(digest))
+    return {
+      kind: "retry",
+      reason: "Planning the approved Objective.",
+      afterMs: 0,
+      keep: {
+        [AUTHOR_APPROVAL]: { digest, by: answer.by, at: answer.at },
+      },
+    };
+  return hold(
+    `Issue #${state.issue} was written by ${author ? `@${author}` : "a deleted account"}, who has no write access; approve to plan it.\n\nFactory plans from the text GitHub shows (body digest \`${digest}\`): hidden comments are left out. Nothing in it counts until you approve, and an edit asks again.`,
+    ["approve", "cancel"],
+  );
 }
 
 function objectiveProblemsHold(problems: string[], again: string): Outcome {

@@ -232,7 +232,13 @@ export class GitHub {
   async issue(
     issue: number,
     signal?: AbortSignal,
-  ): Promise<{ title: string; body: string | null; state: string }> {
+  ): Promise<{
+    title: string;
+    body: string | null;
+    state: string;
+    /** The issue's author; null for a deleted account. */
+    user: { login: string } | null;
+  }> {
     return this.rest(
       "GET",
       `/repos/${this.repository}/issues/${issue}`,

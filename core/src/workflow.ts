@@ -71,9 +71,9 @@ function checkStep(deps: PlanningDeps): Step {
   return {
     key: "check",
     deadlineMs: 10 * MINUTE,
-    run: ({ state, signal }: StepContext) =>
+    run: (context: StepContext) =>
       guarded(deps.config.repository, async (): Promise<Outcome> => {
-        const read = await readObjective(state.issue, deps, "recheck", signal);
+        const read = await readObjective(deps, "recheck", context);
         return "hold" in read
           ? read.hold
           : { kind: "done", result: read.inputs };

@@ -51,7 +51,7 @@ import {
 } from "../planning/schedule.js";
 import {
   guarded,
-  normalizedBody,
+  objectiveText,
   type PlanningDeps,
 } from "../planning/steps.js";
 import type { Plan, WorkItem } from "../planning/types.js";
@@ -1867,8 +1867,8 @@ async function objectiveEdited(
 ): Promise<Outcome | undefined> {
   const { state, signal } = context;
   const issue = await deps.github.issue(state.issue, signal);
-  const body = normalizedBody(issue.body);
-  const accepted = normalizedBody(
+  const body = objectiveText(issue.body);
+  const accepted = objectiveText(
     ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
       objectiveBody(state),
   );
