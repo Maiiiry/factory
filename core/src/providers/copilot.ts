@@ -49,17 +49,20 @@ const LOGIN_HOLD =
   "Copilot login is missing or expired: run `copilot` and `/login` (or `gh auth login`) as the service's user, then answer retry";
 
 /**
- * A model the login can't use: no retry serves it (each would bill a
- * request), so the answer is the setting, then `switch` to re-freeze the
- * provider's new settings or to move to another provider.
+ * A model the login can't use: the answer is the setting, then `switch` to
+ * re-freeze the provider's new settings or to move to another provider.
+ * `listed`: the hold comes from the model list, before any session, so
+ * `retry` is offered too: it reads the list again and bills nothing, and
+ * succeeds once an admin enables the model or the list catches up. A
+ * session that served another model offers no retry: each bills a request.
  */
-function modelHold(why: string): PlannerError {
+function modelHold(why: string, listed: boolean): PlannerError {
   return new PlannerError(
     "hold",
-    `${why}. Set this provider's model to one the Copilot login can use and restart the service, then answer \`switch NAME\` with this provider's name to run on its new settings, or with another configured provider's name; or cancel.`,
+    `${why}. Set this provider's model to one the Copilot login can use and restart the service, then answer \`switch NAME\` with this provider's name to run on its new settings, or with another configured provider's name;${listed ? " answer `retry` once the login can use the model (an admin enabled it), which checks the model list again before any request;" : ""} or cancel.`,
     undefined,
     undefined,
-    ["switch", "cancel"],
+    listed ? ["retry", "switch", "cancel"] : ["switch", "cancel"],
   );
 }
 
@@ -212,6 +215,7 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
             .map((entry) => entry.id)
             .join(", "),
         )})`,
+        true,
       );
     let text = "";
 
@@ -269,6 +273,7 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
             fail(
               modelHold(
                 `Copilot served ${event.data.model}, not the configured ${turn.choice.model}`,
+                false,
               ),
             );
           if (event.type === "assistant.usage") {
