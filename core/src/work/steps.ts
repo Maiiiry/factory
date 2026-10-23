@@ -459,15 +459,25 @@ async function workStep(
   };
   const keptBase = kept<string>(state, item.id, "base");
   let base = keptBase ?? (await start());
-  await addWorktree(config.checkout, worktree, base, signal);
-  if (kept(state, item.id, "rebase")) {
+  const added = await addWorktree(config.checkout, worktree, base, signal);
+  if (added === "kept" && keptBase === undefined) {
+    // A worktree from an attempt that never kept its base (interrupted
+    // before its outcome) sits on that attempt's base, which the default
+    // branch may have left since: start over on this one.
+    await rebaseWorktree(
+      config.checkout,
+      worktree,
+      base,
+      base,
+      undefined,
+      signal,
+    );
+  } else if (kept(state, item.id, "rebase")) {
     // A conflict or failed delivery: move onto the current start and replay
-    // the refused change, so the worker can resolve it there. An attempt
-    // that never kept its base (stopped when the layer below was repaired)
-    // left files on an unknown base: start over on the current one.
+    // the refused change, so the worker can resolve it there.
     const head = await start();
     const refused = kept<Refused>(state, item.id, "refused")?.commit;
-    if (head !== base || keptBase === undefined) {
+    if (head !== base) {
       await rebaseWorktree(
         config.checkout,
         worktree,
