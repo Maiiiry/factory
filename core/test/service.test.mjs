@@ -74,6 +74,27 @@ function cli(inst, ...args) {
   return { code: result.status, out: result.stdout, err: result.stderr };
 }
 
+/**
+ * A `/factory <answer>` comment as the GitHub sync turns it into a request
+ * (no question named, with the comment's time). Resolves with the result.
+ */
+async function comment(inst, issue, answer, writtenAt) {
+  mkdirSync(inst.requests, { recursive: true });
+  const id = `comment-${Date.now()}`;
+  writeFileSync(
+    join(inst.requests, `${id}.json`),
+    JSON.stringify({
+      id,
+      at: new Date().toISOString(),
+      by: "octo",
+      request: { kind: "answer", issue, answer, writtenAt },
+    }),
+  );
+  const result = join(inst.requests, `${id}.result`);
+  await until(() => existsSync(result), "the comment's result");
+  return readFileSync(result, "utf8").trim();
+}
+
 function status(inst) {
   return JSON.parse(cli(inst, "status", "--json").out);
 }
@@ -191,13 +212,15 @@ test("a step that can't run holds with answers that work", async () => {
   assert.equal(row.status, "holding");
   assert.deepEqual(row.holds[0].answers, ["retry", "cancel"]);
 
-  const wrong = cli(inst, "answer", "7", "approve");
+  const firstHold = row.holds[0].id;
+  assert.equal(cli(inst, "answer", "7", "retry").code, 2, "the CLI names it");
+  const wrong = cli(inst, "answer", "7", "approve", "--question", firstHold);
   assert.equal(wrong.code, 1);
   assert.match(wrong.out, /Answers: retry, cancel/);
   assert.equal(status(inst).objectives[0].status, "holding");
 
-  const firstHold = status(inst).objectives[0].holds[0].id;
-  assert.equal(cli(inst, "answer", "7", "retry").code, 0);
+  // The one open question takes a comment's short form.
+  assert.equal(await comment(inst, 7, "retry", new Date().toISOString()), "ok");
   await until(
     () =>
       status(inst).objectives[0].holds[0]?.id !== undefined &&
@@ -239,7 +262,10 @@ test("unreadable state holds with cancel, and cancel works", async () => {
   const [row] = status(inst).objectives;
   assert.equal(row.status, "unreadable");
   assert.deepEqual(row.holds[0].answers, ["cancel"]);
-  assert.equal(cli(inst, "answer", "9", "retry").code, 1);
+  assert.equal(
+    cli(inst, "answer", "9", "retry", "--question", "unreadable").code,
+    1,
+  );
   assert.equal(cli(inst, "cancel", "9").code, 0);
   await until(
     () => status(inst).objectives[0].status === "cancelled",
@@ -473,7 +499,10 @@ test("a transient wait retries without counting errors, then asks, and wait wait
   assert.deepEqual(first.holds[0].answers, ["wait", "retry", "cancel"]);
   assert.equal(first.holds[0].recommended, "wait");
 
-  assert.equal(cli(inst, "answer", "22", "wait").code, 0);
+  assert.equal(
+    cli(inst, "answer", "22", "wait", "--question", first.holds[0].id).code,
+    0,
+  );
   const granted = stateOf(inst, 22);
   assert.equal(granted.status, "checking");
   assert.ok(granted.retries.check.grantedUntil, "wait grants more time");
@@ -597,8 +626,15 @@ test("an item's question holds only that item and its dependents", async () => {
   assert.equal(stale.code, 1);
   assert.match(stale.out, /isn't open/);
 
-  // An unbound answer goes to the oldest question.
-  assert.equal(cli(inst, "answer", "61", "retry").code, 0);
+  // With two questions open, a comment must name one: an unbound answer
+  // is refused and changes nothing.
+  const open = stateOf(inst, 61).holds;
+  assert.match(
+    await comment(inst, 61, "retry", new Date().toISOString()),
+    /names no question, and more than one question is open/,
+  );
+  assert.deepEqual(stateOf(inst, 61).holds, open);
+  assert.equal(cli(inst, "answer", "61", "retry", "--question", a.id).code, 0);
   await until(
     () =>
       stateOf(inst, 61).holds.length === 2 &&
@@ -624,6 +660,99 @@ test("an item's question holds only that item and its dependents", async () => {
   assert.equal(cli(inst, "cancel", "61").code, 0);
   assert.deepEqual(stateOf(inst, 61).holds, []);
   assert.equal(stateOf(inst, 61).status, "cancelled");
+  await stopped(service);
+});
+
+test("an Objective question from an item step stops every item, once", async () => {
+  const inst = installation();
+  configured(inst, `http://127.0.0.1:${await closedPort()}`);
+  // A real checkout whose local Git configuration runs a program: Factory
+  // refuses to run Git in it, which is about the checkout, not one item.
+  const git = (...args) =>
+    assert.equal(
+      spawnSync("git", args, { encoding: "utf8" }).status,
+      0,
+      args.join(" "),
+    );
+  const origin = join(inst.root, "origin.git");
+  const checkout = join(inst.root, "checkout");
+  git("init", "--quiet", "--bare", "--initial-branch=main", origin);
+  git("clone", "--quiet", origin, checkout);
+  git(
+    "-C",
+    checkout,
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@t",
+    "commit",
+    "--quiet",
+    "--allow-empty",
+    "-m",
+    "base",
+  );
+  git("-C", checkout, "push", "--quiet", "origin", "HEAD:main");
+  git("-C", checkout, "config", "filter.evil.clean", "cat");
+  const item = (id, kind) => ({
+    id,
+    ...(kind ? { kind, children: [] } : {}),
+    ownedPaths: [],
+    dependencies: [],
+  });
+  const asked = new Date().toISOString();
+  seed(inst, 62, "holding", {
+    holds: [
+      {
+        id: `item:a:work@${asked}`,
+        step: "item:a:work",
+        question: "The checkout refuses Git.",
+        answers: ["retry", "cancel"],
+        recommended: "retry",
+        askedAt: asked,
+      },
+    ],
+    holdsChangedAt: asked,
+    done: {
+      check: {},
+      plan: { items: [item("a"), item("e"), item("c", "aggregate")] },
+    },
+  });
+  const service = serve(inst);
+  await until(() => status(inst).service === "running", "service");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const quiet = stateOf(inst, 62);
+  assert.deepEqual(
+    quiet.attempts,
+    {},
+    "an Objective question stops every step",
+  );
+  assert.equal(quiet.done["item:c:merge"], undefined);
+
+  // Answered, every item starts; both work steps meet the refusal, and it
+  // is asked once, about the Objective.
+  assert.equal(
+    cli(inst, "answer", "62", "retry", "--question", quiet.holds[0].id).code,
+    0,
+  );
+  await until(() => {
+    const state = stateOf(inst, 62);
+    return (
+      state.done["item:c:merge"] &&
+      state.holds.length === 1 &&
+      state.holds[0].id !== quiet.holds[0].id &&
+      Object.keys(state.attempts).length === 0
+    );
+  }, "the refusal asked again");
+  const state = stateOf(inst, 62);
+  const [refused] = state.holds;
+  assert.match(refused.question, /filter\.evil\.clean/);
+  assert.equal(refused.item, undefined, "an Objective question");
+  const other = refused.step === "item:a:work" ? "item:e:work" : "item:a:work";
+  assert.equal(
+    state.retries[other]?.lastError,
+    "waiting for the open question",
+  );
+  assert.equal(cli(inst, "cancel", "62").code, 0);
   await stopped(service);
 });
 

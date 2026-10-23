@@ -34,11 +34,11 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
 
   serve                          Run the service (the only writer of state)
   status [ISSUE] [--json]        Show Objectives and open questions
-  answer ISSUE ANSWER [--question ID] [--text T]
-                                 Answer the question ID (default: the oldest open one)
+  answer ISSUE ANSWER --question ID [--text T]
+                                 Answer the open question ID (see status)
   cancel ISSUE                   Cancel an Objective
-  retry ISSUE [--question ID]    Retry an Objective's waiting steps now, or
-                                 answer retry to an open question
+  retry ISSUE [--question ID]    Retry an Objective's waiting steps now; while a
+                                 question is open, answer retry to question ID
 `;
 
 interface StatusRow {
@@ -299,6 +299,14 @@ async function request(
     const answer = args.positional[2];
     if (!answer) {
       process.stderr.write("factory: answer needs an answer\n");
+      return 2;
+    }
+    // Bound to the question the operator read, so a delayed answer never
+    // lands on a newer one. Cancel needs no question.
+    if (answer !== "cancel" && !args.flags.question) {
+      process.stderr.write(
+        "factory: answer needs --question ID, the open question's id from `factory status`\n",
+      );
       return 2;
     }
     body = {

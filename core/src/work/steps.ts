@@ -1857,12 +1857,14 @@ async function objectiveEdited(
       `Issue #${state.issue} was closed while Factory was building it. Reopen it and answer \`continue\`, or cancel.`,
       ["continue", "cancel"],
       "cancel",
+      "objective",
     );
   if (body !== accepted)
     return hold(
       `Objective #${state.issue} was edited after its plan was accepted. \`continue\` keeps building this plan; \`replan\` plans again from the new text.`,
       ["continue", "replan", "cancel"],
       "replan",
+      "objective",
     );
   return undefined;
 }
@@ -1911,7 +1913,9 @@ async function guardedItem(
     try {
       return await work();
     } catch (error) {
-      if (error instanceof GitRefusal) return hold(error.message);
+      // The checkout's or the host's Git: every item's, not this one's.
+      if (error instanceof GitRefusal)
+        return hold(error.message, undefined, undefined, "objective");
       throw error;
     }
   });

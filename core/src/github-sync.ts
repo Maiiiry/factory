@@ -20,8 +20,8 @@ export interface GitHubModule {
   shownAt?: string;
   /** When the card was set to queued for this run, by GitHub's clock. */
   queuedAt?: string;
-  /** The open holds whose question comment exists. */
-  asked?: string[];
+  /** The open holds whose question comment exists, and whether it names its question. */
+  asked?: { id: string; bound: boolean }[];
   /** Comments are read from here on. */
   commentsSince: string;
   /** Request ids already replied to. */
@@ -334,44 +334,53 @@ export class GitHubSync {
   }
 
   /**
-   * Post each open question once, with its answers. An answer that names
-   * no question goes to the oldest, so every other question's comment
-   * shows the answers with its id.
+   * Post each open question once, with its answers. A comment shows the
+   * short form `/factory <answer>` only while it is the one open question
+   * (an answer that names none applies only then, see engine.ts answer);
+   * once another opens, it is edited to name its question.
    */
   private ask(runner: ObjectiveRunner, module: GitHubModule): void {
     const issue = runner.state.issue;
-    runner.state.holds.forEach((hold, index) => {
-      if (module.asked?.includes(hold.id)) return;
-      const bound = index > 0 ? ` --question ${hold.id}` : "";
+    const holds = runner.state.holds;
+    const bound = holds.length > 1;
+    for (const hold of holds) {
+      const asked = module.asked?.find((entry) => entry.id === hold.id);
+      if (asked && (asked.bound || !bound)) continue;
       this.background(issue, `ask:${issue}:${hold.id}`, async () => {
         const marker = MARK(issue, "hold", hold.id);
-        if (!(await this.posted(issue, marker, hold.askedAt))) {
-          const answers = hold.answers
-            .map(
-              (a) =>
-                `\`/factory ${a}${bound}\`${a === hold.recommended ? " (recommended)" : ""}`,
-            )
-            .join(", ");
-          const about = hold.item
-            ? ` It holds Work Item \`${hold.item}\` and the items that depend on it; other work goes on.`
-            : "";
-          crashPoint("sync:ask:before");
-          await this.github.postComment(
-            issue,
-            `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.${about}${bound ? " Other questions are open too, so the answer names this one." : ""}`,
-          );
-          crashPoint("sync:ask:after");
-        }
+        const named = ` --question ${hold.id}`;
+        const answers = hold.answers
+          .map(
+            (a) =>
+              `\`/factory ${a}${bound ? named : ""}\`${a === hold.recommended ? " (recommended)" : ""}`,
+          )
+          .join(", ");
+        const about = hold.item
+          ? ` It holds Work Item \`${hold.item}\` and the items that depend on it; other work goes on.`
+          : "";
+        const form = bound
+          ? " Other questions are open too, so the answer names this one."
+          : ` While this is the only open question, the short form works; \`/factory <answer>${named}\` always does.`;
+        await this.github.upsertComment(
+          issue,
+          marker,
+          `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.${about}${form}`,
+          "sync:ask",
+          undefined,
+          new Date(Date.parse(hold.askedAt) - 10 * 60_000).toISOString(),
+        );
         runner.transact(() => {
           const github = runner.state.modules.github as GitHubModule;
           const open = runner.state.holds.map((h) => h.id);
           github.asked = [
-            ...(github.asked ?? []).filter((id) => open.includes(id)),
-            hold.id,
+            ...(github.asked ?? []).filter(
+              (entry) => open.includes(entry.id) && entry.id !== hold.id,
+            ),
+            { id: hold.id, bound },
           ];
         });
       });
-    });
+    }
   }
 
   /**
@@ -459,7 +468,7 @@ export class GitHubSync {
         module.shown = option;
         if (at) module.shownAt = at;
       });
-    if (!module.asked?.includes("unreadable"))
+    if (!module.asked?.some((entry) => entry.id === "unreadable"))
       this.background(issue, `ask:${issue}`, async () => {
         const marker = MARK(issue, "hold", "unreadable");
         const found = await this.github.markedComment(issue, marker);
@@ -472,7 +481,7 @@ export class GitHubSync {
           );
           crashPoint("sync:ask:after");
         }
-        module.asked = ["unreadable"];
+        module.asked = [{ id: "unreadable", bound: false }];
       });
     else if (due)
       this.readComments(

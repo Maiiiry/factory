@@ -90,6 +90,12 @@ export interface ObjectiveState {
   status: ObjectiveStatus;
   /** Open questions, oldest first: at most one for the Objective and one per Work Item. */
   holds: Hold[];
+  /**
+   * When a question last opened or closed. An answer that names no
+   * question applies only if it was written after this, while one question
+   * was open, so it can't land on a question its author didn't see.
+   */
+  holdsChangedAt?: string;
   /** The latest answer per step, read by the step when it runs again. */
   answers: Record<string, Answer>;
   retries: Record<string, Retry>;

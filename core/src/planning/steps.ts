@@ -1,7 +1,13 @@
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CoreConfig } from "../config.js";
-import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
+import {
+  hold,
+  type Outcome,
+  objectiveWide,
+  type Step,
+  type StepContext,
+} from "../engine.js";
 import { defaultHead } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { parseObjective } from "../objective.js";
@@ -1019,30 +1025,39 @@ export async function guarded(
   try {
     return await work();
   } catch (error) {
-    if (error instanceof PlannerError) {
-      // A usage limit waits for its reset; an idle model is an error
-      // (afterMs -1); anything else is a transient provider failure.
-      if (error.outcome === "retry")
-        return {
-          kind: "retry",
-          reason: error.message,
-          ...(error.afterMs !== undefined ? { afterMs: error.afterMs } : {}),
-          ...(error.wait ? { wait: error.wait } : {}),
-        };
-      if (error.outcome === "hold") return hold(error.message);
-      // Too large for the model, or refused: the Objective has to change.
-      return hold(
-        `${error.message}\n\nEdit the Objective (for example, pin smaller Sources) and answer \`replan\`.`,
-        ["replan", "retry", "cancel"],
-      );
-    }
-    const outcome = githubOutcome(
-      error,
-      repository,
-      undefined,
-      "GitHub says the issue doesn't exist or Factory can't see it",
-    );
-    if (outcome) return outcome;
-    throw error;
+    return objectiveWide(failure(repository, error));
   }
+}
+
+/**
+ * A provider, GitHub or repository failure that escaped a step: about the
+ * provider account, the repository or the Objective, never one Work Item,
+ * so its question is Objective-wide.
+ */
+function failure(repository: string, error: unknown): Outcome {
+  if (error instanceof PlannerError) {
+    // A usage limit waits for its reset; an idle model is an error
+    // (afterMs -1); anything else is a transient provider failure.
+    if (error.outcome === "retry")
+      return {
+        kind: "retry",
+        reason: error.message,
+        ...(error.afterMs !== undefined ? { afterMs: error.afterMs } : {}),
+        ...(error.wait ? { wait: error.wait } : {}),
+      };
+    if (error.outcome === "hold") return hold(error.message);
+    // Too large for the model, or refused: the Objective has to change.
+    return hold(
+      `${error.message}\n\nEdit the Objective (for example, pin smaller Sources) and answer \`replan\`.`,
+      ["replan", "retry", "cancel"],
+    );
+  }
+  const outcome = githubOutcome(
+    error,
+    repository,
+    undefined,
+    "GitHub says the issue doesn't exist or Factory can't see it",
+  );
+  if (outcome) return outcome;
+  throw error;
 }

@@ -476,6 +476,9 @@ async function originHold(context: DeliveryContext): Promise<Hold | undefined> {
   return problem
     ? hold(
         `${problem}. Point origin's fetch and push URLs (and any insteadOf rewrite) at ${context.github.repository} with its default LFS route, then answer retry; or cancel.`,
+        undefined,
+        undefined,
+        "objective",
       )
     : undefined;
 }

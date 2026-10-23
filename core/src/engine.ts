@@ -37,6 +37,8 @@ export type Outcome =
       question: string;
       answers: string[];
       recommended: string;
+      /** What the question stops; absent: `item` (CORE.md#Holds and answers). */
+      scope?: HoldScope;
       keep?: Record<string, unknown>;
     }
   /** The step can't succeed as planned. */
@@ -54,13 +56,33 @@ export type Outcome =
       keep?: Record<string, unknown>;
     };
 
+/**
+ * What a question stops. `item`: a Work Item step's question stops that
+ * item and its dependents (any other step's stops the Objective).
+ * `objective`: the cause is about the whole Objective (the issue, the
+ * repository, the host, a provider account), so it stops every step.
+ */
+export type HoldScope = "item" | "objective";
+
 /** A question for the operator; the first answer is recommended unless another is named. */
 export function hold(
   question: string,
   answers = ["retry", "cancel"],
   recommended = answers[0]!,
+  scope?: HoldScope,
 ): Extract<Outcome, { kind: "hold" }> {
-  return { kind: "hold", question, answers, recommended };
+  return {
+    kind: "hold",
+    question,
+    answers,
+    recommended,
+    ...(scope ? { scope } : {}),
+  };
+}
+
+/** The outcome, with a hold in it made Objective-wide. */
+export function objectiveWide<T extends Outcome>(outcome: T): T {
+  return outcome.kind === "hold" ? { ...outcome, scope: "objective" } : outcome;
 }
 
 export interface StepContext {
@@ -308,6 +330,9 @@ export class ObjectiveRunner {
         (error as NodeJS.ErrnoException | null)?.code === "ENOSPC"
           ? hold(
               `The service host's disk is full (${errorMessage(error)}). Free space, then answer retry; or cancel.`,
+              undefined,
+              undefined,
+              "objective",
             )
           : {
               kind: "retry",
@@ -411,7 +436,13 @@ export class ObjectiveRunner {
         this.retry(key, outcome);
         break;
       case "hold":
-        this.hold(key, outcome.question, outcome.answers, outcome.recommended);
+        this.hold(
+          key,
+          outcome.question,
+          outcome.answers,
+          outcome.recommended,
+          outcome.scope,
+        );
         break;
       case "fail":
         this.hold(
@@ -431,9 +462,11 @@ export class ObjectiveRunner {
         }
         this.abortRunning(outcome.clear);
         // A question about work the repair cleared is moot.
-        state.holds = state.holds.filter(
-          (hold) => !outcome.clear.includes(hold.step),
+        const moot = state.holds.filter((hold) =>
+          outcome.clear.includes(hold.step),
         );
+        if (moot.length)
+          this.setHolds(state.holds.filter((hold) => !moot.includes(hold)));
         state.repairs ??= {};
         const repair = state.repairs[outcome.target] ?? {
           count: 0,
@@ -503,7 +536,9 @@ export class ObjectiveRunner {
       outcome.afterMs !== undefined && outcome.afterMs >= 0
         ? now + outcome.afterMs
         : now + backoff;
-    let question: { text: string; answers: string[] } | undefined;
+    let question:
+      | { text: string; answers: string[]; scope?: HoldScope }
+      | undefined;
     if (isError) {
       if (count >= this.limits.maxErrors)
         question = {
@@ -521,6 +556,8 @@ export class ObjectiveRunner {
         question = {
           text: `${outcome.reason}\n\nThe limit resets ${Number.isFinite(at) ? `at ${new Date(at).toISOString()}` : "at a time it didn't say"}, more than ${hours(this.limits.maxWaitMs)} away. \`${WAIT}\` keeps waiting until it resets${other ? `; \`${SWITCH}\` runs this Objective on ${other} instead` : ""}; or cancel.`,
           answers: [WAIT, ...(other ? [SWITCH] : []), "cancel"],
+          // A limit is the account's, not the step's: one question for all.
+          scope: "objective",
         };
       }
     } else if (
@@ -546,7 +583,13 @@ export class ObjectiveRunner {
     };
     state.retries[key] = record;
     if (question)
-      this.hold(key, question.text, question.answers, question.answers[0]!);
+      this.hold(
+        key,
+        question.text,
+        question.answers,
+        question.answers[0]!,
+        question.scope,
+      );
   }
 
   /** Stop running steps now; their late outcomes are dropped by the token check in `start`. */
@@ -594,10 +637,11 @@ export class ObjectiveRunner {
     question: string,
     answers: string[],
     recommended: string,
+    scope?: HoldScope,
   ): void {
     const state = this.state;
     const now = this.now().toISOString();
-    const item = itemOf(key);
+    const item = scope === "objective" ? undefined : itemOf(key);
     const open = state.holds.find((hold) => hold.item === item);
     if (open && open.step !== key) {
       const previous = state.retries[key];
@@ -612,7 +656,7 @@ export class ObjectiveRunner {
       return;
     }
     const all = answers.includes("cancel") ? answers : [...answers, "cancel"];
-    state.holds = [
+    this.setHolds([
       ...state.holds.filter((hold) => hold !== open),
       {
         id: `${key}@${now}`,
@@ -623,14 +667,22 @@ export class ObjectiveRunner {
         recommended: all.includes(recommended) ? recommended : all[0]!,
         askedAt: now,
       },
-    ];
+    ]);
     state.status = "holding";
   }
 
+  /** Change the open questions, noting when (see `answer`). */
+  private setHolds(holds: Hold[]): void {
+    this.state.holds = holds;
+    this.state.holdsChangedAt = this.now().toISOString();
+  }
+
   /**
-   * Answer an open question: the one `question` names (a hold id), or the
-   * oldest. Returns null when applied, or the reason it doesn't fit. The
-   * caller saves (see `transact`).
+   * Answer the open question `question` names (a hold id). An answer that
+   * names none (a `/factory <answer>` comment) applies only if one question
+   * alone was open from before it was written until now: it can't land on
+   * a question its author didn't see. Returns null when applied, or the
+   * reason it doesn't fit. The caller saves (see `transact`).
    */
   answer(
     answer: string,
@@ -641,27 +693,48 @@ export class ObjectiveRunner {
   ): string | null {
     if (answer === "cancel") return this.cancel(by);
     const holds = this.state.holds;
+    if (!holds.length)
+      return question === undefined
+        ? `#${this.state.issue} has no open question.`
+        : `#${this.state.issue}'s question ${question} was already answered, and no question is open now.`;
+    if (
+      question === undefined &&
+      !(
+        holds.length === 1 &&
+        writtenAt !== undefined &&
+        Date.parse(writtenAt) >= Date.parse(this.state.holdsChangedAt ?? "")
+      )
+    )
+      return `That answer names no question, and ${holds.length > 1 ? "more than one question is open" : "the open questions changed after it was written"}, so it wasn't applied. ${openQuestions(holds)}`;
     const hold =
       question === undefined
         ? holds[0]
         : holds.find((open) => open.id === question);
     if (!hold)
-      return question === undefined
-        ? `#${this.state.issue} has no open question.`
-        : `#${this.state.issue}'s question ${question} isn't open, so that answer wasn't applied. ${openQuestions(holds)}`;
+      return `#${this.state.issue}'s question ${question} isn't open, so that answer wasn't applied. ${openQuestions(holds)}`;
     if (writtenAt && Date.parse(writtenAt) < Date.parse(hold.askedAt) - 60_000)
       return `That answer was written before question ${hold.id} was asked, so it wasn't applied. It asks: ${hold.question.slice(0, 300)} Answers: ${hold.answers.join(", ")}.`;
     if (!hold.answers.includes(answer))
       return `"${answer}" isn't an answer to question ${hold.id}. Answers: ${hold.answers.join(", ")}.`;
     const retry = this.state.retries[hold.step];
-    if (answer === WAIT && retry) this.grant(retry);
-    else {
+    // A limit is the account's: the answer to it is every step's answer.
+    const limited = (other: Retry) =>
+      retry?.wait?.kind === "reset" &&
+      other.wait?.kind === "reset" &&
+      other.wait.provider === retry.wait.provider;
+    if (answer === WAIT && retry)
+      for (const other of Object.values(this.state.retries))
+        if (other === retry || limited(other)) this.grant(other);
+    if (answer !== WAIT || !retry) {
       if (answer === SWITCH) {
         const from = retry?.wait?.kind === "reset" ? retry.wait.provider : "";
         this.state.kept ??= {};
         this.state.kept.provider = this.workflow.providers?.find(
           (provider) => provider !== from,
         );
+        // The other steps waiting on that limit run now, on the new provider.
+        for (const [key, other] of Object.entries(this.state.retries))
+          if (limited(other)) delete this.state.retries[key];
       } else
         this.state.answers[hold.step] = {
           holdId: hold.id,
@@ -673,7 +746,7 @@ export class ObjectiveRunner {
         };
       delete this.state.retries[hold.step];
     }
-    this.state.holds = holds.filter((open) => open !== hold);
+    this.setHolds(holds.filter((open) => open !== hold));
     this.settle();
     return null;
   }
@@ -708,7 +781,7 @@ export class ObjectiveRunner {
       return `#${this.state.issue} has already finished (${status}).`;
     if (status === "cancelled") return null;
     this.state.status = "cancelled";
-    this.state.holds = [];
+    this.setHolds([]);
     this.state.attempts = {};
     this.state.retries = {};
     this.state.answers.cancel = {
@@ -727,15 +800,14 @@ export class ObjectiveRunner {
 
   /**
    * Run waiting steps now; or, while a question is open, answer `retry` to
-   * the one `question` names, or the oldest.
+   * the one `question` names.
    */
   retryNow(by: string, question?: string): string | null {
     const holds = this.state.holds;
     if (question !== undefined || holds.length) {
-      const hold =
-        question === undefined
-          ? holds[0]
-          : holds.find((open) => open.id === question);
+      if (question === undefined)
+        return `#${this.state.issue} has an open question, so retry must name it. ${openQuestions(holds)}`;
+      const hold = holds.find((open) => open.id === question);
       if (hold && !hold.answers.includes("retry"))
         return `#${this.state.issue}'s question ${hold.id} has no retry answer. Answers: ${hold.answers.join(", ")}.`;
       return this.answer("retry", undefined, by, undefined, question);
@@ -753,7 +825,7 @@ export class ObjectiveRunner {
 
 function openQuestions(holds: readonly Hold[]): string {
   return holds.length
-    ? `Open questions: ${holds.map((hold) => `${hold.id} (${hold.answers.join(", ")})`).join("; ")}.`
+    ? `Open questions: ${holds.map((hold) => `${hold.id} (${hold.answers.join(", ")})`).join("; ")}. Name one: \`factory answer <issue> <answer> --question <id>\`, or comment \`/factory <answer> --question <id>\`.`
     : "No question is open now.";
 }
 

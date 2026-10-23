@@ -80,13 +80,24 @@ export function githubOutcome(
   if (error.status === 401)
     return hold(
       `GitHub rejected Factory's login on ${repository} (${detail}). Log in again with \`gh auth login\` (or replace FACTORY_GITHUB_TOKEN), then answer retry; or cancel.`,
+      undefined,
+      undefined,
+      "objective",
     );
   if (error.status === 403 || (error.status === 404 && !missing))
     return hold(
       `${detail}. Give Factory's login ${permission} on ${repository}, then answer retry; or cancel.`,
+      undefined,
+      undefined,
+      "objective",
     );
   if (error.status === 404)
-    return hold(`${missing} (${detail}).`, ["retry", "cancel"], "cancel");
+    return hold(
+      `${missing} (${detail}).`,
+      ["retry", "cancel"],
+      "cancel",
+      "objective",
+    );
   return { kind: "retry", reason: error.message };
 }
 
@@ -306,8 +317,10 @@ export class GitHub {
     body: string,
     point: string,
     signal?: AbortSignal,
+    /** Read comments from here on (a little before the comment was first due). */
+    since?: string,
   ): Promise<void> {
-    const existing = await this.markedComment(issue, marker, undefined, signal);
+    const existing = await this.markedComment(issue, marker, since, signal);
     if (existing?.body === body) return;
     crashPoint(`${point}:before`);
     if (existing)
