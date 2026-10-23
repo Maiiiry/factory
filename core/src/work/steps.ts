@@ -457,16 +457,16 @@ async function workStep(
     );
   } else if (kept(state, item.id, "rebase")) {
     // A conflict or failed delivery: move onto the current start and replay
-    // the refused change, so the worker can resolve it there.
+    // the kept change, so the worker can resolve it there.
     const head = await start();
-    const refused = kept<Refused>(state, item.id, "refused")?.commit;
+    const replay = kept<string>(state, item.id, "replay");
     if (head !== base) {
       await rebaseWorktree(
         config.checkout,
         worktree,
         base,
         head,
-        refused,
+        replay,
         signal,
       );
       base = head;
@@ -522,6 +522,7 @@ async function workStep(
         [finishedKey]: null,
         [keptKey(item.id, "finding")]: null,
         [keptKey(item.id, "refused")]: null,
+        [keptKey(item.id, "replay")]: null,
       },
     };
   }
@@ -708,6 +709,7 @@ async function workStep(
           [finishedKey]: null,
           [keptKey(item.id, "finding")]: null,
           [keptKey(item.id, "refused")]: null,
+          [keptKey(item.id, "replay")]: null,
         },
       };
     }
@@ -788,8 +790,8 @@ function withKeep(outcome: Outcome, keep: Record<string, unknown>): Outcome {
 }
 
 /**
- * Move a kept worktree from `from` to `to` and replay the refused change on
- * it. Conflicts stay in the files for the worker to resolve.
+ * Move a kept worktree from `from` to `to` and replay the kept change
+ * (`replay`) on it. Conflicts stay in the files for the worker to resolve.
  */
 async function rebaseWorktree(
   checkout: string,
@@ -912,14 +914,24 @@ async function repairContext(
 }
 
 /**
- * The result a repair refused: its commit (replayed on a rebase, and the
- * diagnosis's evidence), its tree (collection reads the same tree on the
- * same base as no change) and its notes (for `revalidate`).
+ * The result a repair refused: its commit (the diagnosis's evidence), its
+ * tree (collection reads the same tree on the same base as no change) and
+ * its notes (for `revalidate`).
  */
 interface Refused {
   commit: string;
   tree: string;
   notes: HandoffNote[];
+}
+
+/**
+ * The change a rebase replays: the commit of the item's last work result,
+ * kept on every repair that clears it, whether or not the repair refuses
+ * that result. Separate from the refused fact, whose tree collection reads
+ * as "no change".
+ */
+function replayFact(id: string, work: WorkResult): Record<string, string> {
+  return { [keptKey(id, "replay")]: work.commit };
 }
 
 /** The one writer of the refused fact, from the refused work result. */
@@ -1568,12 +1580,16 @@ function republishOutcome(item: WorkItem, reason: string): Outcome {
  * operator's `repair`, or the selected set couldn't be written), or the
  * finding names a selected destination or cites the candidate receipt.
  *
- * `refusesResult`: the repair refuses the work result's tree itself
+ * Every cleared work result (the item's and each layer's above) keeps its
+ * commit as the replay source, so a rebase never drops the change.
+ *
+ * `refusesResult`: the repair refuses the item's own work result tree
  * (validate, review, CI, merge, a secret it writes), so the worker must
- * change it and the refused fact is recorded for it and the layers above.
- * A select or publish media repair (new candidates, a selection that
- * couldn't be written, LFS objects) may rightly end on the same tracked
- * tree, so it records nothing, and a correct fix is never "no change".
+ * change it and the item's refused fact is recorded. A select or publish
+ * media repair (new candidates, a selection that couldn't be written, LFS
+ * objects) may rightly end on the same tracked tree, so it records no
+ * refused fact, and a correct fix is never "no change". The layers above
+ * are moved, not refused: they never get a refused fact.
  */
 function repairOutcome(
   item: WorkItem,
@@ -1608,14 +1624,13 @@ function repairOutcome(
         finding,
         keep[keptKey(item.id, "finding")] as RepairFinding | undefined,
       ));
-  // The result being refused, when there is one: a repair from `work`
-  // itself keeps the fact of the result refused before it.
-  const refused = refusesResult
-    ? (state.done[stepKey(item.id, "work")] as WorkResult | undefined)
-    : undefined;
+  // The result being cleared, when there is one: a repair from `work`
+  // itself keeps the facts of the result before it.
+  const result = state.done[stepKey(item.id, "work")] as WorkResult | undefined;
   const moved: Record<string, unknown> = {
     [keptKey(item.id, "selection")]: media ? null : (own ?? null),
-    ...(refused ? refusedFact(item.id, refused) : {}),
+    ...(result ? replayFact(item.id, result) : {}),
+    ...(result && refusesResult ? refusedFact(item.id, result) : {}),
   };
   for (const layer of above) {
     const layerSelection = standing(layer);
@@ -1629,7 +1644,7 @@ function repairOutcome(
     if (work) {
       Object.assign(
         moved,
-        refusesResult ? refusedFact(layer.id, work) : {},
+        replayFact(layer.id, work),
         conflictFinding(
           layer,
           `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
