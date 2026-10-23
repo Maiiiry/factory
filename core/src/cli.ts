@@ -3,7 +3,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { type CoreConfig, configPath, loadConfig } from "./config.js";
-import { DEFAULT_LIMITS, hostLimits } from "./engine.js";
+import { DEFAULT_LIMITS, type EngineLimits, hostLimits } from "./engine.js";
 import { GitHub } from "./github.js";
 import { GitHubSync } from "./github-sync.js";
 import { RunLog } from "./log.js";
@@ -23,9 +23,12 @@ import {
   type Hold,
   listObjectives,
   loadState,
+  type ObjectiveState,
   type ObjectiveStatus,
 } from "./state.js";
 import { objectiveWorkflow } from "./workflow.js";
+
+type Provider = CoreConfig["planning"]["provider"];
 
 const USAGE = `Usage: factory <command> --repo OWNER/NAME
 
@@ -40,7 +43,14 @@ interface StatusRow {
   issue: number;
   status: ObjectiveStatus | "unreadable";
   hold: Hold | null;
-  waiting: { step: string; nextAt: string; lastError: string }[];
+  waiting: {
+    step: string;
+    nextAt: string;
+    lastError: string;
+    since: string;
+    /** A person outside Factory the step waits on, such as an environment approval. */
+    gate?: string;
+  }[];
   error?: string;
 }
 
@@ -59,36 +69,66 @@ async function main(argv: string[]): Promise<number> {
   const paths = installationPaths(repository);
   switch (command) {
     case "serve": {
+      const limits = envLimits();
       let sync: GitHubSync | undefined;
       let loaded: CoreConfig | undefined;
       let workflow = objectiveWorkflow();
       if (existsSync(configPath(repository))) {
         const config = loadConfig(repository);
         loaded = config;
-        const github = new GitHub(config.repository).redacting(
+        const github = new GitHub(
+          config.repository,
+          process.env.FACTORY_GITHUB_API,
+        ).redacting(
           config.policy.allowedSecretNames.flatMap(
             (name) => process.env[name] ?? [],
           ),
         );
-        sync = new GitHubSync(github, config, new RunLog(paths.logs, "sync"));
-        const planner = new HedgedPlanner(
-          config.planning.provider === "claude"
-            ? new ClaudePlanner({
-                ...DEFAULT_CLAUDE_MODELS,
-                ...(config.planning.models ?? {}),
-              } as ClaudePlannerOptions)
-            : new CodexPlanner({
-                ...DEFAULT_CODEX_MODELS,
-                ...(config.planning.models ?? {}),
-              } as typeof DEFAULT_CODEX_MODELS),
+        sync = new GitHubSync(
+          github,
+          config,
+          new RunLog(paths.logs, "sync"),
+          limits,
         );
+        // Each provider's planner, made when an Objective first needs it.
+        const planners = new Map<Provider, HedgedPlanner>();
+        const plannerOf = (provider: Provider): HedgedPlanner => {
+          let planner = planners.get(provider);
+          if (planner) return planner;
+          // Configured models belong to the planning provider; a switched
+          // Objective uses the other provider's defaults.
+          const models =
+            provider === config.planning.provider
+              ? (config.planning.models ?? {})
+              : {};
+          planner = new HedgedPlanner(
+            provider === "claude"
+              ? new ClaudePlanner({
+                  ...DEFAULT_CLAUDE_MODELS,
+                  ...models,
+                } as ClaudePlannerOptions)
+              : new CodexPlanner({
+                  ...DEFAULT_CODEX_MODELS,
+                  ...models,
+                } as typeof DEFAULT_CODEX_MODELS),
+          );
+          planners.set(provider, planner);
+          return planner;
+        };
+        const switched = (state: ObjectiveState): Provider | undefined => {
+          const provider = state.kept?.provider;
+          return provider === "claude" || provider === "codex"
+            ? provider
+            : undefined;
+        };
         workflow = objectiveWorkflow({
           config,
           github,
-          planner,
+          planner: (state) =>
+            plannerOf(switched(state) ?? config.planning.provider),
           workDir: (issue) => join(paths.root, "work", String(issue)),
-          worker: (plan, body) =>
-            config.execution.workerProvider === "claude"
+          worker: (state, plan, body) =>
+            (switched(state) ?? config.execution.workerProvider) === "claude"
               ? new ClaudeWorker({
                   sandbox: config.sandbox,
                   plan,
@@ -118,15 +158,12 @@ async function main(argv: string[]): Promise<number> {
           ? { tickMs: Number(process.env.FACTORY_TICK_MS) }
           : {}),
         limits: {
-          ...DEFAULT_LIMITS,
+          ...limits,
           ...(loaded
             ? {
                 concurrency: loaded.execution.concurrency,
                 maxRepairs: loaded.execution.repairs,
               }
-            : {}),
-          ...(process.env.FACTORY_BACKOFF_MS
-            ? { baseBackoffMs: Number(process.env.FACTORY_BACKOFF_MS) }
             : {}),
         },
       });
@@ -141,6 +178,33 @@ async function main(argv: string[]): Promise<number> {
       process.stderr.write(USAGE);
       return 2;
   }
+}
+
+/**
+ * The engine's limits, with shorter timings from the environment for
+ * tests: FACTORY_BACKOFF_MS (first backoff), FACTORY_WAIT_MS (transient
+ * budget), FACTORY_NOTE_MS (status note), FACTORY_REMIND_MS (gate
+ * reminder), FACTORY_DEADLINE_MS (a cap on step deadlines).
+ */
+function envLimits(): EngineLimits {
+  const env = (name: string): number | undefined => {
+    const value = Number(process.env[name]);
+    return process.env[name] && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  };
+  const set = <K extends keyof EngineLimits>(key: K, name: string) => {
+    const value = env(name);
+    return value === undefined ? {} : { [key]: value };
+  };
+  return {
+    ...DEFAULT_LIMITS,
+    ...set("baseBackoffMs", "FACTORY_BACKOFF_MS"),
+    ...set("maxWaitMs", "FACTORY_WAIT_MS"),
+    ...set("noteAfterMs", "FACTORY_NOTE_MS"),
+    ...set("remindAfterMs", "FACTORY_REMIND_MS"),
+    ...set("maxDeadlineMs", "FACTORY_DEADLINE_MS"),
+  };
 }
 
 async function status(paths: Paths, args: Args): Promise<number> {
@@ -176,6 +240,8 @@ async function status(paths: Paths, args: Args): Promise<number> {
         step,
         nextAt: retry.nextAt,
         lastError: retry.lastError,
+        since: retry.since,
+        ...(retry.wait?.kind === "gate" ? { gate: retry.wait.gate } : {}),
       })),
     });
   }
@@ -198,7 +264,9 @@ async function status(paths: Paths, args: Args): Promise<number> {
       );
     for (const wait of row.waiting)
       lines.push(
-        `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
+        wait.gate
+          ? `  Waiting on ${wait.gate} (${wait.step}, since ${wait.since})`
+          : `  Waiting: ${wait.step} retries at ${wait.nextAt} (${wait.lastError})`,
       );
   }
   process.stdout.write(`${lines.join("\n")}\n`);

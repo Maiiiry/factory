@@ -42,21 +42,39 @@ export interface Hold {
 
 export interface Answer {
   holdId: string;
+  /** The question this answers, as it was asked. */
+  question?: string;
   answer: string;
   text?: string;
   by: string;
   at: string;
 }
 
+/**
+ * Why a retry waits (CORE.md#Waits). Absent: an unknown transient cause,
+ * such as the network, a GitHub or provider outage, or CI still running.
+ */
+export type Wait =
+  /** A limit that resets at `at` (unknown when absent), from `provider` when a model provider set it. */
+  | { kind: "reset"; at?: string; provider?: string }
+  /** A person outside Factory: an environment approval, a required review. */
+  | { kind: "gate"; gate: string };
+
 export interface Retry {
   /** Consecutive escaped errors, missed deadlines and interrupted attempts. */
   count: number;
   /** Retries of any kind in this run of retries; sets the backoff. */
   attempts: number;
-  /** When this run of retries began. */
+  /** When this run of retries began (wall clock, so a restart doesn't reset it). */
   since: string;
   nextAt: string;
   lastError: string;
+  /** The reason this run of retries began with. */
+  cause?: string;
+  /** The latest wait's class; absent for errors and unknown transient causes. */
+  wait?: Wait;
+  /** The operator answered `wait`: no question until then. */
+  grantedUntil?: string;
 }
 
 export interface ObjectiveState {

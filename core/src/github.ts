@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { crashPoint } from "./crash.js";
+import { hold, type Outcome } from "./engine.js";
 import { redact } from "./log.js";
 import { errorMessage } from "./text.js";
 
@@ -37,6 +39,49 @@ export class GitHubError extends Error {
 
 const TIMEOUT_MS = 60_000;
 
+/**
+ * A GitHub failure as a step outcome (CORE.md#Waits): only what a person
+ * must fix holds, at once: a rejected login (401), a refusal (403; rate
+ * limits are TransientErrors) naming the `permission` the call needs, and
+ * a missing repository or issue (404, `missing`). A rate limit waits for
+ * its reset. Everything else (5xx, timeouts, 409, 410, 422, GraphQL
+ * errors) may change, so it retries as a transient wait. Undefined for an
+ * error that isn't GitHub's.
+ */
+export function githubOutcome(
+  error: unknown,
+  repository: string,
+  permission = "read access to the repository, its issues, pull requests and checks",
+  missing?: string,
+): Outcome | undefined {
+  if (error instanceof TransientError)
+    return {
+      kind: "retry",
+      reason: error.message,
+      ...(error.retryAfterMs !== undefined
+        ? {
+            wait: {
+              kind: "reset",
+              at: new Date(Date.now() + error.retryAfterMs).toISOString(),
+            },
+          }
+        : {}),
+    };
+  if (!(error instanceof GitHubError)) return undefined;
+  const detail = error.message.slice(0, 500);
+  if (error.status === 401)
+    return hold(
+      `GitHub rejected Factory's login on ${repository} (${detail}). Log in again with \`gh auth login\` (or replace FACTORY_GITHUB_TOKEN), then answer retry; or cancel.`,
+    );
+  if (error.status === 403 || (error.status === 404 && !missing))
+    return hold(
+      `${detail}. Give Factory's login ${permission} on ${repository}, then answer retry; or cancel.`,
+    );
+  if (error.status === 404)
+    return hold(`${missing} (${detail}).`, ["retry", "cancel"], "cancel");
+  return { kind: "retry", reason: error.message };
+}
+
 export interface IssueComment {
   id: number;
   body: string;
@@ -53,6 +98,7 @@ export interface PullRequest {
   draft?: boolean;
   head: { ref: string; sha: string };
   base: { ref: string; sha: string };
+  body?: string | null;
   html_url?: string;
 }
 
@@ -195,9 +241,75 @@ export class GitHub {
     since?: string,
     signal?: AbortSignal,
   ): Promise<number | undefined> {
+    return (await this.markedComment(issue, marker, since, signal))?.id;
+  }
+
+  /** The issue comment Factory marked with `marker`, if it exists. */
+  async markedComment(
+    issue: number,
+    marker: string,
+    since?: string,
+    signal?: AbortSignal,
+  ): Promise<IssueComment | undefined> {
     return (await this.comments(issue, since, signal)).find((c) =>
       c.body.startsWith(marker),
-    )?.id;
+    );
+  }
+
+  /**
+   * Post the marked comment, or edit the one already there: found first,
+   * so a post whose answer was lost is never repeated. `point` names the
+   * crash points before and after the write.
+   */
+  async upsertComment(
+    issue: number,
+    marker: string,
+    body: string,
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const existing = await this.markedComment(issue, marker, undefined, signal);
+    if (existing?.body === body) return;
+    crashPoint(`${point}:before`);
+    if (existing)
+      await this.rest(
+        "PATCH",
+        `/repos/${this.repository}/issues/comments/${existing.id}`,
+        { body },
+        signal,
+      );
+    else await this.postComment(issue, body, signal);
+    crashPoint(`${point}:after`);
+  }
+
+  /** Close an issue with a reason, unless it is closed already. */
+  async closeIssue(
+    issue: number,
+    reason: "completed" | "not_planned",
+    point: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if ((await this.issue(issue, signal)).state !== "open") return;
+    crashPoint(`${point}:before`);
+    await this.rest(
+      "PATCH",
+      `/repos/${this.repository}/issues/${issue}`,
+      { state: "closed", state_reason: reason },
+      signal,
+    );
+    crashPoint(`${point}:after`);
+  }
+
+  /** Branch names under `prefix` (such as `factory/12/`) on the repository. */
+  async branches(prefix: string, signal?: AbortSignal): Promise<string[]> {
+    const refs = await this.pages<{ ref?: unknown }>(
+      `/repos/${this.repository}/git/matching-refs/heads/${prefix.split("/").map(encodeURIComponent).join("/")}`,
+      signal,
+    );
+    return refs
+      .map((ref) => (typeof ref.ref === "string" ? ref.ref : ""))
+      .filter((ref) => ref.startsWith(`refs/heads/${prefix}`))
+      .map((ref) => ref.slice("refs/heads/".length));
   }
 
   async graphql<T>(
@@ -418,18 +530,26 @@ export class GitHub {
   async commit(
     sha: string,
     signal?: AbortSignal,
-  ): Promise<{ sha: string; parents: string[]; committer?: string }> {
+  ): Promise<{
+    sha: string;
+    parents: string[];
+    committer?: string;
+    authorEmail?: string;
+  }> {
     const commit = await this.rest<{
       sha?: string;
       parents?: { sha?: unknown }[];
       committer?: { login?: unknown } | null;
+      commit?: { author?: { email?: unknown } | null } | null;
     }>("GET", this.repo(`commits/${sha}`), undefined, signal);
+    const email = commit.commit?.author?.email;
     return {
       sha: String(commit.sha),
       parents: (commit.parents ?? []).map((parent) => String(parent?.sha)),
       ...(typeof commit.committer?.login === "string"
         ? { committer: commit.committer.login }
         : {}),
+      ...(typeof email === "string" ? { authorEmail: email } : {}),
     };
   }
 
@@ -614,6 +734,7 @@ export class GitHub {
     headRefName: string;
     baseRefName: string;
     mergeStateStatus: string;
+    reviewDecision?: string | null;
   }> {
     const data = await this.graphql<{
       repository?: {
@@ -622,13 +743,14 @@ export class GitHub {
           headRefName: string;
           baseRefName: string;
           mergeStateStatus: string;
+          reviewDecision?: string | null;
         } | null;
       } | null;
     }>(
       `query($owner: String!, $name: String!, $number: Int!) {
         repository(owner: $owner, name: $name) {
           pullRequest(number: $number) {
-            headRefOid headRefName baseRefName mergeStateStatus
+            headRefOid headRefName baseRefName mergeStateStatus reviewDecision
           }
         }
       }`,
@@ -810,13 +932,17 @@ export class GitHub {
       );
       this.token = stdout.trim();
     } catch (error) {
-      throw new TransientError(
-        `GitHub login unavailable (run \`gh auth login\`): ${errorMessage(error)}`,
-      );
+      const message = `GitHub login unavailable (run \`gh auth login\`): ${errorMessage(error)}`;
+      // gh ran and said no, or isn't installed: a person must log in. A
+      // timeout may pass.
+      if ((error as { killed?: boolean }).killed)
+        throw new TransientError(message);
+      throw new GitHubError(message, 401);
     }
     if (!this.token)
-      throw new TransientError(
+      throw new GitHubError(
         "GitHub login unavailable (run `gh auth login`)",
+        401,
       );
     return this.token;
   }

@@ -17,6 +17,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { isRecord } from "../planning/graph.js";
+import type { Wait } from "../state.js";
 import { workerEnvironment } from "../worktree.js";
 import {
   callImages,
@@ -65,8 +66,6 @@ function modelResponseTimeoutMs(reasoningEffort?: string): number {
 }
 /** The quiet bound while a read tool runs. */
 export const ACTIVE_TOOL_IDLE_MS = 45 * 60 * 1_000;
-/** How long a rate or usage limit with no reset time waits before a retry. */
-const LIMIT_WAIT_MS = 15 * 60 * 1_000;
 
 /** The Agent SDK's internal tool that carries `outputFormat` results. */
 const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
@@ -602,7 +601,8 @@ export type FailedResult =
   | { kind: "billing"; message: string }
   | { kind: "login" }
   | { kind: "too-long" }
-  | { kind: "limit"; message: string; afterMs: number }
+  /** A usage limit (`wait` says when it resets), or a rate limit with no usage report (no `wait`: a transient retry). */
+  | { kind: "limit"; message: string; wait?: Wait }
   | { kind: "other" };
 
 /**
@@ -635,19 +635,21 @@ export function failedResult(
     return {
       kind: "limit",
       message: `Claude usage limit until ${new Date(resetsAt * 1000).toISOString()}: ${ended}`,
-      afterMs: Math.max(0, resetsAt * 1000 - Date.now()),
+      wait: {
+        kind: "reset",
+        at: new Date(resetsAt * 1000).toISOString(),
+        provider: "claude",
+      },
     };
-  // A limit with no reset time waits instead of spending the error count.
-  if (
-    status === 429 ||
-    facts.assistantError === "rate_limit" ||
-    facts.limit !== undefined
-  )
+  // A usage report with no reset time: Factory asks whether to wait.
+  if (facts.limit !== undefined)
     return {
       kind: "limit",
-      message: `Claude rate or usage limit: ${ended}`,
-      afterMs: LIMIT_WAIT_MS,
+      message: `Claude usage limit: ${ended}`,
+      wait: { kind: "reset", provider: "claude" },
     };
+  if (status === 429 || facts.assistantError === "rate_limit")
+    return { kind: "limit", message: `Claude rate limit: ${ended}` };
   return { kind: "other" };
 }
 
@@ -690,7 +692,7 @@ function settle(
           `The request is larger than the model's context window: ${ended}`,
         );
       case "limit":
-        throw new PlannerError("retry", failed.message, failed.afterMs);
+        throw new PlannerError("retry", failed.message, undefined, failed.wait);
       // Overload, connection, turn or output limits, structured output
       // retries and anything unknown: a fresh call may succeed.
       case "other":
@@ -957,7 +959,7 @@ export class ClaudePlanner implements Planner {
     } catch (error) {
       if (error instanceof PlannerError) throw error;
       const idle = watchdog.expired;
-      if (idle) throw new PlannerError("retry", idle.message);
+      if (idle) throw new PlannerError("retry", idle.message, -1);
       // The step was cancelled or hit its deadline: the engine decides.
       if (call.signal.aborted) throw call.signal.reason ?? error;
       throw error;

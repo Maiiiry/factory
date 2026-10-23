@@ -19,7 +19,9 @@ import {
   cancelCleanupStep,
   finalReviewStep,
   finalStep,
+  RERUN,
   reportStep,
+  rerunCleanupStep,
 } from "./work/steps.js";
 
 const MINUTE = 60_000;
@@ -40,6 +42,7 @@ export function objectiveWorkflow(deps?: BuildDeps): Workflow {
         return state.done[step.key] ? [] : [step];
       }
       if (state.status === "done" || state.status === "failed") return [];
+      if (deps && state.kept?.[RERUN]) return [rerunCleanupStep(deps)];
       if (!state.done.check) return [check];
       if (!state.done.plan) {
         const step = deps ? planningStep(state, deps) : unavailable("plan");
@@ -52,6 +55,15 @@ export function objectiveWorkflow(deps?: BuildDeps): Workflow {
       if (!state.done.report) return [reportStep(deps)];
       return [];
     },
+
+    providers: deps
+      ? [
+          ...new Set([
+            deps.config.planning.provider,
+            deps.config.execution.workerProvider,
+          ]),
+        ]
+      : [],
 
     status(state: ObjectiveState): ObjectiveStatus {
       if (!state.done.check) return "checking";
@@ -69,7 +81,7 @@ function checkStep(deps: PlanningDeps): Step {
     key: "check",
     deadlineMs: 10 * MINUTE,
     run: ({ state, signal }: StepContext) =>
-      guarded(async (): Promise<Outcome> => {
+      guarded(deps.config.repository, async (): Promise<Outcome> => {
         const read = await readObjective(state.issue, deps, "recheck", signal);
         return "hold" in read
           ? read.hold

@@ -79,6 +79,7 @@ function outcome(error: PlannerError): WorkerResult {
       kind: "retry",
       reason: error.message,
       ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
+      ...(error.wait && { wait: error.wait }),
     };
   // `fail` is a turn larger than the context window: the operator decides.
   return hold(`${error.message}. Narrow the Work Item, then answer retry.`);
@@ -372,7 +373,8 @@ export class CodexWorker implements Worker {
     } catch (error) {
       if (error instanceof PlannerError) return outcome(error);
       const idle = watchdog.expired;
-      if (idle) return { kind: "retry", reason: idle.message };
+      // An idle model is an error: three in a row hold.
+      if (idle) return { kind: "retry", reason: idle.message, afterMs: -1 };
       // Cancelled or past the step deadline: the engine decides.
       if (input.signal.aborted) throw input.signal.reason ?? error;
       // A failed codex process: its stderr is in the message.
