@@ -435,10 +435,14 @@ export class ObjectiveRunner {
 
   /**
    * A retry: an error counts toward `maxErrors`; a wait is classed by its
-   * cause (CORE.md#Waits). Times are wall-clock times saved in the state,
-   * so a restart doesn't reset a budget and a suspended host doesn't spend
-   * it twice: the question comes only after the step ran again and still
-   * had to wait.
+   * cause (CORE.md#Waits). The error count covers one run of consecutive
+   * errors: any other outcome ends it. `since`, `cause`, the backoff and a
+   * granted `wait` cover one run of one class (a reset, a gate, or an
+   * unknown cause, which errors share): a new class starts them again, so
+   * a long gate never spends the transient budget. Times are wall-clock
+   * times saved in the state, so a restart doesn't reset a budget and a
+   * suspended host doesn't spend it twice: the question comes only after
+   * the step ran again and still had to wait.
    */
   private retry(
     key: string,
@@ -446,10 +450,15 @@ export class ObjectiveRunner {
   ): void {
     const state = this.state;
     const now = this.now().getTime();
-    const previous = state.retries[key];
+    const wait = outcome.wait;
     const isError = outcome.afterMs === -1;
+    const before = state.retries[key];
+    // The run of retries this one continues, if it is of the same class.
+    const previous =
+      before && waitClass(before.wait) === waitClass(wait) ? before : undefined;
     const attempts = (previous?.attempts ?? 0) + 1;
     const since = previous?.since ?? new Date(now).toISOString();
+    const count = isError ? (previous?.count ?? 0) + 1 : 0;
     const backoff = Math.min(
       this.limits.baseBackoffMs * 2 ** (attempts - 1),
       this.limits.maxBackoffMs,
@@ -462,16 +471,16 @@ export class ObjectiveRunner {
         ? now + outcome.afterMs
         : now + backoff;
     let question: { text: string; answers: string[] } | undefined;
-    const wait = outcome.wait;
     if (isError) {
-      if ((previous?.count ?? 0) + 1 >= this.limits.maxErrors)
+      if (count >= this.limits.maxErrors)
         question = {
           text: `Step ${key} keeps failing (${outcome.reason}).`,
           answers: ERROR_ANSWERS,
         };
     } else if (wait?.kind === "reset") {
       const at = wait.at ? Date.parse(wait.at) : Number.NaN;
-      if (Number.isFinite(at)) nextAt = Math.max(at, now);
+      // A reset already past (clock skew) still backs off: never a hot loop.
+      if (Number.isFinite(at)) nextAt = Math.max(at, now + backoff);
       if (!granted && !(at - now <= this.limits.maxWaitMs)) {
         const other = this.workflow.providers?.find(
           (provider) => wait.provider && provider !== wait.provider,
@@ -493,7 +502,7 @@ export class ObjectiveRunner {
         answers: [WAIT, "retry", "cancel"],
       };
     const record: Retry = {
-      count: (previous?.count ?? 0) + (isError ? 1 : 0),
+      count,
       attempts,
       since,
       nextAt: new Date(nextAt).toISOString(),
@@ -688,6 +697,11 @@ export class ObjectiveRunner {
     this.state.updatedAt = this.now().toISOString();
     saveState(this.dir, this.state);
   }
+}
+
+/** A retry's class: a reset, a gate, or an unknown cause (errors included). */
+function waitClass(wait: Wait | undefined): string {
+  return wait?.kind ?? "unknown";
 }
 
 function hours(ms: number): string {

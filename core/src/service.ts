@@ -36,6 +36,7 @@ import {
   loadState,
   newObjective,
   type ObjectiveState,
+  removeState,
   saveState,
   TERMINAL,
 } from "./state.js";
@@ -76,7 +77,7 @@ export async function serve(options: ServeOptions): Promise<number> {
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
   const log = new RunLog(paths.logs, runId);
   // Unfinished Objectives, and finished ones until their cleanup and their
-  // last sync are done. Other finished ones are read from disk only when a
+  // final sync are done. Other finished ones are read from disk only when a
   // request or the queue names them (rule 6: cost follows active work).
   const runners = new Map<number, ObjectiveRunner>();
   const unreadable = new Map<number, UnreadableObjective>();
@@ -93,7 +94,11 @@ export async function serve(options: ServeOptions): Promise<number> {
     runners.set(state.issue, runner);
     return runner;
   };
-  /** The Objective's run: in memory, else read from disk (which may find it unreadable). */
+  /**
+   * The Objective's run: in memory, else read from disk (which may find it
+   * unreadable). A read that fails (EMFILE, EIO) throws; nothing is
+   * decided on it, and the caller tries again later.
+   */
   const find = (issue: number): ObjectiveRunner | undefined => {
     const known = runners.get(issue);
     if (known || unreadable.has(issue)) return known;
@@ -102,16 +107,34 @@ export async function serve(options: ServeOptions): Promise<number> {
       unreadable.set(issue, { error: loaded.error });
     return loaded?.kind === "ok" ? open(loaded.state) : undefined;
   };
+  /** State files not read yet because the read failed: tried every tick. */
+  const unloaded = new Set<number>();
+  const load = (issue: number): void => {
+    let runner: ObjectiveRunner | undefined;
+    try {
+      runner = find(issue);
+    } catch (error) {
+      if (!unloaded.has(issue))
+        log.write(issue, { event: "load-failed", error: String(error) });
+      unloaded.add(issue);
+      return;
+    }
+    unloaded.delete(issue);
+    // A finished one stays only until its cleanup and its final sync are done.
+    if (
+      runner &&
+      TERMINAL.includes(runner.state.status) &&
+      !runner.hasWork &&
+      (options.sync?.synced(runner.state) ?? true)
+    )
+      runners.delete(issue);
+  };
 
   // Only the lock holder writes state, so leftover temporary files are from a crash.
   for (const name of readdirSync(paths.objectives))
     if (name.endsWith(".tmp"))
       rmSync(join(paths.objectives, name), { force: true });
-  for (const issue of listObjectives(paths.objectives)) {
-    const runner = find(issue);
-    if (runner && TERMINAL.includes(runner.state.status) && !runner.hasWork)
-      runners.delete(issue);
-  }
+  for (const issue of listObjectives(paths.objectives)) load(issue);
   crashPoint("serve:loaded");
 
   const applyRequests = (): void => {
@@ -200,6 +223,7 @@ export async function serve(options: ServeOptions): Promise<number> {
   };
 
   const tick = (): void => {
+    for (const issue of [...unloaded]) load(issue);
     applyRequests();
     // Running steps keep their slot; then started Objectives; then queue order.
     const ordered = [...runners.values()].sort(
@@ -225,6 +249,9 @@ export async function serve(options: ServeOptions): Promise<number> {
       } else if (state.status === "holding")
         // A hold takes no slot; settle an interrupted attempt, which may open a hold.
         run = Object.keys(state.attempts).length > 0;
+      // A wait on a human gate (an approval, a required review) has no
+      // deadline, so it takes no slot: it polls, and its paths stay owned.
+      else if (gated(runner, workflow)) run = true;
       // Waiting on another Objective's paths takes no slot either, so a hold
       // that owns common paths can't stall the queue (rule 1).
       else if (waitsOnPaths(runner, ordered)) run = false;
@@ -248,10 +275,16 @@ export async function serve(options: ServeOptions): Promise<number> {
       unreadable,
       requestsDir: paths.requests,
       waitingForSlot: (issue) => waitingForSlot.has(issue),
+      find,
       admit: (issue: number, github: GitHubModule) => {
         const previous = find(issue);
         if (unreadable.has(issue)) return; // never over an unreadable file
-        if (previous && !TERMINAL.includes(previous.state.status)) return;
+        // Never over an unfinished run, nor one whose cleanup still runs.
+        if (
+          previous &&
+          (!TERMINAL.includes(previous.state.status) || previous.hasWork)
+        )
+          return;
         // A run again after the operator queued a finished one: the old run
         // stops for good (its steps, its saves, its sync jobs) before the new
         // one exists, so only one run ever writes the file.
@@ -266,10 +299,29 @@ export async function serve(options: ServeOptions): Promise<number> {
         open(state);
         log.write(issue, { event: "admitted", again: Boolean(previous) });
       },
+      withdraw: (issue: number) => {
+        const runner = runners.get(issue);
+        if (
+          !runner ||
+          runner.busy ||
+          TERMINAL.includes(runner.state.status) ||
+          !unstarted(runner.state)
+        )
+          return false;
+        // Dequeued before planning: the run goes as if never admitted, so
+        // queuing it again checks it afresh.
+        removeState(paths.objectives, issue);
+        crashPoint("serve:withdrawn");
+        runner.stop();
+        runners.delete(issue);
+        options.sync?.forget(issue);
+        log.write(issue, { event: "withdrawn" });
+        return true;
+      },
       result: (id: string) => readResult(paths.requests, id),
     });
-    // A finished Objective leaves memory once its cleanup and its one sync
-    // pass are done; a request or a re-queue reads it again from disk.
+    // A finished Objective leaves memory once its cleanup and its final
+    // sync are done; a request or a re-queue reads it again from disk.
     for (const runner of [...runners.values()]) {
       const issue = runner.state.issue;
       if (
@@ -358,13 +410,38 @@ function acceptedAt(state: ObjectiveState): string {
   return (state.kept?.[ACCEPTED_AT] as string | undefined) ?? "";
 }
 
+/**
+ * Whether every step left to run waits on a human gate: nothing it can do
+ * until a person outside Factory acts.
+ */
+function gated(runner: ObjectiveRunner, workflow: Workflow): boolean {
+  const steps = workflow.steps(runner.state);
+  return (
+    steps.length > 0 &&
+    steps.every((step) => runner.state.retries[step.key]?.wait?.kind === "gate")
+  );
+}
+
+/** Not started: nothing past the check (and a re-run's cleanup) has run or begun. */
+function unstarted(state: ObjectiveState): boolean {
+  const early = (key: string) => key === "check" || key === "rerun:cleanup";
+  return (
+    !state.kept?.[RERUN] &&
+    [
+      ...Object.keys(state.done),
+      ...Object.keys(state.retries),
+      ...Object.keys(state.attempts),
+    ].every(early)
+  );
+}
+
 function started(runner: ObjectiveRunner): boolean {
   return (
     runner.busy || Object.keys(runner.state.done).some((key) => key !== "check")
   );
 }
 
-/** The Project's order number when the Objective was queued. */
+/** The Project's order number, read again on every queue read until it starts. */
 function queueOrder(runner: ObjectiveRunner): number {
   return (
     (runner.state.modules.github as GitHubModule | undefined)?.order ??
