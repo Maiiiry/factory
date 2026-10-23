@@ -1,12 +1,12 @@
 import type { CoreConfig, QueueOption } from "./config.js";
 import { crashPoint } from "./crash.js";
 import type { EngineLimits, ObjectiveRunner } from "./engine.js";
-import { type GitHub, TransientError } from "./github.js";
+import { type GitHub, issueGone, TransientError } from "./github.js";
 import type { RunLog } from "./log.js";
 import { QueueDisplay, type QueueItem, queued, readQueue } from "./queue.js";
 import { writeRequest } from "./requests.js";
 import type { ObjectiveState, ObjectiveStatus } from "./state.js";
-import { TERMINAL } from "./state.js";
+import { CLOCK_SKEW_MS, TERMINAL } from "./state.js";
 import { errorMessage } from "./text.js";
 
 /** What the sync keeps in an Objective's state (`modules.github`). */
@@ -34,9 +34,14 @@ export interface GitHubModule {
   shownAt?: string;
   /** When the card was set to queued for this run, by GitHub's clock. */
   queuedAt?: string;
-  /** The hold whose question comment exists. */
-  askedHold?: string;
-  /** Comments are read from here on. */
+  /** An unreadable state's question comment exists (open holds keep theirs: `Hold.shownAt`). */
+  askedUnreadable?: boolean;
+  /**
+   * Comments are read from here on, by GitHub's clock, and only one created
+   * at or after it is a command: an older comment edited later (GitHub's
+   * `since` filters on `updated_at`) never acts. It starts at the run's
+   * admission, or an unreadable state's question, and only moves forward.
+   */
   commentsSince: string;
   /** Request ids already replied to. */
   replied?: string[];
@@ -61,6 +66,8 @@ export interface UncheckedComment {
 /** An Objective whose state file can't be read: it holds, with `cancel`. */
 export interface UnreadableObjective {
   error: string;
+  /** Which incident: the unreadable file's digest. Its question and answers are this incident's only. */
+  incident: string;
   /** Its card and comment cursor, once the sync has seen it on the Project. */
   github?: GitHubModule;
 }
@@ -72,8 +79,12 @@ export interface SyncView {
   find(issue: number): ObjectiveRunner | undefined;
   /** Start (or start again) an Objective seen queued; the service decides whether it may. */
   admit(issue: number, github: GitHubModule): void;
-  /** Withdraw an Objective dequeued before it started; false when it has started. */
-  withdraw(issue: number): boolean;
+  /**
+   * Withdraw an Objective dequeued before it started: now, or (`pending`)
+   * once its running check or a re-run's cleanup ends; false when it has
+   * started.
+   */
+  withdraw(issue: number): "withdrawn" | "pending" | false;
   /** Checked and waiting for a slot: still shown as queued. */
   waitingForSlot(issue: number): boolean;
   requestsDir: string;
@@ -101,6 +112,8 @@ const MAX_BACKOFF_MS = 10 * 60_000;
 /** Comments kept waiting for their author's access to be read, per Objective. */
 const MAX_UNCHECKED = 20;
 const COMMAND = /^\/factory\s+(\S+)(?:\s+([\s\S]*))?$/;
+/** `--question ID` right after the answer names the hold it answers. */
+const QUESTION = /^--question\s+(\S+)(?:\s+([\s\S]*))?$/;
 
 /**
  * GitHub is input and display, never a precondition: every call here runs in
@@ -132,6 +145,12 @@ export class GitHubSync {
   private readonly changed = new Set<number>();
   /** A queue read landed since the last intake. */
   private fresh = false;
+  /**
+   * Withdrawn runs' last queued time, by GitHub's clock: a card that still
+   * reads queued from then (a read that began before the dequeue) is never
+   * a new queue. Only a later queue admits the issue again.
+   */
+  private readonly withdrawnAt = new Map<number, number>();
   /** Known issues GitHub no longer has: left out of later reads. */
   private readonly gone = new Set<number>();
   private lastPoll = 0;
@@ -143,6 +162,8 @@ export class GitHubSync {
   >();
   /** Finished Objectives whose final option and replies are written. */
   private readonly settled = new Set<number>();
+  /** The repository's identity was read once since the service started. */
+  private identified = false;
   private readonly display: QueueDisplay;
 
   constructor(
@@ -158,7 +179,25 @@ export class GitHubSync {
     this.display = new QueueDisplay(github, config);
   }
 
+  /**
+   * A problem that pauses every GitHub effect of the installation: the
+   * repository answers under another name (renamed or transferred). The
+   * service then runs no step and no sync job, and settles nothing, until
+   * the configuration names the repository and the service restarts.
+   */
+  problem(): string | undefined {
+    return this.github.moved?.message;
+  }
+
   tick(sync: SyncView): void {
+    if (this.problem()) return;
+    // Read once at start: a rename while the service was down pauses
+    // before any issue counts as gone (later redirects check it again).
+    if (!this.identified)
+      this.background(0, "identity", async () => {
+        await this.github.checkIdentity();
+        this.identified = true;
+      });
     const due =
       this.now() - this.lastPoll >= this.config.queue.pollSeconds * 1000;
     if (due) {
@@ -183,11 +222,7 @@ export class GitHubSync {
           this.viewKnown = new Set(known);
           this.viewAt = startedAt;
           this.fresh = true;
-          for (const issue of read.gone)
-            if (!this.gone.has(issue)) {
-              this.gone.add(issue);
-              this.log.write(issue, { event: "queue-issue-gone" });
-            }
+          for (const issue of read.gone) this.lose(issue, "queue");
           if (read.truncated)
             this.log.write(0, {
               event: "queue-truncated",
@@ -207,13 +242,24 @@ export class GitHubSync {
       const finished =
         TERMINAL.includes(runner.state.status) && !runner.hasWork;
       if (finished && this.settled.has(issue)) continue;
+      // An issue GitHub no longer has here (deleted, or moved away) has no
+      // card or comments to write: its replies are dropped, and once it
+      // finishes its sync is settled.
+      if (this.gone.has(issue)) {
+        if (finished) {
+          for (const request of module ? unreplied(runner.state, module) : [])
+            this.log.write(issue, { event: "reply-dropped", id: request.id });
+          this.settled.add(issue);
+        }
+        continue;
+      }
       if (finished && this.synced(runner.state)) {
         this.settled.add(issue);
         continue;
       }
       if (!module) continue;
       this.show(runner, module, sync);
-      this.ask(runner, module);
+      this.ask(runner);
       this.reply(runner, module, sync);
       if (finished) continue;
       this.note(runner, module);
@@ -221,7 +267,7 @@ export class GitHubSync {
         this.readComments(
           issue,
           module,
-          () => Boolean(runner.state.hold),
+          () => runner.state.holds.length > 0,
           sync,
           (change) =>
             runner.transact(() =>
@@ -230,7 +276,7 @@ export class GitHubSync {
         );
     }
     for (const [issue, entry] of sync.unreadable)
-      this.unreadable(issue, entry, due, sync);
+      if (!this.gone.has(issue)) this.unreadable(issue, entry, due, sync);
   }
 
   /** Whether a finished Objective's sync is done and no job of it is running. */
@@ -262,6 +308,16 @@ export class GitHubSync {
     for (const key of this.backoff.keys())
       if (key.endsWith(`:${issue}`) || key.includes(`:${issue}:`))
         this.backoff.delete(key);
+  }
+
+  /** The service withdrew a dequeued run: forget it, and keep the dequeue's edge. */
+  withdrawn(state: ObjectiveState): void {
+    this.forget(state.issue);
+    const module = state.modules.github as GitHubModule | undefined;
+    const marks = [module?.queuedAt, module?.shownAt]
+      .map((mark) => Date.parse(mark ?? ""))
+      .filter(Number.isFinite);
+    if (marks.length) this.withdrawnAt.set(state.issue, Math.max(...marks));
   }
 
   /**
@@ -353,13 +409,16 @@ export class GitHubSync {
     const module = runner.state.modules.github as GitHubModule;
     if (TERMINAL.includes(runner.state.status)) {
       if (option === queued) return "requeued";
-    } else if (
-      module.seen === queued &&
-      option !== queued &&
-      sync.withdraw(issue)
-    ) {
-      this.log.write(issue, { event: "dequeued", option });
-      return "withdrawn";
+    } else if (module.seen === queued && option !== queued) {
+      const withdrawn = sync.withdraw(issue);
+      if (withdrawn === "pending")
+        runner.transact(() => {
+          (runner.state.modules.github as GitHubModule).seen = option;
+        });
+      if (withdrawn) {
+        this.log.write(issue, { event: "dequeued", option, withdrawn });
+        return "withdrawn";
+      }
     }
     const desired = this.desired(runner, sync);
     runner.transact(() => {
@@ -371,13 +430,24 @@ export class GitHubSync {
     return "ceded";
   }
 
+  /**
+   * Admit a queued card. Its comments are read from when it was queued, by
+   * GitHub's clock (the option's `updatedAt`), never the host's: a comment
+   * written right after queuing is read even when the host runs ahead, and
+   * one from before (an earlier run's) never counts. GitHub always sends
+   * the time with a set option; without it, a later read admits it.
+   */
   private admitItem(item: QueueItem, sync: SyncView): void {
+    if (!item.optionAt) return;
+    const out = this.withdrawnAt.get(item.issue);
+    if (out !== undefined && !(Date.parse(item.optionAt) > out)) return;
+    this.withdrawnAt.delete(item.issue);
     sync.admit(item.issue, {
       itemId: item.itemId,
       order: item.order,
       seen: item.option,
-      ...(item.optionAt ? { queuedAt: item.optionAt } : {}),
-      commentsSince: new Date(this.now()).toISOString(),
+      queuedAt: item.optionAt,
+      commentsSince: item.optionAt,
     });
   }
 
@@ -397,7 +467,8 @@ export class GitHubSync {
    * Show the status on the card. The card is read first: Factory writes
    * only over what it last saw or wrote itself, never over someone else's
    * change (see `cardChanged`). The option being written is saved first, so
-   * after a crash the card showing it still reads as Factory's own.
+   * after a crash the card showing it still reads as Factory's own. A run
+   * being withdrawn shows nothing: the operator's dequeue stands.
    */
   private show(
     runner: ObjectiveRunner,
@@ -407,6 +478,7 @@ export class GitHubSync {
     const issue = runner.state.issue;
     const option = this.desired(runner, sync);
     if (
+      runner.state.withdrawing ||
       module.shown === option ||
       module.ceded === option ||
       this.changed.has(issue)
@@ -415,6 +487,7 @@ export class GitHubSync {
     const github = () => runner.state.modules.github as GitHubModule;
     this.background(issue, `show:${issue}`, async () => {
       const card = await this.display.get(github().itemId);
+      if (runner.state.withdrawing) return;
       const { seen, writing } = github();
       if (
         seen !== undefined &&
@@ -446,46 +519,76 @@ export class GitHubSync {
     });
   }
 
-  /** Post the open question once, with its answers. */
-  private ask(runner: ObjectiveRunner, module: GitHubModule): void {
-    const hold = runner.state.hold;
-    if (!hold || module.askedHold === hold.id) return;
+  /**
+   * Post each open question once, with its answers. A comment shows the
+   * short form `/factory <answer>` only while it is the one open question;
+   * once another opens, it is edited to name its question. The comment's
+   * GitHub time is saved on the hold (`shownAt`): an answer that names no
+   * question is compared with it (engine.ts `answer`). A short form shown
+   * before another question (`lastShownAt`) would be refused, so that
+   * comment is edited to name its question too.
+   */
+  private ask(runner: ObjectiveRunner): void {
+    // A run being withdrawn goes instead of asking (service.ts tick).
+    if (runner.state.withdrawing) return;
     const issue = runner.state.issue;
-    this.background(issue, `ask:${issue}`, async () => {
-      const marker = MARK(issue, "hold", hold.id);
-      if (!(await this.posted(issue, marker, hold.askedAt))) {
+    const holds = runner.state.holds;
+    const others = holds.length > 1;
+    const lastShownAt = Date.parse(runner.state.lastShownAt ?? "");
+    for (const hold of holds) {
+      const bound =
+        others ||
+        (hold.shortForm === true &&
+          lastShownAt > Date.parse(hold.shownAt ?? ""));
+      if (hold.shownAt !== undefined && (!hold.shortForm || !bound)) continue;
+      this.background(issue, `ask:${issue}:${hold.id}`, async () => {
+        const marker = MARK(issue, "hold", hold.id);
+        const named = ` --question ${hold.id}`;
         const answers = hold.answers
           .map(
             (a) =>
-              `\`/factory ${a}\`${a === hold.recommended ? " (recommended)" : ""}`,
+              `\`/factory ${a}${bound ? named : ""}\`${a === hold.recommended ? " (recommended)" : ""}`,
           )
           .join(", ");
-        crashPoint("sync:ask:before");
-        await this.github.postComment(
+        const about = hold.item
+          ? ` It stops Work Item \`${hold.item}\` and the items that depend on it; other work goes on.`
+          : "";
+        const form = others
+          ? " Other questions are open too, so the answer names this one."
+          : bound
+            ? " Another question was shown after this one, so the answer names this one."
+            : ` While this is the only open question, the short form works; \`/factory <answer>${named}\` always does.`;
+        const comment = await this.github.upsertComment(
           issue,
-          `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.`,
+          marker,
+          `${marker}\n**Factory needs you.** ${hold.question}\n\nReply with one of: ${answers}. Add text after the answer to explain it.${about}${form}`,
+          "sync:ask",
+          undefined,
+          new Date(Date.parse(hold.askedAt) - CLOCK_SKEW_MS).toISOString(),
         );
-        crashPoint("sync:ask:after");
-      }
-      runner.transact(() => {
-        (runner.state.modules.github as GitHubModule).askedHold = hold.id;
+        runner.transact(() =>
+          runner.shown(
+            hold.id,
+            comment.updated_at ?? comment.created_at,
+            !bound,
+          ),
+        );
       });
-    });
+    }
   }
 
   /**
    * A wait shown on the issue: one status note, edited in place, once an
    * unknown transient cause has lasted `noteAfterMs`; one reminder once a
    * human gate (an approval, a required review) has lasted `remindAfterMs`.
-   * Neither while a question is open: no step waits then but on its
-   * answer, and the engine pauses their clocks until it comes.
+   * Neither for a step an open question stops: it waits on the answer,
+   * and the engine pauses its clocks until it comes.
    */
   private note(runner: ObjectiveRunner, module: GitHubModule): void {
-    if (runner.state.hold) return;
     const now = this.now();
     const issue = runner.state.issue;
     const waits = Object.entries(runner.state.retries)
-      .filter(([, retry]) => retry.count === 0)
+      .filter(([step, retry]) => retry.count === 0 && !runner.heldBy(step))
       .sort(([, a], [, b]) => a.since.localeCompare(b.since));
     const transient = waits.find(
       ([, retry]) =>
@@ -545,11 +648,9 @@ export class GitHubSync {
     sync: SyncView,
   ): void {
     const item = this.view.find((i) => i.issue === issue);
+    // Comments are read once the question is shown, from its time on.
     if (!entry.github && item)
-      entry.github = {
-        itemId: item.itemId,
-        commentsSince: new Date(this.now()).toISOString(),
-      };
+      entry.github = { itemId: item.itemId, commentsSince: "" };
     const module = entry.github;
     if (!module) return;
     const option = this.config.queue.options.holding;
@@ -561,20 +662,22 @@ export class GitHubSync {
         module.shown = option;
         if (at) module.shownAt = at;
       });
-    if (module.askedHold !== "unreadable")
+    if (!module.askedUnreadable)
       this.background(issue, `ask:${issue}`, async () => {
-        const marker = MARK(issue, "hold", "unreadable");
-        const found = await this.github.markedComment(issue, marker);
-        if (found) module.commentsSince = found.created_at;
-        else {
+        // This incident's question: an earlier incident's question, and
+        // the answers to it, never count for this one.
+        const marker = MARK(issue, "hold", `unreadable:${entry.incident}`);
+        let question = await this.github.markedComment(issue, marker);
+        if (!question) {
           crashPoint("sync:ask:before");
-          await this.github.postComment(
+          question = await this.github.postComment(
             issue,
             `${marker}\n**Factory needs you.** Factory can't read this Objective's state (${entry.error.slice(0, 500)}). Reply with \`/factory cancel\` (recommended) to start over from a cancelled record; then queue it again to run it again.`,
           );
           crashPoint("sync:ask:after");
         }
-        module.askedHold = "unreadable";
+        module.commentsSince = question.created_at;
+        module.askedUnreadable = true;
       });
     else if (due)
       this.readComments(
@@ -608,6 +711,9 @@ export class GitHubSync {
       let latest = since;
       const fresh: UncheckedComment[] = [];
       for (const comment of comments) {
+        // Created before the cursor: read already, or from before this run
+        // or its question, and edited since.
+        if (Date.parse(comment.created_at) < Date.parse(since)) continue;
         if (comment.created_at > latest) latest = comment.created_at;
         if (
           !comment.user ||
@@ -688,12 +794,14 @@ export class GitHubSync {
     const command = comment.body.match(COMMAND);
     if (!command) return;
     const answer = command[1]!.toLowerCase();
-    const text = command[2]?.trim();
+    const bound = QUESTION.exec(command[2]?.trim() ?? "");
+    const question = bound?.[1];
+    const text = (bound ? bound[2] : command[2])?.trim();
     writeRequest(
       sync.requestsDir,
       answer === "cancel"
         ? { kind: "cancel", issue }
-        : answer === "retry" && !holding
+        : answer === "retry" && !holding && !question
           ? { kind: "retry", issue }
           : {
               kind: "answer",
@@ -701,6 +809,7 @@ export class GitHubSync {
               answer,
               ...(text ? { text } : {}),
               writtenAt: comment.createdAt,
+              ...(question ? { question } : {}),
             },
       comment.login,
       `comment-${comment.id}`,
@@ -740,8 +849,39 @@ export class GitHubSync {
     marker: string,
     since: string,
   ): Promise<boolean> {
-    const from = new Date(Date.parse(since) - 10 * 60_000).toISOString();
+    // An unreadable state's cursor is empty until its question is shown.
+    const at = Date.parse(since);
+    const from = Number.isFinite(at)
+      ? new Date(at - CLOCK_SKEW_MS).toISOString()
+      : undefined;
     return (await this.github.findComment(issue, marker, from)) !== undefined;
+  }
+
+  /** GitHub no longer has the issue here: nothing more is written to it. */
+  private lose(issue: number, job: string, status?: number): void {
+    if (this.gone.has(issue)) return;
+    this.gone.add(issue);
+    this.log.write(issue, {
+      event: "issue-gone",
+      job,
+      ...(status ? { status } : {}),
+    });
+  }
+
+  /**
+   * Read the issue itself (redirects are answers, never followed); lose it
+   * only on 404, 410 or a redirect while the repository still answers
+   * under its configured name. A moved repository (RepositoryMoved, from
+   * the client's identity check) never makes an issue gone.
+   */
+  private async confirmGone(issue: number, job: string): Promise<void> {
+    if (this.github.moved) return;
+    try {
+      await this.github.issue(issue);
+    } catch (error) {
+      if (issueGone(error) && !this.github.moved)
+        this.lose(issue, job, error.status);
+    }
   }
 
   /**
@@ -760,7 +900,11 @@ export class GitHubSync {
     this.busy.set(key, issue);
     job()
       .then(() => this.backoff.delete(key))
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
+        // A sub-resource's 404 (comments, a card) can be transient or a
+        // permission gap: the issue is gone only if a direct read of it
+        // also says so. Otherwise the job retries with its backoff.
+        if (issue && issueGone(error)) await this.confirmGone(issue, key);
         const failures = (this.backoff.get(key)?.failures ?? 0) + 1;
         if (backs)
           this.backoff.set(key, {

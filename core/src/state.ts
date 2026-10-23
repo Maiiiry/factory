@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
@@ -11,9 +12,15 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { crashPoint } from "./crash.js";
+import type { HoldScope } from "./engine.js";
 import type { ProviderConfig } from "./providers/config.js";
 
-const STATE_VERSION = 1;
+/**
+ * 2: open questions are a list (`holds`), saved ones a map (`asking`).
+ * Another version is unreadable, with no migration; `factory reset`
+ * (#1775) must rebuild `holds`.
+ */
+const STATE_VERSION = 2;
 
 export type ObjectiveStatus =
   | "checking"
@@ -36,10 +43,24 @@ export interface Hold {
   id: string;
   /** The step that asked; it runs again with the answer. */
   step: string;
+  /**
+   * The Work Item it stops (a Work Item step's question about that item):
+   * that item waits, and the items that depend on it. Absent: the whole
+   * Objective waits (CORE.md#Holds and answers).
+   */
+  item?: string;
   question: string;
   answers: string[];
   recommended: string;
   askedAt: string;
+  /**
+   * When its issue comment last changed to what it shows now, by GitHub's
+   * clock (the comment's created_at or updated_at): an answer that names
+   * no question is compared with this, never with a host time.
+   */
+  shownAt?: string;
+  /** The comment shows the short form `/factory <answer>` (it was the one open question). */
+  shortForm?: boolean;
 }
 
 export interface Answer {
@@ -79,6 +100,17 @@ export interface Retry {
   grantedUntil?: string;
 }
 
+/**
+ * A question the engine raised about a step (a repair over budget, a
+ * crash-loop suspect) while another question that stops it was open.
+ */
+export interface PendingQuestion {
+  question: string;
+  answers: string[];
+  recommended: string;
+  scope?: HoldScope;
+}
+
 /** The provider an Objective was admitted with, kept for its whole run. */
 export interface FrozenProvider {
   name: string;
@@ -91,15 +123,28 @@ export interface FrozenProvider {
 export interface ObjectiveState {
   version: number;
   issue: number;
+  /** `holding` while any question is open. */
   status: ObjectiveStatus;
   /** Frozen at admission; absent only for a record that never ran. */
   provider?: FrozenProvider;
-  /** The status to return to when a hold is answered. */
-  resumeStatus?: ObjectiveStatus;
-  hold: Hold | null;
+  /** Open questions, oldest first: at most one for the Objective and one per Work Item. */
+  holds: Hold[];
+  /**
+   * The latest GitHub time at which any question's comment was shown
+   * (posted or edited), closed questions included. An answer that names no
+   * question applies only to a question shown after every other one, so it
+   * can't land on a question its author didn't read (engine.ts `answer`).
+   */
+  lastShownAt?: string;
   /** The latest answer per step, read by the step when it runs again. */
   answers: Record<string, Answer>;
   retries: Record<string, Retry>;
+  /**
+   * Questions saved per step, asked as soon as no open question stops the
+   * step, before it runs. Kept apart from `retries`, so no change to a
+   * retry drops one; cleared when asked, or when a repair clears the step.
+   */
+  asking: Record<string, PendingQuestion>;
   /** Facts steps keep across repairs (Outcome `keep`), by key. */
   kept: Record<string, unknown>;
   /** Repairs per target step, with the latest findings (newest last). */
@@ -113,6 +158,12 @@ export interface ObjectiveState {
   attempts: Record<string, { startedAt: string; run?: string }>;
   /** The service run that last finished a step of this Objective, saved with the step's outcome. */
   finishedRun?: string;
+  /**
+   * Dequeued while its check or a re-run's cleanup ran: nothing past them
+   * starts, and the service withdraws it once no step runs and the re-run's
+   * cleanup is done.
+   */
+  withdrawing?: boolean;
   /** The latest applied requests and their results, so a request is never applied twice. */
   appliedRequests: { id: string; message: string }[];
   /** Per-capability data. Modules own their key. */
@@ -134,9 +185,10 @@ export function newObjective(
     issue,
     status: "checking",
     ...(provider ? { provider } : {}),
-    hold: null,
+    holds: [],
     answers: {},
     retries: {},
+    asking: {},
     repairs: {},
     kept: {},
     done: {},
@@ -146,6 +198,27 @@ export function newObjective(
     updatedAt: now.toISOString(),
     startedAt: now.toISOString(),
   };
+}
+
+/**
+ * A run's identity: its admission time (with the issue, it names the run).
+ * Every artifact Factory relies on across runs is bound to it: memory
+ * records and pins, the report comment. A record from before runs had one
+ * reads as `unknown`.
+ */
+export function runOf(state: ObjectiveState): string {
+  return state.startedAt ?? "unknown";
+}
+
+/** The most this host's clock is taken to differ from GitHub's: host times read against GitHub's go back this far. */
+export const CLOCK_SKEW_MS = 10 * 60_000;
+
+/** Where a GitHub read of this run's own comments starts: its admission (a host time), less the skew. */
+export function sinceRun(state: ObjectiveState): string | undefined {
+  const at = Date.parse(state.startedAt ?? "");
+  return Number.isFinite(at)
+    ? new Date(at - CLOCK_SKEW_MS).toISOString()
+    : undefined;
 }
 
 function statePath(dir: string, issue: number): string {
@@ -158,7 +231,15 @@ function statePath(dir: string, issue: number): string {
  */
 export function saveState(dir: string, state: ObjectiveState): void {
   mkdirSync(dir, { recursive: true });
-  const path = statePath(dir, state.issue);
+  writeWhole(dir, statePath(dir, state.issue), state, "state");
+}
+
+function writeWhole(
+  dir: string,
+  path: string,
+  state: ObjectiveState,
+  point?: string,
+): void {
   const temporary = `${path}.${process.pid}.tmp`;
   const fd = openSync(temporary, "w", 0o600);
   try {
@@ -167,10 +248,10 @@ export function saveState(dir: string, state: ObjectiveState): void {
   } finally {
     closeSync(fd);
   }
-  crashPoint("state:before-rename");
+  if (point) crashPoint(`${point}:before-rename`);
   renameSync(temporary, path);
   syncDirectory(dir);
-  crashPoint("state:saved");
+  if (point) crashPoint(`${point}:saved`);
 }
 
 /** Remove the Objective's state: it was dequeued before it started. */
@@ -205,6 +286,58 @@ export function finishState(dir: string, issue: number): void {
   syncDirectory(dir);
 }
 
+const OBSERVATION = ".observe.json";
+
+/**
+ * A run's settled observation that hasn't landed (service.ts `late`): the
+ * state it observes, saved beside the finished states until it lands, so
+ * a restart retries it. Returns the file, to remove once it lands.
+ */
+export function saveObservation(dir: string, state: ObjectiveState): string {
+  const finished = join(dir, FINISHED);
+  mkdirSync(finished, { recursive: true });
+  const run = runOf(state).replace(/[^\w.-]/g, "-");
+  const path = join(finished, `${state.issue}@${run}${OBSERVATION}`);
+  writeWhole(finished, path, state);
+  return path;
+}
+
+/**
+ * The settled observations still to land. Only these files are read, never
+ * the finished states; one that doesn't parse comes with its `error`, and
+ * leftover temporary files are removed.
+ */
+export function listObservations(
+  dir: string,
+): { path: string; state?: ObjectiveState; error?: string }[] {
+  const finished = join(dir, FINISHED);
+  let names: string[];
+  try {
+    names = readdirSync(finished);
+  } catch {
+    return [];
+  }
+  const found: { path: string; state?: ObjectiveState; error?: string }[] = [];
+  for (const name of names) {
+    const path = join(finished, name);
+    if (name.includes(`${OBSERVATION}.`) && name.endsWith(".tmp"))
+      rmSync(path, { force: true });
+    if (!name.endsWith(OBSERVATION)) continue;
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      continue; // read again at the next start
+    }
+    try {
+      found.push({ path, state: JSON.parse(text) });
+    } catch (error) {
+      found.push({ path, error: String(error) });
+    }
+  }
+  return found;
+}
+
 /** The Objective's active state, else its finished one; null when it has neither. */
 export function findState(dir: string, issue: number): Loaded | null {
   return loadState(dir, issue) ?? loadState(join(dir, FINISHED), issue);
@@ -231,7 +364,13 @@ function syncDirectory(dir: string): void {
 
 export type Loaded =
   | { kind: "ok"; state: ObjectiveState }
-  | { kind: "unreadable"; issue: number; error: string };
+  | {
+      kind: "unreadable";
+      issue: number;
+      error: string;
+      /** The file's digest: one incident of unreadable state, until the file changes. */
+      incident: string;
+    };
 
 /**
  * The Objective's state; null when it has none. Only a file that doesn't
@@ -253,12 +392,21 @@ export function loadState(dir: string, issue: number): Loaded | null {
         kind: "unreadable",
         issue,
         error: `state version ${state.version}, expected ${STATE_VERSION}`,
+        incident: digest(text),
       };
     return { kind: "ok", state };
   } catch (error) {
-    return { kind: "unreadable", issue, error: String(error) };
+    return {
+      kind: "unreadable",
+      issue,
+      error: String(error),
+      incident: digest(text),
+    };
   }
 }
+
+const digest = (text: string): string =>
+  createHash("sha256").update(text).digest("hex").slice(0, 16);
 
 /** Issue numbers with a state file. Leftover temporary files are ignored. */
 export function listObjectives(dir: string): number[] {

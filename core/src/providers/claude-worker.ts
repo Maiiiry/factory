@@ -36,7 +36,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { SandboxConfig } from "../config.js";
-import { hold } from "../engine.js";
+import { hold, objectiveWide } from "../engine.js";
 import { openParent, within } from "../paths.js";
 import { ownsPath } from "../planning/graph.js";
 import { DESIGN_QUESTIONS } from "../planning/rubric.js";
@@ -69,7 +69,12 @@ import {
   usageOf,
 } from "./claude.js";
 import { CLAUDE_TOOLS } from "./config.js";
-import { detail, IdleWatchdog, PlannerError } from "./planner.js";
+import {
+  detail,
+  IdleWatchdog,
+  PlannerError,
+  providerOutcome,
+} from "./planner.js";
 
 // Configuration
 
@@ -987,9 +992,11 @@ function failure(
   const failed = failedResult(result, facts, ended);
   switch (failed.kind) {
     case "billing":
-      return hold(failed.message);
+      return providerOutcome(new PlannerError("hold", failed.message));
     case "login":
-      return hold(`${LOGIN_HOLD} (${ended})`);
+      return providerOutcome(
+        new PlannerError("hold", `${LOGIN_HOLD} (${ended})`),
+      );
     case "too-long":
       return hold(
         `The Work Item's prompt is larger than the worker model's context window; choose a model with a larger window or replan the item smaller, then answer retry (${ended})`,
@@ -1051,15 +1058,18 @@ export class ClaudeWorker implements Worker {
         import("zod"),
       ]);
     } catch (error) {
-      return hold(
-        `The Claude worker needs the optional @anthropic-ai/claude-agent-sdk package; install it, then answer retry (${detail(String(error))})`,
+      return providerOutcome(
+        new PlannerError(
+          "hold",
+          `The Claude worker needs the optional @anthropic-ai/claude-agent-sdk package; install it, then answer retry (${detail(String(error))})`,
+        ),
       );
     }
     let login: Record<string, string>;
     try {
       login = serviceLoginEnvironment();
     } catch (error) {
-      if (error instanceof PlannerError) return hold(error.message);
+      if (error instanceof PlannerError) return providerOutcome(error);
       throw error;
     }
     const { config } = this;
@@ -1071,7 +1081,8 @@ export class ClaudeWorker implements Worker {
     try {
       gitlinks = await hasGitlink(input.worktree, { signal: input.signal });
     } catch (error) {
-      if (error instanceof GitRefusal) return hold(error.message);
+      if (error instanceof GitRefusal)
+        return objectiveWide(hold(error.message));
       throw error;
     }
     const validate =

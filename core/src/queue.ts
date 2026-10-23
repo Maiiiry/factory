@@ -64,6 +64,7 @@ const ISSUE_FIELDS = `
 fragment Card on Issue {
   number
   state
+  repository { nameWithOwner }
   projectItems(first: 20) {
     nodes {
       id
@@ -83,6 +84,7 @@ fragment Card on Issue {
 const issuesQuery = (numbers: number[]) => `
 query($owner: String!, $name: String!, $field: String!, $order: String!) {
   repository(owner: $owner, name: $name) {
+    nameWithOwner
     recent: issues(states: OPEN, first: 20, orderBy: { field: UPDATED_AT, direction: DESC }) {
       nodes { ...Card }
     }
@@ -116,6 +118,7 @@ interface ItemsPage {
 interface Card {
   number: number;
   state: string;
+  repository: { nameWithOwner: string };
   projectItems: {
     nodes: ({
       id: string;
@@ -226,7 +229,11 @@ export async function readQueue(
       error.path[0] === "repository" &&
       aliases.has(String(error.path[1]));
     const { data } = await github.graphqlPartial<{
-      repository: Record<string, Card | { nodes: Card[] } | null> | null;
+      repository:
+        | (Record<string, Card | { nodes: Card[] } | null> & {
+            nameWithOwner: string;
+          })
+        | null;
     }>(
       issuesQuery(chunk),
       { owner: github.owner, name: github.name, ...fields },
@@ -235,17 +242,29 @@ export async function readQueue(
     );
     if (!data.repository)
       throw new Error(`Repository ${config.repository} not found`);
+    // GraphQL resolves an old name: a renamed or transferred repository
+    // throws RepositoryMoved here, so `ours` never loses its issues.
+    github.sameRepository(data.repository.nameWithOwner);
     for (const issue of (data.repository.recent as { nodes: Card[] } | null)
       ?.nodes ?? [])
       read(issue);
     for (const n of chunk) {
       const issue = data.repository[`i${n}`] as Card | null | undefined;
-      if (issue) read(issue);
+      // One transferred away reads as the issue it is now: gone from here.
+      if (issue && ours(issue, n)) read(issue);
       else {
         gone.push(n);
         cards.set(n, null);
       }
     }
+  }
+  /** The repository itself is checked above: a mismatch here is the issue moved away. */
+  function ours(issue: Card, n: number): boolean {
+    return (
+      issue.number === n &&
+      issue.repository.nameWithOwner.toLowerCase() ===
+        config.repository.toLowerCase()
+    );
   }
   function read(issue: Card): void {
     const node = issue.projectItems.nodes.find(
@@ -403,7 +422,10 @@ const OFF_DONE = ["In Progress", "Todo"];
 const BUILT_IN = `
 query($owner: String!, $name: String!, $issue: Int!, $project: ID!, $field: String!) {
   repository(owner: $owner, name: $name) {
+    nameWithOwner
     issue(number: $issue) {
+      number
+      repository { nameWithOwner }
       projectItems(first: 50) {
         nodes {
           id
@@ -443,7 +465,10 @@ export async function moveStatusOffDone(
   if (config.queue.field === BUILT_IN_STATUS) return undefined;
   const data = await github.graphql<{
     repository: {
+      nameWithOwner: string;
       issue: {
+        number: number;
+        repository: { nameWithOwner: string };
         projectItems: {
           nodes: ({
             id: string;
@@ -468,7 +493,16 @@ export async function moveStatusOffDone(
     },
     signal,
   );
-  const item = data.repository?.issue?.projectItems.nodes.find(
+  if (data.repository) github.sameRepository(data.repository.nameWithOwner);
+  const found = data.repository?.issue;
+  // Never the Status of an issue transferred away.
+  if (
+    found?.number !== issue ||
+    found.repository.nameWithOwner.toLowerCase() !==
+      config.repository.toLowerCase()
+  )
+    return undefined;
+  const item = found.projectItems.nodes.find(
     (n) => n?.project.id === config.queue.projectId && !n.isArchived,
   );
   const field = data.node?.field;

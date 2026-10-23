@@ -42,6 +42,7 @@ import {
   IdleWatchdog,
   type ModelChoice,
   PlannerError,
+  providerOutcome,
 } from "./planner.js";
 
 const DEFAULT_CODEX_WORKER_MODEL: ModelChoice<CodexEffort> = {
@@ -74,18 +75,8 @@ const TMP_SUFFIX =
 const real = (path: string) => realpathSync(path);
 const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
-/** A classified Codex failure as the Worker's outcome. */
-function outcome(error: PlannerError): WorkerResult {
-  if (error.outcome === "retry")
-    return {
-      kind: "retry",
-      reason: error.message,
-      ...(error.afterMs !== undefined && { afterMs: error.afterMs }),
-      ...(error.wait && { wait: error.wait }),
-    };
-  // `fail` is a turn larger than the context window: the operator decides.
-  return hold(`${error.message}. Narrow the Work Item, then answer retry.`);
-}
+/** A classified Codex failure as the Worker's outcome (planner.ts providerOutcome). */
+const outcome = (error: PlannerError): WorkerResult => providerOutcome(error);
 
 interface WorkerHome {
   root: string;
@@ -282,14 +273,17 @@ export class CodexWorker implements Worker {
     // Under a root controller Codex's `:minimal` profile reads root-only
     // host files (/etc/shadow, SSH host keys) too.
     if (runsAsRoot() && this.options.sandbox.required !== false)
-      return hold(ROOT_REFUSAL);
+      return outcome(new PlannerError("hold", ROOT_REFUSAL));
     input.signal.throwIfAborted();
     let Codex: typeof import("@openai/codex-sdk").Codex;
     try {
       ({ Codex } = await import("@openai/codex-sdk"));
     } catch (error) {
-      return hold(
-        `Codex workers need the @openai/codex-sdk package; install it, then answer retry (${detail(String(error))})`,
+      return outcome(
+        new PlannerError(
+          "hold",
+          `Codex workers need the @openai/codex-sdk package; install it, then answer retry (${detail(String(error))})`,
+        ),
       );
     }
     const keep = this.options.allowedSecretNames ?? [];
@@ -298,8 +292,11 @@ export class CodexWorker implements Worker {
     try {
       home = workerHome(input.worktree, this.options.network === "host", keep);
     } catch (error) {
-      return hold(
-        `Factory could not set up the Codex worker home: ${detail(errorMessage(error))}. Fix the host or installation, then answer retry.`,
+      return outcome(
+        new PlannerError(
+          "hold",
+          `Factory could not set up the Codex worker home: ${detail(errorMessage(error))}. Fix the host or installation, then answer retry.`,
+        ),
       );
     }
     const watchdog = new IdleWatchdog(

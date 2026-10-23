@@ -15,9 +15,15 @@ import {
   RESET_BRANCH,
   type Repair,
 } from "../delivery.js";
-import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
+import {
+  hold,
+  type Outcome,
+  objectiveWide,
+  type Step,
+  type StepContext,
+} from "../engine.js";
 import { defaultHead } from "../git.js";
-import { GitHubError } from "../github.js";
+import { GitHubError, issueGone } from "../github.js";
 import {
   type CandidateSet,
   captureAssets,
@@ -55,11 +61,12 @@ import {
 } from "../planning/schedule.js";
 import {
   guarded,
+  OBJECTIVE_ACCEPTED,
   type ObjectiveInputs,
   type PlanningDeps,
   REOPENED,
 } from "../planning/steps.js";
-import type { Plan, WorkItem } from "../planning/types.js";
+import { executable, type Plan, type WorkItem } from "../planning/types.js";
 import { type DeliveryUnit, unitOf, units } from "../planning/units.js";
 import { moveStatusOffDone } from "../queue.js";
 import { correction, type RepairFinding } from "../repair.js";
@@ -72,7 +79,7 @@ import {
   reviewResult,
 } from "../review/result.js";
 import { type ObjectiveBlock, readShown, shownDigest } from "../shown.js";
-import type { ObjectiveState } from "../state.js";
+import { type ObjectiveState, runOf, sinceRun } from "../state.js";
 import { validateTree } from "../validate.js";
 import {
   addWorktree,
@@ -180,12 +187,41 @@ interface PublishResult {
 }
 
 /**
+ * The steps after planning: the build, then final validation, final review
+ * and the report. Every one takes `replan` here, before it runs, so any of
+ * their holds may offer it and the answer always plans again.
+ */
+export function deliverySteps(state: ObjectiveState, deps: BuildDeps): Step[] {
+  const steps = !built(state)
+    ? buildSteps(state, deps)
+    : !state.done.final
+      ? [finalStep(deps)]
+      : !state.done["final-review"]
+        ? [finalReviewStep(deps)]
+        : !state.done.report
+          ? [reportStep(deps)]
+          : [];
+  return steps.map(replannable);
+}
+
+/** The step, except that a `replan` answer to its hold takes the replan route. */
+function replannable(step: Step): Step {
+  return {
+    ...step,
+    run: (context) =>
+      context.answer?.answer === "replan"
+        ? Promise.resolve(replanOutcome(context.state))
+        : step.run(context),
+  };
+}
+
+/**
  * The runnable item steps, most important first (planning/schedule.ts): each
  * unsettled item whose dependencies have merged, or a native-stack layer
  * whose layer below is published. An item's first step waits, without a
  * question, while an in-flight item holds a resource it declares.
  */
-export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
+function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
   const plan = state.done.plan as Plan;
   if (plan.split) return [splitPending(plan.split.children.length)];
   const stacked =
@@ -206,7 +242,7 @@ export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
       ...Object.entries(state.kept ?? {})
         .filter(([key, value]) => key.endsWith(":base") && value != null)
         .map(([key]) => key),
-      ...(state.hold ? [state.hold.step] : []),
+      ...state.holds.map((hold) => hold.step),
     ]
       .filter((key) => key.startsWith("item:"))
       .map((key) => key.split(":")[1]),
@@ -249,9 +285,10 @@ export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
     );
   };
   const next = (item: WorkItem): Step | undefined => {
+    // The planner is offered only executable kinds; a saved plan from
+    // another build may still hold one this build can't run.
+    if (!executable(item.kind)) return notYet(item, `${item.kind} items`);
     if (item.kind === "aggregate") return aggregateStep(item);
-    if (item.kind === "qa" || item.kind === "discovery")
-      return notYet(item, `${item.kind} items`);
     const place = layerOf(item.id);
     const top = !place || place.layer === place.unit.items.length - 1;
     const phase = PHASES.find(
@@ -282,6 +319,26 @@ export function buildSteps(state: ObjectiveState, deps: BuildDeps): Step[] {
     steps.push(step);
   }
   return steps;
+}
+
+/**
+ * The native-stack layers below item `id`, whose questions stop it too
+ * (engine.ts Workflow `upstream`): `buildSteps` makes a layer runnable once
+ * the layer below is published, before it settles, so a stack successor
+ * waits on its predecessors' holds as a dependent waits on its
+ * dependencies'.
+ */
+export function layersBelow(
+  state: ObjectiveState,
+  deps: BuildDeps,
+  id: string,
+): string[] {
+  const plan = state.done.plan as Plan | undefined;
+  if (!plan || plan.split) return [];
+  const place = stackLayer(plan, deps, id);
+  return place
+    ? place.unit.items.slice(0, place.layer).map((layer) => layer.id)
+    : [];
 }
 
 /** Whether every item has merged (or, for aggregates, completed). */
@@ -338,13 +395,11 @@ function unitsProblem(problem: string): Step {
   return {
     key: "build:units",
     deadlineMs: MINUTE,
-    run: async (context) =>
-      context.answer?.answer === "replan"
-        ? replanOutcome(context.state)
-        : hold(
-            `${problem}, so Factory can't deliver the plan as native stacks. Answer replan to plan again, or cancel.`,
-            ["replan", "cancel"],
-          ),
+    run: async () =>
+      hold(
+        `${problem}, so Factory can't deliver the plan as native stacks. Answer replan to plan again, or cancel.`,
+        ["replan", "cancel"],
+      ),
   };
 }
 
@@ -357,13 +412,11 @@ function splitPending(children: number): Step {
   return {
     key: "build:split",
     deadlineMs: MINUTE,
-    run: async (context) =>
-      context.answer?.answer === "replan"
-        ? replanOutcome(context.state)
-        : hold(
-            `The accepted plan splits this Objective into ${children} child Objectives, and Factory can't create child Objectives yet. Answer replan to plan it without a split, or cancel.`,
-            ["replan", "cancel"],
-          ),
+    run: async () =>
+      hold(
+        `The accepted plan splits this Objective into ${children} child Objectives, and Factory can't create child Objectives yet. Answer replan to plan it without a split, or cancel.`,
+        ["replan", "cancel"],
+      ),
   };
 }
 
@@ -405,10 +458,7 @@ function itemStep(item: WorkItem, phase: Phase, deps: BuildDeps): Step {
         : phase === "ci"
           ? 10 * MINUTE
           : 45 * MINUTE,
-    run: (context) =>
-      context.answer?.answer === "replan"
-        ? Promise.resolve(replanOutcome(context.state))
-        : guardedItem(deps, () => run(item, context, deps)),
+    run: (context) => guardedItem(deps, () => run(item, context, deps)),
   };
 }
 
@@ -634,7 +684,7 @@ async function workStep(
         kind: "retry",
         reason:
           "The repair staged new candidate sets, so the operator chooses again",
-        afterMs: 0,
+        progress: true,
         keep: { ...keepAll, [finishedKey]: finished, [selectionKey]: null },
       };
     finished = { ...finished, sets: own.sets };
@@ -656,7 +706,7 @@ async function workStep(
       return {
         kind: "retry",
         reason: "Candidate media sets captured; collecting the result",
-        afterMs: 0,
+        progress: true,
         keep: {
           ...keepAll,
           [finishedKey]: { ...finished, sets: captured.value },
@@ -1036,7 +1086,7 @@ async function validateStep(
         return {
           kind: "retry",
           reason: `\`${result.failed.command}\` failed on a tree the worker's own validation passed; running it once more.`,
-          afterMs: 0,
+          progress: true,
           keep: {
             [flakyKey]: { tree: result.tree, command: result.failed.command },
           },
@@ -1708,6 +1758,7 @@ function replanOutcome(state: ObjectiveState): Outcome {
     kind: "repair",
     finding: "The operator asked to replan.",
     target: "check",
+    reset: true,
     clear: [
       ...new Set([
         ...Object.keys(state.done),
@@ -1773,7 +1824,7 @@ interface FinalResult {
 const REPUSHED = "final:repushed";
 
 /** `final`: the final commands on the default branch head after every merge. */
-export function finalStep(deps: BuildDeps): Step {
+function finalStep(deps: BuildDeps): Step {
   return {
     key: "final",
     resource: "cpu",
@@ -1783,7 +1834,6 @@ export function finalStep(deps: BuildDeps): Step {
         const { state, signal } = context;
         const { config } = deps;
         const plan = state.done.plan as Plan;
-        if (context.answer?.answer === "replan") return replanOutcome(state);
         const head = await defaultHead(config.checkout, signal);
         for (const item of plan.items) {
           const merged = state.done[stepKey(item.id, "merge")] as
@@ -1853,22 +1903,27 @@ export function finalStep(deps: BuildDeps): Step {
   };
 }
 
+/** Final review's refusal is the open question: its `retry` means the default branch was fixed. */
+const REFUSED = "final-review:refused";
+
 /** `final-review`: every Objective criterion against the integrated result. */
-export function finalReviewStep(deps: BuildDeps): Step {
+function finalReviewStep(deps: BuildDeps): Step {
   return {
     key: "final-review",
     deadlineMs: 45 * MINUTE,
     run: (context) =>
       guardedItem(deps, async () => {
         const { state, signal } = context;
-        if (context.answer?.answer === "replan") return replanOutcome(state);
-        // A fix on the default branch: validate the new head before reviewing again.
-        if (context.answer?.answer === "retry")
+        // A `retry` to the refusal (never to an error or a wait question):
+        // the operator fixed the default branch, so validate the new head
+        // before reviewing again.
+        if (context.answer?.answer === "retry" && (state.kept ?? {})[REFUSED])
           return {
             kind: "repair",
             finding: "Final review runs again after the operator's fix.",
             target: "final",
             clear: ["final", "final-review"],
+            keep: { [REFUSED]: null },
           };
         const plan = state.done.plan as Plan;
         const final = state.done.final as FinalResult;
@@ -1932,12 +1987,13 @@ export function finalReviewStep(deps: BuildDeps): Step {
           signal,
           log: context.log,
         });
-        return reviewOutcome(review, "final:questions", () =>
-          hold(
+        return reviewOutcome(review, "final:questions", () => ({
+          ...hold(
             `Final review refused the integrated result:\n\n${review.kind === "refused" ? review.refused.map((r) => `- ${r.criterion}: ${r.detail}`).join("\n") : ""}\n\nFix it on the default branch and answer \`retry\`, or \`replan\` to plan the remaining work, or cancel.`,
             ["retry", "replan", "cancel"],
           ),
-        );
+          keep: { [REFUSED]: true },
+        }));
       }),
   };
 }
@@ -1960,7 +2016,7 @@ async function objectiveEdited(
     readShown(issue.body_html, { sources: planned.writer === true }),
   );
   const accepted =
-    ((state.kept ?? {})["objective:accepted"] as string | undefined) ??
+    ((state.kept ?? {})[OBJECTIVE_ACCEPTED] as string | undefined) ??
     shownDigest(planned.shown);
   if (context.answer?.answer === "continue")
     return digest === accepted
@@ -1968,20 +2024,24 @@ async function objectiveEdited(
       : {
           kind: "retry",
           reason: "Continuing with the edited Objective.",
-          afterMs: 0,
-          keep: { "objective:accepted": digest },
+          progress: true,
+          keep: { [OBJECTIVE_ACCEPTED]: digest },
         };
   if (issue.state !== "open")
-    return hold(
-      `Issue #${state.issue} was closed while Factory was building it. Reopen it and answer \`continue\`, or cancel.`,
-      ["continue", "cancel"],
-      "cancel",
+    return objectiveWide(
+      hold(
+        `Issue #${state.issue} was closed while Factory was building it. Reopen it and answer \`continue\`, or cancel.`,
+        ["continue", "cancel"],
+        "cancel",
+      ),
     );
   if (digest !== accepted)
-    return hold(
-      `Objective #${state.issue} was edited after its plan was accepted. \`continue\` keeps building this plan; \`replan\` plans again from the new text.`,
-      ["continue", "replan", "cancel"],
-      "replan",
+    return objectiveWide(
+      hold(
+        `Objective #${state.issue} was edited after its plan was accepted. \`continue\` keeps building this plan; \`replan\` plans again from the new text.`,
+        ["continue", "replan", "cancel"],
+        "replan",
+      ),
     );
   return undefined;
 }
@@ -2032,7 +2092,8 @@ async function guardedItem(
     try {
       return await work();
     } catch (error) {
-      if (error instanceof GitRefusal) return hold(error.message);
+      if (error instanceof GitRefusal)
+        return objectiveWide(hold(error.message));
       throw error;
     }
   });
@@ -2042,7 +2103,7 @@ async function guardedItem(
 // report and cancel cleanup
 
 /** `report`: post the outcome on the issue, close it, and remove the work files. */
-export function reportStep(deps: BuildDeps): Step {
+function reportStep(deps: BuildDeps): Step {
   return {
     key: "report",
     deadlineMs: 10 * MINUTE,
@@ -2050,14 +2111,16 @@ export function reportStep(deps: BuildDeps): Step {
       guardedItem(deps, async () => {
         const { state, signal } = context;
         const { github } = deps;
-        if (context.answer?.answer === "replan") return replanOutcome(state);
-        const marker = `<!-- factory:${state.issue}:report -->`;
+        // The report is this run's: an earlier run of the same issue (queued
+        // again after it finished) has its own, which never counts here.
+        const run = runOf(state);
+        const marker = `<!-- factory:${state.issue}:report:${run} -->`;
         // Once the report is posted, the issue close that follows is Factory's
         // own: a restart after it must not read it as the operator's.
         const reported = await github.findComment(
           state.issue,
           marker,
-          undefined,
+          sinceRun(state),
           signal,
         );
         if (!reported) {
@@ -2122,13 +2185,21 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
         if (kept) log({ event: "branch-kept", branch, reason: kept });
       }
       // The Objective's issue closes as not planned, so the queue and the
-      // issue agree; the operator can reopen and queue it again.
-      await deps.github.closeIssue(
-        state.issue,
-        "not_planned",
-        "cancel:close",
-        signal,
-      );
+      // issue agree; the operator can reopen and queue it again. An issue
+      // GitHub no longer has here (deleted, or transferred away: GitHub
+      // redirects, and Factory never follows) has nothing to close: cleanup
+      // goes on, so it settles.
+      try {
+        await deps.github.closeIssue(
+          state.issue,
+          "not_planned",
+          "cancel:close",
+          signal,
+        );
+      } catch (error) {
+        if (!issueGone(error)) throw error;
+        log({ event: "issue-gone", status: error.status });
+      }
       await removeWorkFiles(state.issue, deps, signal);
       return { kind: "done" };
     },
@@ -2147,6 +2218,7 @@ export function cancelCleanupStep(deps: BuildDeps): Step {
 export function rerunCleanupStep(deps: BuildDeps): Step {
   return {
     key: "rerun:cleanup",
+    resource: "github",
     deadlineMs: 10 * MINUTE,
     run: (context) =>
       guardedItem(deps, async () => {

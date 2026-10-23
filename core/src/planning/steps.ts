@@ -1,12 +1,22 @@
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CoreConfig } from "../config.js";
-import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
+import {
+  hold,
+  type Outcome,
+  objectiveWide,
+  type Step,
+  type StepContext,
+} from "../engine.js";
 import { defaultHead } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
 import { checkObjective } from "../objective.js";
-import { type Planner, PlannerError } from "../providers/planner.js";
+import {
+  type Planner,
+  PlannerError,
+  providerOutcome,
+} from "../providers/planner.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import { readShown, type ShownObjective, shownDigest } from "../shown.js";
 import type { Answer, ObjectiveState } from "../state.js";
@@ -599,10 +609,13 @@ function decideStep(
         const approved = state.kept?.[approvedKey] as
           | PlannerDecision
           | undefined;
-        const withApproved = (decision: Decision): Outcome => ({
+        const withApproved = (
+          decision: Decision,
+          keep: Record<string, unknown> = {},
+        ): Outcome => ({
           kind: "done",
           result: approved ? { ...decision, approved } : decision,
-          keep: { [approvedKey]: null },
+          keep: { [approvedKey]: null, ...keep },
         });
         if (answer) {
           const record = (text?: string) => decisionOf(answer, text);
@@ -626,7 +639,14 @@ function decideStep(
                 decision: record(),
               } satisfies Decision);
             case "continue":
-              return withApproved({ accept: true, decision: record() });
+              // The operator keeps this plan for the text GitHub shows now:
+              // build-time edit detection starts from it.
+              return withApproved(
+                { accept: true, decision: record() },
+                {
+                  [OBJECTIVE_ACCEPTED]: await shownNow(state, g, deps, signal),
+                },
+              );
             case "answer":
             case "allow": {
               if (!answer.text?.trim())
@@ -674,11 +694,32 @@ async function objectiveChanged(
   deps: PlanningDeps,
   signal: AbortSignal,
 ): Promise<boolean> {
+  return (
+    (await shownNow(state, g, deps, signal)) !==
+    shownDigest(generationInputs(state, g).shown)
+  );
+}
+
+/** The digest of what GitHub shows of the issue now, read as this generation read it. */
+async function shownNow(
+  state: ObjectiveState,
+  g: number,
+  deps: PlanningDeps,
+  signal: AbortSignal,
+): Promise<string> {
   const inputs = generationInputs(state, g);
   const issue = await deps.github.renderedIssue(state.issue, signal);
-  const shown = readShown(issue.body_html, { sources: inputs.writer === true });
-  return shownDigest(shown) !== shownDigest(inputs.shown);
+  return shownDigest(
+    readShown(issue.body_html, { sources: inputs.writer === true }),
+  );
 }
+
+/**
+ * The digest of the Objective text the operator accepted when it differs
+ * from what planning read (a `continue` to an edit): building checks for
+ * later edits against it (work/steps.ts objectiveEdited).
+ */
+export const OBJECTIVE_ACCEPTED = "objective:accepted";
 
 /** The question this round needs answered, if any. Recomputed, so an answer re-derives the same text. */
 function questionFor(
@@ -964,14 +1005,16 @@ function authorHold(
     return {
       kind: "retry",
       reason: "Planning the approved Objective.",
-      afterMs: 0,
+      progress: true,
       keep: {
         [AUTHOR_APPROVAL]: { digest, by: answer.by, at: answer.at },
       },
     };
-  return hold(
-    `Issue #${state.issue} was written by ${author ? `@${author}` : "a deleted account"}, who has no write access; approve to plan it.\n\nFactory plans from what GitHub shows of it (digest \`${digest}\`), so content GitHub hides never reaches a model. Diagram and math sources aren't planner input either: each mermaid diagram is \`[mermaid diagram]\` and each math block \`[math]\`, as you see only the drawing. Nothing in it counts until you approve, and an edit asks again.`,
-    ["approve", "cancel"],
+  return objectiveWide(
+    hold(
+      `Issue #${state.issue} was written by ${author ? `@${author}` : "a deleted account"}, who has no write access; approve to plan it.\n\nFactory plans from what GitHub shows of it (digest \`${digest}\`), so content GitHub hides never reaches a model. Diagram and math sources aren't planner input either: each mermaid diagram is \`[mermaid diagram]\` and each math block \`[math]\`, as you see only the drawing. Nothing in it counts until you approve, and an edit asks again.`,
+      ["approve", "cancel"],
+    ),
   );
 }
 
@@ -1083,23 +1126,18 @@ export async function guarded(
   try {
     return await work();
   } catch (error) {
-    if (error instanceof PlannerError) {
-      // A usage limit waits for its reset; an idle model is an error
-      // (afterMs -1); anything else is a transient provider failure.
-      if (error.outcome === "retry")
-        return {
-          kind: "retry",
-          reason: error.message,
-          ...(error.afterMs !== undefined ? { afterMs: error.afterMs } : {}),
-          ...(error.wait ? { wait: error.wait } : {}),
-        };
-      if (error.outcome === "hold") return hold(error.message, error.answers);
-      // Too large for the model, or refused: the Objective has to change.
-      return hold(
-        `${error.message}\n\nEdit the Objective (for example, pin smaller Sources) and answer \`replan\`.`,
-        ["replan", "retry", "cancel"],
+    // A usage limit waits for its reset; an idle model is an error
+    // (afterMs -1); a hold takes the provider error's scope. Too large
+    // for the model, or refused: the Objective has to change.
+    if (error instanceof PlannerError)
+      return providerOutcome(error, (message) =>
+        objectiveWide(
+          hold(
+            `${message}\n\nEdit the Objective (for example, pin smaller Sources) and answer \`replan\`.`,
+            ["replan", "retry", "cancel"],
+          ),
+        ),
       );
-    }
     const outcome = githubOutcome(
       error,
       repository,

@@ -56,10 +56,12 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
         [--worker codex|claude|copilot]
         [--default]              Add or change a named provider in the configuration
   status [ISSUE] [--json]        Show Objectives and open questions
-  answer ISSUE ANSWER [--text T] Answer an Objective's open question
+  answer ISSUE ANSWER --question ID [--text T]
+                                 Answer the open question ID (see status)
                                  (switch NAME: run it on another provider)
   cancel ISSUE                   Cancel an Objective
-  retry ISSUE                    Retry an Objective's waiting steps now
+  retry ISSUE [--question ID]    Retry the waiting steps no open question stops
+                                 now; with --question, answer retry to question ID
   dream [--preview] [--budget-bytes N] [--input-budget-bytes N] [--provider NAME]
                                  Propose a playbook from settled episodes
   dream --record --objective N   Record a settled Objective's episode
@@ -71,7 +73,8 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME
 interface StatusRow {
   issue: number;
   status: ObjectiveStatus | "unreadable";
-  hold: Hold | null;
+  /** Open questions, oldest first. */
+  holds: Hold[];
   provider?: FrozenProvider;
   waiting: {
     step: string;
@@ -148,6 +151,7 @@ async function main(argv: string[]): Promise<number> {
         hostLimits.configure({
           worker: loaded.execution.workers,
           cpu: loaded.execution.validations,
+          github: loaded.queue.maxActiveObjectives,
         });
       return await serve({
         paths,
@@ -295,14 +299,16 @@ async function status(paths: Paths, args: Args): Promise<number> {
       rows.push({
         issue,
         status: "unreadable",
-        hold: {
-          id: "unreadable",
-          step: "state",
-          question: `Factory can't read this Objective's state (${loaded.error}).`,
-          answers: ["cancel"],
-          recommended: "cancel",
-          askedAt: "",
-        },
+        holds: [
+          {
+            id: "unreadable",
+            step: "state",
+            question: `Factory can't read this Objective's state (${loaded.error}).`,
+            answers: ["cancel"],
+            recommended: "cancel",
+            askedAt: "",
+          },
+        ],
         waiting: [],
         error: loaded.error,
       });
@@ -312,7 +318,7 @@ async function status(paths: Paths, args: Args): Promise<number> {
     rows.push({
       issue,
       status: state.status,
-      hold: state.hold,
+      holds: state.holds,
       ...(state.provider ? { provider: state.provider } : {}),
       waiting: Object.entries(state.retries).map(([step, retry]) => ({
         step,
@@ -324,14 +330,17 @@ async function status(paths: Paths, args: Args): Promise<number> {
     });
   }
   const live = await serviceLive(paths);
-  const loop = live ? crashLoop(paths) : undefined;
+  const service = live ? serviceRecord(paths) : {};
+  const loop = service.crashLoop;
   if (args.flags.json !== undefined) {
     process.stdout.write(
-      `${JSON.stringify({ service: live ? "running" : "stopped", ...(loop ? { crashLoop: loop } : {}), objectives: rows }, null, 2)}\n`,
+      `${JSON.stringify({ service: live ? "running" : "stopped", ...service, objectives: rows }, null, 2)}\n`,
     );
     return 0;
   }
   const lines = [`Service: ${live ? "running" : "stopped"}`];
+  if (service.problem)
+    lines.push(`  Problem: ${service.problem}. GitHub effects are paused.`);
   if (loop)
     lines.push(
       `  Crash loop: the service restarted after ${loop.crashes} deaths in a row; interrupted steps ${Date.parse(loop.resumeAt) > Date.now() ? "resume" : "resumed"} at ${loop.resumeAt}.`,
@@ -343,11 +352,11 @@ async function status(paths: Paths, args: Args): Promise<number> {
       lines.push(
         `  Provider: ${row.provider.name} (selectedBy: ${row.provider.selectedBy})`,
       );
-    if (row.hold)
+    for (const hold of row.holds)
       lines.push(
-        `  Question: ${row.hold.question}`,
-        `  Answers: ${row.hold.answers.join(", ")} (recommended: ${row.hold.recommended})`,
-        `  Answer with: factory answer ${row.issue} <answer>`,
+        `  Question ${hold.id}${hold.item ? ` (Work Item ${hold.item})` : ""}: ${hold.question}`,
+        `  Answers: ${hold.answers.join(", ")} (recommended: ${hold.recommended})`,
+        `  Answer with: factory answer ${row.issue} <answer> --question ${hold.id}`,
       );
     for (const wait of row.waiting)
       lines.push(
@@ -468,6 +477,15 @@ async function request(
       process.stderr.write("factory: answer needs an answer\n");
       return 2;
     }
+    // Bound to the question the operator read, so a delayed answer never
+    // lands on a newer one. Cancel needs no question.
+    const question = args.flags.question;
+    if (answer !== "cancel" && !question) {
+      process.stderr.write(
+        "factory: answer needs --question ID, the open question's id from `factory status`\n",
+      );
+      return 2;
+    }
     // `answer ISSUE switch NAME` names the provider, as `--text NAME` does.
     const text = args.flags.text ?? args.positional[3];
     body = {
@@ -475,8 +493,15 @@ async function request(
       issue,
       answer,
       ...(text ? { text } : {}),
+      ...(question ? { question } : {}),
     };
-  } else body = { kind: command, issue };
+  } else if (command === "retry")
+    body = {
+      kind: "retry",
+      issue,
+      ...(args.flags.question ? { question: args.flags.question } : {}),
+    };
+  else body = { kind: command, issue };
   const by = process.env.USER ?? "operator";
   const id = writeRequest(paths.requests, body, by);
   if (!(await serviceLive(paths))) {
@@ -506,28 +531,35 @@ async function request(
 }
 
 /**
- * The running service's crash loop, from `service.json`: the deaths in a
- * row before this start, and when it resumes interrupted steps. Shown
- * until the run has lived 10 min past that time.
+ * The running service's record, from `service.json`: its crash loop (the
+ * deaths in a row before this start, and when it resumes interrupted
+ * steps; shown until the run has lived 10 min past that time), and a
+ * problem that pauses its GitHub effects.
  */
-function crashLoop(
-  paths: Paths,
-): { crashes: number; resumeAt: string } | undefined {
+function serviceRecord(paths: Paths): {
+  crashLoop?: { crashes: number; resumeAt: string };
+  problem?: string;
+} {
   try {
     const record = JSON.parse(
       readFileSync(join(paths.root, "service.json"), "utf8"),
-    ) as { starts?: string[]; resumeAt?: string };
-    if (
-      !record.resumeAt ||
-      Date.now() > Date.parse(record.resumeAt) + 10 * 60 * 1000
-    )
-      return undefined;
+    ) as { starts?: string[]; resumeAt?: string; problem?: string };
     return {
-      crashes: (record.starts?.length ?? 1) - 1,
-      resumeAt: record.resumeAt,
+      ...(record.resumeAt &&
+      Date.now() <= Date.parse(record.resumeAt) + 10 * 60 * 1000
+        ? {
+            crashLoop: {
+              crashes: (record.starts?.length ?? 1) - 1,
+              resumeAt: record.resumeAt,
+            },
+          }
+        : {}),
+      ...(typeof record.problem === "string"
+        ? { problem: record.problem }
+        : {}),
     };
   } catch {
-    return undefined;
+    return {};
   }
 }
 

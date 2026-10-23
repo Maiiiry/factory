@@ -14,7 +14,7 @@
 import { BaseFiles } from "../planning/facts.js";
 import type { Plan } from "../planning/types.js";
 import type { ObjectiveState } from "../state.js";
-import { TERMINAL } from "../state.js";
+import { runOf, TERMINAL } from "../state.js";
 import { mergeOf } from "../work/merged.js";
 import { admitted, type PlanningContext } from "./settings.js";
 import { type Database, sha256, transaction, withStore } from "./store.js";
@@ -163,11 +163,6 @@ export function releaseRun(
   return added;
 }
 
-/** A run's identity: its admission time. A record from before runs had one reads as `unknown`. */
-export function runOf(state: ObjectiveState): string {
-  return state.startedAt ?? "unknown";
-}
-
 /** Fill each record's digests: its cited files at its tree. A tree Git can't read leaves them out. */
 async function withDigests(
   records: MemoryRecord[],
@@ -265,8 +260,8 @@ function stateRecords(state: ObjectiveState): MemoryRecord[] {
       digests: {},
     });
   }
-  if (state.hold) {
-    const { item, paths, label, tree } = scope(state.hold.step);
+  for (const hold of state.holds) {
+    const { item, paths, label, tree } = scope(hold.step);
     records.push({
       kind: "failure",
       objective,
@@ -275,8 +270,8 @@ function stateRecords(state: ObjectiveState): MemoryRecord[] {
       ...(tree ? { tree } : {}),
       authority: "observation",
       validity: "historical",
-      summary: `${label} held at ${state.hold.step}: ${firstLine(state.hold.question)}`,
-      body: `${state.hold.question}\n\nAnswers: ${state.hold.answers.join(", ")}`,
+      summary: `${label} held at ${hold.step}: ${firstLine(hold.question)}`,
+      body: `${hold.question}\n\nAnswers: ${hold.answers.join(", ")}`,
       paths,
       digests: {},
     });

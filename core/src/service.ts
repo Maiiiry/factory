@@ -38,9 +38,12 @@ import {
   findState,
   finishState,
   listObjectives,
+  listObservations,
   newObjective,
   type ObjectiveState,
   removeState,
+  runOf,
+  saveObservation,
   saveState,
   TERMINAL,
 } from "./state.js";
@@ -68,8 +71,14 @@ export interface ServeOptions {
  * reads an active state file. It gets a copy and runs beside the loop,
  * aborted by `signal` past its deadline; a failure is retried with backoff
  * until it succeeds. `release` ends a run that a new admission of the same
- * issue replaces, before the new run starts; if it throws, the admission
- * waits.
+ * issue replaces, or a withdrawal removes, before the new run starts.
+ *
+ * Knowledge is best effort for the lifecycle: a failed observation or
+ * release never holds back admission, withdrawal or retirement. The run's
+ * settled observation (which also releases it) is kept and retried in the
+ * background, with backoff, until it lands, across restarts (saved beside
+ * the finished states): an episode may be recorded late, but the queue
+ * never waits on it.
  */
 export interface StateObserver {
   observe(
@@ -78,6 +87,13 @@ export interface StateObserver {
     signal: AbortSignal,
   ): Promise<void>;
   release(state: ObjectiveState): void;
+}
+
+interface Observation {
+  mark?: string;
+  busy: boolean;
+  failures: number;
+  nextAt: number;
 }
 
 const OBSERVE_BACKOFF_MS = 1000;
@@ -126,10 +142,73 @@ export async function serve(options: ServeOptions): Promise<number> {
   const runners = new Map<number, ObjectiveRunner>();
   const unreadable = new Map<number, UnreadableObjective>();
   /** Per Objective: the mark last observed, an observation in flight, the failure backoff. */
-  const observed = new Map<
-    number,
-    { mark?: string; busy: boolean; failures: number; nextAt: number }
+  const observed = new Map<number, Observation>();
+  /**
+   * Settled observations of runs no longer in memory (retired, replaced or
+   * withdrawn before the observer took them), by `<issue>@<run>`: retried
+   * with backoff until they land. Each is saved in finished/ (`path`)
+   * until then, and startup reads those files back.
+   */
+  const late = new Map<
+    string,
+    Observation & { state: ObjectiveState; path?: string }
   >();
+  const keepLate = (state: ObjectiveState, path?: string): void => {
+    late.set(`${state.issue}@${runOf(state)}`, {
+      state: structuredClone(state),
+      ...(path ? { path } : {}),
+      busy: false,
+      failures: 0,
+      nextAt: 0,
+    });
+  };
+  /** Keep a settled observation on disk too; one that can't be saved is kept in memory and logged. */
+  const observeLate = (state: ObjectiveState): void => {
+    if (!options.observer) return;
+    try {
+      keepLate(state, saveObservation(paths.objectives, state));
+    } catch (error) {
+      log.write(state.issue, {
+        event: "observe-unsaved",
+        error: String(error),
+      });
+      keepLate(state);
+    }
+  };
+  /** Run an observer job unless one is in flight or backing off; log a failure and back off. */
+  const attempt = (
+    entry: Observation,
+    issue: number,
+    job: () => Promise<void>,
+    done: () => void,
+  ): void => {
+    if (entry.busy || Date.now() < entry.nextAt) return;
+    entry.busy = true;
+    job()
+      .then(
+        () => {
+          entry.failures = 0;
+          done();
+        },
+        (error: unknown) => {
+          entry.failures += 1;
+          entry.nextAt =
+            Date.now() +
+            Math.min(
+              OBSERVE_BACKOFF_MS * 2 ** (entry.failures - 1),
+              OBSERVE_MAX_BACKOFF_MS,
+            );
+          log.write(issue, {
+            event: "observe-failed",
+            error: String(error),
+            retryAt: new Date(entry.nextAt).toISOString(),
+          });
+        },
+      )
+      .finally(() => {
+        entry.busy = false;
+      });
+  };
   /** Checked Objectives waiting for a slot, as of the last tick. */
   const waitingForSlot = new Set<number>();
   const open = (state: ObjectiveState): ObjectiveRunner => {
@@ -154,7 +233,10 @@ export async function serve(options: ServeOptions): Promise<number> {
     if (known || unreadable.has(issue)) return known;
     const loaded = findState(paths.objectives, issue);
     if (loaded?.kind === "unreadable")
-      unreadable.set(issue, { error: loaded.error });
+      unreadable.set(issue, {
+        error: loaded.error,
+        incident: loaded.incident,
+      });
     return loaded?.kind === "ok" ? open(loaded.state) : undefined;
   };
   /** State files not read yet because the read failed: tried every tick. */
@@ -181,25 +263,39 @@ export async function serve(options: ServeOptions): Promise<number> {
     )
       retire(issue);
   };
-  /** A settled Objective leaves memory, and its file moves to finished/. */
+  /**
+   * A settled Objective leaves memory, and its file moves to finished/. Its
+   * settled observation, if it hasn't landed, goes on in the background.
+   */
   const retire = (issue: number): void => {
+    const runner = runners.get(issue);
+    const unobserved =
+      options.observer &&
+      runner &&
+      observed.get(issue)?.mark !== observeMark(runner);
+    let path: string | undefined;
     try {
+      // Saved before the move, so a restart retries it from finished/.
+      if (unobserved) path = saveObservation(paths.objectives, runner.state);
       finishState(paths.objectives, issue);
     } catch (error) {
       // It stays, and moves on a later tick.
       log.write(issue, { event: "finish-failed", error: String(error) });
       return;
     }
+    if (unobserved) keepLate(runner.state, path);
     runners.delete(issue);
     options.sync?.forget(issue);
     observed.delete(issue);
   };
   /**
    * The observer ends a run that is replaced (a re-queue) or withdrawn,
-   * before its state goes. False when it can't: the caller waits.
+   * before its state goes. One that fails is retried in the background,
+   * never waited on.
    */
-  const release = (state: ObjectiveState): boolean => {
-    if (!options.observer) return true;
+  const release = (state: ObjectiveState): void => {
+    if (!options.observer) return;
+    observed.delete(state.issue);
     try {
       options.observer.release(structuredClone(state));
     } catch (error) {
@@ -207,10 +303,8 @@ export async function serve(options: ServeOptions): Promise<number> {
         event: "release-deferred",
         error: String(error),
       });
-      return false;
+      observeLate(state);
     }
-    observed.delete(state.issue);
-    return true;
   };
 
   // Only the lock holder writes state, so leftover temporary files are from a crash.
@@ -218,6 +312,15 @@ export async function serve(options: ServeOptions): Promise<number> {
     if (name.endsWith(".tmp"))
       rmSync(join(paths.objectives, name), { force: true });
   for (const issue of listObjectives(paths.objectives)) load(issue);
+  // Settled observations that hadn't landed: retried, never history read.
+  for (const { path, state, error } of options.observer
+    ? listObservations(paths.objectives)
+    : [])
+    if (state) keepLate(state, path);
+    else {
+      log.write(0, { event: "observation-unreadable", path, error });
+      rmSync(path, { force: true });
+    }
   const record = startRecord(previous, startedAt, runId, runners, limits);
   run.resumeAt = Date.parse(record.resumeAt ?? "") || 0;
   if (record.resumeAt)
@@ -231,14 +334,14 @@ export async function serve(options: ServeOptions): Promise<number> {
   // Saved before any hold below, so a crash in between never counts the
   // same death twice.
   heartbeat();
-  const culprit = suspect(record.crashes);
-  if (culprit) {
+  const culprits = suspects(record.crashes);
+  for (const culprit of culprits)
     try {
       runners
         .get(culprit.issue)
         ?.suspect(
           culprit.step,
-          `The service died ${SUSPECT_CRASHES} times in a row while step ${culprit.step} ran, and other steps finished in between, so this step may be what stops it (for example, by running the host out of memory). \`retry\` runs it again; or cancel.`,
+          `The service died ${SUSPECT_CRASHES} times in a row while step ${culprit.step} ran, and other steps finished in between, so this step may be what stops it (for example, by running the host out of memory).${culprits.length > 1 ? ` ${culprits.length - 1} other step${culprits.length > 2 ? "s" : ""} ran at every one of those deaths too, and each holds with a question like this one.` : ""} \`retry\` runs it again; or cancel.`,
         );
     } catch (error) {
       log.write(culprit.issue, {
@@ -246,7 +349,10 @@ export async function serve(options: ServeOptions): Promise<number> {
         error: String(error),
       });
     }
-    // The evidence is spent: another hold needs three new deaths.
+  if (culprits.length) {
+    // The evidence is spent: the question is asked, or saved to ask as
+    // soon as no open question stops the step (engine.ts `hold`); another
+    // needs three new deaths.
     record.crashes = [];
     heartbeat();
   }
@@ -311,7 +417,7 @@ export async function serve(options: ServeOptions): Promise<number> {
           result = runner.cancel(stored.by);
           break;
         case "retry":
-          result = runner.retryNow(stored.by);
+          result = runner.retryNow(stored.by, request.question);
           break;
         case "answer":
           result = runner.answer(
@@ -319,6 +425,7 @@ export async function serve(options: ServeOptions): Promise<number> {
             request.text,
             stored.by,
             request.writtenAt,
+            request.question,
           );
           break;
       }
@@ -338,9 +445,39 @@ export async function serve(options: ServeOptions): Promise<number> {
     return message;
   };
 
+  /**
+   * Dequeued before planning: the run goes as if never admitted, so
+   * queuing it again checks it afresh. The observer ends it first.
+   */
+  const withdrawNow = (runner: ObjectiveRunner): void => {
+    const issue = runner.state.issue;
+    release(runner.state);
+    removeState(paths.objectives, issue);
+    crashPoint("serve:withdrawn");
+    runner.stop();
+    runners.delete(issue);
+    options.sync?.withdrawn(runner.state);
+    log.write(issue, { event: "withdrawn" });
+  };
+
+  /** The service-level problem last logged (GitHubSync.problem). */
+  let reported: string | undefined;
   const tick = (): void => {
     for (const issue of [...unloaded]) load(issue);
     applyRequests();
+    // The repository moved: every GitHub effect pauses. No step runs (no
+    // push, merge or close), no sync job runs, nothing settles or
+    // retires; states stay as they are until a restart with the fixed
+    // configuration. Requests are still recorded.
+    const problem = options.sync?.problem();
+    if (problem) {
+      if (reported !== problem)
+        log.write(0, { event: "service-problem", problem });
+      reported = problem;
+      record.problem = problem;
+      heartbeat();
+      return;
+    }
     // Running steps keep their slot; then started Objectives; then queue order.
     const ordered = [...runners.values()].sort(
       (a, b) =>
@@ -353,17 +490,37 @@ export async function serve(options: ServeOptions): Promise<number> {
     waitingForSlot.clear();
     for (const runner of ordered) {
       const { state } = runner;
+      // Dequeued while its check or a re-run's cleanup ran: it goes once
+      // that ends, and nothing past them starts. A cleanup the service's
+      // death interrupted resumes first; one that holds or errors is never
+      // asked about: the run goes at once.
+      if (state.withdrawing && !TERMINAL.includes(state.status)) {
+        if (!ending(runner)) {
+          try {
+            withdrawNow(runner);
+          } catch (error) {
+            log.write(state.issue, {
+              event: "withdraw-failed",
+              error: String(error),
+            });
+          }
+          continue;
+        }
+        if (runner.busy) continue;
+      }
       let run = false;
       if (TERMINAL.includes(state.status)) run = runner.hasWork;
       // The check (and a new run's cleanup) runs when the Objective is first
-      // seen, slot or not (rule 7); planning and building need a slot.
+      // seen, slot or not (rule 7), within the host's `github` cap;
+      // planning and building need a slot.
       else if (!state.done.check) run = true;
       else if (runner.busy) {
         // Running steps keep their slot, even while another step's question is open.
         slots -= 1;
         run = true;
-      } else if (state.status === "holding")
-        // A hold takes no slot; a step the service's death interrupted resumes.
+      } else if (runner.held)
+        // Questions that stop every step it could start take no slot; a
+        // step the service's death interrupted resumes.
         run = Object.keys(state.attempts).length > 0;
       // A wait on a human gate (an approval, a required review) has no
       // deadline, so it takes no slot: it polls, and its paths stay owned.
@@ -386,7 +543,8 @@ export async function serve(options: ServeOptions): Promise<number> {
         });
       }
     }
-    for (const runner of options.observer ? runners.values() : []) {
+    const observer = options.observer;
+    for (const runner of observer ? runners.values() : []) {
       const { state } = runner;
       const mark = observeMark(runner);
       const entry = observed.get(state.issue) ?? {
@@ -395,40 +553,39 @@ export async function serve(options: ServeOptions): Promise<number> {
         nextAt: 0,
       };
       observed.set(state.issue, entry);
-      if (entry.busy || entry.mark === mark || Date.now() < entry.nextAt)
-        continue;
-      entry.busy = true;
+      if (entry.mark === mark) continue;
       // The mark is kept only once the observation succeeded.
-      options
-        .observer!.observe(
-          structuredClone(state),
-          settled(runner),
-          AbortSignal.timeout(OBSERVE_DEADLINE_MS),
-        )
-        .then(
-          () => {
-            entry.mark = mark;
-            entry.failures = 0;
-          },
-          (error: unknown) => {
-            entry.failures += 1;
-            entry.nextAt =
-              Date.now() +
-              Math.min(
-                OBSERVE_BACKOFF_MS * 2 ** (entry.failures - 1),
-                OBSERVE_MAX_BACKOFF_MS,
-              );
-            log.write(state.issue, {
-              event: "observe-failed",
-              error: String(error),
-              retryAt: new Date(entry.nextAt).toISOString(),
-            });
-          },
-        )
-        .finally(() => {
-          entry.busy = false;
-        });
+      const copy = structuredClone(state);
+      const end = settled(runner);
+      attempt(
+        entry,
+        state.issue,
+        () =>
+          observer!.observe(
+            copy,
+            end,
+            AbortSignal.timeout(OBSERVE_DEADLINE_MS),
+          ),
+        () => {
+          entry.mark = mark;
+        },
+      );
     }
+    for (const [key, entry] of observer ? late : [])
+      attempt(
+        entry,
+        entry.state.issue,
+        () =>
+          observer!.observe(
+            entry.state,
+            true,
+            AbortSignal.timeout(OBSERVE_DEADLINE_MS),
+          ),
+        () => {
+          late.delete(key);
+          if (entry.path) rmSync(entry.path, { force: true });
+        },
+      );
     options.sync?.tick({
       runners,
       unreadable,
@@ -445,9 +602,9 @@ export async function serve(options: ServeOptions): Promise<number> {
         )
           return;
         // A run again after the operator queued a finished one. The observer
-        // ends the old run first (its episode, its playbook pin); if it
-        // can't, the item stays queued and the next queue read admits it.
-        if (previous && !release(previous.state)) return;
+        // ends the old run first (its episode, its playbook pin), now or in
+        // the background.
+        if (previous) release(previous.state);
         // The old run stops for good (its steps, its saves, its sync jobs)
         // before the new one exists, so only one run ever writes the file.
         previous?.stop();
@@ -469,33 +626,35 @@ export async function serve(options: ServeOptions): Promise<number> {
         const runner = runners.get(issue);
         if (
           !runner ||
-          runner.busy ||
           TERMINAL.includes(runner.state.status) ||
           !unstarted(runner.state)
         )
           return false;
-        // Dequeued before planning: the run goes as if never admitted, so
-        // queuing it again checks it afresh. The observer ends it first.
-        if (!release(runner.state)) return false;
-        removeState(paths.objectives, issue);
-        crashPoint("serve:withdrawn");
-        runner.stop();
-        runners.delete(issue);
-        options.sync?.forget(issue);
-        log.write(issue, { event: "withdrawn" });
-        return true;
+        // Its check or a re-run's cleanup still runs: it goes once that
+        // ends, and nothing past them starts meanwhile (see tick). A
+        // cleanup not begun never runs: the earlier run's record stands.
+        if (ending(runner)) {
+          if (!runner.state.withdrawing)
+            runner.transact(() => {
+              runner.state.withdrawing = true;
+            });
+          return "pending";
+        }
+        withdrawNow(runner);
+        return "withdrawn";
       },
       result: (id: string) => readResult(paths.requests, id),
     });
     // A finished Objective leaves memory, and its file objectives/, once
-    // its cleanup, its final sync and its settled observation are done; a
-    // request or a re-queue reads it again from finished/.
+    // its cleanup and its final sync are done, and no observation of it is
+    // in flight (one that failed goes on in the background); a request or
+    // a re-queue reads it again from finished/.
     for (const runner of [...runners.values()]) {
       const issue = runner.state.issue;
       if (
         settled(runner) &&
         (options.sync?.idle(issue) ?? true) &&
-        (!options.observer || observed.get(issue)?.mark === observeMark(runner))
+        !observed.get(issue)?.busy
       )
         retire(issue);
     }
@@ -579,28 +738,43 @@ function acceptedAt(state: ObjectiveState): string {
 }
 
 /**
- * Whether every step left to run waits on a human gate: nothing it can do
- * until a person outside Factory acts.
+ * Whether every step left to run waits on a human gate or an open
+ * question: nothing it can do until a person acts.
  */
 function gated(runner: ObjectiveRunner, workflow: Workflow): boolean {
   const steps = workflow.steps(runner.state);
   return (
     steps.length > 0 &&
-    steps.every((step) => runner.state.retries[step.key]?.wait?.kind === "gate")
+    steps.every(
+      (step) =>
+        runner.state.retries[step.key]?.wait?.kind === "gate" ||
+        runner.heldBy(step.key),
+    )
+  );
+}
+
+const CLEANUP = "rerun:cleanup";
+
+/**
+ * A dequeued run waits to be withdrawn only while a step runs, or a re-run's
+ * cleanup has begun (an attempt is open): its effects are half made.
+ */
+function ending(runner: ObjectiveRunner): boolean {
+  return (
+    runner.busy ||
+    Boolean(runner.state.kept?.[RERUN] && runner.state.attempts[CLEANUP])
   );
 }
 
 /** Not started: nothing past the check (and a re-run's cleanup) has run or begun. */
 function unstarted(state: ObjectiveState): boolean {
-  const early = (key: string) => key === "check" || key === "rerun:cleanup";
-  return (
-    !state.kept?.[RERUN] &&
-    [
-      ...Object.keys(state.done),
-      ...Object.keys(state.retries),
-      ...Object.keys(state.attempts),
-    ].every(early)
-  );
+  const early = (key: string) => key === "check" || key === CLEANUP;
+  return [
+    ...Object.keys(state.done),
+    ...Object.keys(state.retries),
+    ...Object.keys(state.asking),
+    ...Object.keys(state.attempts),
+  ].every(early);
 }
 
 function started(runner: ObjectiveRunner): boolean {
@@ -682,6 +856,8 @@ interface ServiceRecord {
   /** Set by a clean stop. */
   stopped?: boolean;
   unreadable: Record<string, string>;
+  /** What pauses the service's GitHub effects (GitHubSync.problem); `status` shows it. */
+  problem?: string;
 }
 
 interface Crash {
@@ -695,7 +871,7 @@ const STREAK_MS = 10 * 60 * 1000;
 /** Starts in a streak before interrupted steps are delayed: 30 s, doubling, up to MAX_RESUME_DELAY_MS. */
 const LOOP_STARTS = 3;
 const MAX_RESUME_DELAY_MS = 30 * 60 * 1000;
-/** Deaths in a row with one step running at each before that step holds. */
+/** Deaths in a row with a step running at each before that step holds. */
 const SUSPECT_CRASHES = 3;
 
 function readServiceRecord(root: string): Partial<ServiceRecord> | undefined {
@@ -772,20 +948,20 @@ function startRecord(
 }
 
 /**
- * The one step running at each of the last SUSPECT_CRASHES deaths, when
+ * Every step running at each of the last SUSPECT_CRASHES deaths, when
  * other steps finished in the runs between them: the strongest sign the
- * saved state gives that this step stops the service. Two or more such
- * steps prove nothing about either.
+ * saved state gives that one of them stops the service. Each holds, so a
+ * crash streak ends in questions within SUSPECT_CRASHES deaths however
+ * many steps keep being interrupted together.
  */
-function suspect(crashes: Crash[]): Crash["running"][number] | undefined {
-  if (crashes.length < SUSPECT_CRASHES) return undefined;
+function suspects(crashes: Crash[]): Crash["running"] {
+  if (crashes.length < SUSPECT_CRASHES) return [];
   const last = crashes.slice(-SUSPECT_CRASHES);
-  if (!last.slice(1).every((crash) => crash.progressed)) return undefined;
+  if (!last.slice(1).every((crash) => crash.progressed)) return [];
   const id = (r: { issue: number; step: string }) => `${r.issue} ${r.step}`;
-  const common = last[0]!.running.filter((r) =>
+  return last[0]!.running.filter((r) =>
     last.every((crash) => crash.running.some((o) => id(o) === id(r))),
   );
-  return common.length === 1 ? common[0] : undefined;
 }
 
 function writeServiceRecord(
