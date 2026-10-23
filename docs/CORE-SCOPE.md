@@ -322,9 +322,10 @@ Status words:
 ## Tests and drills
 
 - CI covers each stability rule it can reach without GitHub or a model: the lock, holds and answers, requests while stopped, unreadable state, the crash points on the hold and cancel path, log rotation, three deaths while two Objectives run (neither holds; the restart backs off), the one step running at three deaths holds, a step deadline (retry, then a hold after 3), a transient wait (no error count, a question after its budget, `wait` waits on; GitHub unreachable, so rule 5 too), and containment (a held Objective and one waiting on its paths leave the slot to another). (new) **ported** (core/test/service.test.mjs).
-- Crash points around GitHub effects (sync, plan, report, cancel, rerun) are listed in the CI loop as skipped: CI has no GitHub. **owed** to the drill below.
-- The slice gate drill: cut the network for a minute and stop a model mid-turn, on a real Objective (design plan section 7.2; CORE.md#Testing). Slices 1 to 3 merged without it, and so did this stability pass. **owed**: the maintainer runs it before slice 5 starts, with the crash points above.
-- A test that bounded cost holds (rule 6) needs a GitHub Project of some size. **owed** to the same drill: count the queue read's requests with many open issues off the Project.
+- Crash points around GitHub effects (sync, plan, report, cancel, rerun) are listed in the CI loop as skipped: CI has no GitHub. Drilled 2026-10-22 on the scratch repository: 26 of 30 pass. **owed**: plan:data before/after (needs a plan over 65,000 characters) and sync:remind before/after (needs a human gate on the scratch repository); both go to the drill suite.
+- The slice gate drill: cut the network for a minute and stop a model mid-turn, on a real Objective (design plan section 7.2; CORE.md#Testing). **ported**: drilled 2026-10-22 on the stability build. A one-minute cut during planning, during a hold and during the CI wait was retried, not held, and a Codex planner and worker killed mid-turn reran with no error counted. The drill suite repeats it on demand.
+- A test that bounded cost holds (rule 6). **ported**: drilled 2026-10-22 through a counting proxy. Each queue poll is exactly 2 GraphQL requests plus one comment read per unfinished Objective, flat as the Project grows.
+- A CI test of step order (CORE.md#Testing lists it). **owed**: no service test checks it yet; every drill exercises it. Add one with the next engine change.
 
 ## Milestone log
 
