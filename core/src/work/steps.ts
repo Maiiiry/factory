@@ -1310,6 +1310,7 @@ async function publishStep(
           failure(item, result.finding),
           context,
           deps,
+          true,
         )
       : hold(
           `${result.finding}\n\nPublication stopped; nothing was pushed (finding \`${result.digest}\`). Answer repair to have the worker remove the value; publish if the matched text isn't a secret, which lets exactly this finding on this commit through once; or cancel. Rotate the secret if the worker may have written it anywhere else.`,
@@ -1566,6 +1567,13 @@ function republishOutcome(item: WorkItem, reason: string): Outcome {
  * unless the repair is about the media: it comes from the select step (the
  * operator's `repair`, or the selected set couldn't be written), or the
  * finding names a selected destination or cites the candidate receipt.
+ *
+ * `refusesResult`: the repair refuses the work result's tree itself
+ * (validate, review, CI, merge, a secret it writes), so the worker must
+ * change it and the refused fact is recorded for it and the layers above.
+ * A select or publish media repair (new candidates, a selection that
+ * couldn't be written, LFS objects) may rightly end on the same tracked
+ * tree, so it records nothing, and a correct fix is never "no change".
  */
 function repairOutcome(
   item: WorkItem,
@@ -1574,6 +1582,7 @@ function repairOutcome(
   keep: Record<string, unknown>,
   context: StepContext,
   deps: BuildDeps,
+  refusesResult = from !== "select" && from !== "publish",
 ): Outcome {
   const { state } = context;
   const place = stackLayer(state.done.plan as Plan, deps, item.id);
@@ -1601,9 +1610,9 @@ function repairOutcome(
       ));
   // The result being refused, when there is one: a repair from `work`
   // itself keeps the fact of the result refused before it.
-  const refused = state.done[stepKey(item.id, "work")] as
-    | WorkResult
-    | undefined;
+  const refused = refusesResult
+    ? (state.done[stepKey(item.id, "work")] as WorkResult | undefined)
+    : undefined;
   const moved: Record<string, unknown> = {
     [keptKey(item.id, "selection")]: media ? null : (own ?? null),
     ...(refused ? refusedFact(item.id, refused) : {}),
@@ -1620,7 +1629,7 @@ function repairOutcome(
     if (work) {
       Object.assign(
         moved,
-        refusedFact(layer.id, work),
+        refusesResult ? refusedFact(layer.id, work) : {},
         conflictFinding(
           layer,
           `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
