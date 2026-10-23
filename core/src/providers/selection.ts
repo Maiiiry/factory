@@ -11,11 +11,7 @@ import { hold, type Step, type Workflow } from "../engine.js";
 import type { Plan } from "../planning/types.js";
 import { type ObjectiveState, TERMINAL } from "../state.js";
 import type { Worker } from "../work/worker.js";
-import {
-  ClaudePlanner,
-  type ClaudePlannerOptions,
-  DEFAULT_CLAUDE_MODELS,
-} from "./claude.js";
+import { ClaudePlanner, DEFAULT_CLAUDE_MODELS } from "./claude.js";
 import { ClaudeWorker } from "./claude-worker.js";
 import { CodexPlanner, DEFAULT_CODEX_MODELS } from "./codex.js";
 import { CodexWorker } from "./codex-worker.js";
@@ -30,28 +26,18 @@ import { HedgedPlanner, type Planner } from "./planner.js";
 
 /** The provider's planner, hedged against stalled calls. */
 export function providerPlanner(provider: ProviderConfig): Planner {
-  const models = provider.models ?? {};
   switch (provider.planner) {
     case "claude":
       return new HedgedPlanner(
-        new ClaudePlanner({
-          ...DEFAULT_CLAUDE_MODELS,
-          ...models,
-        } as ClaudePlannerOptions),
+        new ClaudePlanner({ ...DEFAULT_CLAUDE_MODELS, ...provider.models }),
       );
     case "copilot":
       return new HedgedPlanner(
-        new CopilotPlanner({
-          ...DEFAULT_COPILOT_MODELS,
-          ...models,
-        } as typeof DEFAULT_COPILOT_MODELS),
+        new CopilotPlanner({ ...DEFAULT_COPILOT_MODELS, ...provider.models }),
       );
     default:
       return new HedgedPlanner(
-        new CodexPlanner({
-          ...DEFAULT_CODEX_MODELS,
-          ...models,
-        } as typeof DEFAULT_CODEX_MODELS),
+        new CodexPlanner({ ...DEFAULT_CODEX_MODELS, ...provider.models }),
       );
   }
 }

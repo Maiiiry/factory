@@ -19,6 +19,7 @@ import type {
 import { isRecord } from "../planning/graph.js";
 import type { Wait } from "../state.js";
 import { workerEnvironment } from "../worktree.js";
+import type { CLAUDE_EFFORTS } from "./config.js";
 import {
   callImages,
   detail,
@@ -33,7 +34,7 @@ import {
   type PlannerModels,
 } from "./planner.js";
 
-export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
 
 export interface ClaudePlannerOptions extends PlannerModels<ClaudeEffort> {
   /** Output token ceiling for every planning and review call. */

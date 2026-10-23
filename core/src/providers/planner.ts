@@ -7,13 +7,15 @@ import { accessSync, constants, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Wait } from "../state.js";
 
-export type PlannerPhase =
-  | "plan"
-  | "graph-review"
-  | "result-review"
-  | "objective-review"
-  | "diagnosis"
-  | "dream";
+export const PLANNER_PHASES = [
+  "plan",
+  "graph-review",
+  "result-review",
+  "objective-review",
+  "diagnosis",
+  "dream",
+] as const;
+export type PlannerPhase = (typeof PLANNER_PHASES)[number];
 
 export interface PlannerCall {
   role: "planner" | "reviewer";

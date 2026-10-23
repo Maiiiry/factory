@@ -67,6 +67,7 @@ import {
   serviceLoginEnvironment,
   usageOf,
 } from "./claude.js";
+import { CLAUDE_TOOLS } from "./config.js";
 import { detail, IdleWatchdog, PlannerError } from "./planner.js";
 
 // Configuration
@@ -88,9 +89,9 @@ export interface ClaudeWorkerConfig {
   maxTurns: number;
 }
 
-const FILE_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"];
 /** Factory's own tool in `tools`, served over MCP, not an SDK built-in. */
 const VALIDATE = "Validate";
+const FILE_TOOLS: string[] = CLAUDE_TOOLS.filter((tool) => tool !== VALIDATE);
 
 const DEFAULT_CLAUDE_WORKER: ClaudeWorkerConfig = {
   model: "claude-opus-5-5",
