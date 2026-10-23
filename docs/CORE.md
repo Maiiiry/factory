@@ -49,7 +49,7 @@ There is one process, `factory serve`, per installation, run by systemd. It is t
 
 ## State
 
-Each Objective has one JSON file: `objectives/<issue>.json` under the installation's state directory.
+Each Objective has one JSON file: `objectives/<issue>.json` under the installation's state directory. Once a finished Objective's cleanup, final sync and settled observation are done, the file moves to `objectives/finished/<issue>.json`. Startup never reads `finished/` (rule 6); a request, a re-queue or `status` reads a file there when it names the Objective, and a later save writes the active file again until it moves back.
 
 ```jsonc
 {
@@ -132,6 +132,8 @@ Any other retry is a wait. Waiting more than a few hours is never right, so a wa
 | An unknown transient cause       | The network down; 5xx or an outage at GitHub or the provider; 409, 410, 422 or a GraphQL error from GitHub; CI queued or running                                                                                        | Retry with backoff. After 1 h, post one status note on the issue (edited in place). After 3 h, hold with a question naming the cause and the last error: `wait` (another 3 h), `retry` and `cancel`.                                                                                                         |
 
 A problem on the host counts as fatal when it is certain (disk, login) and as transient otherwise. Times are wall-clock times saved in the state, so a restart doesn't reset a budget, and the question comes only after the step ran again and still had to wait.
+
+- **An open question pauses the clocks.** While a question is open, no other step starts, so no other step's wait counts. When the question closes, each waiting step's wait start and any granted `wait` move forward by the time it was due but blocked. No status note or gate reminder is posted while a question is open. A step that asks while another question is open records nothing: it runs again after the answer and asks then.
 
 - **One budget per class.** A step's wait start, first cause, backoff and any granted `wait` belong to one run of one class: a reset, a gate, or an unknown cause (errors count as unknown). When the class changes, they start again, so eight hours on a review never spend the transient budget. The error count covers one run of consecutive errors; any other outcome resets it.
 - **Only a real rate limit is a reset.** A 429, or a 403 rate limit, waits for its reset. A 5xx is an unknown transient even when it carries rate-limit headers; its `retry-after` only sets the backoff. A reset at or before now (a skewed clock) still waits at least the normal backoff.
@@ -254,7 +256,7 @@ These carry over unchanged:
 
 - Credentials stay with the service. Workers never see them.
 - Workers run in the OS sandbox with the configured network policy.
-- Secrets are named by reference.
+- Secrets are named by reference. The configuration derives the secret values once: those named in `policy.allowedSecretNames` and each managed provider's credential (`apiKeyEnv`, `credentialEnv`, from the environment or a service credential). Everything Factory writes to GitHub, Dream input and the Codex worker's reported commands and errors are redacted of them. Only the named ones reach a worker's environment.
 - Deploys stay in the target's own GitHub Actions, behind environment approvals.
 
 A same-user process is trusted, as decided for the archive: it can already change Factory's code and credentials.
