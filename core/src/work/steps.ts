@@ -466,7 +466,7 @@ async function workStep(
     // that never kept its base (stopped when the layer below was repaired)
     // left files on an unknown base: start over on the current one.
     const head = await start();
-    const refused = kept<string>(state, item.id, "refusedCommit");
+    const refused = kept<Refused>(state, item.id, "refused")?.commit;
     if (head !== base || keptBase === undefined) {
       await rebaseWorktree(
         config.checkout,
@@ -528,6 +528,7 @@ async function workStep(
         ...keepBase,
         [finishedKey]: null,
         [keptKey(item.id, "finding")]: null,
+        [keptKey(item.id, "refused")]: null,
       },
     };
   }
@@ -674,9 +675,7 @@ async function workStep(
     item,
     sandbox: config.sandbox,
     finalResponse: finished.finalResponse,
-    ...(kept<string>(state, item.id, "refusedTree")
-      ? { refusedTree: kept<string>(state, item.id, "refusedTree")! }
-      : {}),
+    refusedTree: kept<Refused>(state, item.id, "refused")?.tree,
     signal,
   });
   switch (collected.kind) {
@@ -712,6 +711,7 @@ async function workStep(
           ...keepAll,
           [finishedKey]: null,
           [keptKey(item.id, "finding")]: null,
+          [keptKey(item.id, "refused")]: null,
         },
       };
     }
@@ -869,7 +869,9 @@ async function repairContext(
     checkout: deps.config.checkout,
     base,
     commit:
-      kept<string>(state, item.id, "refusedCommit") ?? previous?.commit ?? base,
+      kept<Refused>(state, item.id, "refused")?.commit ??
+      previous?.commit ??
+      base,
     sources,
     prior: applied,
     ...(answer ? { operatorAnswer: answer } : {}),
@@ -914,10 +916,32 @@ async function repairContext(
 }
 
 /**
+ * The result a repair refused: its commit (replayed on a rebase, and the
+ * diagnosis's evidence), its tree (collection reads the same tree on the
+ * same base as no change) and its notes (for `revalidate`).
+ */
+interface Refused {
+  commit: string;
+  tree: string;
+  notes: HandoffNote[];
+}
+
+/** The one writer of the refused fact, from the refused work result. */
+function refusedFact(id: string, work: WorkResult): Record<string, Refused> {
+  return {
+    [keptKey(id, "refused")]: {
+      commit: work.commit,
+      tree: work.tree,
+      notes: work.notes,
+    },
+  };
+}
+
+/**
  * The kept refused result as a work result, when it can be checked again
  * unchanged: its commit still exists with the refused tree, on `base`, and
- * an item with media still has the selection to write on it again. Notes
- * come back when they were kept with that commit; sets from the selection.
+ * an item with media still has the selection to write on it again; sets
+ * come from the selection.
  */
 async function refusedResult(
   state: ObjectiveState,
@@ -926,38 +950,21 @@ async function refusedResult(
   base: string,
   signal: AbortSignal,
 ): Promise<WorkResult | undefined> {
-  const commit = kept<string>(state, item.id, "refusedCommit");
-  const tree = kept<string>(state, item.id, "refusedTree");
-  if (!commit || !tree) return undefined;
+  const refused = kept<Refused>(state, item.id, "refused");
+  if (!refused) return undefined;
   const own = kept<KeptSelection>(state, item.id, "selection");
   if (needsSelection(item) && !own) return undefined;
   const shown = await hostGitExit(
     checkout,
-    ["show", "--no-patch", "--format=%P %T", `${commit}^{commit}`],
+    ["show", "--no-patch", "--format=%P %T", `${refused.commit}^{commit}`],
     { signal },
   );
   if (
     shown.code !== 0 ||
-    shown.stdout.toString("utf8").trim() !== `${base} ${tree}`
+    shown.stdout.toString("utf8").trim() !== `${base} ${refused.tree}`
   )
     return undefined;
-  const notes = kept<{ commit: string; notes: HandoffNote[] }>(
-    state,
-    item.id,
-    "refusedNotes",
-  );
-  return {
-    base,
-    commit,
-    tree,
-    notes: notes?.commit === commit ? notes.notes : [],
-    sets: own?.sets ?? [],
-  };
-}
-
-/** The refused result's notes, kept with its commit for `revalidate`. */
-function refusedNotes(work: WorkResult) {
-  return { commit: work.commit, notes: work.notes };
+  return { base, ...refused, sets: own?.sets ?? [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,10 +1034,6 @@ async function validateStep(
         result.detail,
         {
           ...failure(item, result.output),
-          // The worker's own tree: collection compares the next result to it.
-          [keptKey(item.id, "refusedTree")]: work.tree,
-          [keptKey(item.id, "refusedCommit")]: work.commit,
-          [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
         },
         context,
         deps,
@@ -1173,9 +1176,6 @@ async function reviewStep(
           tree: review.tree,
           refused: review.kind === "refused" ? review.refused : [],
         } satisfies RepairFinding,
-        [keptKey(item.id, "refusedTree")]: work.tree,
-        [keptKey(item.id, "refusedCommit")]: work.commit,
-        [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       },
       context,
       deps,
@@ -1458,7 +1458,6 @@ function deliveryRepair(
   repair: Repair,
   phase: Phase,
 ): Outcome {
-  const work = context.state.done[stepKey(item.id, "work")] as WorkResult;
   return repairOutcome(
     item,
     phase,
@@ -1470,9 +1469,6 @@ function deliveryRepair(
       ...(repair.conflict?.onto
         ? { [keptKey(item.id, "onto")]: repair.conflict.onto }
         : {}),
-      [keptKey(item.id, "refusedCommit")]: work.commit,
-      [keptKey(item.id, "refusedTree")]: work.tree,
-      [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       [keptKey(item.id, "rebase")]: true,
     },
     context,
@@ -1547,8 +1543,14 @@ function repairOutcome(
         finding,
         keep[keptKey(item.id, "finding")] as RepairFinding | undefined,
       ));
+  // The result being refused, when there is one: a repair from `work`
+  // itself keeps the fact of the result refused before it.
+  const refused = state.done[stepKey(item.id, "work")] as
+    | WorkResult
+    | undefined;
   const moved: Record<string, unknown> = {
     [keptKey(item.id, "selection")]: media ? null : (own ?? null),
+    ...(refused ? refusedFact(item.id, refused) : {}),
   };
   for (const layer of above) {
     const layerSelection = standing(layer);
@@ -1560,9 +1562,9 @@ function repairOutcome(
     moved[keptKey(layer.id, "finished")] = null;
     moved[keptKey(layer.id, "onto")] = null;
     if (work) {
-      moved[keptKey(layer.id, "refusedCommit")] = work.commit;
       Object.assign(
         moved,
+        refusedFact(layer.id, work),
         conflictFinding(
           layer,
           `Work Item ${item.id}, the stack layer below this one, is being repaired, so this change moves onto its new head.`,
