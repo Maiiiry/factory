@@ -1,5 +1,6 @@
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -610,7 +611,7 @@ export class CodexPlanner implements Planner {
         clearTimeout(timer);
       }
       saveModelsCache(home.env.CODEX_HOME!);
-      keepOrRemove(home.root, record.thread as string | undefined);
+      keepOrRemove(home.root, record.thread as string | undefined, call.log);
     }
   }
 }
@@ -647,17 +648,32 @@ function traceWrapper(
 /**
  * FACTORY_PROVIDER_TRACE=<dir> keeps each call's private Codex home (its
  * session record and logs) under <dir>/<thread>, for investigating a call
- * afterwards. Without it the home is removed.
+ * afterwards: moved, or copied when <dir> is on another filesystem. A
+ * home that can't be kept is logged. Without it the home is removed.
  */
-function keepOrRemove(root: string, thread: string | undefined): void {
+function keepOrRemove(
+  root: string,
+  thread: string | undefined,
+  log: (event: Record<string, unknown>) => void,
+): void {
   const trace = process.env.FACTORY_PROVIDER_TRACE;
   if (trace) {
+    const target = join(trace, thread ?? `call-${Date.now()}`);
     try {
       mkdirSync(trace, { recursive: true });
-      renameSync(root, join(trace, thread ?? `call-${Date.now()}`));
-      return;
-    } catch {
-      // Fall through and remove it.
+      try {
+        renameSync(root, target);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+        cpSync(root, target, { recursive: true, verbatimSymlinks: true });
+      }
+    } catch (error) {
+      log({
+        event: "provider-trace-failed",
+        target,
+        error: errorMessage(error),
+      });
     }
   }
   rmSync(root, { recursive: true, force: true });
