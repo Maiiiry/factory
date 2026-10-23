@@ -409,3 +409,44 @@ test("the service retries a failed observation, across a restart, and one run ke
   );
   assert.equal(count(inst, "SELECT count(*) FROM memory"), 4);
 });
+
+test("a planner lookup reads a file at the base inside the selectors and refuses traversal", async () => {
+  const { DEFAULT_BOUNDS } = await import("../dist/knowledge/settings.js");
+  const { plannerLookups } = await import("../dist/planning/lookup.js");
+  const { BaseFiles } = await import("../dist/planning/facts.js");
+  const { readShown } = await import("../dist/shown.js");
+  const checkout = join(installation().root, "..", "..", "checkout");
+  const git = (...args) =>
+    spawnSync("git", ["-C", checkout, ...args], { encoding: "utf8" });
+  mkdirSync(join(checkout, "docs"));
+  writeFileSync(join(checkout, "docs", "a.md"), "base text\n");
+  writeFileSync(join(checkout, "x.ts"), "outside\n");
+  git("add", ".");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD").stdout.trim();
+  // The working tree moves on; the lookup still reads the base.
+  writeFileSync(join(checkout, "docs", "a.md"), "edited\n");
+  const context = {
+    bounds: DEFAULT_BOUNDS,
+    selectors: ["docs/"],
+    memory: false,
+  };
+  const shown = readShown("<h2>Adaptive workflow</h2><p>enabled</p>", {
+    sources: false,
+  });
+  const lookups = plannerLookups(
+    { kept: {} },
+    "plan:1:1",
+    { base, shown },
+    { planning: { context } },
+  );
+  const ask = (path) => ({ kind: "file", path, heading: "", query: "" });
+  const { outcome } = await lookups.take(
+    { contextLookups: [ask("docs/a.md"), ask("docs/../x.ts")] },
+    { issue: 1, files: new BaseFiles(checkout, base), secrets: [], log() {} },
+  );
+  const [read, traversal] = outcome.keep["lookups:plan:1:1"].rounds[0];
+  assert.equal(read.content, "base text\n");
+  assert.equal(traversal.disposition, "refused");
+  assert.equal(traversal.content, undefined);
+});
