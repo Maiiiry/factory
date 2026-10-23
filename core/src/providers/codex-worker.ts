@@ -102,8 +102,9 @@ const PROXY = /^(?:HTTPS?|NO|ALL)_PROXY$/i;
 /**
  * What the worker's shell sees of the proxy variables Codex keeps to reach
  * its API: nothing when the shell has no network; with network, each URL
- * without its user name and password (a URL that doesn't parse is left
- * out), so the shell never holds a proxy credential.
+ * (one without a scheme read as http://) without its user name and
+ * password (a URL that doesn't parse is left out), so the shell never
+ * holds a proxy credential.
  */
 function proxyPolicy(source: NodeJS.ProcessEnv, network: boolean): string {
   const set: string[] = [];
@@ -117,7 +118,10 @@ function proxyPolicy(source: NodeJS.ProcessEnv, network: boolean): string {
     if (/^no_proxy$/i.test(name)) continue;
     let url: URL;
     try {
-      url = new URL(value);
+      // curl, pip and npm read a proxy without a scheme as http://.
+      url = new URL(
+        /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `http://${value}`,
+      );
     } catch {
       exclude.push(name);
       continue;
