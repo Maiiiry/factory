@@ -476,6 +476,35 @@ async function workStep(
       deps,
     );
   }
+  if (!finished && context.answer?.answer === "revalidate") {
+    // The operator says the refused result is correct and Factory's check
+    // was at fault: it is the step's result again, unchanged, with no
+    // worker run, collection or repair. Only reads: a rerun does the same.
+    const refused = await refusedResult(
+      state,
+      item,
+      config.checkout,
+      base,
+      signal,
+    );
+    if (!refused)
+      return withKeep(
+        hold(
+          `Work Item ${item.id}'s refused result can no longer be checked again as it is (it is gone, or no longer sits on ${base}). Answer \`retry\` to diagnose the failure again, or cancel.`,
+          ["retry", "cancel"],
+        ),
+        keepBase,
+      );
+    return {
+      kind: "done",
+      result: refused,
+      keep: {
+        ...keepBase,
+        [finishedKey]: null,
+        [keptKey(item.id, "finding")]: null,
+      },
+    };
+  }
   if (!finished) {
     const repair = await repairContext(item, context, deps, base);
     if (repair && "hold" in repair) return withKeep(repair.hold, keepBase);
@@ -816,13 +845,23 @@ async function repairContext(
     signal,
     log: context.log,
   });
-  if (result.kind === "question")
+  if (result.kind === "question") {
+    const recheck = (await refusedResult(
+      state,
+      item,
+      deps.config.checkout,
+      base,
+      signal,
+    ))
+      ? "\n\nIf the refused result is correct and Factory's own check was at fault (for example, the check could not see files the result has), answer `revalidate`: Factory runs validation, review and delivery again on the same result, unchanged, without running the worker. It doesn't count as a repair."
+      : "";
     return {
       hold: hold(
-        `Work Item ${item.id} needs your decision before it is repaired:\n\n${result.question}\n\nAnswer with \`answer <decision>\`.`,
-        ["answer", "retry", "cancel"],
+        `Work Item ${item.id} needs your decision before it is repaired:\n\n${result.question}\n\nAnswer with \`answer <decision>\` to send the worker a correction, or \`retry\` to diagnose the failure again.${recheck}`,
+        ["answer", "retry", ...(recheck ? ["revalidate"] : []), "cancel"],
       ),
     };
+  }
   const repairContextValue: RepairContext = {
     finding: result.correction.failure,
     correction: {
@@ -843,6 +882,53 @@ async function repairContext(
   };
 }
 
+/**
+ * The kept refused result as a work result, when it can be checked again
+ * unchanged: its commit still exists with the refused tree, on `base`, and
+ * an item with media still has the selection to write on it again. Notes
+ * come back when they were kept with that commit; sets from the selection.
+ */
+async function refusedResult(
+  state: ObjectiveState,
+  item: WorkItem,
+  checkout: string,
+  base: string,
+  signal: AbortSignal,
+): Promise<WorkResult | undefined> {
+  const commit = kept<string>(state, item.id, "refusedCommit");
+  const tree = kept<string>(state, item.id, "refusedTree");
+  if (!commit || !tree) return undefined;
+  const own = kept<KeptSelection>(state, item.id, "selection") ?? undefined;
+  if (needsSelection(item) && !own) return undefined;
+  const shown = await hostGitExit(
+    checkout,
+    ["show", "--no-patch", "--format=%P %T", `${commit}^{commit}`],
+    { signal },
+  );
+  if (
+    shown.code !== 0 ||
+    shown.stdout.toString("utf8").trim() !== `${base} ${tree}`
+  )
+    return undefined;
+  const notes = kept<{ commit: string; notes: HandoffNote[] }>(
+    state,
+    item.id,
+    "refusedNotes",
+  );
+  return {
+    base,
+    commit,
+    tree,
+    notes: notes?.commit === commit ? notes.notes : [],
+    sets: own?.sets ?? [],
+  };
+}
+
+/** The refused result's notes, kept with its commit for `revalidate`. */
+function refusedNotes(work: WorkResult) {
+  return { commit: work.commit, notes: work.notes };
+}
+
 // ---------------------------------------------------------------------------
 // validate
 
@@ -860,6 +946,7 @@ async function validateStep(
   await addWorktree(config.checkout, worktree, work.base, signal);
   const result = await validateTree({
     checkout: config.checkout,
+    repository: config.repository,
     directory: `${worktree}.validation`,
     commit: candidate(state, item.id),
     item,
@@ -912,6 +999,7 @@ async function validateStep(
           // The worker's own tree: collection compares the next result to it.
           [keptKey(item.id, "refusedTree")]: work.tree,
           [keptKey(item.id, "refusedCommit")]: work.commit,
+          [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
         },
         context,
         deps,
@@ -1056,6 +1144,7 @@ async function reviewStep(
         } satisfies RepairFinding,
         [keptKey(item.id, "refusedTree")]: work.tree,
         [keptKey(item.id, "refusedCommit")]: work.commit,
+        [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       },
       context,
       deps,
@@ -1351,6 +1440,7 @@ function deliveryRepair(
         : {}),
       [keptKey(item.id, "refusedCommit")]: work.commit,
       [keptKey(item.id, "refusedTree")]: work.tree,
+      [keptKey(item.id, "refusedNotes")]: refusedNotes(work),
       [keptKey(item.id, "rebase")]: true,
     },
     context,
@@ -1586,6 +1676,7 @@ export function finalStep(deps: BuildDeps): Step {
         const members = validationMembers(plan, undefined, selection(state));
         const result = await validateTree({
           checkout: config.checkout,
+          repository: config.repository,
           directory: join(workDir, "final"),
           commit: head,
           plan,

@@ -10,8 +10,8 @@
  *   work      resolveInputs → (prepareWorkPrompt stages them) → worker →
  *             captureAssets → collect → destinationFinding
  *   select    selectionQuestion / readSelection → materializeSelection
- *   validate  validationMembers → hydrateSelected (in the fresh checkout) →
- *             commands → rewrittenMedia
+ *   validate  validationMembers → hydrateTree (every LFS file of the fresh
+ *             checkout) → commands → rewrittenMedia
  *   review    candidateReceipts (result review, and final review of merged items)
  *   publish   lfsPushIfPointers, called by delivery's publish before it pushes
  *   final     validationMembers → verifyOriginMedia
@@ -1233,77 +1233,157 @@ export function validationMembers(
 }
 
 /**
- * Restore the real bytes of selected LFS members in a validation checkout,
- * offline from the local LFS store, and check each one's sha256 and size.
- * A member whose exact pointer the tree holds is restored; a required one
- * without its pointer holds. Returns the restored destinations: they now
- * differ from their pointer blobs, so the caller leaves them out of its
- * clean-checkout and mutation checks.
+ * A Git LFS file a validation checkout holds as its pointer: `path`, and
+ * the object's sha256 and size the pointer names.
+ */
+export interface LfsFile {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/**
+ * Restore the bytes of EVERY Git LFS file in a validation checkout: each
+ * regular file at a `filter=lfs` path whose HEAD blob is an LFS pointer,
+ * as `git lfs pull` would, so the commands see the repository as a person
+ * who clones it does, whatever the format. Objects come from the local LFS
+ * store; those it lacks are fetched from origin at `commit` first. Each
+ * copy is checked against its pointer's sha256 and size. A selected member
+ * marked `required` must be its exact pointer in the tree, else it holds.
+ * At most MAX_CAPTURE_BYTES are restored in all. Returns the restored
+ * files: they now differ from their pointer blobs, so the caller leaves
+ * them out of its clean-checkout and mutation checks and gives them to
+ * rewrittenMedia after the commands.
  *
- * Each destination is written literally: Factory copies the store's object
- * over the pointer file itself, without following a link. `git lfs
- * checkout` can't do that: its arguments are gitignore-style patterns, so
- * a glob character or a bare file name restores other files too, and it
- * matches nothing for a `:(literal)` pathspec (checked with git-lfs 3.7.1).
+ * Each file is written literally: Factory copies the store's object over
+ * the pointer file itself, without following a link. `git lfs checkout`
+ * can't do that: its arguments are gitignore-style patterns, so a glob
+ * character or a bare file name restores other files too, and it matches
+ * nothing for a `:(literal)` pathspec (checked with git-lfs 3.7.1).
  *
  * Validation: call in the fresh checkout after it is made and before any
  * command runs, with validationMembers(plan, item, …). done → run the
- * commands; hold → hold as the validate step's own. Its holds offer
- * `retry` (validate again), `replan` (a required member's pointer is gone:
- * the step's replan route) and `cancel`.
+ * commands; retry (origin unreachable) → retry; hold → hold as the
+ * validate step's own. Its holds offer `retry` (validate again), `replan`
+ * (a required member's pointer is gone: the step's replan route) and
+ * `cancel`.
  */
-export async function hydrateSelected(input: {
+export async function hydrateTree(input: {
   directory: string;
+  repository: string;
+  commit: string;
   members: readonly SelectedMember[];
   signal: AbortSignal;
-}): Promise<Extract<MediaOutcome<string[]>, { kind: "done" | "hold" }>> {
+}): Promise<Exclude<MediaOutcome<LfsFile[]>, { kind: "repair" }>> {
   const { directory, signal } = input;
-  const restored: string[] = [];
   for (const member of input.members) {
+    if (!member.required) continue;
     const blob = await hostGitExit(
       directory,
       ["cat-file", "blob", `HEAD:${member.destination}`],
       { signal },
     );
     const found = blob.code === 0 ? lfsPointer(blob.stdout) : undefined;
-    if (found?.oid !== member.sha256 || found.size !== member.bytes) {
-      if (member.required)
-        return hold(
-          `${member.destination}, ${member.item}'s selected ${member.role}, is not the Git LFS pointer of the selected bytes in this tree; someone may have changed it. Restore it on the default branch and answer retry, or replan or cancel.`,
-          ["retry", "replan", "cancel"],
-        );
-      continue;
-    }
-    const held = await restoreObject(directory, member, signal);
-    if (held?.sha256 !== member.sha256 || held.bytes !== member.bytes)
+    if (found?.oid !== member.sha256 || found.size !== member.bytes)
       return hold(
-        `Factory could not restore ${member.destination} (sha256 ${member.sha256}, ${member.bytes} bytes) from the local Git LFS store. Run \`git lfs fetch\` in the target checkout and answer retry, or cancel.`,
+        `${member.destination}, ${member.item}'s selected ${member.role}, is not the Git LFS pointer of the selected bytes in this tree; someone may have changed it. Restore it on the default branch and answer retry, or replan or cancel.`,
+        ["retry", "replan", "cancel"],
       );
-    restored.push(member.destination);
   }
-  return { kind: "done", value: restored };
+  const files = await lfsFiles(directory, signal);
+  const total = files.reduce((sum, file) => sum + file.bytes, 0);
+  if (total > MAX_CAPTURE_BYTES)
+    return hold(
+      `The tree being validated holds ${files.length} Git LFS files, ${total} bytes in all; Factory restores at most ${MAX_CAPTURE_BYTES} bytes of LFS files for a validation run, so their commands can't see the real files. Make the repository's LFS files smaller in all on the default branch and answer retry, or cancel.`,
+    );
+  const absent = async () => {
+    const missing: LfsFile[] = [];
+    for (const file of files)
+      if (!(await lfsObject(directory, file.sha256, signal)))
+        missing.push(file);
+    return missing;
+  };
+  let missing = await absent();
+  if (missing.length) {
+    const fetched = await lfsFetch({
+      checkout: directory,
+      repository: input.repository,
+      commit: input.commit,
+      paths: missing.map((file) => file.path),
+      signal,
+    });
+    if (fetched) return fetched;
+    missing = await absent();
+  }
+  if (missing.length)
+    return hold(
+      `Origin does not serve the Git LFS objects of ${missing
+        .slice(0, 20)
+        .map((file) => `${file.path} (oid ${file.sha256}, ${file.bytes} bytes)`)
+        .join(
+          ", ",
+        )}${missing.length > 20 ? ` and ${missing.length - 20} more` : ""} at ${input.commit.slice(0, 12)}, and Factory's checkout doesn't hold them, so validation can't restore those files. Push the objects to origin's LFS storage (\`git lfs push --object-id origin <oid>\` from a clone that has them) and answer retry, or cancel.`,
+    );
+  for (const file of files) {
+    const held = await restoreObject(directory, file, signal);
+    if (held?.sha256 !== file.sha256 || held.bytes !== file.bytes)
+      return hold(
+        `Factory could not restore ${file.path} (sha256 ${file.sha256}, ${file.bytes} bytes) from the local Git LFS store: the store's object or the checkout's file is not a regular file with those bytes. Remove the object from the target checkout's .git/lfs/objects and answer retry, or cancel.`,
+      );
+  }
+  return { kind: "done", value: files };
+}
+
+/** The checkout's Git LFS files at HEAD: pointers at `filter=lfs` paths. */
+async function lfsFiles(
+  directory: string,
+  signal: AbortSignal,
+): Promise<LfsFile[]> {
+  const entries = (
+    await hostGit(directory, ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], {
+      signal,
+    })
+  )
+    .toString("utf8")
+    .split("\0");
+  // "<mode> <type> <oid>\t<path>"; only regular files can be pointers Git LFS smudges.
+  const blobs: { oid: string; path: string }[] = [];
+  for (const entry of entries) {
+    const tab = entry.indexOf("\t");
+    const [mode, type, oid] = entry.slice(0, tab).split(" ");
+    if (tab > 0 && type === "blob" && mode?.startsWith("100") && oid)
+      blobs.push({ oid, path: entry.slice(tab + 1) });
+  }
+  const pointers = await pointerBlobs(directory, blobs, signal);
+  if (!pointers.length) return [];
+  const filtered = lfsFiltered(
+    await hostGit(directory, ["check-attr", "-z", "--stdin", "filter"], {
+      input: `${pointers.map((p) => p.path).join("\0")}\0`,
+      signal,
+    }),
+  );
+  return pointers
+    .filter((pointer) => filtered.has(pointer.path))
+    .map(({ path, oid, size }) => ({ path, sha256: oid, bytes: size }));
 }
 
 /**
- * The restored destinations whose bytes are no longer the selected ones
- * (or that are no longer regular files reached without links): what a
- * validation command rewrote. Call after the commands, with
- * hydrateSelected's members and its result.
+ * The restored files whose bytes are no longer their pointers' (or that
+ * are no longer regular files reached without links): what a validation
+ * command rewrote. Call after the commands, with hydrateTree's result.
  */
 export async function rewrittenMedia(
   directory: string,
-  members: readonly SelectedMember[],
-  restored: ReadonlySet<string>,
+  restored: readonly LfsFile[],
 ): Promise<string[]> {
   const changed: string[] = [];
-  for (const member of members) {
-    if (!restored.has(member.destination)) continue;
+  for (const file of restored) {
     let parent: ReturnType<typeof openParent>;
     try {
-      parent = openParent(directory, member.destination, false);
+      parent = openParent(directory, file.path, false);
     } catch {
       // Gone, or now behind a link.
-      changed.push(member.destination);
+      changed.push(file.path);
       continue;
     }
     let held: { sha256: string; bytes: number } | undefined;
@@ -1314,27 +1394,27 @@ export async function rewrittenMedia(
     } finally {
       closeSync(parent.fd);
     }
-    if (held?.sha256 !== member.sha256 || held.bytes !== member.bytes)
-      changed.push(member.destination);
+    if (held?.sha256 !== file.sha256 || held.bytes !== file.bytes)
+      changed.push(file.path);
   }
   return changed;
 }
 
 /**
- * Copy the local store's object for `member` over its pointer file in
+ * Copy the local store's object for `file` over its pointer file in
  * `directory`, reached without links. Undefined when the store lacks it or
  * either file isn't a regular file reached without links.
  */
 async function restoreObject(
   directory: string,
-  member: SelectedMember,
+  file: LfsFile,
   signal: AbortSignal,
 ): Promise<{ sha256: string; bytes: number } | undefined> {
-  const stored = await lfsObject(directory, member.sha256, signal);
+  const stored = await lfsObject(directory, file.sha256, signal);
   if (!stored) return undefined;
   let parent: ReturnType<typeof openParent>;
   try {
-    parent = openParent(directory, member.destination, false);
+    parent = openParent(directory, file.path, false);
   } catch {
     return undefined;
   }
@@ -1346,7 +1426,7 @@ async function restoreObject(
       stored.root,
       stored.relative,
       target,
-      member.bytes,
+      file.bytes,
       true,
     );
   } catch (error) {
@@ -1390,6 +1470,15 @@ async function addedPointers(
     if (mode?.startsWith("100") && oid)
       blobs.push({ oid, path: entries[index + 1]! });
   }
+  return pointerBlobs(checkout, blobs, signal);
+}
+
+/** The blobs among `blobs` that are Git LFS pointers, with the oid and size each names. */
+async function pointerBlobs(
+  checkout: string,
+  blobs: readonly { oid: string; path: string }[],
+  signal: AbortSignal,
+): Promise<{ oid: string; size: number; path: string }[]> {
   if (!blobs.length) return [];
   const sizes = (
     await hostGit(checkout, ["cat-file", "--batch-check"], {
@@ -1491,7 +1580,7 @@ async function lfsFetch(input: {
   paths: readonly string[];
   storage?: string;
   signal: AbortSignal;
-}): Promise<MediaOutcome<never> | undefined> {
+}): Promise<Exclude<MediaOutcome<never>, { kind: "repair" }> | undefined> {
   const { checkout, signal } = input;
   const problem = await originProblem(checkout, input.repository, signal);
   if (problem)

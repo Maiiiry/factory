@@ -89,6 +89,7 @@ async function main(argv: string[]): Promise<number> {
                   sandbox: config.sandbox,
                   plan,
                   body,
+                  repository: config.repository,
                   config: config.execution.claudeWorker,
                   allowedSecretNames: config.policy.allowedSecretNames,
                 })

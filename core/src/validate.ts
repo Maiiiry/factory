@@ -28,7 +28,8 @@ import type { SandboxConfig } from "./config.js";
 import { hold, type Outcome } from "./engine.js";
 import { githubEmptyField, markdownLines } from "./markdown.js";
 import {
-  hydrateSelected,
+  hydrateTree,
+  type LfsFile,
   rewrittenMedia,
   type SelectedMember,
 } from "./media.js";
@@ -104,11 +105,14 @@ export interface ValidateInput {
     /** Private capture directory, such as `<state>/artifacts/<issue>/<item>` or `.../final`; emptied first. */
     dir: string;
   };
+  /** Origin's `owner/name`: Git LFS objects the local store lacks are fetched from it. */
+  repository: string;
   /**
-   * Selected media to restore from the local LFS store before any command
-   * runs: media's `validationMembers(plan, item, selection)`. Restored
-   * files are left out of the clean and mutation checks; after the
-   * commands their bytes must still have the selected digests.
+   * The selected media the tree must hold: media's `validationMembers(plan,
+   * item, selection)`. Every Git LFS file of the tree, these and any other,
+   * is restored before any command runs (hydrateTree); restored files are
+   * left out of the clean and mutation checks, and after the commands
+   * their bytes must still be their pointers'.
    */
   media?: readonly SelectedMember[];
   signal: AbortSignal;
@@ -163,7 +167,8 @@ export type Validation =
  * capture is one, naming its command; `retry` → retry; `hold` → hold. A
  * plan selector the installation dropped is a hold with retry (after the
  * selector is restored), replan or cancel; a required media member whose
- * pointer is gone, or that the LFS store cannot restore, is media's hold.
+ * pointer is gone, a Git LFS file neither the local store nor origin can
+ * restore, or LFS files over the bound are media's hold (hydrateTree).
  */
 export async function validateTree(input: ValidateInput): Promise<Validation> {
   const { checkout, commit, plan, item } = input;
@@ -275,18 +280,18 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
       return hold(
         `The validation checkout's tree ${checkedOut} is not the candidate's tree ${tree}. Answer retry to make it again; if it repeats, report it: Factory's checkout is wrong.`,
       );
-    // Selected media arrive as LFS pointers; commands get their bytes.
-    // Restored files differ from their pointer blobs by design.
-    let hydrated = new Set<string>();
-    if (input.media?.length) {
-      const restored = await hydrateSelected({
-        directory: worktree,
-        members: input.media,
-        signal,
-      });
-      if (restored.kind !== "done") return restored;
-      hydrated = new Set(restored.value);
-    }
+    // Git LFS files arrive as pointers; commands get their bytes, as in a
+    // clone. Restored files differ from their pointer blobs by design.
+    const restored = await hydrateTree({
+      directory: worktree,
+      repository: input.repository,
+      commit,
+      members: input.media ?? [],
+      signal,
+    });
+    if (restored.kind !== "done") return restored;
+    const lfsFiles: readonly LfsFile[] = restored.value;
+    const hydrated = new Set(lfsFiles.map((file) => file.path));
     const baseline = await status(worktree, signal);
     const dirty = mutationDetail(Buffer.alloc(0), baseline, hydrated);
     if (dirty) {
@@ -466,14 +471,12 @@ export async function validateTree(input: ValidateInput): Promise<Validation> {
     if (input.returnTo && item)
       produced = await returnProduced(worktree, input.returnTo, item, signal);
     // Hydrated files are left out of the status comparison, so their
-    // bytes are checked against the selected digests instead.
-    const rewritten = input.media?.length
-      ? await rewrittenMedia(worktree, input.media, hydrated)
-      : [];
+    // bytes are checked against their pointers instead.
+    const rewritten = await rewrittenMedia(worktree, lfsFiles);
     const mutation =
       mutationDetail(baseline, await status(worktree, signal), hydrated) ??
       (rewritten.length
-        ? `selected media rewritten: ${rewritten.slice(0, 20).join(", ")}${rewritten.length > 20 ? ` and ${rewritten.length - 20} more` : ""}`
+        ? `Git LFS files rewritten: ${rewritten.slice(0, 20).join(", ")}${rewritten.length > 20 ? ` and ${rewritten.length - 20} more` : ""}`
         : undefined);
     if (mutation || (await revParse(worktree, "HEAD", signal)) !== commit) {
       const detail = `Validation command modified the result tree: ${mutation ?? "HEAD moved"}`;
@@ -551,7 +554,7 @@ async function revParse(
 
 /**
  * The status records that differ between two listings, at most 20 paths, or
- * undefined. A `hydrated` media file's modified record is left out: its
+ * undefined. A `hydrated` Git LFS file's modified record is left out: its
  * bytes replaced its pointer on purpose (rewrittenMedia checks those bytes).
  * Deleting or renaming it still counts.
  */
