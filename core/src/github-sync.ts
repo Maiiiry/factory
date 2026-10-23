@@ -1,6 +1,6 @@
 import type { CoreConfig, QueueOption } from "./config.js";
 import { crashPoint } from "./crash.js";
-import type { EngineLimits, ObjectiveRunner } from "./engine.js";
+import { DEADLINE, type EngineLimits, type ObjectiveRunner } from "./engine.js";
 import {
   type GitHub,
   GitHubError,
@@ -8,7 +8,7 @@ import {
   TransientError,
 } from "./github.js";
 import { backoffMs, Jobs } from "./jobs.js";
-import type { RunLog } from "./log.js";
+import { type RunLog, redact } from "./log.js";
 import { code, mark, prose } from "./markdown.js";
 import {
   decisionsOf,
@@ -26,7 +26,13 @@ import {
   unqueueIssue,
 } from "./queue.js";
 import { type RequestResult, refused, writeRequest } from "./requests.js";
-import type { ObjectiveState, ObjectiveStatus, QueueControl } from "./state.js";
+import type {
+  Hold,
+  ObjectiveState,
+  ObjectiveStatus,
+  QueueControl,
+  Retry,
+} from "./state.js";
 import {
   answerForm,
   CLOCK_SKEW_MS,
@@ -80,6 +86,10 @@ export interface GitHubModule {
   noted?: string;
   /** The human gate a reminder was posted for (`<step>@<since>`). */
   reminded?: string;
+  /** Open questions whose 24 h reminder is posted, by hold id (its step and `askedAt`). */
+  remindedHolds?: string[];
+  /** A cancelled run's closing comment is posted, or GitHub refused it: it counts as shown. */
+  cancelShown?: boolean;
   /** `/factory` comments whose author's access couldn't be read yet, oldest first. */
   unchecked?: UncheckedComment[];
   /** The live status comment's last write: its stable body's hash, the status it showed, and its GitHub time. */
@@ -228,6 +238,8 @@ export class GitHubSync {
   private readonly trackTried = new Map<number, number>();
   /** Status and tracking jobs failed in a row by something other than GitHub's transient errors, by job key. */
   private readonly failures = new Map<string, number>();
+  /** Question comments written compact after GitHub refused them in full, by Objective and hold id (`compactAsk`). */
+  private readonly compact = new Map<number, Set<string>>();
   /** When each live status edit of the last hour was made, across Objectives (this host's clock). */
   private statusEdits: number[] = [];
 
@@ -339,8 +351,10 @@ export class GitHubSync {
       this.status(runner, sync);
       this.track(runner);
       this.reply(runner, module, sync);
+      this.cancelled(runner, module);
       if (finished) continue;
       this.note(runner, module);
+      this.remind(runner, module);
       if (due && !TERMINAL.includes(runner.state.status))
         this.readComments(
           issue,
@@ -425,8 +439,11 @@ export class GitHubSync {
       finalShown(state, this.config) &&
       !unreplied(state, module).length &&
       (!this.config.progress.enabled ||
-        module.statusGivenUp === true ||
-        module.status?.shown === state.status) &&
+        ((module.statusGivenUp === true ||
+          module.status?.shown === state.status) &&
+          (state.status !== "cancelled" ||
+            state.withdrawing === true ||
+            module.cancelShown === true))) &&
       (!this.config.tracking.enabled ||
         module.trackingGivenUp === true ||
         !trackingDue(state))
@@ -449,6 +466,10 @@ export class GitHubSync {
     this.trackTried.delete(issue);
     this.failures.delete(`status:${issue}`);
     this.failures.delete(`track:${issue}`);
+    this.failures.delete(`cancel:${issue}`);
+    for (const key of this.failures.keys())
+      if (key.startsWith(`ask:${issue}:`)) this.failures.delete(key);
+    this.compact.delete(issue);
     this.tally?.forget(issue);
     this.jobs.forget(issue, (key) => key.startsWith("reply:"));
   }
@@ -697,7 +718,9 @@ export class GitHubSync {
    * GitHub time is saved on the hold (`shownAt`): an answer that names no
    * question is compared with it (engine.ts `answer`). A short form shown
    * before another question (`lastShownAt`) would be refused, so that
-   * comment is edited to name its question too.
+   * comment is edited to name its question too. A failure's comment
+   * (cause `failure`) names the failed step and its evidence as well
+   * (`failureLines`), unless progress comments are off. Text is redacted.
    */
   private ask(runner: ObjectiveRunner): void {
     // A run being withdrawn goes instead of asking (service.ts tick).
@@ -712,40 +735,90 @@ export class GitHubSync {
         (hold.shortForm === true &&
           lastShownAt > Date.parse(hold.shownAt ?? ""));
       if (hold.shownAt !== undefined && (!hold.shortForm || !bound)) continue;
-      this.background(issue, `ask:${issue}:${hold.id}`, async (signal) => {
-        const marker = mark(issue, "hold", hold.id);
-        const named = `--question ${hold.id}`;
-        const answers = hold.options
-          .map(
-            (option) =>
-              `- ${code(`/factory ${answerForm(option, bound ? named : undefined)}`)}${option.recommended ? " (recommended)" : ""}: ${prose(option.consequence)}`,
-          )
-          .join("\n");
-        const about = hold.item
-          ? ` It stops Work Item ${code(hold.item)} and the items that depend on it; other work goes on.`
-          : "";
-        const form = others
-          ? " Other questions are open too, so the answer names this one."
-          : bound
-            ? " Another question was shown after this one, so the answer names this one."
-            : ` While this is the only open question, the short form works; \`/factory <answer> ${named}\` always does.`;
-        const comment = await this.github.upsertComment(
-          issue,
-          marker,
-          `${marker}\n**Factory needs you.** ${prose(hold.question)}\n\nReply with one of:\n${answers}\n\nAdd text after the answer to explain it.${about}${form}`,
-          "sync:ask",
-          signal,
-          new Date(Date.parse(hold.askedAt) - CLOCK_SKEW_MS).toISOString(),
-        );
-        runner.transact(() =>
-          runner.shown(
-            hold.id,
-            comment.updated_at ?? comment.created_at,
-            !bound,
-          ),
-        );
-      });
+      this.background(
+        issue,
+        `ask:${issue}:${hold.id}`,
+        async (signal) => {
+          const marker = mark(issue, "hold", hold.id);
+          const named = `--question ${hold.id}`;
+          const answers = hold.options
+            .map(
+              (option) =>
+                `- ${code(`/factory ${answerForm(option, bound ? named : undefined)}`)}${option.recommended ? " (recommended)" : ""}: ${prose(option.consequence)}`,
+            )
+            .join("\n");
+          const about = hold.item
+            ? ` It stops Work Item ${code(hold.item)} and the items that depend on it; other work goes on.`
+            : "";
+          const form = others
+            ? " Other questions are open too, so the answer names this one."
+            : bound
+              ? " Another question was shown after this one, so the answer names this one."
+              : ` While this is the only open question, the short form works; \`/factory <answer> ${named}\` always does.`;
+          const secrets = this.config.secrets;
+          const question = shownQuestion(
+            hold.question,
+            secrets,
+            issue,
+            this.compact.get(issue)?.has(hold.id)
+              ? COMPACT_LIMIT
+              : QUESTION_LIMIT,
+          );
+          const failed =
+            hold.cause === "failure" && this.config.progress.enabled
+              ? failureLines(hold, runner.state.retries[hold.step], secrets)
+              : undefined;
+          const opening = failed
+            ? `${failed.title}\n\n${question}${failed.evidence}`
+            : `**Factory needs you.** ${question}`;
+          const comment = await this.github.upsertComment(
+            issue,
+            marker,
+            `${marker}\n${opening}\n\nReply with one of:\n${answers}\n\nAdd text after the answer to explain it.${about}${form}`,
+            "sync:ask",
+            signal,
+            new Date(Date.parse(hold.askedAt) - CLOCK_SKEW_MS).toISOString(),
+          );
+          runner.transact(() =>
+            runner.shown(
+              hold.id,
+              comment.updated_at ?? comment.created_at,
+              !bound,
+            ),
+          );
+        },
+        true,
+        (error) => this.compactAsk(issue, hold.id, error),
+      );
     }
+  }
+
+  /**
+   * A question comment GitHub refused (a 422 for its size, any lasting
+   * 4xx), or that failed three times in a row other than transiently, is
+   * written compact from then on (its question cut to COMPACT_LIMIT), so
+   * a hold is never left unshown; it keeps retrying with its backoff,
+   * since it is how the question is answered on GitHub.
+   */
+  private compactAsk(issue: number, hold: string, error: unknown): void {
+    if (error instanceof TransientError) return;
+    const key = `ask:${issue}:${hold}`;
+    const failures = (this.failures.get(key) ?? 0) + 1;
+    this.failures.set(key, failures);
+    const refused =
+      error instanceof GitHubError && error.status >= 400 && error.status < 500;
+    if (!refused && failures < GIVE_UP_AFTER) return;
+    this.failures.delete(key);
+    const compact = this.compact.get(issue) ?? new Set<string>();
+    if (compact.has(hold)) return;
+    compact.add(hold);
+    this.compact.set(issue, compact);
+    this.log.write(issue, {
+      event: "question-compacted",
+      hold,
+      failures,
+      error: errorMessage(error),
+    });
   }
 
   /**
@@ -794,8 +867,7 @@ export class GitHubSync {
             ...(state.startedAt ? { startedAt: state.startedAt } : {}),
           },
           this.config.secrets,
-          // W3-08: progress.includeQuestions sets this.
-          { questions: true },
+          { questions: this.config.progress.includeQuestions },
           now,
         );
         const last = (state.modules.github as GitHubModule).status;
@@ -899,7 +971,7 @@ export class GitHubSync {
    */
   private givenUp(
     runner: ObjectiveRunner,
-    job: "status" | "track",
+    job: "status" | "track" | "cancel",
     error: unknown,
   ): void {
     if (error instanceof TransientError) return;
@@ -914,10 +986,16 @@ export class GitHubSync {
     runner.transact(() => {
       const github = runner.state.modules.github as GitHubModule;
       if (job === "status") github.statusGivenUp = true;
-      else github.trackingGivenUp = true;
+      else if (job === "track") github.trackingGivenUp = true;
+      else github.cancelShown = true;
     });
     this.log.write(issue, {
-      event: job === "status" ? "status-given-up" : "tracking-given-up",
+      event:
+        job === "status"
+          ? "status-given-up"
+          : job === "track"
+            ? "tracking-given-up"
+            : "cancel-comment-given-up",
       failures,
       error: errorMessage(error),
     });
@@ -928,9 +1006,11 @@ export class GitHubSync {
    * unknown transient cause has lasted `noteAfterMs`; one reminder once a
    * human gate (an approval, a required review) has lasted `remindAfterMs`.
    * Neither for a step an open question stops: it waits on the answer,
-   * and the engine pauses its clocks until it comes.
+   * and the engine pauses its clocks until it comes. Neither while
+   * progress comments are off.
    */
   private note(runner: ObjectiveRunner, module: GitHubModule): void {
+    if (!this.config.progress.enabled) return;
     const now = this.now();
     const issue = runner.state.issue;
     const waits = Object.entries(runner.state.retries)
@@ -948,7 +1028,7 @@ export class GitHubSync {
         await this.github.upsertComment(
           issue,
           marker,
-          `${marker}\n**Factory is waiting.** Step \`${step}\` has been retrying since ${retry.since}. It began with: ${(retry.cause ?? retry.lastError).slice(0, 500)}\n\nLast error: ${retry.lastError.slice(0, 500)}\n\nFactory keeps retrying on its own, and asks here if the wait goes on.`,
+          `${marker}\n**Factory is waiting.** Step ${code(step)} has been retrying since ${code(retry.since)}. It began with: ${excerpt(retry.cause ?? retry.lastError, this.config.secrets, 500)}\n\nLast error: ${excerpt(retry.lastError, this.config.secrets, 500)}\n\nFactory keeps retrying on its own, and asks here if the wait goes on.`,
           "sync:note",
           signal,
         );
@@ -971,7 +1051,7 @@ export class GitHubSync {
         await this.github.ensureComment(
           issue,
           marker,
-          `${marker}\n**Factory is still waiting on ${what}**, since ${retry.since}. It carries on by itself once that is done.`,
+          `${marker}\n**Factory is still waiting on ${prose(redact(what, this.config.secrets))}**, since ${code(retry.since)}. It carries on by itself once that is done.`,
           "sync:remind",
           signal,
           skewed(retry.since),
@@ -981,6 +1061,105 @@ export class GitHubSync {
         });
       });
     }
+  }
+
+  /**
+   * One reminder per open question once it has been open `remindAfterMs`
+   * (24 h; FACTORY_REMIND_MS in tests), linking its question comment. It
+   * is keyed by the hold's id, which carries its step and `askedAt`, so a
+   * restart never posts it twice and a question asked again is a new one
+   * with its own day. Only a question already shown on the issue is
+   * reminded of, and none while progress comments are off.
+   */
+  private remind(runner: ObjectiveRunner, module: GitHubModule): void {
+    if (!this.config.progress.enabled || runner.state.withdrawing) return;
+    const now = this.now();
+    const issue = runner.state.issue;
+    for (const hold of runner.state.holds) {
+      if (
+        hold.shownAt === undefined ||
+        module.remindedHolds?.includes(hold.id) ||
+        now - Date.parse(hold.askedAt) < this.limits.remindAfterMs
+      )
+        continue;
+      this.background(issue, `remind:${issue}:${hold.id}`, async (signal) => {
+        const since = skewed(hold.askedAt);
+        const asked = await this.github.markedComment(
+          issue,
+          mark(issue, "hold", hold.id),
+          since,
+          signal,
+        );
+        const marker = mark(issue, "remind", `hold:${hold.id}`);
+        const first = redact(hold.question, this.config.secrets)
+          .split("\n")[0]!
+          .trim();
+        const about = first.length > 300 ? `${first.slice(0, 299)}…` : first;
+        await this.github.ensureComment(
+          issue,
+          marker,
+          `${marker}\n**Factory still needs you.** Question ${code(hold.id)}${hold.item ? ` (Work Item ${code(hold.item)})` : ""} has been open since ${code(hold.askedAt)}: ${prose(about)}\n\nIts answers are in ${asked?.html_url ? `[its comment](${asked.html_url})` : "its comment above"}; ${code(`factory status ${issue}`)} lists them too. This is the only reminder.`,
+          "sync:remind",
+          signal,
+          since,
+        );
+        runner.transact(() => {
+          const github = runner.state.modules.github as GitHubModule;
+          const open = new Set(runner.state.holds.map((h) => h.id));
+          github.remindedHolds = [
+            ...(github.remindedHolds ?? []).filter((id) => open.has(id)),
+            hold.id,
+          ];
+        });
+      });
+    }
+  }
+
+  /**
+   * A cancelled run's one closing comment: who cancelled it (the login
+   * of a `/factory cancel` comment's author; a CLI cancel is "the
+   * operator", never the host's user name), or its deadline. Keyed by the run, so a restart never posts it twice;
+   * a finished Objective settles once it is posted, or GitHub refused it
+   * (`givenUp`). None for a withdrawn run or while progress comments are
+   * off.
+   */
+  private cancelled(runner: ObjectiveRunner, module: GitHubModule): void {
+    const { state } = runner;
+    if (
+      !this.config.progress.enabled ||
+      state.status !== "cancelled" ||
+      state.withdrawing ||
+      module.cancelShown
+    )
+      return;
+    const issue = state.issue;
+    this.background(
+      issue,
+      `cancel:${issue}`,
+      async (signal) => {
+        const marker = mark(issue, "cancelled", runOf(state));
+        const ended = state.ended;
+        const why =
+          ended?.by === DEADLINE
+            ? `its deadline${state.deadline ? `, ${code(state.deadline)},` : ""} passed`
+            : ended?.source === "github" && ended.by
+              ? `${prose(ended.by)} cancelled it`
+              : "the operator cancelled it";
+        await this.github.ensureComment(
+          issue,
+          marker,
+          `${marker}\n**Factory cancelled this Objective**${ended ? ` at ${code(ended.at)}` : ""}: ${why}. Its open pull requests close and the issue closes as not planned; what merged stays merged. Queue it again to run it from a new plan.`,
+          "sync:cancel",
+          signal,
+          sinceRun(state),
+        );
+        runner.transact(() => {
+          (runner.state.modules.github as GitHubModule).cancelShown = true;
+        });
+      },
+      true,
+      (error) => this.givenUp(runner, "cancel", error),
+    );
   }
 
   /**
@@ -1167,6 +1346,7 @@ export class GitHubSync {
             },
       comment.login,
       `comment-${comment.id}`,
+      "github",
     );
   }
 
@@ -1247,6 +1427,91 @@ export class GitHubSync {
       },
     });
   }
+}
+
+/** A question's most in a comment: whole up to here, then cut with where the rest is. */
+const QUESTION_LIMIT = 20_000;
+/** Each error line of a failure's evidence. */
+const EVIDENCE_LIMIT = 1_000;
+
+/** The end of a question kept whole when its middle is cut: the engine appends its notes (the switch answers, the deadline) there. */
+const QUESTION_TAIL = 4_000;
+/** A compact question comment, after GitHub refused the full one: its question is cut to this. */
+const COMPACT_LIMIT = 4_000;
+
+/**
+ * Untrusted error text in a comment: redacted with `secrets`, then cut to
+ * `limit` characters, then one code span, so the cut never splits a
+ * secret's redaction or an escape.
+ */
+function excerpt(
+  value: string,
+  secrets: readonly string[],
+  limit: number,
+): string {
+  const shown = redact(value, secrets);
+  return code(shown.length > limit ? `${shown.slice(0, limit - 1)}…` : shown);
+}
+
+/**
+ * A question for a comment: redacted, escaped (markdown.ts `prose`), and
+ * only then cut to `limit` characters, so the limit holds for what GitHub
+ * gets. A long question loses its middle, never its end, where the
+ * engine's notes are, and a cut never splits an escape (`&…;`).
+ */
+function shownQuestion(
+  question: string,
+  secrets: readonly string[],
+  issue: number,
+  limit: number,
+): string {
+  const text = prose(redact(question, secrets));
+  if (text.length <= limit) return text;
+  const gap = `\n\n… (cut to fit a comment; ${code(`factory status ${issue}`)} shows it all) …\n\n`;
+  const tail = Math.min(QUESTION_TAIL, Math.floor(limit / 2));
+  const head = entitySafe(text, limit - tail - gap.length, "end");
+  const end = entitySafe(text, text.length - tail, "start");
+  return `${text.slice(0, head)}${gap}${text.slice(end)}`;
+}
+
+/**
+ * A cut position in escaped text moved off any `&…;` escape it falls
+ * inside: back to its `&` when it ends the head, past its `;` when it
+ * starts the tail.
+ */
+function entitySafe(text: string, at: number, side: "end" | "start"): number {
+  const amp = text.lastIndexOf("&", at - 1);
+  if (amp < 0 || at - amp > 6) return at;
+  const semi = text.indexOf(";", amp);
+  if (semi < 0 || semi < at) return at;
+  return side === "end" ? amp : semi + 1;
+}
+
+/**
+ * A failure's comment (a hold with the cause `failure`): a title naming
+ * the failed step and its Work Item, and the evidence the engine kept
+ * for the step (`retries`: its run of errors, first and last), redacted
+ * and cut to EVIDENCE_LIMIT each. The question itself says what failed.
+ */
+function failureLines(
+  hold: Hold,
+  retry: Retry | undefined,
+  secrets: readonly string[],
+): { title: string; evidence: string } {
+  const item = hold.item ? ` of Work Item ${code(hold.item)}` : "";
+  const title = `**Factory stopped: step ${code(hold.step)}${item} failed.** It can't succeed as it is, so it waits for your answer; nothing else it stops runs until then.`;
+  if (!retry?.count) return { title, evidence: "" };
+  const line = (value: string) => excerpt(value, secrets, EVIDENCE_LIMIT);
+  const first = retry.cause ?? retry.lastError;
+  const evidence = [
+    "",
+    "",
+    "**Evidence**",
+    `- ${retry.count} ${retry.count === 1 ? "error" : "errors in a row"} before it asked, since ${code(retry.since)}.`,
+    ...(first !== retry.lastError ? [`- First: ${line(first)}`] : []),
+    `- Last: ${line(retry.lastError)}`,
+  ].join("\n");
+  return { title, evidence };
 }
 
 /**
