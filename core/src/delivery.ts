@@ -319,22 +319,20 @@ export function publish(
         signal,
       );
     } catch (error) {
-      // The branch adds nothing to the default branch: an empty change.
-      if (
-        error instanceof GitHubError &&
-        error.status === 422 &&
-        /No commits between/i.test(error.message)
-      )
+      if (!(error instanceof GitHubError && error.status === 422))
+        throw needing(error, "Pull requests: write");
+      // GitHub's compare status decides, not its error text: a result
+      // identical to or behind the base adds nothing, an empty change.
+      const status = await github.compare(baseBranch, input.commit, signal);
+      if (status === "identical" || status === "behind")
         return {
           kind: "empty",
-          finding: `The result ${input.commit} adds no commits to ${baseBranch} (GitHub: ${error.message.slice(0, 300)}). The Work Item's change is empty or already on ${baseBranch}: make the change the Work Item asks for.`,
+          finding: `The result ${input.commit} adds no commits to ${baseBranch} (GitHub compares it as ${status}). The Work Item's change is empty or already on ${baseBranch}: make the change the Work Item asks for.`,
         };
       // A PR for the branch exists already (a create whose answer was lost).
-      if (error instanceof GitHubError && error.status === 422)
-        return retry(
-          `GitHub refused a second PR for ${branch}: ${error.message}`,
-        );
-      throw needing(error, "Pull requests: write");
+      return retry(
+        `GitHub refused a second PR for ${branch}: ${error.message}`,
+      );
     }
     crashPoint("deliver:pr-create:after");
     return {
