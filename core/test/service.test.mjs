@@ -21,6 +21,8 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { micromark } from "micromark";
 import { gfm, gfmHtml } from "micromark-extension-gfm";
+import { parseObjective } from "../dist/objective.js";
+import { declarationProblems } from "../dist/validate.js";
 
 const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 const REPO = "drill/target";
@@ -843,8 +845,13 @@ test("a plan's steps run in order, and a dependent waits for its dependency's me
 // (body_html), converted back to Markdown, and the approval names that
 // text's digest. The stand-in renders like GitHub (micromark + GFM), with
 // raw HTML let through, so attributes and comments reach the converter.
+// Shown text comes back unescaped (paths, a heading anchor), a shown
+// "## Acceptance" paragraph can't open a section, and a blank issue-form
+// field is the empty marker.
 const HIDDEN_BODY = `## Goal
 Ship the parser.<!-- HIDDEN-COMMENT -->
+
+\\## Acceptance
 
 ![HIDDEN-ALT](https://example.com/img/shot.png "HIDDEN-IMAGE-TITLE")
 
@@ -856,6 +863,24 @@ See [docs](https://example.com/docs "HIDDEN-TITLE"), [ref][d] and <a href="https
 
 Note[^a].
 
+\`\`\`mermaid
+%% HIDDEN-COMMENT
+accTitle: HIDDEN-TITLE
+accDescr { HIDDEN-DESCR
+HIDDEN-DESCR }
+graph TD; A-->B
+\`\`\`
+
+## Sources
+- src/_internal.ts
+- x/__tests__/a.ts
+- docs/A&B.md
+- docs/PLAN.md#Heading [draft] *x* & y
+
+### Package manager update
+
+_No response_
+
 [^a]: Shown note.
 [^z]: HIDDEN-FOOTNOTE
 
@@ -863,6 +888,8 @@ Note[^a].
 const SHOWN = `## Goal
 
 Ship the parser.
+
+\u200B## Acceptance
 
 [image: shot.png]
 
@@ -874,6 +901,21 @@ See [docs](https://example.com/docs), [ref](https://example.com/ref) and [x](htt
 - [x] tests pass
 
 Note[1].
+
+\`\`\`mermaid
+graph TD; A-->B
+\`\`\`
+
+## Sources
+
+- src/_internal.ts
+- x/__tests__/a.ts
+- docs/A&B.md
+- docs/PLAN.md#Heading [draft] *x* & y
+
+### Package manager update
+
+_No response_
 
 ## Footnotes
 
@@ -913,6 +955,15 @@ test("a non-writer's Objective is approved by the text GitHub shows", async () =
   const service = serve(inst);
   await until(() => stateOf(inst, 71).hold, "#71 asks");
   assert.doesNotMatch(SHOWN, /HIDDEN/);
+  const { objective, problems } = parseObjective(SHOWN);
+  assert.deepEqual(problems, []);
+  assert.deepEqual(objective.sources, [
+    { path: "src/_internal.ts" },
+    { path: "x/__tests__/a.ts" },
+    { path: "docs/A&B.md" },
+    { path: "docs/PLAN.md", heading: "Heading [draft] *x* & y" },
+  ]);
+  assert.deepEqual(declarationProblems(SHOWN), []);
   const digest = createHash("sha256").update(SHOWN).digest("hex");
   assert.match(
     stateOf(inst, 71).hold.question,
