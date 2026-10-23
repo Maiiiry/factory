@@ -42,7 +42,11 @@ export type ItemKind = "work" | "qa" | "aggregate" | "discovery";
  * read this list. A kind joins it when its executor lands; a saved plan
  * with any other kind holds at that item.
  */
-export const EXECUTABLE_KINDS: readonly ItemKind[] = ["work", "aggregate"];
+export const EXECUTABLE_KINDS: readonly ItemKind[] = [
+  "work",
+  "qa",
+  "aggregate",
+];
 
 /** Whether this build executes, and the planner is offered, `kind`. */
 export const executable = (kind: ItemKind = "work"): boolean =>
@@ -295,8 +299,10 @@ export interface PlanningFacts {
   authorizedCommands: string[];
   /** Installation commands that need network and run only in CI. */
   ciOnlyCommands: string[];
-  /** CI check names in the base workflows. */
+  /** CI check names the base's pull-request workflows report. */
   checkNames: string[];
+  /** CI check names the base's workflows report on a push to the default branch: integrated-ci's only choices. */
+  integratedCheckNames: string[];
   /** Root package scripts the final commands run, which no item may change. */
   fixedScripts: { name: string; body: string }[];
   /** The Objective's Acceptance criteria, in order. */
