@@ -26,7 +26,6 @@ import {
   type Selection,
   selectionQuestion,
   selectionRef,
-  selectionSummary,
   validationMembers,
   verifyOriginMedia,
 } from "../media.js";
@@ -929,6 +928,8 @@ async function selectStep(
     tree: made.value.tree,
     set: read.set,
     bound: read.bound,
+    by: answer.by,
+    at: answer.at,
   };
   return { kind: "done", result: done };
 }
@@ -967,12 +968,10 @@ async function reviewStep(
     validation: validated,
     sources: await pinnedSources(state, deps, signal),
     dir: `${worktree}.review`,
-    notes: [
-      JSON.stringify(work.notes),
-      ...(chosen
-        ? [selectionSummary([{ item: item.id, selection: chosen }])]
-        : []),
-    ].join("\n\n"),
+    notes: JSON.stringify(work.notes),
+    ...(chosen
+      ? { candidates: [{ item, sets: work.sets, selection: chosen }] }
+      : {}),
     ...(validated.artifacts ? { artifacts: validated.artifacts } : {}),
     decisions,
     signal,
@@ -1570,6 +1569,15 @@ export function finalReviewStep(deps: BuildDeps): Step {
                 )?.artifacts ?? [],
             })),
           ],
+          candidates: plan.items.flatMap((item) => {
+            const chosen = selection(state)(item.id);
+            const work = state.done[stepKey(item.id, "work")] as
+              | WorkResult
+              | undefined;
+            return chosen && work && mergedIds.includes(item.id)
+              ? [{ item, sets: work.sets, selection: chosen }]
+              : [];
+          }),
           sources: await pinnedSources(state, deps, signal),
           dir: join(deps.workDir(state.issue), "final-review"),
           ...(criterionDecisions(

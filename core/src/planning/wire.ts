@@ -158,7 +158,7 @@ export const CONTROLLER_GUARANTEES: { id: string; statement: string }[] = [
   {
     id: "selected-set-materialization",
     statement:
-      "Factory captures complete candidate AssetSets in private staging and stops for explicit human whole-set selection. It then materializes only selected bytes to Work Item-owned destinations, enforces the target Git attributes for every required LFS role, scans the staged result, and verifies each committed LFS pointer against the captured SHA-256 digest and byte count.",
+      "Factory captures complete candidate AssetSets in private staging and stops for explicit human whole-set selection. It then materializes only selected bytes to Work Item-owned destinations, enforces the target Git attributes for every required LFS role, scans the staged result, and verifies each committed LFS pointer against the captured SHA-256 digest and byte count. Unselected sets stay in private staging: they are never committed, validated, reviewed as delivered bytes or merged; review receives a controller receipt of every captured set and the selection.",
   },
   {
     id: "review-artifact-capture",
@@ -366,7 +366,12 @@ function contract(facts: PlanningFacts, options: WireOptions = {}) {
           },
           // Numeric bounds are not supported by every structured-output grammar.
           // A decimal pattern enforces positivity before strict safe-integer decoding.
-          minimumAssetSets: { type: "string", pattern: "^[1-9][0-9]*$" },
+          minimumAssetSets: {
+            type: "string",
+            pattern: "^[1-9][0-9]*$",
+            description:
+              "How many alternative sets the worker offers for the operator to choose from; only the selected set is delivered and validated.",
+          },
           requiredLfsRoles: { type: "array", items: text },
         }),
       ],

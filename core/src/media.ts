@@ -12,6 +12,7 @@
  *   select    selectionQuestion / readSelection → materializeSelection
  *   validate  validationMembers → hydrateSelected (in the fresh checkout) →
  *             commands → rewrittenMedia
+ *   review    candidateReceipts (result review, and final review of merged items)
  *   publish   lfsPushIfPointers, called by delivery's publish before it pushes
  *   final     validationMembers → verifyOriginMedia
  *
@@ -131,6 +132,9 @@ export interface Selection {
   set: CandidateSet;
   /** Direct dependents that receive the set as read-only inputs. */
   bound: string[];
+  /** Who chose the set and when; absent on selections made before Factory recorded them. */
+  by?: string;
+  at?: string;
 }
 
 /** A file a worker gets read-only under `.factory-inputs/assets`. */
@@ -1675,19 +1679,137 @@ async function reachable(
   }
 }
 
+/** One item's captured candidate sets and the operator's selection, for review. */
+export interface CandidateRecord {
+  item: WorkItem;
+  sets: readonly CandidateSet[];
+  selection: Selection;
+}
+
+/** Bounds for the candidate copies one review's evidence root holds. */
+const REVIEW_MEMBER_BYTES = 1 * MIB;
+const REVIEW_CANDIDATE_BYTES = 64 * MIB;
+
+/** What captureAssets and destinationFinding check; a set that fails one is never captured. */
+const CAPTURE_CHECKS = [
+  "The manifest .factory-assets.json is within its byte bound, passed the secret scan and is well-formed JSON with a sets array",
+  "The manifest declares at least the item's minimum number of sets",
+  "Each set id is well-formed, unique ignoring case and not a reserved answer",
+  "Each set has provenance with source, rights, visibility (private or repository) and lineage",
+  "Each set has members; each member has a well-formed role used once in its set, a staged path under .factory-media/, a media type and a destination that is a repository path the item owns, used once in its set",
+  "Each set has every expected output role",
+  "Each member is a regular file reached without links, within the per-member and per-capture byte bounds; Factory copied it to private staging and recorded the copy's sha256 and byte count",
+  "No two sets have the same content (the same sha256 for every role)",
+  "Every text member passed the secret scan",
+  "The worker's committed result neither writes nor deletes any candidate destination",
+];
+
+/** What materializeSelection checks for the selected set before it commits it. */
+const SELECTION_CHECKS = [
+  "Every captured copy of the selected set still has its recorded sha256 and byte count",
+  "The target's .gitattributes routes every required LFS role's destination through Git LFS",
+  "No destination already held other content",
+  "The selection commit changes exactly the selected destinations, on top of the worker's commit",
+  "Each committed Git LFS pointer carries the member's sha256 and byte count",
+];
+
 /**
- * Selected media as text for result and final review: per item, the set,
- * its provenance and each member's role, destination, type and digest.
+ * The controller candidate receipt for result and final review: per item,
+ * every captured set (id, provenance, worker-declared relationships,
+ * production and format metadata, each member's role, destination, media
+ * type, size and sha256), the capture checks every set passed, and the
+ * operator's selection. Factory's private copy of each member within the
+ * review bounds goes to `media-sets/<item>/<set>/` under `root`, checked
+ * against its recorded digest, so the reviewer can compare the sets' bytes.
+ * Returns one receipt per item, as JSON text.
  */
-export function selectionSummary(
-  selections: readonly { item: string; selection: Selection }[],
-): string {
-  return selections
-    .map(
-      ({ item, selection: { set, bound } }) =>
-        `Work Item ${item} delivers selected set ${set.id} (source ${set.provenance.source}; rights ${set.provenance.rights}; visibility ${set.provenance.visibility}; lineage ${set.provenance.lineage.join(" > ") || "none"}${bound.length ? `; bound to ${bound.join(", ")}` : ""}):\n${set.members.map((m) => `- ${m.role} → ${m.destination} (${m.mediaType}, ${m.bytes} bytes, sha256 ${m.sha256})`).join("\n")}`,
-    )
-    .join("\n\n");
+export async function candidateReceipts(
+  root: string,
+  records: readonly CandidateRecord[],
+): Promise<{ item: string; content: string }[]> {
+  let budget = REVIEW_CANDIDATE_BYTES;
+  const receipts = [];
+  for (const { item, sets, selection } of records) {
+    const described = [];
+    for (const set of sets) {
+      const members = [];
+      for (const member of set.members) {
+        const relative = `media-sets/${safeName(item.id)}/${set.id.toLowerCase()}/${basename(member.file)}`;
+        let copied = false;
+        if (member.bytes <= Math.min(REVIEW_MEMBER_BYTES, budget)) {
+          const target = join(root, relative);
+          await mkdir(join(target, ".."), { recursive: true, mode: 0o700 });
+          const held = await copyFile(member.file, target)
+            .then(() => digestFile(target))
+            .catch(() => undefined);
+          copied =
+            held?.sha256 === member.sha256 && held.bytes === member.bytes;
+          if (copied) budget -= member.bytes;
+          else await rm(target, { force: true });
+        }
+        members.push({
+          role: member.role,
+          destination: member.destination,
+          mediaType: member.mediaType,
+          bytes: member.bytes,
+          sha256: member.sha256,
+          reviewCopy: copied ? relative : null,
+          ...(member.formatMetadata !== undefined && {
+            declaredFormatMetadata: member.formatMetadata,
+          }),
+        });
+      }
+      described.push({
+        id: set.id,
+        selected: set.id === selection.set.id,
+        provenance: set.provenance,
+        ...(set.relationships !== undefined && {
+          declaredRelationships: set.relationships,
+        }),
+        ...(set.production !== undefined && {
+          declaredProduction: set.production,
+        }),
+        members,
+      });
+    }
+    const roles = [
+      ...new Set(sets.flatMap((s) => s.members.map((m) => m.role))),
+    ];
+    const digests = (role: string) =>
+      new Set(
+        sets.map((s) => s.members.find((m) => m.role === role)?.sha256 ?? ""),
+      ).size;
+    receipts.push({
+      item: item.id,
+      content: JSON.stringify({
+        record:
+          "Factory controller candidate receipt: built by Factory from the sets it captured and the operator's answer, not written by the worker. Fields named declared* are the worker's manifest declarations, checked only for shape.",
+        workItem: item.id,
+        minimumSets: item.minimumAssetSets ?? 1,
+        expectedRoles: item.expectedOutputRoles ?? [],
+        capturedSets: sets.length,
+        captureChecksPassedByEverySet: CAPTURE_CHECKS,
+        rolesWhoseBytesDifferAcrossSets: roles.filter((r) => digests(r) > 1),
+        rolesWithIdenticalBytesAcrossSets: roles.filter(
+          (r) => digests(r) === 1,
+        ),
+        sets: described,
+        selection: {
+          set: selection.set.id,
+          by: selection.by ?? null,
+          at: selection.at ?? null,
+          boundTo: selection.bound,
+          selectionCommit: selection.commit,
+          checksPassed: SELECTION_CHECKS,
+        },
+        delivery:
+          "Only the selected set is written at its destinations, then validated (its members hydrated in the fresh validation checkout and checked against their sha256 and size before the validation commands ran), reviewed, published and merged. Unselected sets stay in Factory's private staging: they are never committed, validated or delivered.",
+        reviewCopies:
+          "reviewCopy is the evidence-root path of Factory's private copy of the member, checked against its sha256; null when the member exceeds the review copy bounds.",
+      }),
+    });
+  }
+  return receipts;
 }
 
 // ── Bytes ───────────────────────────────────────────────────────────────

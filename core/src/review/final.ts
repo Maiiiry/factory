@@ -12,6 +12,7 @@
  * operator. Provider failures escape as `PlannerError`.
  */
 import { rm } from "node:fs/promises";
+import type { CandidateRecord } from "../media.js";
 import { parseObjective } from "../objective.js";
 import { coverageCriterion } from "../planning/graph.js";
 import { DESIGN_CHECKLIST } from "../planning/rubric.js";
@@ -23,7 +24,9 @@ import {
   reviewArtifactEvidence,
 } from "./artifacts.js";
 import {
+  CANDIDATE_GUIDANCE,
   type CriterionDecision,
+  candidateRows,
   changeIndexRow,
   decisionRows,
   decodeResultReview,
@@ -61,6 +64,8 @@ export async function reviewObjective(input: {
    */
   artifacts?: readonly ReviewArtifactGroup[];
   sources: readonly PinnedSource[];
+  /** Each merged item's captured candidate sets and the operator's selection. */
+  candidates?: readonly CandidateRecord[];
   /** A private directory for the evidence root. */
   dir: string;
   /** Operator decisions; those on this tree replace the reviewer's verdict. */
@@ -87,6 +92,7 @@ export async function reviewObjective(input: {
       tree,
       root,
     );
+    const receipts = await candidateRows(root, input.candidates);
     const evidence: ResultEvidence[] = [
       ...sourceRows(input.sources),
       ...input.plan.items.map(
@@ -100,6 +106,7 @@ export async function reviewObjective(input: {
       ...decisionRows(input.plan),
       changeIndexRow(input.base, input.commit, tree, changes, input.merges),
       validationRow(input.validation),
+      ...receipts,
       ...captured.rows,
       ...rows,
     ];
@@ -108,9 +115,11 @@ export async function reviewObjective(input: {
         role: "reviewer",
         phase: "objective-review",
         prompt: reviewPrompt(
-          captured.rows.length
-            ? `${FINAL_INSTRUCTIONS}\n${REVIEW_ARTIFACT_GUIDANCE}`
-            : FINAL_INSTRUCTIONS,
+          [
+            FINAL_INSTRUCTIONS,
+            ...(captured.rows.length ? [REVIEW_ARTIFACT_GUIDANCE] : []),
+            ...(receipts.length ? [CANDIDATE_GUIDANCE] : []),
+          ].join("\n"),
           criteria,
           evidence,
           input.base,
