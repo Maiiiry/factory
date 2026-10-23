@@ -697,11 +697,14 @@ export class ObjectiveRunner {
    * run while a question is open, so its wait clocks (`since`, a granted
    * wait) pause from when it was due, or the question was asked if later,
    * until now. Its budgets and the status note count only time it could run.
+   * A human gate's `since` stays: it is never timed out, and its reminder
+   * (github-sync note) is keyed to the original start, so moving it would
+   * post the reminder again.
    */
   private resume(askedAt: string, held: string): void {
     const now = this.now().getTime();
     for (const [key, retry] of Object.entries(this.state.retries)) {
-      if (key === held) continue;
+      if (key === held || retry.wait?.kind === "gate") continue;
       const paused =
         now - Math.max(Date.parse(askedAt), Date.parse(retry.nextAt));
       if (!(paused > 0)) continue;
