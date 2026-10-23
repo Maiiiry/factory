@@ -126,7 +126,18 @@ function shown(nodes: readonly RootContent[]): ElementContent[] {
     // A rendered diagram (mermaid and the like): its source, as code.
     if (tag === "section" && p.dataType !== undefined)
       return find(node, "pre").flatMap((pre) => shown([pre]));
-    if (tag === "pre") return [codeBlock(textOf(node), language(node))];
+    if (tag === "pre") {
+      const lang = language(node);
+      // A mermaid `%%` line is a comment: the rendered diagram never shows it.
+      const source =
+        lang === "mermaid"
+          ? textOf(node)
+              .split("\n")
+              .filter((line) => !/^\s*%%/.test(line))
+              .join("\n")
+          : textOf(node);
+      return [codeBlock(source, lang)];
+    }
     if (tag === "math-renderer") {
       const source = textOf(node);
       return classes(p).includes("js-display-math")
