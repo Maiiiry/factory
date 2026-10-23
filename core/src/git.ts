@@ -254,17 +254,56 @@ export async function defaultHead(
   }
 }
 
-/** The byte strings a secret value is found by: as written, and base64. */
+/**
+ * The shortest whole secret value a push is refused for. Redaction
+ * (config.ts MIN_SECRET_LENGTH) goes lower: hiding a short value from a
+ * comment is harmless, but refusing every file that contains one isn't.
+ */
+const MIN_REFUSED_SECRET = 8;
+
+/** The shortest piece of a multi-line secret a push is refused for. */
+const MIN_REFUSED_PIECE = 16;
+
+/** A PEM armor line, the same in every key. */
+const PEM_ARMOR = /^-----(?:BEGIN|END) [A-Z0-9 ]+-----$/;
+
+/**
+ * Whether a piece of a multi-line secret looks like key material: mixed
+ * case and digits (base64), or long hex, with high entropy. JSON keys,
+ * well-known URLs and other lowercase words don't qualify.
+ */
+function keyMaterial(piece: string): boolean {
+  if (piece.length < MIN_REFUSED_PIECE || PEM_ARMOR.test(piece)) return false;
+  const mixed = /[a-z]/.test(piece) && /[A-Z]/.test(piece) && /\d/.test(piece);
+  if (!mixed && !/^[0-9a-fA-F]{32,}$/.test(piece)) return false;
+  const counts = new Map<string, number>();
+  for (const c of piece) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let bits = 0;
+  for (const n of counts.values())
+    bits -= (n / piece.length) * Math.log2(n / piece.length);
+  return bits >= 3.5;
+}
+
+/**
+ * The byte strings a push is refused for, as written and base64: each
+ * whole secret value, and the pieces of a multi-line one (a PEM key, a
+ * service-account JSON) that are key material, so a fixture holding PEM
+ * armor or a common JSON line isn't refused.
+ */
 function secretNeedles(secrets: readonly string[]): {
   exact: Buffer[];
   encoded: Buffer[];
 } {
   const values = new Set<string>();
   for (const secret of secrets) {
-    values.add(secret);
-    // Line by line too, as redact (log.ts) does.
-    for (const line of secret.split(/\r?\n/))
-      if (line.length >= 4) values.add(line);
+    if (secret.length >= MIN_REFUSED_SECRET) values.add(secret);
+    if (!/[\r\n]/.test(secret)) continue;
+    for (const line of secret.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (keyMaterial(trimmed)) values.add(trimmed);
+      for (const token of trimmed.split(/[\s"',:;{}[\]=]+/))
+        if (keyMaterial(token)) values.add(token);
+    }
   }
   const exact: Buffer[] = [];
   const encoded = new Set<string>();
@@ -304,7 +343,7 @@ class StreamSearch {
 
 /**
  * A search of one stream of bytes for the values of `secrets`
- * (config.secrets): as written, line by line as redact (log.ts) does, or
+ * (config.secrets, secretNeedles): as written, or
  * base64 (standard or URL-safe, at any alignment, line breaks ignored).
  * Memory stays bounded by the longest needle, whatever the stream's size.
  */

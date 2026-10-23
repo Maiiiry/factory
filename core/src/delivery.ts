@@ -19,6 +19,7 @@ import {
   operatorGit,
   pathsHoldingSecrets,
   pinnedGitExit,
+  sha256,
 } from "./git.js";
 import {
   type AsyncMerge,
@@ -166,6 +167,8 @@ export interface PublishInput {
   reset?: boolean;
   /** The values no pushed blob may hold (config.secrets). */
   secrets: readonly string[];
+  /** The digest of a secret finding the operator let through (`publish`). */
+  allowSecret?: string;
   /**
    * The PR's base: omitted (the default branch) for a regular item or the
    * bottom layer of a native stack; the predecessor layer's branch
@@ -201,8 +204,11 @@ export type PublishResult =
       merged: boolean;
     }
   | Empty
-  /** A blob the push would add holds a secret value; nothing was pushed. */
-  | { kind: "secret"; finding: string }
+  /**
+   * A blob the push would add holds a secret value; nothing was pushed.
+   * `digest` names this finding on this commit, for the operator's answer.
+   */
+  | { kind: "secret"; finding: string; digest: string }
   | Retry
   | Repair
   | Hold;
@@ -218,11 +224,13 @@ export type PublishResult =
  * there is none is one opened, so a lost create is found by the next run.
  *
  * Before a push, a blob the result adds or changes that holds a value of
- * `secrets` stops it: `secret`.
+ * `secrets` stops it: `secret`, unless `allowSecret` is that finding's
+ * digest.
  *
  * Outcomes for the publish step: `published` → done; `empty` and `repair`
  * → the item's delivery repair with the finding; `secret` → a hold whose
- * `repair` answer sends the finding to the worker; `retry` and `hold` as
+ * `repair` answer sends the finding to the worker and whose `publish`
+ * answer lets exactly that finding through; `retry` and `hold` as
  * they are.
  */
 export function publish(
@@ -299,11 +307,15 @@ export function publish(
           signal,
         )),
       ];
-      if (leaked.length)
-        return {
-          kind: "secret",
-          finding: `The result writes the value of a secret Factory redacts (a policy.allowedSecretNames variable or a managed provider's credential), as written or base64-encoded, into ${leaked.map((path) => JSON.stringify(path)).join(", ")}. Remove it from those files and never write a secret's value into the repository.`,
-        };
+      if (leaked.length) {
+        const finding = `The result writes the value of a secret Factory redacts (a policy.allowedSecretNames variable or a managed provider's credential), as written or base64-encoded, into ${leaked.map((path) => JSON.stringify(path)).join(", ")}. Remove it from those files and never write a secret's value into the repository.`;
+        const digest = sha256(Buffer.from(`${input.commit}\n${finding}`)).slice(
+          0,
+          16,
+        );
+        if (input.allowSecret !== digest)
+          return { kind: "secret", finding, digest };
+      }
       // Only before a push: a branch that holds the result already has its objects.
       const media = await lfsPushIfPointers({
         checkout: context.checkout,

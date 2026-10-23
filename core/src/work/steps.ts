@@ -1251,6 +1251,11 @@ function delivery(
   };
 }
 
+/** The secret finding digest a publish hold names. */
+function findingDigest(question: string): string | undefined {
+  return /\(finding `([0-9a-f]{16})`\)/.exec(question)?.[1];
+}
+
 async function publishStep(
   item: WorkItem,
   context: StepContext,
@@ -1290,6 +1295,10 @@ async function publishStep(
       ...(context.answer?.answer === RESET_BRANCH ? { reset: true } : {}),
       ...(branch ? { baseBranch: branch } : {}),
       secrets: deps.config.secrets,
+      // The operator's `publish` counts only for the finding it answered.
+      ...(context.answer?.answer === "publish" && context.answer.question
+        ? { allowSecret: findingDigest(context.answer.question) }
+        : {}),
     },
   );
   if (result.kind === "secret")
@@ -1303,8 +1312,8 @@ async function publishStep(
           deps,
         )
       : hold(
-          `${result.finding}\n\nPublication stopped; nothing was pushed. Answer repair to have the worker remove the value, or cancel. Rotate the secret if the worker may have written it anywhere else.`,
-          ["repair", "cancel"],
+          `${result.finding}\n\nPublication stopped; nothing was pushed (finding \`${result.digest}\`). Answer repair to have the worker remove the value; publish if the matched text isn't a secret, which lets exactly this finding on this commit through once; or cancel. Rotate the secret if the worker may have written it anywhere else.`,
+          ["repair", "publish", "cancel"],
         );
   // An empty change, or a pointer whose LFS object is missing: a fault in
   // the result itself, not a conflict, so no rebase.
