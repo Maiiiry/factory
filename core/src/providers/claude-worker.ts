@@ -65,6 +65,7 @@ import {
   type SessionFacts,
   SYNTHETIC_MODEL,
   serviceLoginEnvironment,
+  toolResultText,
   usageOf,
 } from "./claude.js";
 import { CLAUDE_TOOLS } from "./config.js";
@@ -76,9 +77,14 @@ import {
 } from "./planner.js";
 import {
   addTokens,
-  captureRequest,
+  addUsage,
   captureResponse,
+  captureToolOutput,
+  describeRequest,
+  firstToken,
   logUsage,
+  NativeTools,
+  providerUsage,
   Tallies,
   tokens,
   usageRecord,
@@ -1035,7 +1041,10 @@ export class ClaudeWorker implements Worker {
       effort: config.effort,
       item: input.item.id,
     });
-    captureRequest(record, input.prompt);
+    describeRequest(record, {
+      prompt: input.prompt,
+      ...(input.facts ? { facts: input.facts } : {}),
+    });
     const started = Date.now();
     try {
       const result = await this.converse(attempt, sdk, login, record);
@@ -1172,11 +1181,20 @@ export class ClaudeWorker implements Worker {
     let facts: SessionFacts = { initialized: false, modelResponded: false };
     const abort = () => controller.abort(watchdog.signal.reason);
     watchdog.signal.addEventListener("abort", abort, { once: true });
+    // Every query is a fresh session (none resumes); its turns count from 1.
+    record.sessionMode = "fresh";
+    record.imageOutputs = 0;
+    const callStarted = Date.now();
+    const send = (content: string) => {
+      record.sessionTurn = (record.sessionTurn as number) + 1;
+      turns.send(content);
+    };
     const start = (prompt: string) => {
       turns = userTurns();
       controller = new AbortController();
       facts = { initialized: false, modelResponded: false };
-      turns.send(prompt);
+      record.sessionTurn = 0;
+      send(prompt);
       session = sdk.query({
         prompt: turns.messages(),
         options: this.queryOptions(attempt, login, controller),
@@ -1193,10 +1211,15 @@ export class ClaudeWorker implements Worker {
     // Tokens likewise: the queries a credential retry ended, and the running one.
     let spentTokens = tokens({ input: 0, output: 0, cached: 0 });
     let queryTokens = spentTokens;
+    // The provider's own usage, summed over queries like the tokens.
+    let spentUsage: Record<string, unknown> | undefined;
+    let queryUsage: Record<string, unknown> | undefined;
     let result: SDKResultMessage | undefined;
     /** Running tool calls' names by id, for their results. */
     const toolNames = new Map<string, string>();
     const calls = new Tallies();
+    const tools = new NativeTools();
+    let response: string | undefined;
     try {
       let events = start(input.prompt);
       for (;;) {
@@ -1212,11 +1235,25 @@ export class ClaudeWorker implements Worker {
             ? message.retry_delay_ms + (message.no_response?.retry_wait_ms ?? 0)
             : 0,
         );
+        if (message.type === "stream_event") firstToken(record, callStarted);
+        if (
+          message.type === "assistant" &&
+          message.message.model !== SYNTHETIC_MODEL
+        ) {
+          firstToken(record, callStarted);
+          record.reportedModel = message.message.model;
+          // One response may arrive split over several messages with its id.
+          if (message.message.id !== response) tools.response();
+          response = message.message.id;
+        }
         if (message.type === "assistant" || message.type === "user") {
           const content = message.message.content;
           if (Array.isArray(content))
             for (const block of content)
-              if (block.type === "tool_use") {
+              if (message.type === "assistant" && block.type === "image")
+                record.imageOutputs = (record.imageOutputs as number) + 1;
+              else if (block.type === "tool_use") {
+                tools.call(block.id);
                 watchdog.progress(`tool_use:${block.name}`, {
                   id: block.id,
                   active: true,
@@ -1232,6 +1269,12 @@ export class ClaudeWorker implements Worker {
                 });
                 const tool = toolNames.get(block.tool_use_id);
                 toolNames.delete(block.tool_use_id);
+                tools.result(block.tool_use_id, block.is_error === true);
+                captureToolOutput(
+                  record,
+                  tool ?? "unknown",
+                  toolResultText(block.content),
+                );
                 if (tool)
                   input.activity({ kind: "tool", phase: "finished", tool });
               }
@@ -1254,6 +1297,7 @@ export class ClaudeWorker implements Worker {
         if (message.type === "system" && message.subtype === "init") {
           facts.initialized = true;
           record.session = message.session_id;
+          record.reportedModel = message.model;
         }
         if (message.type !== "result") continue;
         result = message;
@@ -1264,6 +1308,11 @@ export class ClaudeWorker implements Worker {
         record.costUsd = spentUsd + queryUsd;
         record.turns = message.num_turns;
         record.resultSubtype = message.subtype;
+        queryUsage = providerUsage({
+          usage: message.usage,
+          modelUsage: message.modelUsage,
+        });
+        record.providerUsage = addUsage(spentUsage, queryUsage) ?? null;
         if (message.stop_reason) record.stopReason = message.stop_reason;
         const error = resultError(message);
         if (
@@ -1292,6 +1341,8 @@ export class ClaudeWorker implements Worker {
           spentUsd += queryUsd;
           queryUsd = 0;
           spentTokens = addTokens(spentTokens, queryTokens);
+          spentUsage = addUsage(spentUsage, queryUsage);
+          queryUsage = undefined;
           queryTokens = tokens({ input: 0, output: 0, cached: 0 });
           events = start(`${input.prompt}${CREDENTIAL_RESTART}`);
           continue;
@@ -1303,14 +1354,14 @@ export class ClaudeWorker implements Worker {
           // Unfinished work, not a failed attempt: the same conversation
           // and worktree continue.
           continuations += 1;
-          turns.send(continuation(attempt.grants.validate));
+          send(continuation(attempt.grants.validate));
           continue;
         }
         if (!error && handoffRefusals < MAX_HANDOFF_REFUSALS) {
           const handoff = await watchdog.race(attempt.validator.checkHandoff());
           if (!handoff.passed) {
             handoffRefusals += 1;
-            turns.send(
+            send(
               `Your result is not finished. ${handoff.text}\nThen give your final report.`,
             );
             continue;
@@ -1323,7 +1374,7 @@ export class ClaudeWorker implements Worker {
           (await watchdog.race(attempt.validator.finalTree())) === false
         ) {
           validationRequested = true;
-          turns.send(VALIDATE_REQUEST);
+          send(VALIDATE_REQUEST);
           continue;
         }
         break;
@@ -1339,6 +1390,8 @@ export class ClaudeWorker implements Worker {
         reason: `The Claude worker's turn was lost: ${detail(errorMessage(error))}`,
       };
     } finally {
+      tools.response();
+      record.nativeTools = tools.value;
       watchdog.signal.removeEventListener("abort", abort);
       watchdog.stop();
       turns.end();

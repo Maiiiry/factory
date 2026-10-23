@@ -11,6 +11,7 @@
  * request the service applies ({@link applyDream}), so the store has one
  * writer. With no service running, a write is refused.
  */
+
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -26,6 +27,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { crashPoint } from "../crash.js";
 import { redact } from "../log.js";
 import type { Planner } from "../providers/planner.js";
+import { logRefused } from "../providers/usage.js";
 import {
   type DreamRequest,
   type RequestResult,
@@ -802,20 +804,19 @@ async function dream(
   // An invalid answer gets one retry that shows the model the error.
   for (let attempt = 0; attempt < 2 && !draft; attempt++) {
     let answer: unknown;
+    let callId: string | undefined;
     try {
-      answer = (
-        await planner.answer({
-          role: "planner",
-          phase: "dream",
-          prompt: dreamPrompt(selection, refusal),
-          schema: dreamSchema(
-            selection.sources.length,
-            selection.parent?.draft.lessons.length ?? 0,
-          ),
-          signal,
-          log: (event) => options.log({ ...event, dream: id }),
-        })
-      ).value;
+      ({ value: answer, callId } = await planner.answer({
+        role: "planner",
+        phase: "dream",
+        prompt: dreamPrompt(selection, refusal),
+        schema: dreamSchema(
+          selection.sources.length,
+          selection.parent?.draft.lessons.length ?? 0,
+        ),
+        signal,
+        log: (event) => options.log({ ...event, dream: id }),
+      }));
     } catch (error) {
       await options.send({
         op: "end",
@@ -825,10 +826,26 @@ async function dream(
       });
       throw error;
     }
+    // Set when draftOf refused the answer itself, not when the store failed.
+    let decoded = true;
     try {
-      draft = readStore(settings.root, (db) => draftOf(db, answer, selection));
+      draft = readStore(settings.root, (db) => {
+        try {
+          return draftOf(db, answer, selection);
+        } catch (error) {
+          // A store error carries a code; a refused answer doesn't.
+          if ((error as { code?: unknown }).code === undefined) decoded = false;
+          throw error;
+        }
+      });
     } catch (error) {
       refusal = errorMessage(error);
+      if (!decoded)
+        logRefused(
+          (event) => options.log({ ...event, dream: id }),
+          callId,
+          refusal,
+        );
     }
   }
   if (!draft) {

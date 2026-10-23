@@ -24,6 +24,8 @@ import { errorMessage } from "../text.js";
 import {
   addCodexTelemetry,
   codexTokens,
+  codexTurnUsage,
+  modelItem,
   SDK_OPERATIONS,
 } from "./codex-telemetry.js";
 import {
@@ -39,7 +41,7 @@ import {
   PlannerError,
   type PlannerModels,
 } from "./planner.js";
-import { captureResponse, Tallies } from "./usage.js";
+import { captureResponse, firstToken, Tallies } from "./usage.js";
 
 export type CodexEffort = ModelReasoningEffort;
 
@@ -492,6 +494,8 @@ export class CodexPlanner implements Planner {
           : { workingDirectory: home.workdir, sandboxMode: "read-only" }),
       };
       const thread = codex.startThread(options);
+      record.sessionTurn = 1;
+      record.sessionMode = "fresh";
       // Images go as local_image input: codex exec attaches them with --image.
       const input: Input = images.length
         ? [
@@ -556,6 +560,7 @@ export class CodexPlanner implements Planner {
             : undefined,
         );
         if (event.type === "thread.started") record.thread = event.thread_id;
+        if (modelItem(item)) firstToken(record, callStarted);
         if (item && SDK_OPERATIONS.has(item.type)) {
           operations.add(item.type, item.id);
           record.sdkOperations = operations.value;
@@ -575,6 +580,7 @@ export class CodexPlanner implements Planner {
             cached: event.usage.cached_input_tokens,
           };
           record.tokens = codexTokens(event.usage);
+          codexTurnUsage(record, event.usage);
         }
         if (event.type === "turn.failed")
           throw codexFailure(event.error.message);
@@ -591,6 +597,7 @@ export class CodexPlanner implements Planner {
       try {
         value = JSON.parse(response);
       } catch {
+        record.stage = "parse";
         throw new PlannerError(
           "retry",
           `Codex answer is not JSON: ${detail(response)}`,
