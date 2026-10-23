@@ -58,6 +58,25 @@ export type Outcome =
     };
 
 /** A question for the operator; the first answer is recommended unless another is named. */
+/**
+ * Providers `switch` can move to: every other configured one, and the
+ * current one when its configured settings changed since they were frozen
+ * (a model fixed in the configuration, then the service restarted). The
+ * one rule for what a hold offers and what the engine accepts.
+ */
+export function switchTargets(
+  current: ObjectiveState["provider"],
+  providers: Readonly<Record<string, ProviderConfig>> | undefined,
+): string[] {
+  return Object.entries(providers ?? {})
+    .filter(
+      ([name, settings]) =>
+        name !== current?.name ||
+        !isDeepStrictEqual(settings, current.settings),
+    )
+    .map(([name]) => name);
+}
+
 export function hold(
   question: string,
   answers = ["retry", "cancel"],
@@ -715,21 +734,8 @@ export class ObjectiveRunner {
     }
   }
 
-  /** Configured provider names other than the one this Objective runs on. */
-  /**
-   * Providers `switch` can move to: every other configured one, and this
-   * one when its configured settings changed since they were frozen (a
-   * model fixed in the configuration, then the service restarted).
-   */
   private otherProviders(): string[] {
-    const current = this.state.provider;
-    return Object.entries(this.workflow.providers ?? {})
-      .filter(
-        ([name, settings]) =>
-          name !== current?.name ||
-          !isDeepStrictEqual(settings, current.settings),
-      )
-      .map(([name]) => name);
+    return switchTargets(this.state.provider, this.workflow.providers);
   }
 
   /**

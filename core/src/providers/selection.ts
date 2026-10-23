@@ -7,7 +7,7 @@
 
 import { isDeepStrictEqual } from "node:util";
 import type { CoreConfig } from "../config.js";
-import { hold, type Step, type Workflow } from "../engine.js";
+import { hold, type Step, switchTargets, type Workflow } from "../engine.js";
 import type { Plan } from "../planning/types.js";
 import { type ObjectiveState, TERMINAL } from "../state.js";
 import type { Worker } from "../work/worker.js";
@@ -110,28 +110,26 @@ export function providerWorkflow(
       ? route.workflow
       : undefined;
   };
+  // `switch NAME` freezes these settings, so the new route matches them.
+  const providers = Object.fromEntries(
+    [...routes].map(([name, route]) => [name, frozenSettings(route.settings)]),
+  );
   return {
     steps(state) {
       // Cancel cleanup is the same on every provider.
       if (state.status === "cancelled") return fallback.steps(state);
       if (TERMINAL.includes(state.status)) return [];
       const workflow = frozen(state);
-      return workflow ? workflow.steps(state) : [unavailable(state, routes)];
+      return workflow ? workflow.steps(state) : [unavailable(state, providers)];
     },
     status: (state) => (frozen(state) ?? fallback).status(state),
-    // `switch NAME` freezes these settings, so the new route matches them.
-    providers: Object.fromEntries(
-      [...routes].map(([name, route]) => [
-        name,
-        frozenSettings(route.settings),
-      ]),
-    ),
+    providers,
   };
 }
 
 function unavailable(
   state: ObjectiveState,
-  routes: ReadonlyMap<string, ProviderRoute>,
+  providers: Readonly<Record<string, ProviderConfig>>,
 ): Step {
   return {
     key: "provider",
@@ -143,16 +141,22 @@ function unavailable(
           "This Objective has no frozen provider: it was admitted by a Factory build that didn't record one. Cancel it and queue it again.",
           ["cancel"],
         );
-      const what = routes.has(provider.name)
+      const configured = provider.name in providers;
+      const what = configured
         ? `whose settings changed since then. It needs them as they were: ${JSON.stringify(provider.settings)}. Restore them`
         : "which the configuration no longer names. Restore it with the settings it had";
-      // Another configured provider: `switch` moves the Objective onto it
-      // now, without a configuration change and a restart.
-      const others = [...routes.keys()].filter((n) => n !== provider.name);
-      const named = others.map((n) => `\`${n}\``).join(", ");
+      // `switch` moves the Objective now, without restoring anything: onto
+      // another configured provider, or onto this one's new settings. The
+      // engine accepts exactly these (switchTargets).
+      const others = switchTargets(provider, providers);
+      const named = others
+        .map((n) =>
+          n === provider.name ? `\`${n}\` (its new settings)` : `\`${n}\``,
+        )
+        .join(", ");
       return others.length
         ? hold(
-            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry. Or ${others.length === 1 ? `answer \`switch\` to run it on provider ${named}` : `answer \`switch NAME\` to run it on another configured provider: ${named}`}; or cancel.`,
+            `This Objective started on provider "${provider.name}", ${what} and restart the service, then answer retry. Or ${others.length === 1 ? `answer \`switch\` to run it on provider ${named}` : `answer \`switch NAME\` to run it on one of these providers: ${named}`}; or cancel.`,
             ["switch", "retry", "cancel"],
           )
         : hold(
