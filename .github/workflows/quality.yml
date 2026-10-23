@@ -23,6 +23,7 @@ jobs:
       - run: npm run lint
       - run: npm run format:check
       - run: npm run notices:check
+      - run: node scripts/ledger-counts.mjs --check
 
   # The old src/ tree is frozen until cutover. Its suite runs on every push
   # to main, and on a pull request only when the pull request changes a file
