@@ -5,7 +5,12 @@ import { hold, type Outcome, type Step, type StepContext } from "../engine.js";
 import { defaultHead, sha256 } from "../git.js";
 import { type GitHub, githubOutcome } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
-import { UnreadableMarkdown, visibleMarkdown } from "../markdown.js";
+import {
+  firstDifference,
+  renderedText,
+  UnreadableMarkdown,
+  visibleMarkdown,
+} from "../markdown.js";
 import { parseObjective } from "../objective.js";
 import { type Planner, PlannerError } from "../providers/planner.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
@@ -890,7 +895,7 @@ export async function readObjective(
   const { config } = deps;
   const { state, signal } = context;
   const issue = state.issue;
-  const found = await deps.github.issue(issue, signal);
+  const found = await deps.github.renderedIssue(issue, signal);
   if (found.state !== "open")
     return {
       hold: hold(
@@ -911,6 +916,8 @@ export async function readObjective(
       ),
     };
   }
+  const unconfirmed = await renderedHold(found, body, again, deps, context);
+  if (unconfirmed) return { hold: unconfirmed };
   const unapproved = await authorHold(found.user?.login, body, deps, context);
   if (unapproved) return { hold: unapproved };
   const inputs = {
@@ -935,6 +942,53 @@ export async function readObjective(
     problems.push(...(await localExecutables(inputs, config, signal)).problems);
   if (problems.length) return { hold: objectiveProblemsHold(problems, again) };
   return { inputs };
+}
+
+/** The body digest whose planning text GitHub's renderer last confirmed. */
+const RENDERED = "objective:rendered";
+
+/**
+ * GitHub's renderer is the authority on what a reader sees. The text
+ * Factory plans from (visibleMarkdown) must render, through POST /markdown
+ * in this repository, to the same visible text as the issue's own body_html;
+ * anything else holds, so a construct visibleMarkdown gets wrong can't hide
+ * text from the approver or drop text they saw. Confirmed once per body:
+ * the digest is kept, and the step runs again to read on from it. A GitHub
+ * error propagates (retry), so the check is never skipped.
+ */
+async function renderedHold(
+  found: { body: string | null; body_html: string },
+  body: string,
+  again: string,
+  deps: PlanningDeps,
+  context: StepContext,
+): Promise<Outcome | undefined> {
+  const { state, signal } = context;
+  const digest = sha256(Buffer.from(`${found.body ?? ""}\0${body}`)).slice(
+    0,
+    16,
+  );
+  if (
+    (state.kept?.[RENDERED] as { digest: string } | undefined)?.digest ===
+    digest
+  )
+    return undefined;
+  const shown = renderedText(found.body_html);
+  const planned = renderedText(await deps.github.renderMarkdown(body, signal));
+  if (shown === planned)
+    return {
+      kind: "retry",
+      reason: "GitHub's renderer confirmed the text Factory plans from.",
+      afterMs: 0,
+      keep: { [RENDERED]: { digest } },
+    };
+  const differ = firstDifference(shown, planned);
+  const quote = (text: string) =>
+    text ? `\`${text.replace(/`/g, "'")}\`` : "nothing";
+  return hold(
+    `Factory can't confirm that the text it plans from matches what GitHub shows for issue #${state.issue} (first difference: GitHub shows ${quote(differ.a)}, Factory's text shows ${quote(differ.b)}). Edit the issue to remove hidden content, then answer \`${again}\`; or cancel.`,
+    [again, "cancel"],
+  );
 }
 
 /** Where the operator's approval of a non-writer's Objective is kept. */

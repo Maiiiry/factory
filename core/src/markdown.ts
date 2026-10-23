@@ -80,11 +80,13 @@ interface MarkdownNode {
 /**
  * Markdown as GitHub shows it, for text a person approved by reading the
  * rendered issue. A CommonMark + GFM parser finds what the reader never
- * sees: comments (and the like) inside raw HTML, link reference
- * definitions, and footnote definitions nothing shown references. Those
- * source ranges are cut, a line left blank by a cut is dropped, and
- * invisible characters are removed; everything else stays as written, so headings and sections survive. Throws UnreadableMarkdown
- * when the parser fails: the caller holds rather than pass text through.
+ * sees: comments (and the like) inside raw HTML, and link or footnote
+ * definitions nothing shown references or that repeat an earlier label.
+ * Those source ranges are cut, a line left blank by a cut is dropped, and
+ * invisible characters are removed; everything else stays as written, so
+ * headings and sections survive. Throws UnreadableMarkdown when the parser
+ * fails: the caller holds rather than pass text through. This is the
+ * producer only: renderedText checks its result against GitHub's renderer.
  */
 export function visibleMarkdown(content: string): string {
   // GitHub shows NUL as U+FFFD; NUL then marks the cuts below.
@@ -98,34 +100,61 @@ export function visibleMarkdown(content: string): string {
   } catch (error) {
     throw new UnreadableMarkdown(errorMessage(error));
   }
-  // GitHub renders a footnote only when shown text references it, so a
-  // footnote referenced only from an unshown footnote stays hidden too.
-  const cited = new Map<string, string[]>();
-  const collect = (node: MarkdownNode, found: string[]): void => {
-    if (node.type === "footnoteReference" && node.identifier)
-      found.push(node.identifier);
-    if (node.type === "footnoteDefinition" && node.identifier !== undefined) {
-      const inside: string[] = [];
-      cited.set(node.identifier, inside);
-      found = inside;
+  // GitHub (cmark-gfm) resolves a label to its first definition, renders a
+  // footnote only when shown text references it, and shows nothing for an
+  // unreferenced link definition. So a footnote referenced only from an
+  // unshown footnote stays hidden, and only first definitions count.
+  interface Scope {
+    notes: string[];
+    links: string[];
+  }
+  const top: Scope = { notes: [], links: [] };
+  const footnotes = new Map<string, Scope>();
+  const firsts = new Set<MarkdownNode>();
+  const defined = new Set<string>();
+  const collect = (node: MarkdownNode, scope: Scope): void => {
+    const id = node.identifier;
+    if (node.type === "footnoteReference" && id) scope.notes.push(id);
+    if (
+      (node.type === "linkReference" || node.type === "imageReference") &&
+      id !== undefined
+    )
+      scope.links.push(id);
+    if (node.type === "footnoteDefinition" && id !== undefined) {
+      // A later duplicate's references go to a scope nothing reads.
+      scope = { notes: [], links: [] };
+      if (!footnotes.has(id)) {
+        footnotes.set(id, scope);
+        firsts.add(node);
+      }
     }
-    for (const child of node.children ?? []) collect(child, found);
+    if (node.type === "definition" && id !== undefined && !defined.has(id)) {
+      defined.add(id);
+      firsts.add(node);
+    }
+    for (const child of node.children ?? []) collect(child, scope);
   };
-  const pending: string[] = [];
-  collect(tree, pending);
+  collect(tree, top);
   const shown = new Set<string>();
+  const linked = new Set(top.links);
+  const pending = [...top.notes];
   for (let id = pending.pop(); id !== undefined; id = pending.pop())
     if (!shown.has(id)) {
       shown.add(id);
-      pending.push(...(cited.get(id) ?? []));
+      const scope = footnotes.get(id);
+      pending.push(...(scope?.notes ?? []));
+      for (const link of scope?.links ?? []) linked.add(link);
     }
   const cuts: [number, number][] = [];
   const visit = (node: MarkdownNode): void => {
     const start = node.position?.start.offset;
     const end = node.position?.end.offset;
+    const id = node.identifier ?? "";
     const unshown =
-      node.type === "footnoteDefinition" && !shown.has(node.identifier ?? "");
-    if (node.type === "definition" || node.type === "html" || unshown) {
+      (node.type === "footnoteDefinition" &&
+        !(firsts.has(node) && shown.has(id))) ||
+      (node.type === "definition" && !(firsts.has(node) && linked.has(id)));
+    if (node.type === "html" || unshown) {
       if (start === undefined || end === undefined)
         throw new UnreadableMarkdown(`a ${node.type} node has no position`);
       if (node.type !== "html") {
@@ -158,4 +187,58 @@ export function visibleMarkdown(content: string): string {
     })
     .join("\n")
     .replace(INVISIBLE, "");
+}
+
+/** An HTML start or end tag; quoted attribute values may hold `>`. */
+const HTML_TAG = /<\/?[A-Za-z][^\s/>]*(?:[^>"']|"[^"]*"|'[^']*')*>/g;
+
+/** Footnote back-links: renderer chrome, not the author's text. */
+const BACKREF =
+  /<a(?=\s)(?=(?:[^>"']|"[^"]*"|'[^']*')*?\sdata-footnote-backref[\s=>])(?:[^>"']|"[^"]*"|'[^']*')*>[\s\S]*?<\/a>/g;
+
+const ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: "\u00A0",
+};
+
+/**
+ * The text a reader sees in GitHub-rendered HTML, for comparing two
+ * renderings: comments, footnote back-links and tags (with their
+ * attributes: ids, hrefs, anchors) are dropped, a tag counts as a space,
+ * entities are decoded, invisible characters removed and whitespace
+ * collapsed. An entity it doesn't know stays as written, on both sides.
+ */
+export function renderedText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, "")
+    .replace(BACKREF, "")
+    .replace(HTML_TAG, " ")
+    .replace(
+      /&(?:#(\d{1,7})|#[xX]([0-9A-Fa-f]{1,6})|([A-Za-z]+));/g,
+      (entity, decimal?: string, hex?: string, name?: string) => {
+        if (name) return ENTITIES[name] ?? entity;
+        const point = decimal ? Number(decimal) : Number.parseInt(hex!, 16);
+        return point > 0 && point <= 0x10ffff
+          ? String.fromCodePoint(point)
+          : "\uFFFD";
+      },
+    )
+    .replace(INVISIBLE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Where two texts first differ, as a short excerpt of each. */
+export function firstDifference(
+  a: string,
+  b: string,
+): { a: string; b: string } {
+  let at = 0;
+  while (at < a.length && a[at] === b[at]) at++;
+  const from = Math.max(0, at - 20);
+  return { a: a.slice(from, at + 40), b: b.slice(from, at + 40) };
 }
