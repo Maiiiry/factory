@@ -284,7 +284,7 @@ export function publish(
         remote &&
         !input.reset &&
         !(await updates(context, remote, earlier, bases)) &&
-        !(await factoryMade(context, remote, defaultBranch))
+        !(await factoryMade(context, remote, defaultBranch, bases))
       )
         return hold(
           `Remote branch ${branch} holds commits Factory did not make (head ${remote}; Factory pushed ${[...known].join(", ")}). Move them off the branch and answer retry; answer ${RESET_BRANCH} to replace the branch with Factory's result, dropping them from it; or cancel.`,
@@ -396,13 +396,16 @@ export function publish(
  * each is committed as FACTORY_EMAIL (Factory commits with a clean Git
  * environment; an amend, rebase or cherry-pick by anyone else changes the
  * committer), or is GitHub's update-branch merge (updateMerge) whose first
- * parent is one of those commits and whose other is on the default branch.
- * The whole range is read; a range too long to read is not Factory's.
+ * parent is one of those commits and whose other is on one of the item's
+ * accepted `bases` (a stack layer's predecessor branch too), as updates()
+ * accepts. The whole range is read; a range too long to read is not
+ * Factory's.
  */
 async function factoryMade(
   context: DeliveryContext,
   remote: string,
   defaultBranch: string,
+  bases: readonly string[],
 ): Promise<boolean> {
   const { total, commits } = await context.github.commitsBeyond(
     defaultBranch,
@@ -417,7 +420,7 @@ async function factoryMade(
       commit.committerEmail !== FACTORY_EMAIL &&
       !(
         range.has(commit.parents[0] ?? "") &&
-        (await updateMerge(context, commit, [defaultBranch]))
+        (await updateMerge(context, commit, bases))
       )
     )
       return false;
@@ -432,16 +435,18 @@ async function factoryMade(
  * it. A branch already gone (GitHub's auto-delete, or a run before a
  * crash) is done. Returns why a branch was kept; a refused delete never
  * blocks the step. A failure to reach origin throws, for a retry.
+ * `baseBranch` is a stack layer's predecessor branch, as for publish.
  */
 export async function deleteFactoryBranch(
   context: DeliveryContext,
   branch: string,
   point: string,
+  baseBranch?: string,
 ): Promise<string | undefined> {
   const remote = await remoteHead(context, branch);
   if (!remote) return undefined;
-  const defaultBranch = await context.github.defaultBranch(context.signal);
-  if (!(await factoryMade(context, remote, defaultBranch)))
+  const { defaultBranch, bases } = await acceptedBases(context, baseBranch);
+  if (!(await factoryMade(context, remote, defaultBranch, bases)))
     return `${branch} holds commits Factory did not make`;
   crashPoint(`${point}:before`);
   try {

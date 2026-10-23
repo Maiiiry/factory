@@ -1446,6 +1446,7 @@ async function deleteBranches(
       where,
       branch,
       "deliver:branch-delete",
+      baseBranch(context.state, deps, item),
     );
     if (kept) context.log({ event: "branch-kept", branch, reason: kept });
   }
