@@ -478,8 +478,9 @@ export async function memorySection(
   // Sources supplied to this call, and copies of a Source text already
   // kept (several Objectives pin the same text), are left out.
   // A record about any admitted path is shown with only its admitted
-  // citations; a reference carries its Source's text, so it needs all of
-  // its paths admitted.
+  // citations, but its staleness comes from every cited file's digest (a
+  // digest compare shows no content); a reference carries its Source's
+  // text, so it needs all of its paths admitted.
   const seen = new Set(query.supplied);
   const eligible = matches.flatMap((record) => {
     const paths = record.paths.filter((path) => admitted(path, selectors));
@@ -488,15 +489,7 @@ export async function memorySection(
       (record.source !== undefined && paths.length < record.paths.length)
     )
       return [];
-    const shown = {
-      ...record,
-      paths,
-      digests: Object.fromEntries(
-        Object.entries(record.digests).filter(([path]) =>
-          admitted(path, selectors),
-        ),
-      ),
-    };
+    const shown = { ...record, paths };
     if (!record.source) return [shown];
     const copy = `${record.source}\0${sha256(record.body)}`;
     if (seen.has(record.source) || seen.has(copy)) return [];
@@ -535,6 +528,15 @@ async function render(
   const changed: string[] = [];
   for (const [path, digest] of Object.entries(record.digests))
     if ((await query.digest(path)) !== digest) changed.push(path);
+  // Only shown paths are named; a changed file outside them is counted.
+  const named = changed.filter((path) => record.paths.includes(path));
+  const unnamed = changed.length - named.length;
+  const what = [
+    ...named,
+    ...(unnamed
+      ? [`${unnamed} cited file${unnamed === 1 ? "" : "s"} outside these paths`]
+      : []),
+  ];
   // Changed files make any record stale, a historical one too.
   const disposition = changed.length
     ? "stale"
@@ -548,7 +550,7 @@ async function render(
     ...(record.item ? [`Work Item ${record.item}`] : []),
     record.created.slice(0, 10),
   ].join(", ");
-  return `- [${record.kind}, ${record.authority}, ${disposition}${changed.length ? `: ${changed.join(", ")} changed since` : ""}] ${about}: ${record.summary}${record.paths.length ? `\n  Paths: ${record.paths.join(", ")}` : ""}\n  ${record.body.split("\n").join("\n  ")}`;
+  return `- [${record.kind}, ${record.authority}, ${disposition}${what.length ? `: ${what.join(", ")} changed since` : ""}] ${about}: ${record.summary}${record.paths.length ? `\n  Paths: ${record.paths.join(", ")}` : ""}\n  ${record.body.split("\n").join("\n  ")}`;
 }
 
 function stored(row: Record<string, unknown>): StoredRecord {

@@ -257,7 +257,7 @@ Rules for modules:
 Review and knowledge see what the worker saw:
 
 - **Review inputs.** Result review and final review get a controller input receipt for each item: every read-only input its worker got (source assets and bound selections) with kind, path, visibility, media type, size and sha256, and Factory's digest-checked copy under `inputs/` in the evidence root, within the candidate copy bounds.
-- **Repository memory** shows a record that cites any path inside the planning selectors, with only its admitted paths. A reference record carries its Source's text, so it needs every path admitted. An episode counts a native stack's lower layer as merged when the stack merged.
+- **Repository memory** shows a record that cites any path inside the planning selectors, with only its admitted paths; its staleness still comes from every cited file's digest, and a changed file outside the selectors is counted, not named. A reference record carries its Source's text, so it needs every path admitted. An episode counts a native stack's lower layer as merged when the stack merged.
 - Provider APIs stay inside their adapter.
 
 ## Security
