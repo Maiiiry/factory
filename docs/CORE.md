@@ -259,6 +259,15 @@ These carry over unchanged:
 - Secrets are named by reference. The configuration derives the secret values once: those named in `policy.allowedSecretNames` and each managed provider's credential (`apiKeyEnv`, `credentialEnv`, from the environment or a service credential). Everything Factory writes to GitHub, Dream input and the Codex worker's reported commands and errors are redacted of them. Only the named ones reach a worker's environment.
 - Deploys stay in the target's own GitHub Actions, behind environment approvals.
 
+Added after the 2026-10-23 security review:
+
+- **Issue bodies.** Planning reads only what GitHub shows: HTML comments outside code, link reference titles and invisible characters are dropped (markdown.ts visibleMarkdown). When the issue's author has no write access, the check holds once: approve or cancel. The approval is kept against the visible body's digest, so any later edit asks again. Until then nothing in the body counts. Queue consent stays the Project field.
+- **Write access** (`/factory` answers, issue authors) is asked of GitHub again after 10 minutes.
+- **Local source assets** come only from directories listed in `media.localAssetRoots` (empty by default: off), by real path, and never from anything the sandbox seals: HOME as a whole, logins, Factory's config and state, runtime sockets or shared temporary directories. The plan check and the copy both check.
+- **Pushed content.** Before publish pushes, every blob the result adds or changes, and every LFS object it uploads, is searched for the secret values, as written and base64. A match pushes nothing and holds with `repair` and `cancel`.
+- **Workers.** A Claude worker never loads project or local settings (their hooks would run on the host). A Codex worker's shell gets proxy URLs without credentials, or none when it has no network. A managed worker's archive is read without following links.
+- **Factory's branches.** A web-flow merge counts as Factory's only when its first parent is Factory's head, its second is on the PR's base, and its tree is what `git merge-tree` makes of the two.
+
 A same-user process is trusted, as decided for the archive: it can already change Factory's code and credentials.
 
 ## Lean code
