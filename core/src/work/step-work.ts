@@ -9,7 +9,10 @@ import {
   mediaDirectory,
   missingMember,
   needsSelection,
+  resentSet,
   resolveInputs,
+  sentBackDirectory,
+  sentBackInputs,
 } from "../media.js";
 import { objectiveText } from "../objective.js";
 import { forceRemove } from "../paths.js";
@@ -79,6 +82,9 @@ export async function workStep(
   const workDir = deps.workDir(state.issue);
   const worktree = worktreePath(workDir, state.issue, item.id);
   const media = mediaDirectory(workDir, item.id);
+  const sentBack = fact(state, "sentBack", item.id);
+  // Its fact is gone (new sets captured, or `fresh`): so are the copies.
+  if (!sentBack) await forceRemove(sentBackDirectory(media));
   // An item builds on the default branch as it is when it starts, which
   // holds every merged dependency; a native-stack layer above the bottom
   // builds on the layer below's current delivered head: the head a merge
@@ -348,7 +354,10 @@ export async function workStep(
       fixedScripts: scripts.map((script) => script.name),
       ...(pin ? { packageManagerUpdate: pin } : {}),
       ...(repair ? { repair: repair.context } : {}),
-      mediaInputs: inputs.value,
+      mediaInputs: [
+        ...inputs.value,
+        ...(await sentBackInputs(item.id, sentBack ?? [])),
+      ],
       ...(own
         ? {
             keptSelection: {
@@ -448,6 +457,18 @@ export async function workStep(
         ...keepAll,
         ...facts({ finished }, item.id),
       });
+    const resent = resentSet(captured.value, sentBack ?? []);
+    if (resent)
+      return mediaOutcome(
+        item,
+        {
+          kind: "repair",
+          finding: `Candidate set ${resent.set} has the content of set ${resent.sentBack}, which the operator sent back. Stage new content for every set.`,
+        },
+        context,
+        place,
+        { ...keepAll, ...facts({ finished }, item.id) },
+      );
     if (captured.value.length)
       return {
         kind: "retry",
@@ -456,7 +477,7 @@ export async function workStep(
         keep: {
           ...keepAll,
           ...facts(
-            { finished: { ...finished, sets: captured.value } },
+            { finished: { ...finished, sets: captured.value }, sentBack: null },
             item.id,
           ),
         },

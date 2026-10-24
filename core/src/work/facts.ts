@@ -29,6 +29,13 @@ export interface ItemFacts {
   onto: string;
   finished: Finished;
   selection: KeptSelection;
+  /**
+   * The candidate sets the operator sent back with a select `repair`, as
+   * Factory's copies under `<media>/sent-back/`: the attempts after it get
+   * them read-only, since the answer ("other colours") is about them.
+   * Capturing new sets clears it.
+   */
+  sentBack: CandidateSet[];
   /** The latest repair's finding, for the next attempt's repair context. */
   finding: RepairFinding;
   refused: Refused;
@@ -145,7 +152,8 @@ export interface Finished {
  * and the select step writes the same set on the new work commit.
  */
 export interface KeptSelection {
-  selection: Selection;
+  /** The choice; its commit and tree are the old work commit's, which a repair replaces. */
+  selection: Omit<Selection, "commit" | "tree">;
   sets: CandidateSet[];
 }
 
