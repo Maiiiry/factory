@@ -5,6 +5,7 @@ import { type CoreConfig, ownRepositoryProblem } from "../config.js";
 import {
   errored,
   failure,
+  type Held,
   hold,
   type Offer,
   type Outcome,
@@ -28,6 +29,7 @@ import { logRefused } from "../providers/usage.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import { readShown, type ShownObjective, shownDigest } from "../shown.js";
 import { type Answer, findState, type ObjectiveState } from "../state.js";
+import { oneLine } from "../text.js";
 import { adaptiveWorkflow, declarationProblems } from "../validate.js";
 import { fact, facts as keptFacts } from "../work/facts.js";
 import { checkPlan } from "./checks.js";
@@ -45,6 +47,7 @@ import {
 import { forgetting, lookupsKey, plannerLookups } from "./lookup.js";
 import {
   ACCEPTED_AT,
+  amendmentGrants,
   currentPlan,
   generationInputs,
   position,
@@ -246,6 +249,8 @@ interface Decision {
   decision?: PlannerDecision;
   /** An `approve` that found the Objective edited, before this decision. */
   approved?: PlannerDecision;
+  /** The `more` that sent a kept `decision` past the allowance, after it. */
+  more?: PlannerDecision;
 }
 
 function cleanDraft(round: PlanRound): boolean {
@@ -261,8 +266,8 @@ export function decisions(
     .filter(([key]) => key.startsWith("decide:") && keep(key))
     .sort(([a], [b]) => compareKeys(a, b))
     .flatMap(([, value]) => {
-      const { approved, decision } = value as Decision;
-      return [approved, decision].filter(
+      const { approved, decision, more } = value as Decision;
+      return [approved, decision, more].filter(
         (d): d is PlannerDecision => d !== undefined,
       );
     });
@@ -785,19 +790,22 @@ function lastReview(
 // decide:g:n
 
 // Text is required (`needsText`): the engine refuses an answer without it.
-const ANSWERING: Offer = {
+// `spent`: past planningRevisions, an answer is kept until `more` sends it.
+const KEPT = "Keeps your answer; `more` then sends it to the planner.";
+const answering = (spent: boolean): Offer => ({
   answer: "answer",
   family: "answer",
-  consequence: "Sends your decision back to the planner.",
+  consequence: spent ? KEPT : "Sends your decision back to the planner.",
   needsText: true,
-};
-const ASK: Offer[] = [
-  ANSWERING,
+});
+const ask = (spent: boolean): Offer[] => [
+  answering(spent),
   {
     answer: "allow",
     family: "answer",
-    consequence:
-      "Authorizes that exact validation command for this Objective and plans again.",
+    consequence: spent
+      ? `Authorizes that exact validation command for this Objective. ${KEPT}`
+      : "Authorizes that exact validation command for this Objective and plans again.",
     needsText: true,
   },
   "replan",
@@ -831,7 +839,32 @@ function decideStep(
           ...(decision ? { decision } : {}),
         } satisfies Decision);
       }
-      const question = questionFor(state, g, n, planned, fixes, asks);
+      // Every round counts against planningRevisions, whatever started it:
+      // past the allowance, the next round waits for `more`. An answer that
+      // would start one is kept (`answeredKey`) until `more` sends it.
+      const answeredKey = `${key}:answered`;
+      const answered = state.kept?.[answeredKey] as PlannerDecision | undefined;
+      const allowance =
+        allowances(state).planningRevisions + granted(state, g, n);
+      const spent = n > allowance;
+      const question = questionFor(state, g, n, planned, fixes, asks, spent);
+      const nextRound = (decision?: PlannerDecision): Outcome =>
+        spent
+          ? {
+              ...spentHold(state, n, allowance, fixes, decision),
+              keep: { [answeredKey]: decision ?? null },
+            }
+          : {
+              kind: "done",
+              result: {
+                corrections: [
+                  ...fixes,
+                  ...(decision ? operatorCorrections([decision]) : []),
+                ],
+                ...(decision ? { decision } : {}),
+              } satisfies Decision,
+              keep: { [answeredKey]: null },
+            };
       // An `approve` that found the Objective edited (see changedHold).
       const approvedKey = `${key}:approved`;
       const approved = state.kept?.[approvedKey] as PlannerDecision | undefined;
@@ -847,11 +880,20 @@ function decideStep(
         const record = (text?: string) => decisionOf(answer, text);
         switch (answer.answer) {
           case "more":
-            return done({
-              corrections: fixes,
-              grant: grant(state, "planningRevisions"),
-              decision: record(),
-            } satisfies Decision);
+            // A kept answer is the round's decision, and `more` its grant.
+            return {
+              kind: "done",
+              result: {
+                corrections: [
+                  ...fixes,
+                  ...(answered ? operatorCorrections([answered]) : []),
+                ],
+                grant: grant(state, "planningRevisions"),
+                decision: answered ?? record(),
+                ...(answered ? { more: record() } : {}),
+              } satisfies Decision,
+              keep: { [answeredKey]: null },
+            };
           case "approve":
             if (await objectiveChanged(state, g, deps, signal))
               return {
@@ -873,12 +915,8 @@ function decideStep(
             );
           case "answer":
           case "allow": {
-            // Text is required (ASK): the engine refuses an answer without it.
-            const decision = record((answer.text ?? "").trim());
-            return done({
-              decision,
-              corrections: [...fixes, ...operatorCorrections([decision])],
-            } satisfies Decision);
+            // Text is required (`ask`): the engine refuses an answer without it.
+            return nextRound(record((answer.text ?? "").trim()));
           }
         }
       }
@@ -891,9 +929,54 @@ function decideStep(
         }
         return done({ accept: true } satisfies Decision);
       }
-      return done({ corrections: fixes } satisfies Decision);
+      return nextRound();
     },
   };
+}
+
+/**
+ * The question before a round past `planningRevisions` (with `allowance`
+ * the grants included): `more` grants as much again and starts it, with
+ * the kept answer `pending` when an answer asked for it.
+ */
+function spentHold(
+  state: ObjectiveState,
+  n: number,
+  allowance: number,
+  fixes: Finding[],
+  pending: PlannerDecision | undefined,
+): Held {
+  const more = grant(state, "planningRevisions");
+  const list = fixes.map((f, i) => `${i + 1}. ${f.message}`).join("\n");
+  const past = `${n} rounds, past the ${allowance} autonomy.allowances.planningRevisions allows`;
+  return pending
+    ? hold(
+        `Planning has run ${past}. Your answer is kept until \`more\` sends it to the planner.\n\nQuestion: ${prose(oneLine(pending.question, 500))}\n\nAnswer: \`${pending.answer}\`${pending.text ? ` ${prose(pending.text)}` : ""}\n\n\`more\` allows ${more} more rounds and sends it.`,
+        [
+          {
+            answer: "more",
+            family: "retry",
+            consequence: `Allows ${more} more plan rounds and sends your answer.`,
+          },
+          "replan",
+          "cancel",
+        ],
+      )
+    : hold(
+        `The plan still has ${fixes.length} problem${fixes.length === 1 ? "" : "s"} after ${past}:
+
+${list}
+
+\`more\` allows ${more} more rounds.`,
+        [
+          {
+            answer: "more",
+            family: "retry",
+            consequence: `Allows ${more} more plan rounds.`,
+          },
+          ...ask(true),
+        ],
+      );
 }
 
 /**
@@ -929,7 +1012,8 @@ export function planningReplan(
       decision,
       ...(approved ? { approved } : {}),
     } satisfies Decision,
-    keep: { [approvedKey]: null },
+    // An answer kept past the allowance (see decideStep) ends with it.
+    keep: { [approvedKey]: null, [`${key}:answered`]: null },
   };
 }
 
@@ -992,24 +1076,32 @@ function questionFor(
   planned: PlanRound,
   fixes: Finding[],
   asks: Finding[],
+  spent: boolean,
 ): { text: string; offers: Offer[] } | undefined {
   const list = (items: Finding[]) =>
     items.map((f, i) => `${i + 1}. ${f.message}`).join("\n");
+  const question = (text: string, offers: Offer[]) => ({
+    text: spent
+      ? `${text}\n\nPlanning has run ${n} rounds, past what autonomy.allowances.planningRevisions allows, so an answer is kept and \`more\` then sends it to the planner.`
+      : text,
+    offers,
+  });
+  const ASK = ask(spent);
   if (planned.question)
-    return {
-      text: `The planner needs a decision:\n\n${planned.question}\n\nAnswer with \`answer <your choice>\`. If it needs a validation command the Objective doesn't list, \`allow <exact command>\` authorizes it.`,
-      offers: ASK,
-    };
+    return question(
+      `The planner needs a decision:\n\n${planned.question}\n\nAnswer with \`answer <your choice>\`. If it needs a validation command the Objective doesn't list, \`allow <exact command>\` authorizes it.`,
+      ASK,
+    );
   if (asks.length && !fixes.length && !state.done[`review:${g}:${n}`])
-    return {
-      text: `Factory's plan checks found ${asks.length === 1 ? "a question" : "questions"} only you can decide:\n\n${list(asks)}\n\n\`answer <decision>\` sends your decision back to the planner.`,
-      offers: ASK,
-    };
+    return question(
+      `Factory's plan checks found ${asks.length === 1 ? "a question" : "questions"} only you can decide:\n\n${list(asks)}\n\n\`answer <decision>\` sends your decision back to the planner.`,
+      ASK,
+    );
   if (asks.length && !fixes.length)
-    return {
-      text: `The plan reviewer found ${asks.length === 1 ? "a question" : "questions"} only you can decide:\n\n${list(asks)}\n\n\`approve\` runs the plan as it is; \`answer <decision>\` sends your decision back to the planner.`,
-      offers: [
-        ANSWERING,
+    return question(
+      `The plan reviewer found ${asks.length === 1 ? "a question" : "questions"} only you can decide:\n\n${list(asks)}\n\n\`approve\` runs the plan as it is; \`answer <decision>\` sends your decision back to the planner.`,
+      [
+        answering(spent),
         {
           answer: "approve",
           family: "accept",
@@ -1017,56 +1109,32 @@ function questionFor(
         },
         ...ASK.slice(1),
       ],
-    };
+    );
   if (!fixes.length) return undefined;
   const previous =
     n > 1 ? (state.done[`decide:${g}:${n - 1}`] as Decision) : undefined;
   if (previous?.corrections && sameFindings(previous.corrections, fixes))
-    return {
-      text: `Plan round ${n} came back with the same problems as round ${n - 1}:\n\n${list(fixes)}\n\nAnswer with guidance for the planner, or \`replan\` after editing the Objective.`,
-      offers: ASK,
-    };
-  const allowance = allowances(state).planningRevisions + granted(state, g, n);
-  if (fixRounds(state, g, n) > allowance)
-    return {
-      text: `The plan still has ${fixes.length} problem${fixes.length === 1 ? "" : "s"} after ${n} rounds, past the ${allowance} autonomy.allowances.planningRevisions allows:
-
-${list(fixes)}
-
-\`more\` allows ${grant(state, "planningRevisions")} more rounds.`,
-      offers: [
-        {
-          answer: "more",
-          family: "retry",
-          consequence: `Allows ${grant(state, "planningRevisions")} more plan rounds.`,
-        },
-        ...ASK,
-      ],
-    };
+    return question(
+      `Plan round ${n} came back with the same problems as round ${n - 1}:\n\n${list(fixes)}\n\nAnswer with guidance for the planner, or \`replan\` after editing the Objective.`,
+      ASK,
+    );
   return undefined;
 }
 
-/** Rounds of this generation spent on fixes (not on operator answers), this one included. */
-function fixRounds(state: ObjectiveState, g: number, n: number): number {
-  let rounds = 1;
-  for (let m = 1; m < n; m++) {
-    const decided = state.done[`decide:${g}:${m}`] as Decision | undefined;
-    // A `more` grant is a decision, but the round after it fixes findings.
-    if (decided && (!decided.decision || decided.grant)) rounds += 1;
-  }
-  return rounds;
-}
-
 /**
- * Planning revisions of the current generation: the rounds spent on fixes
- * before this one, plus the amendments of the plan it accepted, and the
- * rounds allowed with the operator's grants.
+ * Planning revisions of the current generation: the rounds before this
+ * one, whatever started them (fixes, answers, grants), plus the amendments
+ * of the plan it accepted; and what is allowed with every `more` granted,
+ * to planning and to amendments alike.
  */
 export function planningRevisions(state: ObjectiveState): Usage {
   const { g, n } = position(state);
   return {
-    used: fixRounds(state, g, n) - 1 + proposalsOf(state).length,
-    allowed: allowances(state).planningRevisions + granted(state, g, n),
+    used: n - 1 + proposalsOf(state).length,
+    allowed:
+      allowances(state).planningRevisions +
+      granted(state, g, n) +
+      amendmentGrants(state),
   };
 }
 
