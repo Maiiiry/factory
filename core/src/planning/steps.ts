@@ -16,7 +16,7 @@ import {
 import { defaultHead } from "../git.js";
 import type { GitHub } from "../github.js";
 import { planningKnowledge } from "../knowledge/index.js";
-import { prose } from "../markdown.js";
+import { planMarks, prose } from "../markdown.js";
 import { checkObjective } from "../objective.js";
 import type { Planner, PlannerAnswer } from "../providers/planner.js";
 import { resolvedProvider } from "../providers/selection.js";
@@ -28,7 +28,7 @@ import {
 import { logRefused } from "../providers/usage.js";
 import type { ReviewArtifactSelector } from "../review/artifacts.js";
 import { readShown, type ShownObjective, shownDigest } from "../shown.js";
-import type { Answer, ObjectiveState } from "../state.js";
+import { type Answer, type ObjectiveState, runOf } from "../state.js";
 import { oneLine } from "../text.js";
 import { declarationProblems } from "../validate.js";
 import { fact, facts as keptFacts } from "../work/facts.js";
@@ -1085,12 +1085,9 @@ function acceptStep(g: number, n: number, deps: PlanningDeps): Step {
           ? { reviewArtifacts: inputs.reviewArtifacts }
           : {}),
       };
-      await postPlan(deps, state.issue, plan, signal);
-      return {
-        kind: "done",
-        result: plan,
-        keep: { [ACCEPTED_AT]: new Date().toISOString() },
-      };
+      const accepted = new Date().toISOString();
+      await postPlan(deps, state, plan, signal, { accepted });
+      return { kind: "done", result: plan, keep: { [ACCEPTED_AT]: accepted } };
     },
   };
 }
@@ -1120,17 +1117,24 @@ const LISTED_ITEMS = 200;
  * Post the plan on the issue, or edit the comments already there. The plan
  * data (what `factory reset` rebuilds from) goes in the plan comment when
  * it fits, else in numbered continuation comments the plan comment names;
- * it is never dropped. An accepted amendment posts its plan the same way,
- * with `note` saying which amendment it is and its own crash points
+ * it is never dropped. The line after the marker names the run, the
+ * accepted plan (`accepted`, else the one accepted now) and the data's
+ * digest, so a reset takes only its own run's plan, as Factory wrote it. An accepted amendment posts its plan the same
+ * way, with `note` saying which amendment it is and its own crash points
  * (`point`: `<point>:post:*`, `<point>:data:*`).
  */
 export async function postPlan(
-  deps: PlanningDeps,
-  issue: number,
+  deps: Pick<PlanningDeps, "github">,
+  state: ObjectiveState,
   plan: Plan,
   signal: AbortSignal,
-  { point = "plan", note }: { point?: string; note?: string } = {},
+  {
+    point = "plan",
+    note,
+    accepted = state.kept[ACCEPTED_AT] as string,
+  }: { point?: string; note?: string; accepted?: string } = {},
 ): Promise<void> {
+  const issue = state.issue;
   const marker = PLAN_MARK(issue);
   const listed = plan.items.slice(0, LISTED_ITEMS);
   const items = `${listed
@@ -1141,12 +1145,12 @@ export async function postPlan(
     .join(
       "\n",
     )}${plan.items.length > listed.length ? `\n- and ${plan.items.length - listed.length} more (see the plan data)` : ""}`;
+  const json = JSON.stringify(plan);
   const summary =
-    `${marker}\n**Factory's plan** (${plan.items.length} Work Item${plan.items.length === 1 ? "" : "s"}, base \`${plan.base.slice(0, 12)}\`)${note ? `\n\n${note}` : ""}\n\n${items}${plan.decisions.length ? `\n\nDecisions:\n${plan.decisions.map((d) => `- ${d.answer}${d.text ? `: ${prose(d.text)}` : ""} (${prose(d.by)})`).join("\n")}` : ""}`.slice(
+    `${marker}\n${planMarks(runOf(state), accepted, json)}\n**Factory's plan** (${plan.items.length} Work Item${plan.items.length === 1 ? "" : "s"}, base \`${plan.base.slice(0, 12)}\`)${note ? `\n\n${note}` : ""}\n\n${items}${plan.decisions.length ? `\n\nDecisions:\n${plan.decisions.map((d) => `- ${d.answer}${d.text ? `: ${prose(d.text)}` : ""} (${prose(d.by)})`).join("\n")}` : ""}`.slice(
       0,
       COMMENT_LIMIT - 200,
     );
-  const json = JSON.stringify(plan);
   const data = (text: string, label: string) =>
     `\n\n<details><summary>${label}</summary>\n\n\`\`\`json\n${text}\n\`\`\`\n</details>`;
   const whole = data(json, "Plan data");
