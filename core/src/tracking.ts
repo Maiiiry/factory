@@ -17,7 +17,7 @@ import {
   removeLabel,
   WORK_ITEM_LABEL,
 } from "./github-roles.js";
-import { code, mark, prose } from "./markdown.js";
+import { code, inert, mark, prose } from "./markdown.js";
 import { currentPlan } from "./planning/plan.js";
 import type { Plan } from "./planning/types.js";
 import { addCard, cardProject } from "./queue.js";
@@ -187,8 +187,10 @@ function wanted(state: ObjectiveState): Map<string, Wanted> {
     items.set(item.id, {
       planned: !ended,
       ...(status ? { status } : {}),
-      // A title is plain text, never Markdown: only cut to one line.
-      title: cut(item.title, 200),
+      // A title is plain text, never Markdown: cut to one line, and it
+      // references and mentions nothing (markdown.ts inert). Every create
+      // and edit of the issue uses this title.
+      title: inert(cut(item.title, 200)),
       body: issueBody(objective, item, plan!),
       dependencies: [...item.dependencies].sort(),
       comment: liveComment(objective, item.id, [
@@ -909,11 +911,13 @@ function liveComment(objective: number, item: string, lines: string[]): string {
 
 /**
  * Model or worker text as prose on one line, cut to `max`: it can open no
- * HTML, mention no one (markdown.ts `prose`), and start no link
- * definition, so nothing in it is hidden.
+ * HTML, mention or reference nothing (markdown.ts `prose`, `inert`), and
+ * start no link definition, so nothing in it is hidden.
  */
 function line(value: string, max: number): string {
-  return prose(cut(value, max)).replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+  return prose(inert(cut(value, max)))
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
 }
 
 /** One line, cut to `max` characters. */

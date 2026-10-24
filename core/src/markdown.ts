@@ -70,6 +70,33 @@ export function prose(text: string): string {
     .replace(/@/g, "&#64;");
 }
 
+/** U+200D: invisible, but GitHub no longer reads a reference or mention through it. */
+const JOINER = "‍";
+
+/**
+ * Model-written text GitHub can't act on: every closing keyword, every
+ * `#N`, `GH-N` and `owner/repo#N` reference, every issue or pull request
+ * URL (bare, `www.`, autolinked or a link's target) and every @mention
+ * gets a zero-width joiner, so none links, closes an issue or notifies
+ * anyone. Plain text: titles and commit subjects use it as it is, Markdown
+ * wraps it in `prose`. Factory's own references are added after,
+ * untouched.
+ */
+export function inert(text: string): string {
+  return text
+    .replace(
+      /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b/gi,
+      (keyword) => `${keyword[0]}${JOINER}${keyword.slice(1)}`,
+    )
+    .replace(
+      /\bgithub\.com(?=\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d)/gi,
+      (host) => `${host.slice(0, 6)}${JOINER}${host.slice(6)}`,
+    )
+    .replace(/#(?=\d)/g, `#${JOINER}`)
+    .replace(/\bgh-(?=\d)/gi, (prefix) => `${prefix}${JOINER}`)
+    .replace(/@(?=[\w-])/g, `@${JOINER}`);
+}
+
 /**
  * Factory's hidden marker, `<!-- factory:<issue>:<kind>:<id> -->`, on the
  * first line of a comment or issue body it writes: found by it (by

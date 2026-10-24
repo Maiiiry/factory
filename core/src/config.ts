@@ -235,7 +235,8 @@ export interface SandboxConfig {
    * Fixed environment variables for every sandboxed command, such as the
    * variable that locates a pre-provisioned tool directory. Names Factory
    * controls or that could leak or redirect are refused. A value that is an
-   * absolute path should lie within `readOnlyPaths`.
+   * absolute path should lie within `readOnlyPaths`. Never a secret: values
+   * are not redacted (a secret goes in policy.allowedSecretNames).
    */
   environment: Record<string, string>;
   limits: SandboxLimits;
