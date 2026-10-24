@@ -11,11 +11,13 @@ import {
 import { join } from "node:path";
 import { crashPoint } from "./crash.js";
 import {
+  CANCEL_CLEANUP,
   type CapacityUse,
   DEFAULT_LIMITS,
   type EngineLimits,
   hostLimits,
   itemOf,
+  MAX_CLEANUP_FAILURES,
   ObjectiveRunner,
   type ServiceRun,
   type Workflow,
@@ -39,6 +41,7 @@ import {
   type RequestResult,
   type RunRequest,
   refused,
+  rejectRequest,
   removeRequest,
   type StoredRequest,
 } from "./requests.js";
@@ -264,7 +267,9 @@ export async function serve(options: ServeOptions): Promise<number> {
         error: loaded.error,
         incident: loaded.incident,
       });
-    return loaded?.kind === "ok" ? open(loaded.state) : undefined;
+    if (loaded?.kind !== "ok") return undefined;
+    workflow.resumed?.(loaded.state);
+    return open(loaded.state);
   };
   /** State files not read yet because the read failed: tried every tick. */
   const unloaded = new Set<number>();
@@ -414,32 +419,103 @@ export async function serve(options: ServeOptions): Promise<number> {
   }
   crashPoint("serve:loaded");
 
+  /**
+   * Each pending request is applied once. One that can't be taken (checked
+   * where it enters: requests.ts `pendingRequests`) moves to rejected/ and
+   * is refused; one whose apply throws is refused with the error after
+   * that one try, never retried every tick. Neither stops the others.
+   */
+  /** Rejected requests whose file could neither move nor go: refused once, then skipped. */
+  const refusedOnce = new Set<string>();
   const applyRequests = (): void => {
-    for (const { file, stored } of pendingRequests(paths.requests)) {
+    for (const pending of pendingRequests(paths.requests)) {
+      const { file, id, stored } = pending;
       if (!stored) {
-        removeRequest(file);
+        if (refusedOnce.has(id)) continue;
+        log.write(0, {
+          event: "request-rejected",
+          id,
+          problem: pending.problem,
+        });
+        try {
+          rejectRequest(file);
+        } catch (error) {
+          // Never read again either way: the refusal below answers it.
+          log.write(0, { event: "reject-failed", id, error: String(error) });
+          try {
+            removeRequest(file);
+          } catch {
+            // It stays, but it is refused only this once.
+            refusedOnce.add(id);
+          }
+        }
+        writeResult(
+          paths.requests,
+          id,
+          refused(
+            "invalid_request",
+            `Request ${id} can't be taken: ${pending.problem}. It moved to requests/rejected/.`,
+          ),
+        );
         continue;
       }
       let result: RequestResult | undefined;
       try {
         result = applyRequest(stored);
       } catch (error) {
-        // Not saved: the request file stays and is tried again next tick.
         log.write(stored.request.issue, {
           event: "request-failed",
-          id: stored.id,
+          id,
           error: String(error),
         });
-        continue;
+        result = refused(
+          "request_failed",
+          `Applying the request failed, so nothing changed: ${String(error)}. Run the command again.`,
+        );
       }
       // A reset that is rebuilding, or a run waiting for its admission:
       // answered when that lands.
       if (!result) continue;
-      if (stored.request.kind === "run")
-        endRun(stored.request.issue, stored.id);
-      writeResult(paths.requests, stored.id, result);
+      if (stored.request.kind === "run") endRun(stored.request.issue, id);
+      if (stored.source === "github" && result.code)
+        recordRefusal(id, stored, result);
+      writeResult(paths.requests, id, result);
       crashPoint("requests:applied");
       removeRequest(file);
+    }
+  };
+
+  /**
+   * A `/factory` comment's refusal made outside the Objective's own save
+   * (no state for it now, a failed apply): kept in its applied requests
+   * when it has a run, so the sync replies once (`unreplied`) and the same
+   * comment read again is answered from there, never applied again.
+   */
+  const recordRefusal = (
+    id: string,
+    stored: StoredRequest,
+    result: RequestResult,
+  ): void => {
+    const runner = runners.get(stored.request.issue);
+    if (!runner || runner.state.appliedRequests.some((r) => r.id === id))
+      return;
+    try {
+      runner.transact(() => {
+        runner.state.appliedRequests = [
+          ...runner.state.appliedRequests,
+          {
+            id,
+            message: result.message,
+            ...(result.code ? { code: result.code } : {}),
+          },
+        ].slice(-KEEP_REQUEST_IDS);
+      });
+    } catch (error) {
+      log.write(stored.request.issue, {
+        event: "refusal-unsaved",
+        id,
+        error: String(error),
+      });
     }
   };
 
@@ -629,6 +705,17 @@ export async function serve(options: ServeOptions): Promise<number> {
     const known = find(issue);
     if (known && !TERMINAL.includes(known.state.status))
       return { message: "ok" };
+    // Admission never replaces a run whose cleanup still runs (`admit`),
+    // so the request would wait unanswered: it is refused instead.
+    if (known && !known.settled) {
+      const last = known.state.retries[CANCEL_CLEANUP]?.lastError;
+      return refused(
+        "cleanup_running",
+        known.state.status === "cancelled"
+          ? `#${issue}'s cleanup after cancel hasn't settled yet${last ? ` (${last.slice(0, 300)})` : ""}; it settles after ${MAX_CLEANUP_FAILURES} tries at most once it has retried for ${Math.round(limits.maxWaitMs / 60_000)} min. Run factory run ${issue} again then, or factory reset ${issue} to rebuild it from GitHub now.`
+          : `#${issue} is done, and its last step is still ending; run factory run ${issue} again in a moment, or factory reset ${issue} to rebuild it from GitHub.`,
+      );
+    }
     const current = runs.get(issue);
     if (current && current.id > stored.id)
       return refused(
@@ -1257,16 +1344,28 @@ function writeResult(dir: string, id: string, result: RequestResult): void {
   }
 }
 
+/** Results, leftover temporary files and rejected requests past RESULT_TTL_MS. */
 function sweepResults(dir: string): void {
+  const rejected = join(dir, "rejected");
   let names: string[];
   try {
-    names = readdirSync(dir);
+    names = [
+      ...readdirSync(dir).filter(
+        (name) => name.endsWith(".result") || name.endsWith(".tmp"),
+      ),
+      ...(() => {
+        try {
+          return readdirSync(rejected).map((name) => join("rejected", name));
+        } catch {
+          return [];
+        }
+      })(),
+    ];
   } catch {
     return;
   }
   const cutoff = Date.now() - RESULT_TTL_MS;
   for (const name of names) {
-    if (!name.endsWith(".result") && !name.endsWith(".tmp")) continue;
     const path = join(dir, name);
     try {
       if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true });

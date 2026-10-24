@@ -544,6 +544,9 @@ async function pushBranch(
     );
   }
   crashPoint("deliver:push:after");
+  // GitHub's reads of the new branch and commit may lag behind the push.
+  context.github.made(commit);
+  context.github.made(branch);
   if ((await remoteHead(context, branch)) !== commit)
     return retry(
       `Remote branch ${branch} does not show the pushed ${commit} yet`,
@@ -992,7 +995,7 @@ async function judge(
       kind: "retry",
       reason: gate ? `Waiting on ${gate}` : waiting,
       afterMs: CI_POLL_MS,
-      ...(gate ? { wait: { kind: "gate", gate } } : {}),
+      ...(gate ? { wait: { kind: "gate", gate, human: true } } : {}),
       ...(settle ? { holdAfter: settle } : {}),
     };
   }
@@ -1247,6 +1250,7 @@ async function unregisteredChecks(
           wait: {
             kind: "gate",
             gate: `an environment approval for Actions workflow runs on PR #${pr}`,
+            human: true,
           },
         }
       : {
