@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
@@ -21,7 +22,7 @@ export const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 export const REPO = "drill/target";
 
 export function installation() {
-  const stateDir = mkdtempSync(join(tmpdir(), "factory-core-"));
+  const stateDir = mkdtempSync(join(tmpdir(), "factory-test-"));
   const root = join(stateDir, REPO.replace("/", "__"));
   const env = {
     ...process.env,
@@ -104,8 +105,11 @@ export function cli(inst, ...args) {
 export async function comment(inst, issue, answer, writtenAt, question) {
   mkdirSync(inst.requests, { recursive: true });
   const id = `comment-${Date.now()}`;
+  // Written whole, then renamed, as Factory writes requests (requests.ts
+  // writeRequest): the service never reads a file half-written.
+  const temporary = join(inst.requests, `.${id}.tmp`);
   writeFileSync(
-    join(inst.requests, `${id}.json`),
+    temporary,
     JSON.stringify({
       id,
       at: new Date().toISOString(),
@@ -119,6 +123,7 @@ export async function comment(inst, issue, answer, writtenAt, question) {
       },
     }),
   );
+  renameSync(temporary, join(inst.requests, `${id}.json`));
   const result = join(inst.requests, `${id}.result`);
   await until(() => existsSync(result), "the comment's result");
   return JSON.parse(readFileSync(result, "utf8")).message;
