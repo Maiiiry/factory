@@ -40,9 +40,8 @@ Every model call writes one `model-usage` event when it ends, whatever its outco
     "reasoning": 752,
     "total": 996791
   },
-  "tokenSource": "sdk",
   "costUsd": null,
-  "nativeToolActivity": { "total": 16, "byName": { "exec": 16 } },
+  "nativeToolActivity": null,
   "cacheEffectiveness": { "hitRate": 0.942, "uncachedInput": 57625 },
   "capture": "4f0c..."
 }
@@ -50,25 +49,24 @@ Every model call writes one `model-usage` event when it ends, whatever its outco
 
 - `role`: `planner`, `reviewer`, `worker` or `dream`. A planner-seam call also has `phase` (`plan`, `graph-review`, `result-review`, `objective-review`, `diagnosis`, `dream`, `propose`) and `tools` (it could read a tree); a worker has `item`.
 - `outcome`: a planner call's `done`, `retry`, `hold`, `fail` or `error` (with `error`); a worker's result kind (`finished`, `retry`, `hold`) or `error`. `ms` is the call's wall time. A hedged second call (planner.ts HedgedPlanner) logs its own event with `hedge: 1`.
-- `tokens`: `input` includes `cached` (read from the prompt cache) and `cacheWrite` (written to it: Claude's cache creation, Codex's `cache_write_input_tokens`, Copilot's `cacheWriteTokens`, Claude managed's `cache_creation`); `output` includes `reasoning`; `total` is input plus output, or the provider's own total when it reports no split. A managed worker's split comes from its own sessions' counts (Claude managed: input, cache reads and writes, output; OpenAI: input with `input_tokens_details.cached_tokens`, output with `output_tokens_details.reasoning_tokens`), and its `total` is the run's spend, which also holds what a crashed earlier run left, so it can exceed input plus output; with no counts it has the total only. Claude and Copilot report no reasoning count; a Claude worker sums its queries, credential retries included.
-- `tokenSource` (Codex only): `sdk`, from the SDK's `turn.completed`, or `native`, from Codex's session record when the stream ended before it.
+- `tokens`: `input` includes `cached` (read from the prompt cache) and `cacheWrite` (written to it: Claude's cache creation, Codex's `cache_write_input_tokens`, Copilot's `cacheWriteTokens`, Claude managed's `cache_creation`); `output` includes `reasoning`; `total` is input plus output, or the provider's own total when it reports no split. A managed worker's split comes from its own sessions' counts (Claude managed: input, cache reads and writes, output; OpenAI: input with `input_tokens_details.cached_tokens`, output with `output_tokens_details.reasoning_tokens`), and its `total` is the run's spend, which also holds what a crashed earlier run left, so it can exceed input plus output; with no counts it has the total only. Claude and Copilot report no reasoning count; a Claude worker sums its queries, credential retries included. A Codex call's come from the SDK's `turn.completed` only: a turn that never completed has `null`.
 - `costUsd`: list cost when the provider reports it (Claude, Claude managed), else `null`.
 - `serviceTier` (Codex): the tier the call asked for (`fast` or `standard`), `null` for Codex's default.
-- `nativeToolActivity`: the model-visible tool calls by name, each call id once (Codex: from its session record, providers/codex-telemetry.ts; Claude: `tool_use` blocks; Copilot: tool executions); `null` where unseen. One call can run many commands. `nativePartial: true` when the Codex record was past its 8 MiB read bound.
+- `nativeToolActivity`: the model-visible tool calls by name, each call id once (Claude: `tool_use` blocks; Copilot: tool executions); `null` where unseen (Codex). One call can run many commands.
 - `cacheEffectiveness`: this call's `hitRate` (cached over input, 4 places; `null` with no input) and `uncachedInput` (input minus cached); `null` when either count is unknown. Aggregates weight by input; never average hit rates.
 - `callId`: the call's id; a `model-refused` event (or a `diagnosis-rejected` one) with `stage: "semantic"` names it when Factory's checks refused a well-formed answer.
-- `reportedModel`: the model as the provider reported it (Claude's init and messages, Codex's session record, Copilot's usage events, a managed agent's), else `null`.
+- `reportedModel`: the model as the provider reported it (Claude's init and messages, Copilot's usage events, a managed agent's), else `null`.
 - `promptDigest`, `schemaDigest`, `sourceDigest`: sha256 of the prompt, of the answer schema (planner calls) and over the source bodies the call was given (a worker's pinned sources, the Objective's sources for planning and plan review); `null` when there is none. `requestBytes`: prompt, schema and images as sent; `responseBytes` and `responseDigest`: the size and sha256 of the call's answer or final message, whether or not capture is on; `promptComponents`: bytes of `prompt`, `schema`, `images`, and `sections`, the prompt's parts as its builder rendered them (the worker prompt, planning and plan review).
 - `stage`: where a failed call failed: `provider` (the default), `parse` (an answer that isn't JSON) or `protocol` (an answer that breaks its schema or contract).
 - `timeToFirstTokenMs`: from the call's start to its first model output, where the SDK streams (not managed agents, which are polled). `sessionTurn` and `sessionMode`: the turn's ordinal in its provider session and `fresh` or `resumed`.
-- `nativeTools`: `rounds` (responses that asked for a tool), `outputs`, `failures` (reported failed), `missingOutputs` and `ms`; with capture on the tool outputs go to the capture file. `imageOutputs`: images the model produced.
-- `providerUsage`: the provider's own usage breakdown, numbers only: Claude's `usage` and per-model `modelUsage` (subagents included; a resumed session's running totals), Codex's turn usage, its session record's last `token_count` and its child threads' (`descendants`), Copilot's per-model usage (with its `totalNanoAiu` billing units), managed spend.
+- `nativeTools`: `rounds` (responses that asked for a tool), `outputs`, `failures` (reported failed), `missingOutputs` and `ms`; with capture on the tool outputs go to the capture file (Codex: each command's output, from the SDK's completed `command_execution` items). `imageOutputs`: images the model produced.
+- `providerUsage`: the provider's own usage breakdown, numbers only: Claude's `usage` and per-model `modelUsage` (subagents included; a resumed session's running totals), Codex's `turn.completed` usage (`turn`), Copilot's per-model usage (with its `totalNanoAiu` billing units), managed spend.
 - `currency`: `USD` beside a known `costUsd`, else `null`.
 - `capture`: the id of the call's capture file, only when capture is on and the file was written.
 - A call that continued a retained conversation has `sessionMode` `resumed` and its turn number in `sessionTurn` (see [Retained conversations](#retained-conversations)). Its tokens and cost are its own turn's, never the conversation's running totals; its capture holds the delta it sent, and `deltaBytes` its size.
 - An adapter adds its own fields: `session` or `thread`, `turns`, `stopReason`, `finalTreeValidated`, managed `key` and `spend`.
 
-**Codex native telemetry.** Each Codex call runs in a private `CODEX_HOME`. Before it is removed, providers/codex-telemetry.ts reads the thread's session record (`sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl`, its last 8 MiB): the last `token_count` gives the thread's counts (reasoning included), and the `function_call`, `custom_tool_call`, `local_shell_call` and `web_search_call` items give `nativeToolActivity`. Unreadable or missing, it adds nothing. A failed turn's outcome reads the same record (providers/codex.ts `codexFailure`): its `task_complete` error's `codex_error_info` and the last `token_count`'s `rate_limits` windows.
+**Codex session record.** Each Codex call runs in a private `CODEX_HOME`. Before it is removed, providers/codex-telemetry.ts reads the thread's session record (`sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl`, its last 8 MiB) for what the SDK stream lacks: a failed turn's outcome (providers/codex.ts `codexFailure`) from its `task_complete` error's `codex_error_info` and the last `token_count`'s `rate_limits` windows, and for a retained conversation the thread's counts before the turn and whether Codex compacted it (see [Retained conversations](#retained-conversations)). Unreadable or missing, it adds nothing.
 
 ### Live calls
 

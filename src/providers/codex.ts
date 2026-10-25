@@ -30,13 +30,12 @@ import {
 import { errorMessage } from "../text.js";
 import { CodexStderr, withStderr } from "./codex-stderr.js";
 import {
-  addCodexTelemetry,
   type CodexBaseline,
-  type CodexTelemetry,
+  type CodexRecord,
   codexBaseline,
   codexLiveRecord,
+  codexRecord,
   codexSessionRecord,
-  codexTelemetry,
   codexTokens,
   codexTurnUsage,
   modelItem,
@@ -58,7 +57,12 @@ import {
   type PlannerModels,
 } from "./planner.js";
 import { openTurn, overflowed, type Turn, turnFields } from "./session.js";
-import { captureRequest, captureResponse, firstToken } from "./usage.js";
+import {
+  captureRequest,
+  captureResponse,
+  captureToolOutput,
+  firstToken,
+} from "./usage.js";
 
 export type CodexEffort = ModelReasoningEffort;
 
@@ -430,7 +434,7 @@ function jsonStatus(message: string): unknown {
  */
 export function codexFailure(
   message: string,
-  telemetry?: CodexTelemetry,
+  recorded?: CodexRecord,
   refused = false,
 ): PlannerError {
   const shown = detail(message);
@@ -439,7 +443,7 @@ export function codexFailure(
       "hold",
       `Factory couldn't start Codex in its own process namespace (${shown}). ${NAMESPACE_FIX}; fix the host, then answer retry`,
     );
-  const failure = telemetry?.failure;
+  const failure = recorded?.failure;
   if (
     jsonStatus(message) === 401 ||
     failure?.kind === "unauthorized" ||
@@ -453,7 +457,7 @@ export function codexFailure(
     return PlannerError.contextOverflow(
       `The request is larger than the model's context window: ${shown}`,
     );
-  const full = (telemetry?.limits ?? []).filter((window) => window.used >= 100);
+  const full = (recorded?.limits ?? []).filter((window) => window.used >= 100);
   if (failure?.kind === "usage_limit_exceeded" || full.length) {
     const resets = full.map((window) => window.resetsAt);
     const at =
@@ -559,7 +563,7 @@ export class CodexPlanner implements Planner {
     const failure = (message: string) =>
       codexFailure(
         message,
-        codexTelemetry(
+        codexRecord(
           home.env.CODEX_HOME!,
           (record.thread as string | undefined) ?? turn.resumed?.id,
           baseline?.size,
@@ -683,6 +687,16 @@ export class CodexPlanner implements Planner {
           response = event.item.text;
           captureResponse(record, response);
         }
+        // With capture on, each command's output goes to the call's capture.
+        if (
+          event.type === "item.completed" &&
+          event.item.type === "command_execution"
+        )
+          captureToolOutput(
+            record,
+            event.item.type,
+            event.item.aggregated_output,
+          );
         if (event.type === "turn.completed") {
           completed = true;
           const counts = baseline
@@ -723,7 +737,7 @@ export class CodexPlanner implements Planner {
         threadId &&
         turn.end(threadId, {
           compacted: Boolean(
-            codexTelemetry(home.env.CODEX_HOME!, threadId, baseline?.size)
+            codexRecord(home.env.CODEX_HOME!, threadId, baseline?.size)
               ?.compacted,
           ),
         });
@@ -760,7 +774,6 @@ export class CodexPlanner implements Planner {
       }
       group.end();
       saveModelsCache(home.env.CODEX_HOME!);
-      addCodexTelemetry(record, home.env.CODEX_HOME!, baseline?.size);
       // A retained conversation's home stays for its next turn, unless a
       // later turn has taken it (a hedge's loser, an aborted attempt).
       if (call.conversation) {

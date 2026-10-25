@@ -26,7 +26,7 @@ export interface Tokens {
 }
 
 /** Distinct operations or tool calls, in all and by name. */
-export interface Tally {
+interface Tally {
   total: number;
   byName: Record<string, number>;
 }

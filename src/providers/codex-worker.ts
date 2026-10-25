@@ -53,12 +53,11 @@ import {
 } from "./codex.js";
 import { CodexStderr, withStderr } from "./codex-stderr.js";
 import {
-  addCodexTelemetry,
   type CodexBaseline,
   codexBaseline,
   codexLiveRecord,
+  codexRecord,
   codexSessionRecord,
-  codexTelemetry,
   codexTokens,
   codexTurnUsage,
   modelItem,
@@ -81,6 +80,7 @@ import {
 import {
   captureRequest,
   captureResponse,
+  captureToolOutput,
   describeRequest,
   firstToken,
   logUsage,
@@ -625,7 +625,7 @@ export class CodexWorker implements Worker {
       failed(
         codexFailure(
           redact(message, secrets),
-          codexTelemetry(
+          codexRecord(
             join(home.root, "codex-home"),
             (record.thread as string | undefined) ?? turn.resumed?.id,
             baseline?.size,
@@ -690,6 +690,16 @@ export class CodexWorker implements Worker {
         if (event.type === "thread.started") record.thread = event.thread_id;
         if (modelItem(item)) firstToken(record, callStarted);
         if (item?.type === "agent_message") finalResponse = item.text;
+        // With capture on, each command's output goes to the call's capture.
+        if (
+          event.type === "item.completed" &&
+          event.item.type === "command_execution"
+        )
+          captureToolOutput(
+            record,
+            event.item.type,
+            event.item.aggregated_output,
+          );
         if (item) codexActivity(input, event.type, item);
         if (event.type === "turn.completed") {
           completed = true;
@@ -714,11 +724,8 @@ export class CodexWorker implements Worker {
         threadId &&
         turn.end(threadId, {
           compacted: Boolean(
-            codexTelemetry(
-              join(home.root, "codex-home"),
-              threadId,
-              baseline?.size,
-            )?.compacted,
+            codexRecord(join(home.root, "codex-home"), threadId, baseline?.size)
+              ?.compacted,
           ),
         });
       return {
@@ -754,7 +761,6 @@ export class CodexWorker implements Worker {
       // Commands the worker left running end with its turn.
       group.end();
       saveModelsCache(join(home.root, "codex-home"));
-      addCodexTelemetry(record, join(home.root, "codex-home"), baseline?.size);
       // A retained conversation's Codex state stays for the item's next
       // repair; its HOME, caches and scratch go now, as for any turn.
       // A later turn may have taken the directory: then it isn't this one's.

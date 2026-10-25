@@ -652,9 +652,7 @@ test("an Objective question from an item step stops every item, once", async () 
 test("a failed Codex turn's outcome comes from its session record; a login hold on one item stops every item, once", async () => {
   const { ObjectiveRunner } = await import("../dist/engine.js");
   const { codexFailure } = await import("../dist/providers/codex.js");
-  const { codexTelemetry } = await import(
-    "../dist/providers/codex-telemetry.js"
-  );
+  const { codexRecord } = await import("../dist/providers/codex-telemetry.js");
   const { providerOutcome } = await import("../dist/providers/planner.js");
   const { newObjective } = await import("../dist/state.js");
   // What the pinned Codex 0.160.0 reported for each failure (turn.failed's
@@ -675,7 +673,7 @@ test("a failed Codex turn's outcome comes from its session record; a login hold 
       join(day, "rollout-2026-10-25T00-03-02-thread.jsonl"),
       cases[name].rollout.map((entry) => `${JSON.stringify(entry)}\n`).join(""),
     );
-    return codexFailure(cases[name].message, codexTelemetry(home, "thread"));
+    return codexFailure(cases[name].message, codexRecord(home, "thread"));
   };
   // The full window's reset, never the local time the message names.
   const limited = failure("usage limit");
