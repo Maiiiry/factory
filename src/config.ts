@@ -594,7 +594,7 @@ export function loadConfig(repository: string): CoreConfig {
         maxBytesPerCall: whole(
           1024,
           CAPTURE_OFF.maxBytesPerCall,
-          256 * 1024 * 1024,
+          CAPTURE_OFF.maxBytesPerCall,
         ),
       }),
       sessions: object({

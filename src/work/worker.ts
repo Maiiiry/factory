@@ -181,6 +181,25 @@ const emptyWindow = (): ActivityWindow => ({
   paths: [],
 });
 
+/** A `worker-activity` event's `counts`: what happened since the previous one. */
+export type ActivityCounts = ActivityWindow["counts"];
+
+/**
+ * One `worker-activity` event's counts added to `into` (zero counts when
+ * absent), for a reader's running totals: diagnostics and watch.
+ */
+export function foldActivity(
+  event: Record<string, unknown>,
+  into: ActivityCounts = emptyWindow().counts,
+): ActivityCounts {
+  const counts = (event.counts ?? {}) as Record<string, unknown>;
+  for (const name of Object.keys(into) as (keyof ActivityCounts)[]) {
+    const n = counts[name];
+    if (typeof n === "number" && Number.isFinite(n)) into[name] += n;
+  }
+  return into;
+}
+
 /** Provider events that only stream a delta of text already in a later event. */
 const DELTA = /(?:^stream_event$|_delta$|\.delta$)/;
 

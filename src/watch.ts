@@ -13,6 +13,7 @@ import {
   readNew,
   untilInterrupted,
 } from "./log.js";
+import { type ActivityCounts, foldActivity } from "./work/worker.js";
 
 /** Events read back per Objective to start the view. */
 const BACKLOG = 500;
@@ -22,16 +23,6 @@ const QUIET_MS = 24 * 60 * 60 * 1000;
 const REDRAW_MS = 5_000;
 /** A running worker without progress this long shows how long. */
 const QUIET_PROGRESS_MS = 15 * 60_000;
-
-interface Totals {
-  toolsStarted: number;
-  toolsFinished: number;
-  edits: number;
-  commands: number;
-  commandsFailed: number;
-  turns: number;
-  compactions: number;
-}
 
 /** One Work Item's line (or the Objective's own steps, item `-`). */
 interface Row {
@@ -44,7 +35,7 @@ interface Row {
   reason?: string;
   at: string;
   /** The running step's activity so far, from its `worker-activity` events. */
-  totals?: Totals;
+  totals?: ActivityCounts;
   tools?: string[];
   /** The last tools started with what they acted on. */
   targets?: { tool: string; target: string }[];
@@ -227,19 +218,8 @@ function applyEvent(
       row.state ||= "running";
       break;
     case "worker-activity": {
-      const counts = (event.counts ?? {}) as Partial<Totals>;
-      const totals = row.totals ?? {
-        toolsStarted: 0,
-        toolsFinished: 0,
-        edits: 0,
-        commands: 0,
-        commandsFailed: 0,
-        turns: 0,
-        compactions: 0,
-      };
-      for (const name of Object.keys(totals) as (keyof Totals)[])
-        totals[name] += Number(counts[name] ?? 0);
-      row.totals = totals;
+      const counts = (event.counts ?? {}) as Partial<ActivityCounts>;
+      row.totals = foldActivity(event, row.totals);
       if (Array.isArray(event.tools) && event.tools.length)
         row.tools = event.tools.map(String);
       if (Array.isArray(event.paths) && event.paths.length)

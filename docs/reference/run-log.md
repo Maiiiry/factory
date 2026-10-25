@@ -87,7 +87,7 @@ The launcher appends codex's standard error to `codex-stderr.log` in the call's 
 Off by default. With `"capture": {"enabled": true}` in the configuration, the request and response bodies of each model call go to `logs/<issue>/<run id>.captures/<id>.json`, and the call's `model-usage` event names the file by `capture`. Bodies never enter the run log itself.
 
 - A capture file is `{id, run, request, response, tools, truncated, original}`: the request is the prompt the call sent (a worker's whole prompt), the response its answer or final message, `tools` the native tool outputs in order (`{name, output}`); a call with no answer has no `response`. `original` gives the bodies as they were before redaction and the cut: the request's and the response's `bytes` and `sha256`, and the tool outputs' `count` and `bytes`; `--show-captures` names them for a cut capture.
-- Each body is redacted (log.ts `redact`, with the configuration's secrets), then cut to half of `capture.maxBytesPerCall` (with tool outputs: two fifths each, and a quarter for the outputs together) (default 8 MiB, at least 1 KiB, at most 256 MiB); `truncated` says a body was cut. Redaction is best effort.
+- Each body is redacted (log.ts `redact`, with the configuration's secrets), then cut to half of `capture.maxBytesPerCall` (with tool outputs: two fifths each, and a quarter for the outputs together) (default and at most 8 MiB, at least 1 KiB); `truncated` says a body was cut. Redaction is best effort.
 - Files are `0600` in a `0700` directory and rotate with their run. A capture that can't be written is skipped; the call and its event are unaffected.
 - Capture is operational, never frozen with an Objective: turning it on or off applies from the next service start and changes no run.
 

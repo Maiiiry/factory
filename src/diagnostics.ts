@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { displayTime, duration, redactDeep } from "./display.js";
 import { itemOf } from "./engine.js";
 import {
+  CAPTURE_OFF,
   type LogEvent,
   logFiles,
   readRunFile,
@@ -20,6 +21,7 @@ import {
 } from "./log.js";
 import { captureFile, readContained } from "./paths.js";
 import { oneLine } from "./text.js";
+import { type ActivityCounts, foldActivity } from "./work/worker.js";
 
 /** Which runs: the latest (default), one by id, or all. */
 export type RunChoice =
@@ -319,8 +321,8 @@ function originalText(original?: Record<string, unknown>): string {
   return parts.length ? `; ${parts.join(", ")}` : "";
 }
 
-/** The most a capture file is read: 2 × the 256 MiB maxBytesPerCall cap, with JSON escapes. */
-const CAPTURE_READ_MAX = 768 * 1024 * 1024;
+/** The most a capture file is read: 3 × the 8 MiB maxBytesPerCall cap, room for its JSON escapes. */
+const CAPTURE_READ_MAX = 3 * CAPTURE_OFF.maxBytesPerCall;
 
 /**
  * A capture file's bodies (`file` under `logs`, from paths.ts captureFile),
@@ -427,28 +429,25 @@ function modelText(event: LogEvent): string {
 }
 
 interface Activity {
-  turns: number;
-  toolsStarted: number;
-  edits: number;
-  commands: number;
-  commandsFailed: number;
+  counts: ActivityCounts;
   tools: Set<string>;
   paths: Set<string>;
   command?: string;
 }
 
 function activityText(item: string, activity: Activity): string {
-  const parts = [`activity ${item}: ${activity.turns} turns`];
-  if (activity.toolsStarted)
+  const { counts } = activity;
+  const parts = [`activity ${item}: ${counts.turns} turns`];
+  if (counts.toolsStarted)
     parts.push(
-      `${activity.toolsStarted} tools${activity.tools.size ? ` (${[...activity.tools].slice(0, 8).join(", ")})` : ""}`,
+      `${counts.toolsStarted} tools${activity.tools.size ? ` (${[...activity.tools].slice(0, 8).join(", ")})` : ""}`,
     );
-  if (activity.edits)
+  if (counts.edits)
     parts.push(
-      `${activity.edits} edits${activity.paths.size ? ` (${[...activity.paths].slice(0, 8).join(", ")})` : ""}`,
+      `${counts.edits} edits${activity.paths.size ? ` (${[...activity.paths].slice(0, 8).join(", ")})` : ""}`,
     );
-  if (activity.commands) parts.push(`${activity.commands} commands`);
-  if (activity.commandsFailed) parts.push(`${activity.commandsFailed} failed`);
+  if (counts.commands) parts.push(`${counts.commands} commands`);
+  if (counts.commandsFailed) parts.push(`${counts.commandsFailed} failed`);
   if (activity.command) parts.push(`last $ ${activity.command}`);
   return parts.join(" · ");
 }
@@ -645,20 +644,11 @@ class Timeline {
 /** One `worker-activity` event added to a step's activity. */
 function fold(event: LogEvent, into?: Activity): Activity {
   const activity = into ?? {
-    turns: 0,
-    toolsStarted: 0,
-    edits: 0,
-    commands: 0,
-    commandsFailed: 0,
+    counts: foldActivity({}),
     tools: new Set<string>(),
     paths: new Set<string>(),
   };
-  const counts = (event.counts ?? {}) as Record<string, unknown>;
-  activity.turns += num(counts.turns) ?? 0;
-  activity.toolsStarted += num(counts.toolsStarted) ?? 0;
-  activity.edits += num(counts.edits) ?? 0;
-  activity.commands += num(counts.commands) ?? 0;
-  activity.commandsFailed += num(counts.commandsFailed) ?? 0;
+  foldActivity(event, activity.counts);
   if (Array.isArray(event.tools))
     for (const tool of event.tools) activity.tools.add(String(tool));
   if (Array.isArray(event.paths))
