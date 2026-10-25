@@ -482,15 +482,6 @@ export function codexSessionRecord(
   );
 }
 
-/** The Codex SDK items that are operations (not messages, reasoning or errors). */
-export const SDK_OPERATIONS: ReadonlySet<string> = new Set([
-  "command_execution",
-  "file_change",
-  "mcp_tool_call",
-  "web_search",
-  "todo_list",
-]);
-
 /** The SDK's `turn.completed` usage as the record's `providerUsage.turn`. */
 export function codexTurnUsage(
   record: Record<string, unknown>,

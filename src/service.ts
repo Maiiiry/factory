@@ -1264,13 +1264,17 @@ export async function serve(options: ServeOptions): Promise<number> {
   options.signal?.addEventListener("abort", stop, { once: true });
   process.on("unhandledRejection", stray);
   try {
+    // Each sweep on its own: one that fails never stops the other.
     const housekeeping = (): void => {
-      try {
-        rotateLogs(paths.logs, runId);
-        sweepResults(paths.requests);
-      } catch (error) {
-        log.write(0, { event: "housekeeping-failed", error: String(error) });
-      }
+      for (const sweep of [
+        () => rotateLogs(paths.logs, runId),
+        () => sweepResults(paths.requests),
+      ])
+        try {
+          sweep();
+        } catch (error) {
+          log.write(0, { event: "housekeeping-failed", error: String(error) });
+        }
     };
     housekeeping();
     let lastHousekeeping = Date.now();

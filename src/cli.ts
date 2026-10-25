@@ -5,29 +5,18 @@ import { Refusal } from "./host.js";
 import { installationPaths, validRepository } from "./paths.js";
 
 /** How an option is written in help and fixes: `--tail N`, `--json`. */
-function flagForm(
-  name: string,
-  kind: FlagKind | undefined,
-  command?: string,
-): string {
+function flagForm(name: string, kind: FlagKind | undefined): string {
   const value =
-    (command === "export-captures" && name === "content"
-      ? "metadata|retained"
-      : undefined) ??
     {
       tail: "N",
       logs: "ITEM",
       run: "ID",
-      content: "ID",
-      "group-by": "FIELD",
-      filter: "FIELD=VALUE",
-      scorecard: "FILE",
+      content: "metadata|retained",
       endpoint: "URL",
       output: "ABSOLUTE_FILE",
       authorize: "DIGEST",
       invocation: "ID",
-    }[name] ??
-    name.toUpperCase();
+    }[name] ?? name.toUpperCase();
   return kind === "switch"
     ? `--${name}`
     : kind === "list"
@@ -40,7 +29,7 @@ const USAGE = `Usage: factory <command> --repo OWNER/NAME (or FACTORY_REPOSITORY
 ${Object.entries(COMMANDS)
   .map(([name, command]) => {
     const flags = Object.entries(command.flags)
-      .map(([flag, kind]) => ` [${flagForm(flag, kind, name)}]`)
+      .map(([flag, kind]) => ` [${flagForm(flag, kind)}]`)
       .join("");
     return `  ${`${name} ${command.args}${flags}`.trimEnd()}\n      ${command.help}`;
   })
@@ -104,7 +93,7 @@ function parse(argv: string[]): Args {
     const value = argv[i + 1];
     if (value === undefined || value.startsWith("--"))
       throw usage(
-        `--${name} needs a value: factory ${command ?? "<command>"} ${flagForm(name, kind, command)}`,
+        `--${name} needs a value: factory ${command ?? "<command>"} ${flagForm(name, kind)}`,
       );
     if (kind === "list")
       args.lists[name] = [...(args.lists[name] ?? []), value];
@@ -141,7 +130,7 @@ function misplaced(name: string, command: string | undefined): string {
     .map(([owner]) => owner);
   if (owners.length) {
     const owner = COMMANDS[owners[0]!]!;
-    return `--${name} belongs to factory ${owners.join(", ")}; use factory ${owners[0]} ${owner.args} ${flagForm(name, owner.flags[name], owners[0])}`.replace(
+    return `--${name} belongs to factory ${owners.join(", ")}; use factory ${owners[0]} ${owner.args} ${flagForm(name, owner.flags[name])}`.replace(
       /\s+/g,
       " ",
     );

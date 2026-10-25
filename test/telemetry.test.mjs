@@ -308,11 +308,6 @@ test("a step's GitHub requests are traced with their failure category, time and 
     );
     assert.ok(call.calls >= 1 && call.failed >= 1, JSON.stringify(call));
     assert.equal(typeof call.requestMs, "number");
-    // analysis sums them with the sync jobs'.
-    const analysis = JSON.parse(
-      cli(inst, "diagnostics", "63", "--analyze", "--json").out,
-    );
-    assert.ok(analysis.github.traced[`network ${category}`] >= 1);
     await stopped(service);
   }
 });
@@ -415,17 +410,20 @@ test("a model call's answer is sized and digested with capture off; a cut captur
     const inst = installation();
     const log = new RunLog(inst.logs, "2026-01-01T00-00-00-000Z-5", capture);
     const record = usageRecord({
-      role: "planner",
+      role: "reviewer",
       provider: "codex",
       model: "gpt-6.1-sol",
       effort: "high",
-      phase: "plan",
+      phase: "result-review",
     });
     describeRequest(record, { prompt });
     captureResponse(record, answer);
     record.tokens = tokens({ input: 10, output: 2, cached: 4, cacheWrite: 3 });
     record.outcome = "done";
-    logUsage((event) => log.write(issue, { step: "plan", ...event }), record);
+    logUsage(
+      (event) => log.write(issue, { step: "item:a:review", ...event }),
+      record,
+    );
     return inst;
   };
   const off = call(CAPTURE_OFF, 66);
@@ -444,19 +442,9 @@ test("a model call's answer is sized and digested with capture off; a cut captur
   const summary = JSON.parse(
     cli(off, "diagnostics", "66", "--summary", "--json").out,
   );
-  assert.equal(summary.roles.planner.tokens.cacheWrite, 3);
+  assert.equal(summary.roles.reviewer.tokens.cacheWrite, 3);
   const on = call({ enabled: true, maxBytesPerCall: 2048 }, 67);
-  const [captured] = JSON.parse(
-    cli(on, "diagnostics", "67", "--captures", "--json").out,
-  ).captures;
-  const shown = cli(
-    on,
-    "diagnostics",
-    "67",
-    "--captures",
-    "--content",
-    captured.id,
-  );
+  const shown = cli(on, "diagnostics", "67", "--logs", "a", "--show-captures");
   assert.match(
     shown.out,
     new RegExp(
@@ -543,7 +531,7 @@ test("watch --once and --json show each row's attempt, PR, tool targets and the 
   assert.equal(tail.at(-1).n, 29);
 });
 
-test("status --json details each Work Item's attempt, commits, last error, repair class and blocker, with the service's setup; analyze groups by attempt and call and breaks tokens down by model and child thread", () => {
+test("status --json details each Work Item's attempt, commits, last error, repair class and blocker, with the service's setup", () => {
   const inst = installation();
   configured(inst, "http://127.0.0.1:1");
   seed(inst, 69, "building", {
@@ -608,134 +596,5 @@ test("status --json details each Work Item's attempt, commits, last error, repai
   assert.match(
     shown.out,
     /Provider: codex \(the default\) · sandbox (required|optional), network (off|package-install)/,
-  );
-  // Analysis: one Claude call with a sub-agent model, a resumed one whose
-  // per-model counts are its session's running total, and one Codex call
-  // with child threads.
-  const log = new RunLog(inst.logs, "2026-01-01T00-00-00-000Z-7");
-  log.write(69, {
-    step: "item:a:review",
-    attemptId: "item:a:review#1",
-    event: "model-usage",
-    callId: "k1",
-    role: "reviewer",
-    provider: "claude",
-    model: "claude-opus",
-    tokens: {
-      input: 150,
-      output: 20,
-      cached: 30,
-      cacheWrite: 20,
-      reasoning: null,
-      total: 170,
-    },
-    providerUsage: {
-      modelUsage: {
-        "claude-opus": {
-          inputTokens: 80,
-          outputTokens: 15,
-          cacheReadInputTokens: 30,
-          cacheCreationInputTokens: 20,
-          costUSD: 0.5,
-        },
-        "claude-haiku": { inputTokens: 20, outputTokens: 5, costUSD: 0.01 },
-      },
-    },
-  });
-  log.write(69, {
-    step: "item:a:review",
-    attemptId: "item:a:review#1",
-    event: "model-usage",
-    callId: "k3",
-    role: "reviewer",
-    provider: "claude",
-    model: "claude-opus",
-    reportedModel: "claude-opus",
-    sessionMode: "resumed",
-    tokens: { input: 40, output: 4, cached: 0, cacheWrite: 0, total: 44 },
-    costUsd: 0.1,
-    providerUsage: {
-      modelUsage: {
-        "claude-opus": { inputTokens: 120, outputTokens: 19, costUSD: 0.6 },
-        "claude-haiku": { inputTokens: 20, outputTokens: 5, costUSD: 0.01 },
-      },
-    },
-  });
-  log.write(69, {
-    step: "item:a:work",
-    attemptId: "item:a:work#1",
-    event: "model-usage",
-    callId: "k2",
-    role: "worker",
-    provider: "codex",
-    model: "gpt-6.1-sol",
-    reportedModel: "gpt-6.1-sol",
-    tokens: {
-      input: 1000,
-      output: 100,
-      cached: 900,
-      cacheWrite: 0,
-      reasoning: 10,
-      total: 1100,
-    },
-    providerUsage: {
-      descendants: {
-        threads: 2,
-        input: 400,
-        cached: 300,
-        output: 40,
-        reasoning: 4,
-        total: 440,
-      },
-    },
-  });
-  const analysis = JSON.parse(
-    cli(
-      inst,
-      "diagnostics",
-      "69",
-      "--analyze",
-      "--json",
-      "--group-by",
-      "attemptId",
-    ).out,
-  );
-  assert.deepEqual(analysis.groups.map((group) => group.key.attemptId).sort(), [
-    "item:a:review#1",
-    "item:a:work#1",
-  ]);
-  assert.deepEqual(analysis.calls.models["claude-haiku"], {
-    calls: 1,
-    input: 20,
-    output: 5,
-    cached: 0,
-    cacheWrite: 0,
-    costUsd: 0.01,
-  });
-  assert.deepEqual(analysis.calls.models["claude-opus"], {
-    calls: 2,
-    input: 170,
-    output: 19,
-    cached: 30,
-    cacheWrite: 20,
-    costUsd: 0.6,
-  });
-  assert.equal(analysis.calls.models["gpt-6.1-sol"].input, 1000);
-  assert.equal(analysis.calls.descendants.threads, 2);
-  const filtered = JSON.parse(
-    cli(
-      inst,
-      "diagnostics",
-      "69",
-      "--analyze",
-      "--json",
-      "--filter",
-      "callId=k2",
-    ).out,
-  );
-  assert.equal(filtered.calls.usage.calls, 1);
-  assert.match(
-    cli(inst, "diagnostics", "69", "--analyze").out,
-    /Codex child threads: 2 in 1 calls · 440 tokens/,
   );
 });

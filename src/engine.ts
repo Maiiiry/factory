@@ -970,7 +970,7 @@ export class ObjectiveRunner {
       ...attempt,
       outcome: outcome.kind,
       ...("reason" in outcome ? { reason: outcome.reason } : {}),
-      // A retry's wait class, or a continuation: what analysis splits waits by.
+      // A retry's wait class, or a continuation, which is no wait.
       ...(outcome.kind === "retry" && outcome.wait
         ? { wait: outcome.wait.kind }
         : {}),

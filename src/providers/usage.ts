@@ -1,7 +1,7 @@
 /**
  * The `model-usage` run-log event: one per model call (planner, reviewer,
  * worker, dream), the same shape for every provider
- * (docs/reference/run-log.md#Model usage). Diagnostics, analysis and the scorecard read it.
+ * (docs/reference/run-log.md#Model usage). Diagnostics and capture export read it.
  * A count a provider doesn't report is null, never zero.
  */
 import { createHash, randomUUID } from "node:crypto";
@@ -96,10 +96,9 @@ export class Tallies {
 /**
  * A call's record, before it runs: every normalized field present, null
  * until the adapter learns it, and a `callId` that a later `model-refused`
- * event names. The adapter adds `tokens`, `costUsd`, `sdkOperations`,
- * `nativeToolActivity`, `reportedModel`, `nativeTools`, `outcome`, `ms`,
- * the per-call fields below and its own (session, thread, turns), then
- * logs it with `logUsage`:
+ * event names. The adapter adds `tokens`, `costUsd`, `nativeToolActivity`,
+ * `reportedModel`, `nativeTools`, `outcome`, `ms`, the per-call fields
+ * below and its own (session, thread, turns), then logs it with `logUsage`:
  * - `reportedModel`: the model as the provider reported it, null when it didn't.
  * - `timeToFirstTokenMs`: from the call's start to the first model output, where the SDK streams.
  * - `sessionTurn` and `sessionMode`: the turn's ordinal in its provider session (1 is the first) and `fresh` or `resumed`.
@@ -121,7 +120,6 @@ export function usageRecord(fields: {
     ...fields,
     tokens: null,
     costUsd: null,
-    sdkOperations: null,
     nativeToolActivity: null,
     reportedModel: null,
   };

@@ -234,10 +234,10 @@ factory status [N] [--json] [--all]      # the service, the queue, each Objectiv
 factory log N [--tail 100] [--follow]    # the run log
 factory watch [N] [--once] [--json]      # live: each Work Item's step, PR, worker's last actions and running calls
 factory queue list                       # the Project's queued, candidate and inert cards, with why
-factory diagnostics N [--summary | --logs ITEM | --captures | --analyze | --gantt]
+factory diagnostics N [--summary | --logs ITEM [--show-captures]]
 ```
 
-`factory log` shows the run log's events as they are. `factory diagnostics` reads the same log and explains it: a timeline of steps, waits, repairs, holds and model calls; `--summary` gives the totals, the critical path and the slowest steps; `--logs ITEM` one Work Item in detail; `--captures` the captured model calls; `--analyze` time, tokens and outcomes per phase or another field; `--gantt` each Work Item's steps over time. Use it to find out why a run was slow, costly or kept repairing.
+`factory log` shows the run log's events as they are. `factory diagnostics` reads the same log and explains it: a timeline of steps, waits, repairs, holds and model calls; `--summary` gives the totals, the critical path and the slowest steps; `--logs ITEM` one Work Item in detail, with `--show-captures` its captured model calls. Use it to find out why a run was slow, costly or kept repairing.
 
 On GitHub, each Objective has a live status comment, each Work Item has its issue and pull request, and the final report closes the issue. Decide from `--json` fields and exit codes, never from message text.
 

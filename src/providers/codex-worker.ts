@@ -62,7 +62,6 @@ import {
   codexTokens,
   codexTurnUsage,
   modelItem,
-  SDK_OPERATIONS,
   turnTokens,
 } from "./codex-telemetry.js";
 import {
@@ -85,7 +84,6 @@ import {
   describeRequest,
   firstToken,
   logUsage,
-  Tallies,
   usageRecord,
 } from "./usage.js";
 
@@ -677,8 +675,6 @@ export class CodexWorker implements Worker {
       let finalResponse = "";
       let completed = false;
       let streamError: string | undefined;
-      const operations = new Tallies();
-      record.sdkOperations = operations.value;
       for (;;) {
         const next = await watchdog.race(events.next());
         if (next.done) break;
@@ -695,10 +691,6 @@ export class CodexWorker implements Worker {
         if (modelItem(item)) firstToken(record, callStarted);
         if (item?.type === "agent_message") finalResponse = item.text;
         if (item) codexActivity(input, event.type, item);
-        if (item && SDK_OPERATIONS.has(item.type)) {
-          operations.add(item.type, item.id);
-          record.sdkOperations = operations.value;
-        }
         if (event.type === "turn.completed") {
           completed = true;
           record.tokens = baseline

@@ -40,7 +40,6 @@ import {
   codexTokens,
   codexTurnUsage,
   modelItem,
-  SDK_OPERATIONS,
   turnTokens,
 } from "./codex-telemetry.js";
 import {
@@ -59,12 +58,7 @@ import {
   type PlannerModels,
 } from "./planner.js";
 import { openTurn, overflowed, type Turn, turnFields } from "./session.js";
-import {
-  captureRequest,
-  captureResponse,
-  firstToken,
-  Tallies,
-} from "./usage.js";
+import { captureRequest, captureResponse, firstToken } from "./usage.js";
 
 export type CodexEffort = ModelReasoningEffort;
 
@@ -637,8 +631,6 @@ export class CodexPlanner implements Planner {
       let response: string | undefined;
       let usage: PlannerAnswer["usage"];
       let completed = false;
-      const operations = new Tallies();
-      record.sdkOperations = operations.value;
       let streamError: string | undefined;
       for (;;) {
         const next = await watchdog.race(events.next());
@@ -684,10 +676,6 @@ export class CodexPlanner implements Planner {
         );
         if (event.type === "thread.started") record.thread = event.thread_id;
         if (modelItem(item)) firstToken(record, callStarted);
-        if (item && SDK_OPERATIONS.has(item.type)) {
-          operations.add(item.type, item.id);
-          record.sdkOperations = operations.value;
-        }
         if (
           event.type === "item.completed" &&
           event.item.type === "agent_message"

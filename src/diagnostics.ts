@@ -357,7 +357,7 @@ function transcriptLine(record: Record<string, unknown>): string {
 }
 
 /** `; the request was 12,345 bytes (sha256 ab12…), the response …`: a cut capture's originals. */
-export function originalText(original?: Record<string, unknown>): string {
+function originalText(original?: Record<string, unknown>): string {
   const part = (name: string) => {
     const body = original?.[name] as
       | { bytes?: unknown; sha256?: unknown }
@@ -784,7 +784,7 @@ export interface SummaryReport {
   slowest: StepSpan[];
 }
 
-export const emptyUsage = (): Usage => ({
+const emptyUsage = (): Usage => ({
   calls: 0,
   ms: 0,
   tokens: {
@@ -962,7 +962,7 @@ function criticalPath(spans: StepSpan[]): StepSpan[] {
   return path;
 }
 
-export function usageText(usage: Usage): string {
+function usageText(usage: Usage): string {
   const t = usage.tokens;
   return [
     `${usage.calls} calls`,

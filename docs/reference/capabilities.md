@@ -13,7 +13,7 @@ A capability is a module that plugs into one of these seams:
 | `Delivery`         | publish, ci, merge                                                           | regular PRs, native linear stacks, LFS assets                                                   |
 | `Planning options` | the plan step                                                                | planner lookups, quality checkpoint, package-manager update, amendments                         |
 | `Knowledge`        | planning, plan review, work prompts and review                               | curated playbook (planning and plan review), repository memory, Dream proposals, peers' notes   |
-| `Observers`        | the run log                                                                  | diagnostics, accounting, scorecard, capture export                                              |
+| `Observers`        | the run log                                                                  | diagnostics, accounting, capture export                                                         |
 
 `Planner` (providers/planner.ts) and `Worker` (work/worker.ts) are interfaces with one adapter per provider. The other seams are modules.
 

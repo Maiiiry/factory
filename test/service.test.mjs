@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -194,7 +195,9 @@ test("unreadable state holds with cancel, and cancel works", async () => {
   await stopped(service);
 });
 
-test("logs keep the newest runs, each with its captures", async () => {
+test("logs keep the newest runs, each with its captures; a run that can't be removed stops no other", {
+  skip: process.getuid?.() === 0 && "root removes any directory",
+}, async () => {
   const inst = installation();
   const dir = join(inst.logs, "5");
   mkdirSync(dir, { recursive: true });
@@ -211,9 +214,13 @@ test("logs keep the newest runs, each with its captures", async () => {
     // Run 1 was written to minutes ago (a dream call still running): kept.
     if (i !== 1) utimesSync(join(dir, `${run}.jsonl`), old, old);
   }
+  // Run 3's captures can't be removed: the runs after it still are.
+  const locked = join(dir, "2026-01-01T00-00-03.captures");
+  chmodSync(locked, 0o500);
   const service = serve(inst);
   await until(() => status(inst).service === "running", "service");
   await stopped(service);
+  chmodSync(locked, 0o700);
   const kept = readdirSync(dir).sort();
   const runs = kept.filter((name) => name.endsWith(".jsonl"));
   assert.equal(runs.length, 21, "the 20 newest and the live one");
@@ -222,16 +229,9 @@ test("logs keep the newest runs, each with its captures", async () => {
   assert.equal(
     kept.length,
     33,
-    "the 11 kept odd runs keep their captures, and the rotated record",
+    "the 11 kept odd runs keep their captures, and run 3's are left",
   );
-  // Each removed run is recorded, so a reader can say it is gone.
-  assert.deepEqual(
-    readFileSync(join(dir, "rotated"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line).run),
-    [0, 2, 3, 4].map((i) => `2026-01-01T00-00-0${i}`),
-  );
+  assert.ok(kept.includes("2026-01-01T00-00-03.captures"));
   // The service's own events went to a file named by its run id.
   assert.ok(
     readdirSync(join(inst.logs, "0")).some((name) =>

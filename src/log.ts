@@ -859,9 +859,7 @@ const LIVE_MS = 10 * 60 * 1000;
  * attempt directory, removed together. Run ids sort by start time, so id order is age order. The
  * `active` run (the caller's own) and any run changed in the last 10
  * minutes (a `factory dream` call still running) are never removed; they
- * still count toward both bounds. Each removed run is first recorded in
- * its Objective's `rotated` file, so a reader can say how many runs it
- * no longer has (`rotatedRuns`).
+ * still count toward both bounds.
  */
 export function rotateLogs(
   dir: string,
@@ -878,17 +876,11 @@ export function rotateLogs(
         return false;
       }
     });
-  const runs: {
-    paths: string[];
-    id: string;
-    bytes: number;
-    issueDir: string;
-  }[] = [];
+  const runs: { paths: string[]; id: string; bytes: number }[] = [];
   for (const issue of safeList(dir)) {
     const issueDir = join(dir, issue);
     const byRun = new Map<string, string[]>();
     for (const name of safeList(issueDir)) {
-      if (name === ROTATED) continue;
       const id = runOfFile(name);
       byRun.set(id, [...(byRun.get(id) ?? []), join(issueDir, name)]);
     }
@@ -896,8 +888,8 @@ export function rotateLogs(
     const excess = ids.length - retention.runsPerObjective;
     ids.forEach((id, i) => {
       const paths = byRun.get(id)!;
-      if (i < excess && !kept(id, paths)) remove(issueDir, id, paths);
-      else runs.push({ paths, id, bytes: paths.reduce(addSize, 0), issueDir });
+      if (i < excess && !kept(id, paths)) remove(paths);
+      else runs.push({ paths, id, bytes: paths.reduce(addSize, 0) });
     });
   }
   runs.sort((a, b) => (a.id < b.id ? 1 : -1));
@@ -905,54 +897,18 @@ export function rotateLogs(
   for (const run of runs) {
     total += run.bytes;
     if (total > retention.totalBytes && !kept(run.id, run.paths))
-      remove(run.issueDir, run.id, run.paths);
+      remove(run.paths);
   }
 }
 
-/** An Objective's record of the runs rotation removed: one JSON line each. */
-const ROTATED = "rotated";
-
-/** A run rotation removed: its id, and when its files were last written. */
-export interface RotatedRun {
-  run: string;
-  lastAt: string;
-}
-
-/** Record the run in its Objective's `rotated` file, then remove its files. */
-function remove(issueDir: string, run: string, paths: string[]): void {
-  let last = 0;
+/** Remove a run's files; one that can't be removed now is tried again at the next pass. */
+function remove(paths: string[]): void {
   for (const path of paths)
     try {
-      last = Math.max(last, statSync(path).mtimeMs);
+      rmSync(path, { recursive: true, force: true });
     } catch {
-      // Gone meanwhile.
+      // Busy or not ours: the next rotation tries again.
     }
-  const record: RotatedRun = { run, lastAt: new Date(last).toISOString() };
-  try {
-    appendFileSync(join(issueDir, ROTATED), `${JSON.stringify(record)}\n`);
-  } catch {
-    // Like a run-log line: losing the record must not stop housekeeping.
-  }
-  for (const path of paths) rmSync(path, { recursive: true, force: true });
-}
-
-/** The runs rotation removed from the Objective's run log, each once; a run still there is not one. */
-export function rotatedRuns(dir: string, issue: number): RotatedRun[] {
-  const issueDir = join(dir, String(issue));
-  const present = new Set(logFiles(dir, issue).map(runOfFile));
-  const file = join(issueDir, ROTATED);
-  const found = new Map<string, RotatedRun>();
-  const text = readFrom(file, 0, sizeOf(file)).toString("utf8");
-  for (const line of text.split("\n")) {
-    try {
-      const { run, lastAt } = JSON.parse(line) as RotatedRun;
-      if (typeof run === "string" && typeof lastAt === "string")
-        if (!present.has(run)) found.set(run, { run, lastAt });
-    } catch {
-      // A torn line: skipped.
-    }
-  }
-  return [...found.values()].sort((a, b) => a.run.localeCompare(b.run));
 }
 
 /** A file's size, or a capture directory's files' sizes. */

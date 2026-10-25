@@ -21,7 +21,7 @@ Each rule has a test (see [Testing](#testing)).
 - **Work Item:** one unit of work, delivered as one PR. It is also tracked by one issue, which only displays progress and never drives it (see [Work Item issues](reference/github.md#work-item-issues)).
 - **Step:** one unit of progress, keyed in state, such as `plan`, `item:3:work` or `item:3:merge`.
 - **Hold:** a step that needs a person. It's a question posted on the issue. A Work Item's hold stops only that item and the items that depend on it; a hold about the whole Objective stops every step.
-- **Run log:** an append-only record of what happened, for status and analysis. It never drives progress.
+- **Run log:** an append-only record of what happened, for status and diagnostics. It never drives progress.
 
 ## Lean code
 
