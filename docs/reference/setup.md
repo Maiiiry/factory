@@ -15,7 +15,7 @@ Part of [the design](../DESIGN.md).
 **Readiness** (readiness.ts) is one checklist, made with no model call and no change to the target or its settings (the Codex probe writes only its own temporary directories). Each check is `ok`, `warn` (it runs, but see the detail) or `blocked` (the service would hold on it), and every check that isn't `ok` names its fix.
 
 - **Host:**
-  - bubblewrap starts a sandbox, and with `package-install`, pasta is there;
+  - bubblewrap starts a sandbox, and with `package-install`, pasta is there; with `host`, the detail says what commands reach;
   - `sandbox.environment` paths are covered, and `sandbox.packageStore` is a directory;
   - git, git lfs, node and each final command's program are on the PATH;
   - node satisfies the checkout's Node pin, the first exact version or semver range in `.nvmrc`, `.node-version`, `.tool-versions` or `package.json` `engines.node` (an alias such as `lts/*` is passed over); a mismatch is `warn`, because the Objective check holds on it;
@@ -40,7 +40,7 @@ Installation options, each setting one key:
 | `--objective-tokens`, `--objective-cents`, `--day-tokens`, `--day-cents`                       | `autonomy.spend.perObjective.*`, `autonomy.spend.perDay.*` |
 | `--required-env NAME`...                                                                       | `autonomy.requiredEnvironment`                             |
 | `--delivery regular\|native-stack`                                                             | `delivery.kind`                                            |
-| `--sandbox-network off\|package-install`, `--package-store DIR`                                | `sandbox.network`, `sandbox.packageStore`                  |
+| `--sandbox-network off\|package-install\|host`, `--package-store DIR`                          | `sandbox.network`, `sandbox.packageStore`                  |
 | `--read-only-path DIR`..., `--sandbox-env NAME=VALUE`...                                       | `sandbox.readOnlyPaths`, `sandbox.environment`             |
 | `--required-command CMD`..., `--ci-only-command CMD`...                                        | `finalValidation.*`                                        |
 | `--allowed-secret NAME`...                                                                     | `policy.allowedSecretNames`                                |
