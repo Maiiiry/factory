@@ -157,12 +157,18 @@ export async function serveInstallation(
       provider: name,
       selectedBy: options.provider ? "--provider" : "defaultProvider",
     };
-    const github = new GitHub(
-      config.repository,
-      process.env.FACTORY_GITHUB_API,
-    ).redacting(config.secrets);
-    // One log per service run: the sync's events go to the run's files too.
-    log = new RunLog(paths.logs, newRunId(), config.capture, config.secrets);
+    // One log per service run: the sync's events go to the run's files
+    // too, and GitHub's failed requests to the service's own.
+    const runLog = new RunLog(
+      paths.logs,
+      newRunId(),
+      config.capture,
+      config.secrets,
+    );
+    log = runLog;
+    const github = new GitHub(config.repository, process.env.FACTORY_GITHUB_API)
+      .redacting(config.secrets)
+      .logging((event) => runLog.write(0, event));
     sync = new GitHubSync(github, config, log, limits);
     const routes = new Map<string, ProviderRoute>();
     for (const [each, settings] of Object.entries(config.providers))

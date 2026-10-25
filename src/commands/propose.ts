@@ -86,10 +86,9 @@ async function propose(
   const deps = {
     config,
     paths,
-    github: new GitHub(
-      config.repository,
-      process.env.FACTORY_GITHUB_API,
-    ).redacting(config.secrets),
+    github: new GitHub(config.repository, process.env.FACTORY_GITHUB_API)
+      .redacting(config.secrets)
+      .logging((event) => log.write(0, event)),
     log: (event: Record<string, unknown>) => log.write(0, event),
     out: (text: string) => process.stdout.write(text),
   };

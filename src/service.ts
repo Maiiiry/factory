@@ -1305,7 +1305,6 @@ export async function serve(options: ServeOptions): Promise<number> {
     // Stopped runners never save again; what still runs ends with the
     // process, which exits right after.
     if (!ended) log.write(0, { event: "stop-drain-timeout", afterMs: drainMs });
-    options.sync?.flushTransport();
     // A clean stop (an upgrade, a reboot) ends any crash streak.
     heartbeat(true);
     lock.close();

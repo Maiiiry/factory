@@ -384,7 +384,7 @@ export function phaseOf(step: string): string {
 }
 
 /** The Work Item an event is about: its own, its step's, or an answer's question's. */
-export function itemOfEvent(event: LogEvent): string | undefined {
+function itemOfEvent(event: LogEvent): string | undefined {
   const step = str(event.step);
   const request = event.request as Record<string, unknown> | undefined;
   const question = str(request?.question);

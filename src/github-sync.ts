@@ -14,13 +14,6 @@ import {
   issueGone,
   TransientError,
 } from "./github.js";
-import {
-  callCounts,
-  newTransport,
-  requestEvents,
-  type Transport,
-  transport,
-} from "./github-trace.js";
 import { backoffMs, Jobs } from "./jobs.js";
 import { type RunLog, redact } from "./log.js";
 import { code, mark, prose } from "./markdown.js";
@@ -287,13 +280,6 @@ export class GitHubSync {
   private readonly trackTried = new Map<number, number>();
   /** Status and tracking jobs failed in a row by something other than GitHub's transient errors, by job key. */
   private readonly failures = new Map<string, number>();
-  /** Per job key: GitHub requests not yet written as `github-call` (`countTransport`). */
-  private readonly transportTally = new Map<
-    string,
-    Transport & { issue: number; since: number; runs: number; ms: number }
-  >();
-  /** Job keys whose last run failed: the next run counts as a retry. */
-  private readonly transportFailed = new Map<string, number>();
   /** Question comments written compact after GitHub refused them in full, by Objective and hold id (`compactAsk`). */
   private readonly compact = new Map<number, Set<string>>();
   /** When each live status edit of the last hour was made, across Objectives (this host's clock). */
@@ -369,14 +355,6 @@ export class GitHubSync {
   }
 
   tick(sync: SyncView): void {
-    // Requests outside steps and sync jobs (readiness, the service's own
-    // reads): the service's, tallied like a job's.
-    const ambient = this.github.takeAmbient();
-    if (ambient) {
-      for (const event of requestEvents(AMBIENT, ambient))
-        this.log.write(0, event);
-      this.countTransport(0, AMBIENT, ambient, 0, ambient.failed > 0);
-    }
     if (this.problem()) return;
     // Read once at start: a rename while the service was down pauses
     // before any issue counts as gone (later redirects check it again).
@@ -592,10 +570,6 @@ export class GitHubSync {
    * marker makes it idempotent.
    */
   forget(issue: number): void {
-    for (const [key, tally] of this.transportTally)
-      if (tally.issue === issue) this.writeTransport(key);
-    for (const [key, owner] of this.transportFailed)
-      if (owner === issue) this.transportFailed.delete(key);
     this.settled.delete(issue);
     this.queuing.delete(issue);
     this.changed.delete(issue);
@@ -1672,98 +1646,23 @@ export class GitHubSync {
     backoff = true,
     failed?: (error: unknown) => void,
   ): void {
-    const counted = newTransport();
-    if (this.transportFailed.has(key)) counted.retries = 1;
-    const started = this.now();
-    const ended = (ok: boolean) => {
-      if (ok) this.transportFailed.delete(key);
-      else this.transportFailed.set(key, issue);
-      // Each failed, re-sent or rate-limited request, unthrottled: one bad request stays traceable.
-      for (const event of requestEvents(key, counted))
-        this.log.write(issue, event);
-      this.countTransport(issue, key, counted, this.now() - started, !ok);
-    };
-    this.jobs.run(
-      issue,
-      key,
-      (signal) => transport.run(counted, () => job(signal)),
-      {
-        backoff,
-        done: () => {
-          ended(true);
-          if (failed) this.failures.delete(key);
-        },
-        failed: async (error) => {
-          ended(false);
-          failed?.(error);
-          if (issue && issueGone(error)) await this.confirmGone(issue, key);
-        },
+    this.jobs.run(issue, key, job, {
+      backoff,
+      done: () => {
+        if (failed) this.failures.delete(key);
       },
-    );
-  }
-
-  /**
-   * Add one job run's GitHub requests to its key's tally, and write the
-   * tally as a `github-call` event at most once a minute per key (at once
-   * after a failed run), and when its Objective is forgotten: counts, never
-   * bodies.
-   */
-  private countTransport(
-    issue: number,
-    key: string,
-    run: Transport,
-    ms: number,
-    failed: boolean,
-  ): void {
-    const tally = this.transportTally.get(key) ?? {
-      ...newTransport(),
-      issue,
-      since: this.now(),
-      runs: 0,
-      ms: 0,
-    };
-    tally.runs += 1;
-    tally.ms += ms;
-    tally.calls += run.calls;
-    tally.retries += run.retries;
-    tally.rateLimited += run.rateLimited;
-    tally.failed += run.failed;
-    tally.bytes += run.bytes;
-    tally.requestMs += run.requestMs;
-    this.transportTally.set(key, tally);
-    if (failed || this.now() - tally.since >= TRANSPORT_EVERY_MS)
-      this.writeTransport(key);
+      failed: async (error) => {
+        failed?.(error);
+        if (issue && issueGone(error)) await this.confirmGone(issue, key);
+      },
+    });
   }
 
   /** The service stops: abort the sync's jobs and wait until each has ended. */
   drain(): Promise<void> {
     return this.jobs.drain();
   }
-
-  /** Write every unwritten `github-call` tally: at the service's stop, before its run ends. */
-  flushTransport(): void {
-    for (const key of [...this.transportTally.keys()]) this.writeTransport(key);
-  }
-
-  private writeTransport(key: string): void {
-    const tally = this.transportTally.get(key);
-    this.transportTally.delete(key);
-    if (!tally?.calls) return;
-    this.log.write(tally.issue, {
-      event: "github-call",
-      job: key,
-      runs: tally.runs,
-      ms: tally.ms,
-      ...callCounts(tally),
-    });
-  }
 }
-
-/** The `job` of requests outside steps and sync jobs. */
-const AMBIENT = "service";
-
-/** The most often one job key's `github-call` tally is written. */
-const TRANSPORT_EVERY_MS = 60_000;
 
 /** A question's most in a comment: whole up to here, then cut with where the rest is. */
 const QUESTION_LIMIT = 20_000;

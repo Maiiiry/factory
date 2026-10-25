@@ -282,7 +282,7 @@ function events(inst, issue) {
     .map((line) => JSON.parse(line));
 }
 
-test("a step's GitHub requests are traced with their failure category, time and counts, like a sync job's", async () => {
+test("a failed GitHub request is logged with its failure category and time, and the step that made it waits with its error", async () => {
   for (const [api, category] of [
     [`http://127.0.0.1:${await closedPort()}`, "connection"],
     ["http://factory-drill.invalid", "dns"],
@@ -291,23 +291,34 @@ test("a step's GitHub requests are traced with their failure category, time and 
     configured(inst, api);
     seed(inst, 63);
     const service = serve(inst);
-    const traced = () =>
-      events(inst, 63).find(
-        (e) => e.event === "github-request" && e.step === "check",
-      );
-    await until(traced, `the check's ${category} failure, traced`, 30_000);
-    const request = traced();
-    assert.equal(request.category, category);
+    // The service's own run log has each failed request.
+    const serviceLog = join(inst.logs, "0");
+    const failed = () =>
+      (existsSync(serviceLog) ? readdirSync(serviceLog) : [])
+        .flatMap((name) =>
+          readFileSync(join(serviceLog, name), "utf8").trim().split("\n"),
+        )
+        .map((line) => JSON.parse(line))
+        .find((e) => e.event === "github-request" && e.category === category);
+    await until(failed, `a ${category} failure, logged`, 30_000);
+    const request = failed();
     assert.equal(request.status, null);
-    assert.equal(request.job, "check");
-    assert.match(request.attemptId, /^check#\d+$/);
+    assert.equal(request.attempt, 1);
     assert.equal(typeof request.ms, "number");
     assert.match(request.route, /^\/(?:repos|graphql|user)/);
-    const call = events(inst, 63).find(
-      (e) => e.event === "github-call" && e.step === "check",
+    // The Objective's own log has the step's wait, naming the request.
+    await until(
+      () =>
+        events(inst, 63).some(
+          (e) =>
+            e.event === "outcome" &&
+            e.step === "check" &&
+            e.outcome === "retry" &&
+            /^GitHub /.test(e.reason),
+        ),
+      "the check's wait",
+      30_000,
     );
-    assert.ok(call.calls >= 1 && call.failed >= 1, JSON.stringify(call));
-    assert.equal(typeof call.requestMs, "number");
     await stopped(service);
   }
 });

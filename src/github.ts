@@ -3,15 +3,6 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { crashPoint } from "./crash.js";
 import { hold, type Outcome, objectiveWide } from "./engine.js";
-import {
-  type NotedRequest,
-  networkCategory,
-  newTransport,
-  note,
-  statusCategory,
-  type Transport,
-  transport,
-} from "./github-trace.js";
 import { redact } from "./log.js";
 import { errorMessage } from "./text.js";
 
@@ -109,25 +100,83 @@ export function issueGone(error: unknown): error is GitHubError {
 
 const TIMEOUT_MS = 60_000;
 
-/**
- * What `send` measured for each answer it returned, and its trace line
- * when it noted one: a GraphQL rate limit, found in the body, retags it.
- */
-const answers = new WeakMap<
-  Response,
-  {
-    answered: {
-      method: string;
-      path: string;
-      status: number;
-      attempt: number;
-      ms: number;
-    };
-    noted: NotedRequest | undefined;
-  }
->();
 /** How long GitHub may lag behind what Factory made (`GitHub.made`). */
 const FRESH_MS = 2 * 60_000;
+
+/** Why a request failed: no answer (`dns`, `tls`, `timeout`, `connection`, `aborted`), or the answer's status. */
+type FailureCategory =
+  | "aborted"
+  | "client"
+  | "connection"
+  | "credential"
+  | "dns"
+  | "not-found"
+  | "permission"
+  | "rate-limit"
+  | "server"
+  | "timeout"
+  | "tls";
+
+/** `path` as a route template: no query, and numbers, hashes and node ids as placeholders. */
+function routeOf(path: string): string {
+  return path
+    .split("?")[0]!
+    .split("/")
+    .map((part) =>
+      /^\d+$/.test(part)
+        ? "{n}"
+        : /^[0-9a-f]{7,64}$/i.test(part) && /\d/.test(part)
+          ? "{sha}"
+          : part,
+    )
+    .join("/");
+}
+
+const DNS = new Set(["ENOTFOUND", "EAI_AGAIN", "EAI_FAIL", "EAI_NONAME"]);
+const TIMEOUTS = new Set([
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+/** A request that got no answer, by its error's structured fields (name and code, its cause's too). */
+function networkCategory(error: unknown, aborted: boolean): FailureCategory {
+  if (aborted) return "aborted";
+  const chain: { name?: unknown; code?: unknown }[] = [];
+  for (
+    let at: unknown = error, depth = 0;
+    at && typeof at === "object" && depth < 4;
+    at = (at as { cause?: unknown }).cause, depth++
+  )
+    chain.push(at as { name?: unknown; code?: unknown });
+  const codes = chain.map((e) => (typeof e.code === "string" ? e.code : ""));
+  if (chain.some((e) => e.name === "TimeoutError")) return "timeout";
+  if (codes.some((code) => DNS.has(code))) return "dns";
+  if (codes.some((code) => TIMEOUTS.has(code))) return "timeout";
+  if (
+    codes.some((code) =>
+      /^(?:ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|ERR_OSSL)/.test(
+        code,
+      ),
+    )
+  )
+    return "tls";
+  return "connection";
+}
+
+/** A failed answer's category; undefined for a success. */
+function statusCategory(
+  status: number,
+  limited: boolean,
+): FailureCategory | undefined {
+  if (limited) return "rate-limit";
+  if (status < 400) return undefined;
+  if (status === 401) return "credential";
+  if (status === 403) return "permission";
+  if (status === 404 || status === 410) return "not-found";
+  return status >= 500 ? "server" : "client";
+}
 
 /**
  * A GitHub failure as a step outcome (docs/reference/steps.md#Waits): only what a person
@@ -293,9 +342,8 @@ const WRITER_TTL_MS = 10 * 60_000;
 
 /**
  * Statuses the running read's caller takes as an answer (a 404 for "no
- * such user", for "unprotected"): `send` neither counts nor traces them
- * as failed (a step's trace still lists them, with no category). Set with
- * `expecting`.
+ * such user", for "unprotected"): `send` logs no `github-request` for
+ * them. Set with `expecting`.
  */
 const expectedStatuses = new AsyncLocalStorage<readonly number[]>();
 
@@ -307,8 +355,8 @@ function expecting<T>(
 }
 
 export class GitHub {
-  /** Requests outside a step or a sync job: the service run's own (`takeAmbient`). */
-  private ambient = newTransport();
+  /** Where a `github-request` event goes (`logging`); nowhere by default. */
+  private log?: (event: Record<string, unknown>) => void;
   private token: string | undefined;
   private secrets: readonly string[] = [];
   private self: string | undefined;
@@ -328,19 +376,18 @@ export class GitHub {
    * writes to GitHub: comments, PR bodies, titles. One choke point, so no
    * hold, report or log excerpt can carry a value a worker saw.
    */
-  /**
-   * The requests made outside any step or sync job since the last take,
-   * and a fresh tally for the next; undefined when there were none.
-   */
-  takeAmbient(): Transport | undefined {
-    if (!this.ambient.calls) return undefined;
-    const taken = this.ambient;
-    this.ambient = newTransport();
-    return taken;
-  }
-
   redacting(secrets: readonly string[]): this {
     this.secrets = secrets;
+    return this;
+  }
+
+  /**
+   * Log one `github-request` event (docs/reference/run-log.md#Run log)
+   * for each request that failed, was re-sent with a fresh login or was
+   * rate-limited: never a body, a token or a query value.
+   */
+  logging(log: (event: Record<string, unknown>) => void): this {
+    this.log = log;
     return this;
   }
 
@@ -1026,16 +1073,10 @@ export class GitHub {
     if (refused.length) {
       const message = refused.map((e) => e.message).join("; ");
       if (refused.some((e) => e.type === "RATE_LIMITED")) {
-        const counted = transport.getStore() ?? this.ambient;
-        counted.rateLimited += 1;
-        // One line per answer: the one send() traced becomes the rate-limit.
-        const { answered, noted } = answers.get(response)!;
-        if (noted) counted.requests?.splice(counted.requests.indexOf(noted), 1);
-        note(
-          counted,
-          { ...answered, category: "rate-limit", rateLimited: true },
-          response,
-        );
+        this.logRequest("POST", "/graphql", response, {
+          category: "rate-limit",
+          rateLimited: true,
+        });
         const reset = Number(response.headers.get("x-ratelimit-reset"));
         throw new TransientError(
           `GitHub GraphQL: ${message}`,
@@ -1721,6 +1762,36 @@ export class GitHub {
     return Buffer.concat(chunks).toString("utf8");
   }
 
+  /** One `github-request` event: the request, its answer's status and the headers that say when to come back. */
+  private logRequest(
+    method: string,
+    path: string,
+    response: Response | undefined,
+    fields: {
+      attempt?: number;
+      ms?: number;
+      category?: FailureCategory;
+      rateLimited?: true;
+    },
+  ): void {
+    const header = (name: string) => response?.headers.get(name) ?? undefined;
+    const retryAfter = Number(header("retry-after"));
+    const reset = Number(header("x-ratelimit-reset"));
+    const requestId = header("x-github-request-id");
+    this.log?.({
+      event: "github-request",
+      method,
+      route: routeOf(path),
+      status: response?.status ?? null,
+      ...fields,
+      ...(requestId ? { requestId: requestId.slice(0, 80) } : {}),
+      ...(retryAfter > 0 ? { retryAfterSeconds: retryAfter } : {}),
+      ...(reset > 0 && fields.category === "rate-limit"
+        ? { rateLimitReset: new Date(reset * 1000).toISOString() }
+        : {}),
+    });
+  }
+
   private async send(
     method: string,
     path: string,
@@ -1738,11 +1809,6 @@ export class GitHub {
         : JSON.stringify(
             method === "GET" ? body : redactDeep(body, this.secrets),
           );
-    // A step's or a sync job's scope, else the service run's own.
-    const counted = transport.getStore() ?? this.ambient;
-    counted.calls += 1;
-    if (refreshed) counted.retries += 1;
-    counted.bytes += sent === undefined ? 0 : Buffer.byteLength(sent);
     const attempt = refreshed ? 2 : 1;
     const sentAt = Date.now();
     let response: Response;
@@ -1762,39 +1828,20 @@ export class GitHub {
         redirect: "manual",
       });
     } catch (error) {
-      const ms = Date.now() - sentAt;
-      counted.requestMs += ms;
-      counted.failed += 1;
-      note(
-        counted,
-        {
-          method,
-          path,
-          status: null,
-          attempt,
-          ms,
-          category: networkCategory(error, Boolean(signal?.aborted)),
-        },
-        undefined,
-      );
+      this.logRequest(method, path, undefined, {
+        attempt,
+        ms: Date.now() - sentAt,
+        category: networkCategory(error, Boolean(signal?.aborted)),
+      });
       if (signal?.aborted) throw error;
       throw new TransientError(
         `GitHub ${method} ${path}: ${errorMessage(error)}`,
       );
     }
-    const ms = Date.now() - sentAt;
-    counted.requestMs += ms;
-    counted.bytes += Number(response.headers.get("content-length")) || 0;
-    const answered = { method, path, status: response.status, attempt, ms };
+    const answered = { attempt, ms: Date.now() - sentAt };
     if (response.ok) {
-      // A re-send that worked is traced too: it was retried.
-      answers.set(response, {
-        answered,
-        noted:
-          refreshed || counted.every
-            ? note(counted, answered, response)
-            : undefined,
-      });
+      // A re-send that worked is logged too: it was retried.
+      if (refreshed) this.logRequest(method, path, response, answered);
       return response;
     }
     const text = await response.text().catch(() => "");
@@ -1806,7 +1853,10 @@ export class GitHub {
     }
     const detail = `GitHub ${method} ${path}: ${response.status} ${text.slice(0, 300)}`;
     if (response.status === 401 && !refreshed) {
-      note(counted, { ...answered, category: "credential" }, response);
+      this.logRequest(method, path, response, {
+        ...answered,
+        category: "credential",
+      });
       return this.send(method, path, body, signal, headers, true);
     }
     const retryAfter = Number(response.headers.get("retry-after"));
@@ -1816,24 +1866,12 @@ export class GitHub {
       (response.status === 403 &&
         (response.headers.get("x-ratelimit-remaining") === "0" ||
           /rate limit/i.test(text)));
-    const expected =
-      !limited && expectedStatuses.getStore()?.includes(response.status);
-    if (!expected) {
-      if (limited) counted.rateLimited += 1;
-      else counted.failed += 1;
-    }
-    if (!expected || counted.every)
-      note(
-        counted,
-        {
-          ...answered,
-          ...(expected
-            ? {}
-            : { category: statusCategory(response.status, limited) }),
-          ...(limited ? { rateLimited: true as const } : {}),
-        },
-        response,
-      );
+    if (limited || !expectedStatuses.getStore()?.includes(response.status))
+      this.logRequest(method, path, response, {
+        ...answered,
+        category: statusCategory(response.status, limited),
+        ...(limited ? { rateLimited: true } : {}),
+      });
     // A 401 that a fresh token didn't fix is a login problem, not a hiccup.
     if (response.status === 401) throw new GitHubError(detail, 401, answer);
     if (limited)
