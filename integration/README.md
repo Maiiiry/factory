@@ -12,6 +12,7 @@ npm run build                                   # the suite runs dist/cli.js
 npm run integration -- --dry-run                     # every case, what it checks, its expected minutes and the budget
 npm run integration                                  # the main suite
 npm run integration -- --suite edge                  # the edge suite: PRD requirements no main case covers
+npm run integration -- --suite prd                   # the PRD suite: the requirements docs/PRD.md's Done still needs shown live
 npm run integration -- --only claude,queue           # some cases
 npm run integration -- --build ../other-checkout     # test another build (its dist/cli.js)
 ```
@@ -27,6 +28,7 @@ npm run integration -- --build ../other-checkout     # test another build (its d
 - No standing scratch repository. Each run creates its own private repositories under the scratch owner (`REPO_OWNER` in `run-suite.sh`), `fd-<time>-m` (installation M, or E in the edge suite) and, in the main suite, `fd-<time>-c` (the crash lane). Each one's main is `fixtures/baseline/` as one commit: a small Node.js project whose CI runs `npm test`, Git LFS rules for media, strict branch protection on main ("require branches to be up to date", check `test`) and no required review. A passing run deletes them; a failed run keeps them to inspect (as does `--keep-repos`), and a later run deletes those after 24 hours.
 - Project "Factory drill" with Factory's single-select field `Factory` and number field `Factory order`: repository M queues on it. One installation serves a Project, so each run that needs repository C also creates a Project for it, with the same two fields, titled like its repositories and deleted with them.
 - A `gh` login that is an owner of the scratch owner organization, with the `delete_repo` scope (`gh auth refresh -s delete_repo`); Codex and Claude logins (subscription, no API key); `pasta` and `unshare` for the network namespace; `git-lfs`.
+- For the prd suite: systemd user services (its `prod` case runs repository C's installation with `factory setup --background` at production models and concurrency, then uninstalls it), `curl`, and the Project's `Factory order` number field. Lane Q queues on repository C's own Project, which the run creates. Its setup commits `fixtures/repo/drill-issue.yml`, `drill-comment.yml` (to file issues and comments as github-actions[bot], a non-writer) and `ROADMAP.md` (for `propose --source`) to repository M's main.
 
 Each run makes fresh state directories under `/tmp/factory-integration/<time>/` and writes its own configuration there. An existing `--state-base` is refused. Plumbing runs on the fastest model and lowest effort each provider offers, and the cases whose check is a planner decision use the production planner.
 
@@ -40,6 +42,6 @@ Each run makes fresh state directories under `/tmp/factory-integration/<time>/` 
 ## Layout
 
 - `run-suite.sh`: the cases table, setup, the wave, the 55-minute stop, cleanup and the results.
-- `cases/main.sh`: the cases on repository M's shared serve. `cases/crash.sh`: the repository C lane. `cases/edge.sh`: the edge suite.
+- `cases/main.sh`: the cases on repository M's shared serve. `cases/crash.sh`: the repository C lane. `cases/edge.sh`: the edge suite. `cases/prd.sh`: the PRD suite (lane P on repository M, lane Q on repository C at production settings).
 - `lib/common.sh`: installations, results, CLI, answers, waits, proxy rules, templates. `lib/serve.sh`: serves. `lib/gh.sh`: the Project, markers, PRs and end checks. `lib/repos.sh`: the run's repositories (create, delete, sweep). `lib/st.py` reads state and run logs by structure only. `lib/crashpoints.mjs` finds a build's `crashPoint()` sites. `lib/netns-serve.sh` runs a serve in a network namespace.
 - `objectives/`: Objective templates. `fixtures/baseline/`: the run repositories' starting tree.
