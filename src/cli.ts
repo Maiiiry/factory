@@ -13,9 +13,6 @@ function flagForm(name: string, kind: FlagKind | undefined): string {
       run: "ID",
       content: "metadata|retained",
       endpoint: "URL",
-      output: "ABSOLUTE_FILE",
-      authorize: "DIGEST",
-      invocation: "ID",
     }[name] ?? name.toUpperCase();
   return kind === "switch"
     ? `--${name}`

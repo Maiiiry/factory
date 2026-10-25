@@ -25,7 +25,7 @@ factory status [ISSUE] [--json]                 # where each Objective is, open 
 factory log ISSUE [--tail N] [--follow] [--json] # what happened, from the run log
 factory diagnostics ISSUE [--summary] [--logs ITEM] [--json] # timeline, model calls, repairs and holds
 factory watch [ISSUE]                           # follow running Work Items live
-factory export-captures ISSUE [--endpoint URL]  # preview model calls as OpenTelemetry spans; sends nothing
+factory export-captures ISSUE                   # print model calls as OpenTelemetry spans; sends nothing
 factory answer ISSUE ANSWER [ARG] --question HOLD_ID [--text T | --text-file ABSOLUTE_PATH]
 factory retry ISSUE [--question HOLD_ID]         # run unheld waiting steps now; with --question, answer retry
 factory propose-amendment ISSUE --file ABSOLUTE_PATH # add work the accepted plan lacks (see Steer)
@@ -82,7 +82,7 @@ At the top level:
 - `crashLoop`, when present, is `{crashes, resumeAt}`: the service died that many times in a row and holds interrupted steps until `resumeAt`. Report it; read `factory log` for the cause.
 - `problem`, when present, names a fault that pauses GitHub effects. Report it first.
 
-For why an Objective is where it is, read `factory log ISSUE --json` (`--tail N` for more, `--follow` to watch). `factory diagnostics ISSUE` shows the run as a timeline with its model calls, repairs and holds (`--summary` the totals, the critical path and the slowest steps; `--logs ITEM` one Work Item in detail), and `factory watch ISSUE` follows its running Work Items live. `factory export-captures ISSUE` previews its model calls as OpenTelemetry spans and sends nothing; with `--endpoint URL` the preview prints the digest a send needs, and `--send --endpoint URL --authorize DIGEST` sends exactly what that preview showed. A quiet log means no new step ended, not that the run is stuck: steps have deadlines and end in progress, a retry or a hold on their own.
+For why an Objective is where it is, read `factory log ISSUE --json` (`--tail N` for more, `--follow` to watch). `factory diagnostics ISSUE` shows the run as a timeline with its model calls, repairs and holds (`--summary` the totals, the critical path and the slowest steps; `--logs ITEM` one Work Item in detail), and `factory watch ISSUE` follows its running Work Items live. `factory export-captures ISSUE` prints its model calls as OpenTelemetry spans and sends nothing; `--endpoint URL --send` sends them to that collector. A quiet log means no new step ended, not that the run is stuck: steps have deadlines and end in progress, a retry or a hold on their own.
 
 ## Answer a hold
 

@@ -6,13 +6,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
@@ -193,7 +191,7 @@ test("unknown and misplaced options are refused with the fix", () => {
     ],
     [
       ["cancel", "5", "--json"],
-      /--json belongs to factory setup, status, log, diagnostics, export-captures, watch, queue/,
+      /--json belongs to factory setup, status, log, diagnostics, watch, queue/,
     ],
     [
       ["status", "--bogus"],
@@ -466,8 +464,8 @@ test("the run log: tail, follow, and status reads its end", async () => {
     cli(inst, "diagnostics", "54", "--summary").out,
     /By role:\n {2}reviewer: 1 calls · 120 tokens/,
   );
-  // export-captures: a preview sends nothing; a send to a loopback
-  // collector needs the digest of that exact preview.
+  // export-captures: a preview prints the OTLP requests and sends
+  // nothing; --endpoint URL --send posts them to a loopback collector.
   const received = [];
   const collector = createHttpServer((req, res) => {
     let body = "";
@@ -507,119 +505,47 @@ test("the run log: tail, follow, and status reads its end", async () => {
       });
       child.on("exit", (code) => resolve({ code, out, err }));
     });
-  const preview = await exporting("--json");
+  const spansOf = (body) =>
+    JSON.parse(body).resourceSpans[0].scopeSpans[0].spans;
+  const attributesOf = (span) =>
+    Object.fromEntries(
+      span.attributes.map((a) => [a.key, Object.values(a.value)[0]]),
+    );
+  const preview = await exporting();
   assert.equal(preview.code, 0, preview.err);
-  const shown = JSON.parse(preview.out);
-  assert.equal(shown.status, "preview");
-  assert.equal(shown.spans, 1);
-  assert.equal(shown.authorizationDigest, null);
-  assert.deepEqual(shown.headerNames, ["authorization"]);
-  const file = join(mkdtempSync(join(tmpdir(), "factory-export-")), "o.jsonl");
-  const retained = await exporting(
-    "--content",
-    "retained",
-    "--endpoint",
-    endpoint,
-    "--output",
-    file,
-  );
+  assert.match(preview.err, /1 model call of #54 .* metadata .* nothing sent/);
+  const [shown] = preview.out.trim().split("\n").map(spansOf);
+  assert.equal(shown.length, 1);
+  assert.equal(attributesOf(shown[0])["factory.role"], "reviewer");
+  assert.equal(attributesOf(shown[0])["factory.request"], undefined);
+  const retained = await exporting("--content", "retained");
   assert.equal(retained.code, 0, retained.err);
-  assert.match(retained.out, /nothing sent/);
-  assert.doesNotMatch(retained.out, /s3cret/);
-  const digest = /--authorize ([0-9a-f]{64})/.exec(retained.out)[1];
-  const written = readFileSync(file, "utf8");
-  assert.match(written, /review \[REDACTED\]/);
-  assert.doesNotMatch(written, /ghp_|sk-a|s3cret/);
+  assert.match(retained.out, /review \[REDACTED\]/);
+  assert.doesNotMatch(retained.out + retained.err, /ghp_|sk-a|s3cret/);
   assert.equal(received.length, 0, "a preview sends nothing");
   assert.equal(
     refusal(
-      await exporting(
-        "--content",
-        "retained",
-        "--send",
-        "--endpoint",
-        endpoint,
-        "--authorize",
-        "0".repeat(64),
-      ),
+      await exporting("--endpoint", "http://collector.invalid", "--send"),
     ),
-    "export_refused",
-  );
-  assert.equal(
-    refusal(await exporting("--endpoint", "http://collector.invalid")),
     "export_refused",
     "plain HTTP only to loopback",
   );
-  assert.equal((await exporting("--send", "--endpoint", endpoint)).code, 2);
-  assert.equal(received.length, 0, "no send without the preview's digest");
-  // --invocation selects one call by its capture or span id; the digest binds it.
-  const one = JSON.parse(
-    (
-      await exporting(
-        "--content",
-        "retained",
-        "--endpoint",
-        endpoint,
-        "--invocation",
-        "c1",
-        "--json",
-      )
-    ).out,
-  );
-  assert.deepEqual(
-    one.invocations.map((call) => call.capture),
-    ["c1"],
-  );
-  assert.notEqual(one.authorizationDigest, digest);
-  assert.equal(
-    JSON.parse(
-      (await exporting("--invocation", shown.invocations[0].spanId, "--json"))
-        .out,
-    ).spans,
-    1,
-  );
-  assert.equal(
-    refusal(await exporting("--invocation", "nope")),
-    "export_refused",
-  );
-  assert.equal(
-    refusal(
-      await exporting(
-        "--content",
-        "retained",
-        "--send",
-        "--endpoint",
-        endpoint,
-        "--invocation",
-        "c1",
-        "--authorize",
-        digest,
-      ),
-    ),
-    "export_refused",
-    "the digest binds the selection",
-  );
+  assert.equal((await exporting("--send")).code, 2);
+  assert.equal((await exporting("--endpoint", endpoint)).code, 2);
   assert.equal(received.length, 0);
   const sent = await exporting(
     "--content",
     "retained",
-    "--send",
     "--endpoint",
     endpoint,
-    "--authorize",
-    digest,
-    "--json",
+    "--send",
   );
   assert.equal(sent.code, 0, sent.err);
-  assert.equal(JSON.parse(sent.out).status, "accepted");
+  assert.match(sent.out, /^Export accepted: 1 model call of #54 .* 1 sent to /);
   assert.equal(received.length, 1);
   assert.equal(received[0].url, "/v1/traces");
   assert.equal(received[0].headers.authorization, "Bearer s3cret-token");
-  const span = JSON.parse(received[0].body).resourceSpans[0].scopeSpans[0]
-    .spans[0];
-  const attributes = Object.fromEntries(
-    span.attributes.map((a) => [a.key, Object.values(a.value)[0]]),
-  );
+  const attributes = attributesOf(spansOf(received[0].body)[0]);
   assert.equal(attributes["factory.role"], "reviewer");
   assert.equal(attributes["factory.request"], "review [REDACTED]");
   assert.equal(attributes["factory.error"], "[REDACTED]");

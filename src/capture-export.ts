@@ -1,23 +1,14 @@
 /**
  * `factory export-captures ISSUE`: an Objective's model calls as
  * OpenTelemetry spans (OTLP/HTTP JSON), from the run log and, with
- * `--content retained`, its captures (docs/reference/run-log.md#Run log). By default
- * a preview: it prints what it would send, or writes it to a local file,
- * and sends nothing. A send needs `--send --endpoint URL --authorize
- * DIGEST`, the digest a preview of exactly that export printed; it binds
- * the endpoint, the content, every batch and the headers. Every event and
+ * `--content retained`, its captures (docs/reference/run-log.md#Run log).
+ * By default a preview: it prints the OTLP requests and sends nothing.
+ * `--endpoint URL --send` posts them to that collector. Every event and
  * capture is redacted as it is read, and every exported string again.
  */
 import { createHash } from "node:crypto";
 import {
-  closeSync,
-  constants as fsConstants,
-  openSync,
-  writeSync,
-} from "node:fs";
-import {
   chosenFiles,
-  itemOfEvent,
   num,
   type RunChoice,
   readCapture,
@@ -33,12 +24,8 @@ export interface ExportOptions {
   repository: string;
   issue: number;
   runs: RunChoice;
-  /** `--invocation ID`: only these model calls, by capture id or span id; every id must match one. */
-  invocations?: readonly string[];
   /** `metadata` reads no captured text; `retained` adds the captured request and response. */
   content: "metadata" | "retained";
-  /** The collector's base URL; the preview's digest needs it. */
-  endpoint?: string;
   secrets: readonly string[];
 }
 
@@ -64,7 +51,7 @@ const loopback = (hostname: string) =>
  * credentials, query or fragment; Factory appends `/v1/traces`. A refusal
  * says why `base` isn't one.
  */
-export function tracesEndpoint(base: string): string | { refused: string } {
+function tracesEndpoint(base: string): string | { refused: string } {
   let url: URL;
   try {
     url = new URL(base);
@@ -100,7 +87,7 @@ export function tracesEndpoint(base: string): string | { refused: string } {
  * `key=value` pairs. A refusal never echoes a value: it usually carries
  * credentials.
  */
-export function otlpHeaders(
+function otlpHeaders(
   environment: NodeJS.ProcessEnv,
 ): { headers: Record<string, string> } | { refused: string } {
   const name = environment.OTEL_EXPORTER_OTLP_TRACES_HEADERS
@@ -110,32 +97,14 @@ export function otlpHeaders(
   for (const entry of (environment[name] ?? "").split(",")) {
     if (!entry.trim()) continue;
     const at = entry.indexOf("=");
-    const key = at > 0 ? entry.slice(0, at).trim() : "";
-    let value: string | undefined;
+    if (at < 1) return { refused: `${name} is malformed` };
     try {
-      value = decodeURIComponent(entry.slice(at + 1).trim());
+      headers[entry.slice(0, at).trim()] = decodeURIComponent(
+        entry.slice(at + 1).trim(),
+      );
     } catch {
-      value = undefined;
-    }
-    // RFC 9110: token names, unique ignoring case; values are tab, space,
-    // visible ASCII or Latin-1 only.
-    if (
-      !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) ||
-      Object.keys(headers).some(
-        (other) => other.toLowerCase() === key.toLowerCase(),
-      ) ||
-      value === undefined ||
-      [...value].some((character) => {
-        const code = character.codePointAt(0)!;
-        return (
-          (code < 0x20 && code !== 0x09) ||
-          (code >= 0x7f && code < 0xa0) ||
-          code > 0xff
-        );
-      })
-    )
       return { refused: `${name} is malformed` };
-    headers[key] = value;
+    }
   }
   return { headers };
 }
@@ -214,15 +183,9 @@ const MEASURES = [
  * run; no invented parentage. Ids hash the run and the call's place in it,
  * so a repeat export keeps them.
  */
-function spansOf(options: ExportOptions): {
-  runs: string[];
-  spans: Span[];
-  calls: Invocation[];
-} {
+function spansOf(options: ExportOptions): { runs: string[]; spans: Span[] } {
   const spans: Span[] = [];
-  const calls: Invocation[] = [];
   const runs: string[] = [];
-  const chosen = options.invocations;
   const secrets = options.secrets;
   for (const file of chosenFiles(options.logs, options.issue, options.runs)) {
     let index = 0;
@@ -233,23 +196,7 @@ function spansOf(options: ExportOptions): {
       if (!Number.isFinite(end)) return;
       const ms = num(event.ms) ?? 0;
       const key = `${options.repository}#${options.issue}:${run}:${index++}`;
-      const spanId = hash(`factory-span:${key}`).slice(0, 16);
-      const capture = str(event.capture);
-      if (
-        chosen?.length &&
-        !chosen.includes(spanId) &&
-        !(capture !== undefined && chosen.includes(capture))
-      )
-        return;
       if (!runs.includes(run)) runs.push(run);
-      calls.push({
-        spanId,
-        run,
-        ...(capture !== undefined ? { capture } : {}),
-        ...(str(event.role) ? { role: str(event.role) } : {}),
-        ...(str(event.phase) ? { phase: str(event.phase) } : {}),
-        ...(itemOfEvent(event) ? { item: itemOfEvent(event) } : {}),
-      });
       const attributes = [
         attribute("session.id", `${options.repository}#${options.issue}`, []),
         attribute("factory.run", run, secrets),
@@ -310,7 +257,7 @@ function spansOf(options: ExportOptions): {
         traceId: hash(
           `factory-trace:${options.repository}#${options.issue}:${run}`,
         ).slice(0, 32),
-        spanId,
+        spanId: hash(`factory-span:${key}`).slice(0, 16),
         name: `Factory ${str(event.phase) ?? str(event.role) ?? "model call"}`,
         kind: 1,
         startTimeUnixNano: nanos(Math.max(0, end - ms)),
@@ -319,17 +266,7 @@ function spansOf(options: ExportOptions): {
       });
     });
   }
-  return { runs, spans, calls };
-}
-
-/** A selected model call: `--invocation` takes its span id, or its capture id. */
-export interface Invocation {
-  spanId: string;
-  run: string;
-  capture?: string;
-  role?: string;
-  phase?: string;
-  item?: string;
+  return { runs, spans };
 }
 
 /** One OTLP request body per batch: at most BATCH_SPANS spans and BATCH_BYTES each. */
@@ -372,144 +309,19 @@ function batchesOf(spans: Span[]): string[] {
   return batches;
 }
 
-/** Binds the endpoint, content, every batch and the headers (names ignoring case, values hashed). */
-function authorizationDigest(
-  endpoint: string,
-  content: string,
-  selection: readonly string[],
-  batches: string[],
-  headers: Record<string, string>,
-): string {
-  const headerDigest = hash(
-    JSON.stringify(
-      Object.entries(headers)
-        .map(([name, value]) => [name.toLowerCase(), value])
-        .sort(([a], [b]) => (a! < b! ? -1 : 1)),
-    ),
-  );
-  return hash(
-    JSON.stringify([
-      endpoint,
-      content,
-      [...selection].sort(),
-      batches.map(hash),
-      headerDigest,
-    ]),
-  );
-}
-
-export interface Prepared {
-  preview: {
-    repository: string;
-    issue: number;
-    runs: string[];
-    content: ExportOptions["content"];
-    spans: number;
-    /** The selected model calls; `--invocation` takes a span id or capture id. */
-    invocations: Invocation[];
-    batches: number;
-    payloadBytes: number;
-    endpoint: string | null;
-    headerNames: string[];
-    /** What `--send --authorize` takes; null without `--endpoint`. */
-    authorizationDigest: string | null;
-    limitations: string[];
-  };
+export interface Export {
+  runs: string[];
+  spans: number;
+  /** One OTLP request body each. */
   batches: string[];
-  headers: Record<string, string>;
 }
 
-/** Build the export, sending nothing; a string is why it can't. */
-export function prepareExport(
-  options: ExportOptions,
-  environment: NodeJS.ProcessEnv = process.env,
-): Prepared | string {
-  const endpoint =
-    options.endpoint === undefined ? null : tracesEndpoint(options.endpoint);
-  if (endpoint !== null && typeof endpoint !== "string")
-    return endpoint.refused;
-  const read = otlpHeaders(environment);
-  if ("refused" in read) return read.refused;
-  const { headers } = read;
-  const { runs, spans, calls } = spansOf(options);
-  const unknown = options.invocations?.find(
-    (id) => !calls.some((call) => call.spanId === id || call.capture === id),
-  );
-  if (unknown !== undefined)
-    return `#${options.issue} has no model call ${unknown} in the chosen runs: a preview lists each call's span id and capture id (--all-runs for every run).`;
+/** Build the export, sending nothing; a string is why there is none. */
+export function buildExport(options: ExportOptions): Export | string {
+  const { runs, spans } = spansOf(options);
   if (!spans.length)
     return `#${options.issue} has no model calls to export in the chosen runs: \`factory diagnostics ${options.issue} --all-runs\` shows them.`;
-  const batches = batchesOf(spans);
-  return {
-    preview: {
-      repository: options.repository,
-      issue: options.issue,
-      runs,
-      content: options.content,
-      spans: spans.length,
-      invocations: calls,
-      batches: batches.length,
-      payloadBytes: batches.reduce((sum, b) => sum + Buffer.byteLength(b), 0),
-      endpoint,
-      headerNames: Object.keys(headers).sort(),
-      authorizationDigest:
-        endpoint === null
-          ? null
-          : authorizationDigest(
-              endpoint,
-              options.content,
-              options.invocations ?? [],
-              batches,
-              headers,
-            ),
-      limitations: [
-        "Each model call is a root span in its run's trace; Factory invents no parentage.",
-        "Ids are stable, so a repeat send may update or duplicate spans at the collector: check it before sending again.",
-        "Redaction is best effort, and metadata can be sensitive too: authorize only a destination your repository's policy allows.",
-      ],
-    },
-    batches,
-    headers,
-  };
-}
-
-/** `--output FILE`: the batches as JSON lines, one OTLP request each, in a new 0600 file. */
-export function writeExport(prepared: Prepared, file: string): void {
-  const fd = openSync(
-    file,
-    fsConstants.O_WRONLY |
-      fsConstants.O_CREAT |
-      fsConstants.O_EXCL |
-      fsConstants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    for (const batch of prepared.batches) writeSync(fd, `${batch}\n`);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-export function previewText(prepared: Prepared): string {
-  const p = prepared.preview;
-  return [
-    `Export preview for #${p.issue} · ${p.spans} model call${p.spans === 1 ? "" : "s"} in ${p.runs.length} run${p.runs.length === 1 ? "" : "s"} · ${p.content} · ${p.batches} batch${p.batches === 1 ? "" : "es"}, ${p.payloadBytes} bytes · nothing sent`,
-    p.endpoint === null
-      ? "  endpoint: none (add --endpoint URL for the digest a send needs)"
-      : `  endpoint: ${p.endpoint}`,
-    `  headers: ${p.headerNames.join(", ") || "none"} (values never shown)`,
-    ...p.invocations.map(
-      (call) =>
-        `  ${call.spanId}${call.capture ? ` capture ${call.capture}` : ""} · ${[call.role ?? "?", call.phase].filter(Boolean).join(" ")} · ${call.item ? `item ${call.item}` : "objective"} · run ${call.run}`,
-    ),
-    ...(p.authorizationDigest
-      ? [
-          `  send with: --send --endpoint ${p.endpoint} --authorize ${p.authorizationDigest}`,
-        ]
-      : []),
-    ...p.limitations.map((line) => `  ${line}`),
-    "",
-  ].join("\n");
+  return { runs, spans: spans.length, batches: batchesOf(spans) };
 }
 
 type BatchResult =
@@ -586,45 +398,41 @@ async function sendBatch(
 
 export interface SendReceipt {
   endpoint: string;
-  authorizationDigest: string;
   batches: number;
   sent: number;
-  spans: number;
-  retries: 0;
   status: "accepted" | "stopped";
   results: BatchResult[];
 }
 
 /**
- * Send an export the operator authorized: `digest` must be the one this
- * exact export previews, or it refuses (a string). Batches go in order,
- * one request each with no retries, and the first one not fully
- * acknowledged stops the send.
+ * Send the export to the collector at `base` (a string: why it can't).
+ * Batches go in order, one request each with no retries, and the first one
+ * not fully acknowledged stops the send.
  */
 export async function sendExport(
-  prepared: Prepared,
-  digest: string,
+  built: Export,
+  base: string,
+  environment: NodeJS.ProcessEnv = process.env,
 ): Promise<SendReceipt | string> {
-  const { endpoint, authorizationDigest: expected } = prepared.preview;
-  if (endpoint === null || expected === null || digest !== expected)
-    return "The export changed, or this digest isn't its preview's: preview this exact endpoint, content, selection and headers again and authorize the new digest.";
+  const endpoint = tracesEndpoint(base);
+  if (typeof endpoint !== "string") return endpoint.refused;
+  const read = otlpHeaders(environment);
+  if ("refused" in read) return read.refused;
   const results: BatchResult[] = [];
-  for (const batch of prepared.batches) {
-    const result = await sendBatch(endpoint, prepared.headers, batch);
+  for (const batch of built.batches) {
+    const result = await sendBatch(endpoint, read.headers, batch);
     results.push(result);
     if (result.status !== "accepted") break;
   }
-  const accepted =
-    results.length === prepared.batches.length &&
-    results.every((result) => result.status === "accepted");
   return {
     endpoint,
-    authorizationDigest: digest,
-    batches: prepared.batches.length,
+    batches: built.batches.length,
     sent: results.length,
-    spans: prepared.preview.spans,
-    retries: 0,
-    status: accepted ? "accepted" : "stopped",
+    status:
+      results.length === built.batches.length &&
+      results.every((result) => result.status === "accepted")
+        ? "accepted"
+        : "stopped",
     results,
   };
 }

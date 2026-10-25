@@ -1,17 +1,10 @@
 /**
  * `factory export-captures`: its options, help and check, and what it does.
  */
-import { isAbsolute } from "node:path";
-import {
-  prepareExport,
-  previewText,
-  sendExport,
-  writeExport,
-} from "../capture-export.js";
+import { buildExport, sendExport } from "../capture-export.js";
 import { configOf, Refusal } from "../host.js";
 import { logFiles, runOfFile } from "../log.js";
 import type { Paths } from "../paths.js";
-import { errorMessage } from "../text.js";
 import { type Args, type Command, issueCheck, issueOf } from "./shared.js";
 
 export const spec: Command = {
@@ -19,44 +12,32 @@ export const spec: Command = {
   flags: {
     run: "value",
     "all-runs": "switch",
-    invocation: "list",
     content: "value",
     endpoint: "value",
-    output: "value",
-    json: "switch",
     send: "switch",
-    authorize: "value",
   },
-  help: "Preview an Objective's model calls as OpenTelemetry spans (OTLP/HTTP JSON) and send nothing: --content metadata (the default; no captured text) or retained (adds the captured request and response, redacted again), --output ABSOLUTE_FILE writes the OTLP requests to a new local file, --endpoint URL (a collector's base URL, HTTPS or loopback HTTP; headers from OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS, never shown) prints the digest a send needs; --invocation ID (repeatable) selects model calls by the span id or capture id the preview lists; --send --endpoint URL --authorize DIGEST sends exactly what that preview showed, in bounded batches; the latest run, or --run ID, or --all-runs",
+  help: "Print an Objective's model calls as OpenTelemetry spans (OTLP/HTTP JSON), one request per line, and send nothing: --content metadata (the default; no captured text) or retained (adds the captured request and response, redacted again); --endpoint URL --send posts them to that collector instead (its base URL, HTTPS or loopback HTTP; headers from OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS, never shown), in bounded batches; the latest run, or --run ID, or --all-runs",
   check: (args, command) => {
     const { flags } = args;
     const content = flags.content ?? "metadata";
-    const output = flags.output;
     return (
       issueCheck(args, command) ??
       (content !== "metadata" && content !== "retained"
         ? "--content takes metadata or retained"
         : flags.run !== undefined && flags["all-runs"] !== undefined
           ? "give --run ID or --all-runs, not both"
-          : (flags.send !== undefined) !== (flags.authorize !== undefined)
-            ? "a send needs --send --endpoint URL --authorize DIGEST, the digest the preview printed"
-            : flags.send !== undefined && flags.endpoint === undefined
-              ? "--send needs --endpoint URL, the one the preview showed"
-              : output !== undefined && !isAbsolute(output)
-                ? "--output needs an absolute path"
-                : output !== undefined && flags.send !== undefined
-                  ? "--output goes with a preview, not --send"
-                  : undefined)
+          : (flags.send !== undefined) !== (flags.endpoint !== undefined)
+            ? "a send needs both --endpoint URL and --send"
+            : undefined)
     );
   },
   run: ({ paths, repository, args }) => exportCommand(paths, repository, args),
 };
 
 /**
- * `factory export-captures ISSUE [--run ID | --all-runs] [--invocation ID]... [--content
- * metadata|retained] [--endpoint URL] [--output FILE] [--json]`: a
- * preview that sends nothing; `--send --endpoint URL --authorize DIGEST`
- * sends what that preview showed. Exits 0 only when every batch was fully
+ * `factory export-captures ISSUE [--run ID | --all-runs] [--content
+ * metadata|retained] [--endpoint URL --send]`: the OTLP requests on
+ * stdout, or sent. A send exits 0 only when every batch was fully
  * acknowledged.
  */
 async function exportCommand(
@@ -77,7 +58,8 @@ async function exportCommand(
       "no_factory_state",
       `#${issue} has no run ${flags.run} in its run log; its runs: ${runs.join(", ")}.`,
     );
-  const prepared = prepareExport({
+  const content = flags.content === "retained" ? "retained" : "metadata";
+  const built = buildExport({
     logs: paths.logs,
     repository,
     issue,
@@ -87,38 +69,22 @@ async function exportCommand(
         : flags["all-runs"] !== undefined
           ? { kind: "all" }
           : { kind: "latest" },
-    content: flags.content === "retained" ? "retained" : "metadata",
-    ...(args.lists.invocation
-      ? { invocations: [...new Set(args.lists.invocation)] }
-      : {}),
-    ...(flags.endpoint !== undefined ? { endpoint: flags.endpoint } : {}),
+    content,
     secrets: configOf(repository)?.secrets ?? [],
   });
-  if (typeof prepared === "string")
-    throw new Refusal("export_refused", prepared);
-  if (flags.authorize === undefined) {
-    if (flags.output !== undefined)
-      try {
-        writeExport(prepared, flags.output);
-      } catch (error) {
-        throw new Refusal(
-          "export_refused",
-          `--output ${flags.output} can't be written as a new file: ${errorMessage(error)}`,
-        );
-      }
-    process.stdout.write(
-      flags.json !== undefined
-        ? `${JSON.stringify({ status: "preview", ...prepared.preview })}\n`
-        : previewText(prepared),
+  if (typeof built === "string") throw new Refusal("export_refused", built);
+  const summary = `${built.spans} model call${built.spans === 1 ? "" : "s"} of #${issue} in ${built.runs.length} run${built.runs.length === 1 ? "" : "s"} · ${content} · ${built.batches.length} batch${built.batches.length === 1 ? "" : "es"}`;
+  if (flags.send === undefined) {
+    for (const batch of built.batches) process.stdout.write(`${batch}\n`);
+    process.stderr.write(
+      `Export preview: ${summary} · nothing sent; --endpoint URL --send sends it. Span ids are stable, so a repeat send may duplicate spans at the collector.\n`,
     );
     return 0;
   }
-  const receipt = await sendExport(prepared, flags.authorize);
+  const receipt = await sendExport(built, flags.endpoint!);
   if (typeof receipt === "string") throw new Refusal("export_refused", receipt);
   process.stdout.write(
-    flags.json !== undefined
-      ? `${JSON.stringify(receipt)}\n`
-      : `Export ${receipt.status}: ${receipt.sent} of ${receipt.batches} batch${receipt.batches === 1 ? "" : "es"} (${receipt.spans} spans) to ${receipt.endpoint}${receipt.status === "accepted" ? "" : `; ${JSON.stringify(receipt.results.at(-1))}: check the collector before sending again`}\n`,
+    `Export ${receipt.status}: ${summary}, ${receipt.sent} sent to ${receipt.endpoint}${receipt.status === "accepted" ? "" : `; ${JSON.stringify(receipt.results.at(-1))}: check the collector before sending again`}\n`,
   );
   return receipt.status === "accepted" ? 0 : 1;
 }

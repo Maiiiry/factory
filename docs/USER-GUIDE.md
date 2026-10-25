@@ -243,14 +243,14 @@ On GitHub, each Objective has a live status comment, each Work Item has its issu
 
 ### Export model calls
 
-`factory export-captures N` builds OpenTelemetry (OTLP/HTTP JSON) spans from a run's model calls and sends nothing. Sending is explicit: preview with the collector's base URL, then authorize that exact preview's digest.
+`factory export-captures N` prints OpenTelemetry (OTLP/HTTP JSON) spans built from a run's model calls, one request per line, and sends nothing. Sending is explicit: give the collector's base URL and `--send`.
 
 ```sh
-factory export-captures N --endpoint https://collector.example.com [--content metadata|retained] [--invocation ID]...
-factory export-captures N --endpoint https://collector.example.com --send --authorize DIGEST
+factory export-captures N [--content metadata|retained] > spans.jsonl
+factory export-captures N --endpoint https://collector.example.com --send [--content metadata|retained]
 ```
 
-`metadata` (the default) reads no captured text; `retained` adds the captured request and response, redacted again. `--output ABSOLUTE_FILE` writes the preview's requests to a new local file instead. Headers come from `OTEL_EXPORTER_OTLP_TRACES_HEADERS` or `OTEL_EXPORTER_OTLP_HEADERS` and are never printed. Changing the selection, content, endpoint or headers needs a new preview. Plain HTTP is allowed only to a loopback collector.
+`metadata` (the default) reads no captured text; `retained` adds the captured request and response, redacted again. Headers come from `OTEL_EXPORTER_OTLP_TRACES_HEADERS` or `OTEL_EXPORTER_OTLP_HEADERS` and are never printed. Plain HTTP is allowed only to a loopback collector.
 
 ## Answer questions
 
