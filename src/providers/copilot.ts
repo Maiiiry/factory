@@ -17,7 +17,7 @@ import type {
   Tool,
 } from "@github/copilot-sdk";
 import { isObject } from "../checked.js";
-import { runningBuild } from "../log.js";
+import { factoryVersion } from "../log.js";
 import { errorMessage } from "../text.js";
 import { validationDeadlineMs } from "../validate.js";
 import {
@@ -299,7 +299,7 @@ async function runTurn(turn: Turn): Promise<TurnResult> {
     enableRemoteSessions: false,
     clientInfo: {
       applicationName: "factory",
-      applicationVersion: runningBuild().factoryVersion ?? "unknown",
+      applicationVersion: factoryVersion() ?? "unknown",
       integrationName: "factory",
       integrationVersion: "1",
     },

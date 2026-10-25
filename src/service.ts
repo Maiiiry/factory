@@ -31,7 +31,7 @@ import type {
 } from "./github-sync.js";
 import { backoffMs, Jobs } from "./jobs.js";
 import { takeServiceLock } from "./lock.js";
-import { endCrashedRun, newRunId, RunLog, rotateLogs } from "./log.js";
+import { newRunId, RunLog, rotateLogs } from "./log.js";
 import type { Paths } from "./paths.js";
 import { declineDiscovery, proposeAmendment } from "./planning/amendments.js";
 import { pathsOverlap } from "./planning/graph.js";
@@ -450,15 +450,6 @@ export async function serve(options: ServeOptions): Promise<number> {
   // Saved before any hold below, so a crash in between never counts the
   // same death twice.
   heartbeat();
-  // The last run died: its files end with that, as far as this start knows them
-  // (after the heartbeat that records the death).
-  if (previous?.runId && !previous.stopped && previous.runId !== runId)
-    endCrashedRun(
-      paths.logs,
-      previous.runId,
-      [...runners.keys(), ...unreadable.keys()],
-      runId,
-    );
   // The evidence is spent before any question is visible: the steps to
   // ask about are saved in the record first (`suspected`), so a death
   // before their questions are saved asks them at the next start, and a
@@ -1296,9 +1287,6 @@ export async function serve(options: ServeOptions): Promise<number> {
     // Nothing of this run writes after its end, or after the lock is
     // released: every step stops (never saving again) and every
     // observation and sync job is aborted, and each has ended.
-    const settledAtStop = new Map(
-      [...runners].map(([issue, runner]) => [issue, runner.settled]),
-    );
     const drained = Promise.allSettled([
       ...[...runners.values()].map((runner) => runner.stop()),
       ...setAsideStops.values(),
@@ -1318,10 +1306,6 @@ export async function serve(options: ServeOptions): Promise<number> {
     // process, which exits right after.
     if (!ended) log.write(0, { event: "stop-drain-timeout", afterMs: drainMs });
     options.sync?.flushTransport();
-    // An Objective still unfinished is handed off to the next run.
-    log.end((issue) =>
-      settledAtStop.get(issue) === false ? "handed-off" : "stopped",
-    );
     // A clean stop (an upgrade, a reboot) ends any crash streak.
     heartbeat(true);
     lock.close();

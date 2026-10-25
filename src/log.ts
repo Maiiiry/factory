@@ -12,7 +12,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { attemptDir, captureDir, readContained } from "./paths.js";
 
@@ -64,43 +64,14 @@ let toolCapture = false;
 export const capturingTools = (): boolean => toolCapture;
 
 /**
- * How a run ended, in its `run-end` event: `stopped` (a clean stop, or a
- * one-off run that finished), `handed-off` (a clean stop with the
- * Objective unfinished: the next run carries it on), or `crashed` (the
- * process died; the next start detects it and appends this event to the
- * dead run's files, `endCrashedRun`).
- */
-export type RunEnd = "stopped" | "handed-off" | "crashed";
-
-/** One run file's line counters: what `log-health` reports. */
-interface FileHealth {
-  path: string;
-  /** The last sequence number given out: every line gets the next, written or not. */
-  seq: number;
-  emitted: number;
-  /** Failed writes: lines (`lost`) and capture files. */
-  failed: number;
-  lost: number;
-  /** `failed` when the last `log-health` went out. */
-  reported: number;
-}
-
-/**
  * The run log: one append-only JSON-lines file per Objective per service
  * run, `logs/<issue>/<run id>.jsonl`, and with capture on its bodies under
- * `logs/<issue>/<run id>.captures/`. It records what happened for status,
- * diagnostics and analysis. It never drives progress, and losing it loses
- * no work.
- *
- * Its formal history (docs/reference/run-log.md#Run log): each file starts with a
- * `run-header` (Factory's version and the running build's source digest);
- * every line carries `seq`, consecutive per file from 1, so a missing
- * number is a lost line; a write that fails is counted, and the next line
- * that lands is followed by a `log-health` event (emitted, failed and
- * lost), as is the run's end (`end`), after its `run-end` event.
+ * `logs/<issue>/<run id>.captures/`. It records what happened for status
+ * and diagnostics (docs/reference/run-log.md#Run log). It never drives
+ * progress, and losing it loses no work: a line that can't be written is
+ * dropped.
  */
 export class RunLog {
-  private readonly files = new Map<number, FileHealth>();
   /** Attempt files given out this run, oldest first, and their bytes on disk. */
   private readonly attempts: RunFile[] = [];
 
@@ -113,17 +84,21 @@ export class RunLog {
     if (capture.enabled) toolCapture = true;
   }
 
+  /** Append `{at, ...event}` to the issue's file of this run, and its capture's id. */
   write(issue: number, event: Record<string, unknown>): void {
-    const file = this.file(issue);
-    if (!file) return;
-    if (file.seq === 0)
-      this.append(file, { event: "run-header", ...runningBuild() });
     const body = (event as { [CAPTURE]?: CaptureBody })[CAPTURE];
     const id = body && this.capture.enabled && this.captured(issue, body);
-    if (body && this.capture.enabled && !id) file.failed += 1;
-    if (!this.append(file, { ...event, ...(id ? { capture: id } : {}) }))
-      return;
-    if (file.failed > file.reported) this.health(file);
+    try {
+      const dir = join(this.dir, String(issue));
+      mkdirSync(dir, { recursive: true });
+      appendFileSync(
+        join(dir, `${this.runId}.jsonl`),
+        `${JSON.stringify({ at: new Date().toISOString(), ...event, ...(id ? { capture: id } : {}) })}\n`,
+      );
+    } catch {
+      // A full disk, a removed directory or an unserializable event must
+      // not stop the run: the log only observes.
+    }
   }
 
   /**
@@ -169,45 +144,6 @@ export class RunLog {
         file: file!.file,
       });
     }
-  }
-
-  /**
-   * The run's end: a `run-end` event (`outcome(issue)`) then a
-   * `log-health` event in every file this run wrote. Call it once, last.
-   */
-  end(outcome: (issue: number) => RunEnd): void {
-    for (const [issue, file] of this.files) {
-      this.append(file, { event: "run-end", outcome: outcome(issue) });
-      this.health(file);
-    }
-  }
-
-  /** One line with the file's next `seq`; false, counted, when it couldn't be written. */
-  private append(file: FileHealth, event: Record<string, unknown>): boolean {
-    file.seq += 1;
-    try {
-      appendFileSync(
-        file.path,
-        `${JSON.stringify({ at: new Date().toISOString(), seq: file.seq, ...event })}\n`,
-      );
-      file.emitted += 1;
-      return true;
-    } catch {
-      // A full disk or a removed directory must not stop the run: the log only observes.
-      file.failed += 1;
-      file.lost += 1;
-      return false;
-    }
-  }
-
-  private health(file: FileHealth): void {
-    file.reported = file.failed;
-    this.append(file, {
-      event: "log-health",
-      emitted: file.emitted,
-      failed: file.failed,
-      lost: file.lost,
-    });
   }
 
   /**
@@ -277,29 +213,6 @@ export class RunLog {
     } catch {
       return undefined;
     }
-  }
-
-  private file(issue: number): FileHealth | undefined {
-    let file = this.files.get(issue);
-    if (!file) {
-      const dir = join(this.dir, String(issue));
-      try {
-        mkdirSync(dir, { recursive: true });
-      } catch {
-        // Tried again with the next line; nothing was numbered yet.
-        return undefined;
-      }
-      file = {
-        path: join(dir, `${this.runId}.jsonl`),
-        seq: 0,
-        emitted: 0,
-        failed: 0,
-        lost: 0,
-        reported: 0,
-      };
-      this.files.set(issue, file);
-    }
-    return file;
   }
 }
 
@@ -554,96 +467,15 @@ export function readRunFile(
   return { text: redact(text, secrets), cut };
 }
 
-/**
- * At a start that found the last run dead: append `run-end` (`crashed`)
- * to that run's files of `issues` (and the service's, 0) that exist,
- * numbered after their last line, which a torn last line doesn't swallow;
- * a file that already has one is left alone.
- * Only the given issues are looked at: the Objectives this start loaded.
- */
-export function endCrashedRun(
-  dir: string,
-  runId: string,
-  issues: Iterable<number>,
-  detectedBy: string,
-): void {
-  for (const issue of new Set([0, ...issues])) {
-    const path = join(dir, String(issue), `${runId}.jsonl`);
-    try {
-      if (!existsSync(path)) continue;
-      const size = sizeOf(path);
-      const tail = readFrom(path, Math.max(0, size - 64 * 1024), size);
-      const lines = parseLines(completeLines(tail).toString("utf8"), true);
-      // Ended already (a start that died after writing this): once only.
-      if (lines.some((line) => line.event === "run-end")) continue;
-      const last = lines.at(-1);
-      const seq = typeof last?.seq === "number" ? last.seq + 1 : undefined;
-      appendFileSync(
-        path,
-        `${tail.length && tail[tail.length - 1] !== 10 ? "\n" : ""}${JSON.stringify(
-          {
-            at: new Date().toISOString(),
-            ...(seq ? { seq } : {}),
-            event: "run-end",
-            outcome: "crashed" satisfies RunEnd,
-            detectedBy,
-          },
-        )}\n`,
-      );
-    } catch {
-      // The log only observes.
-    }
-  }
-}
-
-interface Build {
-  factoryVersion: string | null;
-  sourceDigest: string | null;
-}
-let built: Build | undefined;
-
-/**
- * The running build, once per process: Factory's version (the nearest
- * package.json above this module) and a sha256 over the build's own
- * JavaScript files (paths and bytes, in path order).
- */
-export function runningBuild(): Build {
-  if (built) return built;
-  const root = dirname(fileURLToPath(import.meta.url));
-  let factoryVersion: string | null = null;
-  for (let dir = root; ; dir = dirname(dir)) {
+/** Factory's version: the nearest package.json above this module's. */
+export function factoryVersion(): string | null {
+  for (let dir = dirname(fileURLToPath(import.meta.url)); ; dir = dirname(dir))
     try {
       const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-      factoryVersion = typeof pkg.version === "string" ? pkg.version : null;
-      break;
+      return typeof pkg.version === "string" ? pkg.version : null;
     } catch {
-      if (dirname(dir) === dir) break;
+      if (dirname(dir) === dir) return null;
     }
-  }
-  let sourceDigest: string | null = null;
-  try {
-    const hash = createHash("sha256");
-    const walk = (dir: string): string[] =>
-      readdirSync(dir, { withFileTypes: true })
-        .flatMap((entry) =>
-          entry.isDirectory()
-            ? walk(join(dir, entry.name))
-            : entry.name.endsWith(".js")
-              ? [join(dir, entry.name)]
-              : [],
-        )
-        .sort();
-    for (const file of walk(root))
-      hash
-        .update(`${relative(root, file)}\0`)
-        .update(readFileSync(file))
-        .update("\0");
-    sourceDigest = hash.digest("hex");
-  } catch {
-    // Unreadable: the header says so with null.
-  }
-  built = { factoryVersion, sourceDigest };
-  return built;
 }
 
 /** `text` within `bytes` of UTF-8, cut at a character boundary. */
@@ -741,13 +573,67 @@ export function readNew(
 ): LogEvent[] {
   const fresh: LogEvent[] = [];
   for (const file of logFiles(dir, issue)) {
-    const from = offsets.get(file) ?? 0;
-    const complete = completeLines(readFrom(file, from, sizeOf(file)));
-    if (!complete.length) continue;
-    offsets.set(file, from + complete.length);
-    fresh.push(...ofRun(file, parseLines(complete.toString("utf8"))));
+    const found: LogEvent[] = [];
+    offsets.set(
+      file,
+      streamFile(file, offsets.get(file) ?? 0, (event) => found.push(event)),
+    );
+    fresh.push(...ofRun(file, found));
   }
   return fresh.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+/** Bytes `streamFile` reads per chunk; a line longer than STREAM_LINE is skipped. */
+const STREAM_CHUNK = 1024 * 1024;
+const STREAM_LINE = 16 * 1024 * 1024;
+
+/**
+ * Read `file` from byte `from` in chunks, passing each complete event to
+ * `visit`; returns the offset after the last complete line, where a follow
+ * carries on. A large file costs time, not memory.
+ */
+export function streamFile(
+  file: string,
+  from: number,
+  visit: (event: LogEvent) => void,
+): number {
+  const size = sizeOf(file);
+  let position = from;
+  let done = from;
+  let rest = Buffer.alloc(0);
+  let skipping = false;
+  while (position < size) {
+    const chunk = readFrom(
+      file,
+      position,
+      Math.min(size, position + STREAM_CHUNK),
+    );
+    if (!chunk.length) break;
+    position += chunk.length;
+    let bytes = rest.length ? Buffer.concat([rest, chunk]) : chunk;
+    if (skipping) {
+      // Inside an overlong line: drop it through its newline.
+      const end = bytes.indexOf(10);
+      if (end < 0) {
+        done += bytes.length;
+        rest = Buffer.alloc(0);
+        continue;
+      }
+      done += end + 1;
+      bytes = bytes.subarray(end + 1);
+      skipping = false;
+    }
+    const complete = completeLines(bytes);
+    for (const event of parseLines(complete.toString("utf8"))) visit(event);
+    done += complete.length;
+    rest = Buffer.from(bytes.subarray(complete.length));
+    if (rest.length > STREAM_LINE) {
+      done += rest.length;
+      rest = Buffer.alloc(0);
+      skipping = true;
+    }
+  }
+  return done;
 }
 
 /** Each event marked with the run whose file it was read from. */
@@ -803,12 +689,12 @@ export function loggedIssues(dir: string): number[] {
 }
 
 /** The bytes up to and including the last newline: the complete lines. */
-export function completeLines(bytes: Buffer): Buffer {
+function completeLines(bytes: Buffer): Buffer {
   return bytes.subarray(0, bytes.lastIndexOf(10) + 1);
 }
 
 /** The bytes of `file` from `start` to `end`; empty when it can't be read. */
-export function readFrom(file: string, start: number, end: number): Buffer {
+function readFrom(file: string, start: number, end: number): Buffer {
   if (end <= start) return Buffer.alloc(0);
   let fd: number | undefined;
   try {
@@ -824,7 +710,7 @@ export function readFrom(file: string, start: number, end: number): Buffer {
 }
 
 /** Complete JSON lines as events; with `partialFirst`, the first line was cut and is dropped. */
-export function parseLines(text: string, partialFirst = false): LogEvent[] {
+function parseLines(text: string, partialFirst = false): LogEvent[] {
   const lines = text.split("\n");
   if (partialFirst) lines.shift();
   const events: LogEvent[] = [];
@@ -934,7 +820,7 @@ function safeList(dir: string): string[] {
   }
 }
 
-export function sizeOf(path: string): number {
+function sizeOf(path: string): number {
   try {
     return statSync(path).size;
   } catch {
