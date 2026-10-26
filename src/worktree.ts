@@ -771,3 +771,5 @@ export function validationEnvironment(
   if (process.env.PATH !== undefined) env.PATH = process.env.PATH;
   return env;
 }
+
+# Automated fix for issue #2031: An amendment's fixable review finding rejects it instead of going back to its planner
